@@ -32,8 +32,8 @@ use crate::{
     },
 };
 use gpui::{
-    AnyElement, App, Bounds, Entity, FocusHandle, Pixels, SharedString, Subscription, Window, canvas, div, prelude::*,
-    px,
+    AnyElement, App, Bounds, Entity, FocusHandle, Pixels, SharedString, Subscription, WeakEntity, Window, canvas, div,
+    prelude::*, px,
 };
 use gpui_kit::component::menu::DropdownMenu;
 use gpui_kit::component::notification::Notification;
@@ -123,15 +123,23 @@ const KEYWORD_INPUT_WIDTH: f32 = 200.0;
 /// The least the entry panel is useful at: its fields, and Remove / Cancel /
 /// Update on one line.
 const ENTRY_PANEL_MIN_WIDTH: f32 = 320.;
-/// What the table keeps beside an open entry panel: the tick box, the row
-/// number and the column that names a row — a hash field, a stream id, a
-/// score, 200 at the widest.
+/// What the table keeps beside an open entry panel, and the least of it worth
+/// drawing there: the tick box, the row number, and the naming column and the
+/// value at about [`DATA_COLUMN_MIN_WIDTH`] each (`fit_columns`). In a pane
+/// that cannot give it this, the panel is shown alone.
 const TABLE_MIN_WIDTH: f32 = 320.;
-/// The least of the table worth drawing beside the panel: the tick box, the
-/// row number, a dozen characters of the naming column — and a footer its
-/// filter box fits in. In a pane that cannot give it this, the panel is
-/// shown alone.
-const TABLE_USEFUL_WIDTH: f32 = 240.;
+/// The narrowest a data column is drawn: about a dozen characters at the
+/// table's 14px text, beside the cell's paddings.
+const DATA_COLUMN_MIN_WIDTH: f32 = 96.;
+/// What the table holds back from its columns, so that they end short of its
+/// edge and its scrollbar.
+const TABLE_EDGE_RESERVE: f32 = 10.;
+/// How much narrower than its share a sharing column is drawn.
+const SHARED_COLUMN_GAP: f32 = 5.;
+/// The most of the data columns' room a column that names its width takes
+/// while others share that room: 200px of Field in a table of 400 left the
+/// value 96.
+const NAMED_COLUMN_MAX_SHARE: f32 = 0.4;
 
 /// How an open entry panel and the table share the pane, in pixels.
 #[derive(Debug, PartialEq)]
@@ -141,8 +149,6 @@ struct PanelSplit {
     /// How narrow and how wide the handle lets it go.
     panel_min: f32,
     panel_max: f32,
-    /// What the table keeps whatever the handle does.
-    table_min: f32,
 }
 
 /// Divide `pane` — the width the table has, measured — between the table and
@@ -150,24 +156,99 @@ struct PanelSplit {
 /// `None` where the pane cannot hold the panel and a table worth drawing:
 /// the panel is then shown alone, and the table is back when it closes.
 ///
-/// The table keeps [`TABLE_MIN_WIDTH`] wherever the pane has room for both
-/// minimums, and the rest where it has not. Both used to be worked out from
-/// the *window*: half of it by default and three quarters at most, inside a
-/// pane that is itself only about half the window — so at the default window
-/// size the panel left the table its floor of 100, the tick box and the row
-/// number, and the footer's filter read "Fi" (#182).
+/// The table keeps [`TABLE_MIN_WIDTH`] whatever the handle does. Both sides
+/// used to be worked out from the *window*: half of it by default and three
+/// quarters at most, inside a pane that is itself only about half the window
+/// — so at the default window size the panel left the table its floor of
+/// 100, the tick box and the row number, and the footer's filter read "Fi"
+/// (#182).
 fn entry_panel_split(pane: f32, saved: Option<f32>) -> Option<PanelSplit> {
-    if pane < ENTRY_PANEL_MIN_WIDTH + TABLE_USEFUL_WIDTH {
+    if pane < ENTRY_PANEL_MIN_WIDTH + TABLE_MIN_WIDTH {
         return None;
     }
     let panel_min = ENTRY_PANEL_MIN_WIDTH;
-    let panel_max = (pane - TABLE_MIN_WIDTH).max(panel_min);
+    let panel_max = pane - TABLE_MIN_WIDTH;
     Some(PanelSplit {
         panel: saved.unwrap_or(pane / 2.).clamp(panel_min, panel_max),
         panel_min,
         panel_max,
-        table_min: (pane - panel_max).min(TABLE_MIN_WIDTH),
     })
+}
+
+/// Covers its parent and writes the width that was laid out at into `slot`.
+/// With `redraw`, a width it had not seen renders `view` again on the next
+/// frame: what the view draws depends on a width that is only known after
+/// layout (the `value_diff` pattern).
+fn width_probe<V: 'static>(slot: Rc<Cell<Option<Pixels>>>, view: WeakEntity<V>, redraw: bool) -> impl IntoElement {
+    canvas(
+        move |bounds: Bounds<Pixels>, window: &mut Window, _cx: &mut App| {
+            let width = bounds.size.width;
+            if slot.get() == Some(width) {
+                return;
+            }
+            slot.set(Some(width));
+            if redraw {
+                window.on_next_frame(move |_, cx| {
+                    let _ = view.update(cx, |_, cx| cx.notify());
+                });
+            }
+        },
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
+}
+
+/// Give every column a width, for a table `table_width` wide — its own
+/// width, which is less than the pane's while the entry panel is open.
+///
+/// A column that names a width keeps it and the ones that do not share the
+/// rest — where the table has the room. Where it has not, a named column
+/// takes at most [`NAMED_COLUMN_MAX_SHARE`] of what the data columns have,
+/// so that the value — what the table is opened to read — is the wider of
+/// the two rather than what is left over; and no data column is drawn
+/// narrower than [`DATA_COLUMN_MIN_WIDTH`], whatever does not fit after
+/// that scrolling sideways, last columns first.
+///
+/// The widths used to be worked out once, when the table was built, from an
+/// estimate of the pane. Beside the entry panel that left a table of 320
+/// showing the tick box, the row number, a 200px Field and 16px of the value
+/// (#182, reopened), and a window resized after the key was opened kept the
+/// widths of the old one — the field TTL column out of view to the right.
+fn fit_columns(mut columns: Vec<KvTableColumn>, table_width: f32) -> Vec<KvTableColumn> {
+    let is_data = |column: &KvTableColumn| column.column_type == KvTableColumnType::Value;
+    // The tick box and the row number are as narrow as they go: the room
+    // is what they leave.
+    let leading: f32 = columns
+        .iter()
+        .filter(|column| !is_data(column))
+        .filter_map(|column| column.width)
+        .sum();
+    let room = table_width - TABLE_EDGE_RESERVE - leading;
+    let sharing = columns.iter().filter(|column| column.width.is_none()).count();
+    if sharing == 0 {
+        return columns;
+    }
+
+    let most = (room * NAMED_COLUMN_MAX_SHARE).max(DATA_COLUMN_MIN_WIDTH);
+    let mut remaining = room;
+    for column in columns.iter_mut().filter(|column| is_data(column)) {
+        let Some(width) = column.width else {
+            continue;
+        };
+        // A width under 1 is a share of the room.
+        let width = if width < 1. { width * room } else { width };
+        let width = width.min(most);
+        column.width = Some(width);
+        remaining -= width;
+    }
+    let share = (remaining / sharing as f32 - SHARED_COLUMN_GAP).max(DATA_COLUMN_MIN_WIDTH);
+    for column in columns.iter_mut() {
+        column.width.get_or_insert(share);
+    }
+    columns
 }
 
 /// Parse pasted text into rows of values for bulk insertion.
@@ -288,6 +369,14 @@ pub struct ZedisKvTable<T: ZedisKvFetcher> {
     /// entry panel have to share. Written after layout (`measure` in
     /// `render`), read by the next render; `None` until the first paint.
     pane_width: Rc<Cell<Option<Pixels>>>,
+    /// The width the table itself was last laid out at: the pane's, less the
+    /// entry panel while that is open. Written and read like `pane_width`.
+    table_width: Rc<Cell<Option<Pixels>>>,
+    /// The `table_width` the columns were last fitted to.
+    fitted_width: Option<Pixels>,
+    /// The user dragged a column border: the widths stay as they left them
+    /// until the table has other columns.
+    columns_sized_by_hand: bool,
     /// Fetcher instance
     fetcher: Arc<T>,
     /// Server state, kept so the CSV export action can call `export_to_file`.
@@ -321,59 +410,17 @@ impl<T: ZedisKvFetcher> ZedisKvTable<T> {
         T::new(server_state, value)
     }
 
-    /// Prepares table columns by adding index and action columns, then calculating widths.
-    ///
-    /// # Logic:
-    /// 1. Adds an index column at the start (right-aligned)
-    /// 2. Adds an action column at the end (100px, center-aligned)
-    /// 3. Calculates remaining space for columns without fixed widths
-    /// 4. Distributes remaining width evenly among flexible columns
-    fn new_columns(
-        columns: Vec<KvTableColumn>,
-        selectable: bool,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> Vec<KvTableColumn> {
-        // Calculate available width (window - sidebar - key tree - padding)
-        let window_width = window.viewport_size().width;
+    /// The delegate's columns: the caller's, with the row number (and the
+    /// tick box) in front, fitted to a table `table_width` wide.
+    fn new_columns(columns: Vec<KvTableColumn>, selectable: bool, table_width: Pixels) -> Vec<KvTableColumn> {
+        fit_columns(with_leading_columns(columns, selectable), table_width.as_f32())
+    }
 
-        let mut columns = with_leading_columns(columns, selectable);
-
-        // Calculate remaining width and count columns without fixed width
-        let content_width = cx
-            .global::<ZedisGlobalStore>()
-            .read(cx)
-            .content_width()
-            .unwrap_or(window_width);
-        let mut remaining_width = content_width.as_f32() - 10.;
-        let mut flexible_columns = 0;
-
-        for column in columns.iter_mut() {
-            if let Some(mut width) = column.width {
-                if width < 1.0 {
-                    width *= remaining_width;
-                    column.width = Some(width);
-                }
-                remaining_width -= width;
-            } else {
-                flexible_columns += 1;
-            }
-        }
-
-        // Distribute remaining width among flexible columns
-        let flexible_width = if flexible_columns > 0 {
-            Some((remaining_width / flexible_columns as f32) - 5.)
-        } else {
-            None
-        };
-
-        for column in &mut columns {
-            if column.width.is_none() {
-                column.width = flexible_width;
-            }
-        }
-
-        columns
+    /// The table's width before it has been laid out once: the app's own
+    /// estimate of the pane (window − sidebar − key tree).
+    fn estimated_width(window: &Window, cx: &App) -> Pixels {
+        let estimate = cx.global::<ZedisGlobalStore>().read(cx).content_width();
+        estimate.unwrap_or(window.viewport_size().width)
     }
     /// Creates a new table view with the given columns and server state.
     ///
@@ -510,7 +557,7 @@ impl<T: ZedisKvFetcher> ZedisKvTable<T> {
         let total_count = fetcher.count();
         let selectable = fetcher.supports_batch_remove() && mode.contains(KvTableMode::REMOVE);
         let delegate = ZedisKvDelegate::new(
-            Self::new_columns(columns.clone(), selectable, window, cx),
+            Self::new_columns(columns.clone(), selectable, Self::estimated_width(window, cx)),
             fetcher.clone(),
             window,
             cx,
@@ -525,6 +572,10 @@ impl<T: ZedisKvFetcher> ZedisKvTable<T> {
             }
             TableEvent::ClearSelection => {
                 this.edit_row = None;
+            }
+            // A border dragged by hand: these widths are the user's now.
+            TableEvent::ColumnWidthsChanged(_) => {
+                this.columns_sized_by_hand = true;
             }
             _ => {}
         }));
@@ -576,6 +627,9 @@ impl<T: ZedisKvFetcher> ZedisKvTable<T> {
             base_mode: KvTableMode::ALL,
             panel_width: cx.global::<ZedisGlobalStore>().read(cx).kv_edit_panel_width(),
             pane_width: Rc::new(Cell::new(None)),
+            table_width: Rc::new(Cell::new(None)),
+            fitted_width: None,
+            columns_sized_by_hand: false,
             fetcher,
             server_state,
             columns,
@@ -1384,9 +1438,16 @@ impl<T: ZedisKvFetcher> Render for ZedisKvTable<T> {
         }
         self.panel_was_open = panel_open;
 
+        // The columns are fitted to the table's own width, as it was last
+        // laid out: opening the entry panel, dragging its handle or resizing
+        // the window gives the table another one, and the columns follow on
+        // the next frame. Widths the user dragged are left alone.
+        let table_width = self.table_width.get();
+        let fit_width = table_width.unwrap_or_else(|| Self::estimated_width(window, cx));
         // Rebuild delegate columns when they changed (e.g., Stream with new fields)
-        if std::mem::take(&mut self.columns_dirty) {
-            let new_delegate_columns = Self::new_columns(self.columns.clone(), self.selectable(), window, cx);
+        let columns_changed = std::mem::take(&mut self.columns_dirty);
+        if columns_changed {
+            self.columns_sized_by_hand = false;
             // Rebuild value_states for the new columns
             self.value_states = self
                 .columns
@@ -1395,10 +1456,15 @@ impl<T: ZedisKvFetcher> Render for ZedisKvTable<T> {
                 .filter(|(_, column)| column.column_type == KvTableColumnType::Value)
                 .map(|(index, _)| (index, cx.new(|cx| InputState::new(window, cx))))
                 .collect();
+        }
+        let width_changed = table_width.is_some() && table_width != self.fitted_width;
+        if columns_changed || (width_changed && !self.columns_sized_by_hand) {
+            let new_delegate_columns = Self::new_columns(self.columns.clone(), self.selectable(), fit_width);
             self.table_state.update(cx, |state, cx| {
                 state.delegate_mut().set_columns(new_delegate_columns);
                 state.refresh(cx);
             });
+            self.fitted_width = table_width;
         }
 
         // Clear search input when key changes
@@ -1439,17 +1505,23 @@ impl<T: ZedisKvFetcher> Render for ZedisKvTable<T> {
             .w_full()
             // Main table area
             .child(
-                div().flex_1().w_full().child(
-                    DataTable::new(&self.table_state)
-                        // One step under the default: 30px rows. This is a
-                        // data grid, and at 32 a 1280×800 window showed 19
-                        // rows of a hash that has 100,000 — but the densest
-                        // size (26px rows, 12px text) read as cramped.
-                        .small()
-                        .stripe(true) // Alternating row colors for better readability
-                        .bordered(false) // Table borders
-                        .scrollbar_visible(true, true), // Show both scrollbars
-                ),
+                div()
+                    .relative()
+                    .flex_1()
+                    .w_full()
+                    .child(
+                        DataTable::new(&self.table_state)
+                            // One step under the default: 30px rows. This is a
+                            // data grid, and at 32 a 1280×800 window showed 19
+                            // rows of a hash that has 100,000 — but the densest
+                            // size (26px rows, 12px text) read as cramped.
+                            .small()
+                            .stripe(true) // Alternating row colors for better readability
+                            .bordered(false) // Table borders
+                            .scrollbar_visible(true, true), // Show both scrollbars
+                    )
+                    // The table's width, for the columns to be fitted to.
+                    .child(width_probe(self.table_width.clone(), cx.entity().downgrade(), true)),
             )
             // Footer toolbar with search and status
             .child(
@@ -1694,7 +1766,7 @@ impl<T: ZedisKvFetcher> Render for ZedisKvTable<T> {
                 Some(split) => h_resizable("kv-table-split")
                     .child(
                         resizable_panel()
-                            .size_range(px(split.table_min)..Pixels::MAX)
+                            .size_range(px(TABLE_MIN_WIDTH)..Pixels::MAX)
                             .child(left),
                     )
                     .child(
@@ -1727,27 +1799,7 @@ impl<T: ZedisKvFetcher> Render for ZedisKvTable<T> {
         // split's limits come from it, so while the panel is open a new
         // width lays the split out again on the next frame — a window made
         // narrower with the panel open is what #182 was reported from.
-        let measured = self.pane_width.clone();
-        let view = cx.entity().downgrade();
-        let measure = canvas(
-            move |bounds: Bounds<Pixels>, window: &mut Window, _cx: &mut App| {
-                let width = bounds.size.width;
-                if measured.get() == Some(width) {
-                    return;
-                }
-                measured.set(Some(width));
-                if panel_open {
-                    window.on_next_frame(move |_, cx| {
-                        let _ = view.update(cx, |_, cx| cx.notify());
-                    });
-                }
-            },
-            |_, _, _, _| {},
-        )
-        .absolute()
-        .top_0()
-        .left_0()
-        .size_full();
+        let measure = width_probe(self.pane_width.clone(), cx.entity().downgrade(), panel_open);
 
         h_flex()
             .track_focus(&self.focus_handle)
@@ -1831,49 +1883,44 @@ fn row_holds(
 #[cfg(test)]
 mod tests {
     use super::{
-        ENTRY_PANEL_MIN_WIDTH, PanelSplit, PreviewMode, TABLE_MIN_WIDTH, TABLE_USEFUL_WIDTH, element_json_document,
-        entry_panel_split, parse_bulk_rows, preview_modes, row_holds, tree_editable,
+        DATA_COLUMN_MIN_WIDTH, ENTRY_PANEL_MIN_WIDTH, PanelSplit, PreviewMode, TABLE_MIN_WIDTH, element_json_document,
+        entry_panel_split, fit_columns, parse_bulk_rows, preview_modes, row_holds, tree_editable,
     };
 
     /// The table and the entry panel share the pane the table is in, not the
-    /// window: the table keeps its naming column wherever there is room for
-    /// both, and the two never add up to more than the pane.
+    /// window: the table keeps its naming column and its value wherever it
+    /// is drawn at all, and the two never add up to more than the pane.
     #[test]
-    fn the_entry_panel_leaves_the_table_its_naming_column() {
+    fn the_entry_panel_leaves_the_table_its_columns() {
         let split = |pane, saved| entry_panel_split(pane, saved).expect("room for both");
         // A wide pane: the panel opens at half, the handle stops where the
-        // table would lose its naming column.
+        // table would lose its columns.
         assert_eq!(
             split(1200., None),
             PanelSplit {
                 panel: 600.,
                 panel_min: ENTRY_PANEL_MIN_WIDTH,
                 panel_max: 880.,
-                table_min: TABLE_MIN_WIDTH,
             }
         );
         // The pane of the default window (649): half of the *window* was 600
         // here and left the table 49.
-        let default_window = split(649., None);
-        assert_eq!(default_window.panel, 324.5);
-        assert_eq!(default_window.table_min, TABLE_MIN_WIDTH);
+        assert_eq!(split(649., None).panel, 324.5);
         // A width dragged on a wide window does not take the table's share
         // on a narrow one — and is not forgotten either: it is only clamped.
         assert_eq!(split(649., Some(600.)).panel, 329.);
         assert_eq!(split(1200., Some(600.)).panel, 600.);
         assert_eq!(split(1200., Some(200.)).panel, ENTRY_PANEL_MIN_WIDTH);
 
-        // No room for both minimums: the panel keeps its own and the table
-        // has the rest, down to the least of it worth drawing.
-        let narrow = split(578., None);
-        assert_eq!((narrow.panel, narrow.table_min), (ENTRY_PANEL_MIN_WIDTH, 258.));
-        let least = ENTRY_PANEL_MIN_WIDTH + TABLE_USEFUL_WIDTH;
-        assert_eq!(split(least, None).table_min, TABLE_USEFUL_WIDTH);
-        // Narrower than that, the panel is shown alone.
+        // The narrowest pane with room for both: each at its minimum.
+        let least = ENTRY_PANEL_MIN_WIDTH + TABLE_MIN_WIDTH;
+        assert_eq!(split(least, Some(600.)).panel, ENTRY_PANEL_MIN_WIDTH);
+        // Narrower than that, the panel is shown alone — a table of 258
+        // beside it (the pane of the smallest window) cut the value off.
         assert_eq!(entry_panel_split(least - 1., None), None);
-        assert_eq!(entry_panel_split(449., Some(600.)), None);
+        assert_eq!(entry_panel_split(578., None), None);
 
-        for pane in [560., 578., 649., 900., 1200., 2400.] {
+        for pane in [640., 649., 900., 1200., 2400.] {
             for saved in [None, Some(100.), Some(600.), Some(5000.)] {
                 let split = split(pane, saved);
                 assert!(
@@ -1881,13 +1928,87 @@ mod tests {
                     "{pane} {saved:?}"
                 );
                 assert!(
-                    split.panel_max + split.table_min <= pane + 0.01,
+                    split.panel_max + TABLE_MIN_WIDTH <= pane + 0.01,
                     "{pane} {saved:?}: {split:?}"
                 );
             }
         }
     }
-    use crate::components::KvTableColumn;
+
+    /// The columns follow the table's own width, and in a narrow one the
+    /// value stays in view: 320 beside the entry panel used to be the tick
+    /// box, the row number, a 200px Field and 16px of the value (#182).
+    #[test]
+    fn a_narrow_table_keeps_its_value_in_view() {
+        let widths = |columns: Vec<KvTableColumn>, table: f32| -> Vec<f32> {
+            fit_columns(with_leading_columns(columns, true), table)
+                .iter()
+                .map(|column| column.width.expect("every column is given a width"))
+                .collect()
+        };
+        let hash = || {
+            vec![
+                KvTableColumn::new("field", Some(200.)),
+                KvTableColumn::new_flex("value"),
+            ]
+        };
+
+        // Room for everything: Field keeps its width, the value has the rest.
+        assert_eq!(widths(hash(), 700.), vec![32., 72., 200., 381.]);
+        // Beside the entry panel, at the table's narrowest: both in view,
+        // and nothing to scroll for.
+        let beside_panel = widths(hash(), TABLE_MIN_WIDTH);
+        assert_eq!(beside_panel, vec![32., 72., DATA_COLUMN_MIN_WIDTH, 105.]);
+        assert!(beside_panel.iter().sum::<f32>() <= TABLE_MIN_WIDTH);
+        // In between, the value is the wider of the two: 200px of Field in
+        // a table of 414 would leave it 91.
+        let between = widths(hash(), 414.);
+        assert!(
+            (between[2] - 120.).abs() < 0.01 && (between[3] - 175.).abs() < 0.01,
+            "{between:?}"
+        );
+
+        // A column after the value — the field TTL — does not take its place:
+        // it is the one that scrolls out of view.
+        let with_ttl = || {
+            let mut columns = hash();
+            columns.push(KvTableColumn::new("ttl", Some(90.)));
+            columns
+        };
+        assert_eq!(
+            widths(with_ttl(), TABLE_MIN_WIDTH),
+            vec![32., 72., DATA_COLUMN_MIN_WIDTH, DATA_COLUMN_MIN_WIDTH, 90.]
+        );
+        // And is in view where there is room for it: here Field at 200 used
+        // to push it out.
+        let fitted = widths(with_ttl(), 440.);
+        assert!(fitted.iter().sum::<f32>() <= 440., "{fitted:?}");
+        assert!(fitted[3] >= DATA_COLUMN_MIN_WIDTH, "{fitted:?}");
+
+        // A sorted set has its value first, and the score after it gives way
+        // the same.
+        let zset = vec![
+            KvTableColumn::new_flex("value"),
+            KvTableColumn::new("score", Some(196.)),
+        ];
+        assert_eq!(
+            widths(zset, TABLE_MIN_WIDTH),
+            vec![32., 72., 105., DATA_COLUMN_MIN_WIDTH]
+        );
+
+        // A stream of many fields scrolls sideways rather than draw each a
+        // few characters wide, and its id is not cut to make room for them.
+        let mut stream = vec![KvTableColumn::new("id", Some(196.))];
+        stream.extend((0..10).map(|ix| KvTableColumn::new(&format!("f{ix}"), None)));
+        let fitted = widths(stream, 700.);
+        assert_eq!(fitted[2], 196.);
+        assert!(fitted[3..].iter().all(|width| *width == DATA_COLUMN_MIN_WIDTH));
+
+        // Nothing to share: the widths are the ones that were asked for.
+        let fixed = vec![KvTableColumn::new("a", Some(120.)), KvTableColumn::new("b", Some(80.))];
+        assert_eq!(widths(fixed, 100.), vec![32., 72., 120., 80.]);
+    }
+    use crate::components::{KvTableColumn, with_leading_columns};
     use crate::states::{DataFormat, KvElement};
     use gpui::SharedString;
     use indexmap::IndexMap;

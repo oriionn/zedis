@@ -476,7 +476,12 @@ impl<T: ZedisKvFetcher + 'static> TableDelegate for ZedisKvDelegate<T> {
         let chip_text = cx.theme().foreground.opacity(0.7);
         let group_name: SharedString = format!("td-{}-{}", row_ix, col_ix).into();
         let copied_message = i18n_common(cx, "copied_to_clipboard");
-        base.group(group_name.clone())
+        // The fill under the hover button: the hovered row's own colour, made
+        // opaque so the text it sits on does not show through.
+        let copy_bg = cx.theme().background.blend(cx.theme().table_hover);
+        let copy_inset = column.paddings.map(|paddings| paddings.right).unwrap_or_default();
+        base.relative()
+            .group(group_name.clone())
             .overflow_hidden()
             .when_some(format_chip, |this, format| {
                 this.child(
@@ -497,11 +502,19 @@ impl<T: ZedisKvFetcher + 'static> TableDelegate for ZedisKvDelegate<T> {
                     .min_w_0(),
             )
             .child(
-                div()
+                // Drawn over the end of the cell, not beside the label (as
+                // `ZedisTextTable` does): its width, reserved for the moment
+                // the pointer arrives, was 32px of every cell's text — a
+                // third of a column beside the entry panel (#182).
+                h_flex()
                     .id(("copy-wrapper", row_ix * 100 + col_ix))
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right(copy_inset)
+                    .bg(copy_bg)
                     .invisible()
                     .group_hover(group_name, |style| style.visible())
-                    .flex_none()
                     .on_click(|_, _, cx: &mut App| cx.stop_propagation())
                     .child(
                         Button::new(("copy-cell", row_ix * 100 + col_ix))
