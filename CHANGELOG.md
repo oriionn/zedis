@@ -1,5 +1,60 @@
 # Changelog
 
+## [0.13.0](https://github.com/vicanso/zedis/compare/v0.12.4..v0.13.0) - 2026-10-11
+
+### ⛰️  Features
+
+- *(integration)* Add a Garnet smoke lane and withhold SET KEEPTTL from it - ([0a9f5ed](https://github.com/vicanso/zedis/commit/0a9f5ed6a9eb01a7110812807acd8750e0be554b))
+- *(integration)* Add a Garnet smoke lane and withhold SET KEEPTTL from it - ([a77752d](https://github.com/vicanso/zedis/commit/a77752dd77302c3007fc833ab571411922276474))
+- *(key-tree, editor)* Show active filters as removable chips and say when a script viewer fails (#184 #187) - ([75a4314](https://github.com/vicanso/zedis/commit/75a431480677d94de174fb35625d4230fa342743))
+- *(web)* Open Settings as a dialog over the page - ([286db63](https://github.com/vicanso/zedis/commit/286db63b900487306c7ef974737125c9f384668e))
+- *(web)* Hide the entries the browser build cannot serve and add Sign Out - ([cd14783](https://github.com/vicanso/zedis/commit/cd147834cd17ab002cf0a66b1be6cffc7205fbb4))
+
+### 🐛 Bug Fixes
+
+- *(bridge)* Close pooled connections after their idle window ([#176](https://github.com/orhun/git-cliff/issues/176)) - ([1222bdf](https://github.com/vicanso/zedis/commit/1222bdf193b7e38dec44fc3f1d8bd854b35b9317))
+- *(connection)* Connect to Dragonfly and name it in its own version - ([6999630](https://github.com/vicanso/zedis/commit/699963013d1c1d577530d7efc3485c4576f4d07d))
+- *(dialogs)* Label non-delete confirms "Confirm" and keep the confirm open for Kill by filter and Set Stream ID - ([d55bc56](https://github.com/vicanso/zedis/commit/d55bc561bb036930c607470527d75432629f7c18))
+- *(editor)* Give the key name priority in the key bar and fit the TTL field's placeholder ([#178](https://github.com/orhun/git-cliff/issues/178)) - ([990d186](https://github.com/vicanso/zedis/commit/990d186cc1497e47da7e94597c50251ff0bb312d))
+- *(editor)* Refresh MEMORY USAGE after a collection write ([#169](https://github.com/orhun/git-cliff/issues/169)) - ([1e471ee](https://github.com/vicanso/zedis/commit/1e471ee3b0b76a3596e9e052dc2ab0f94b5784ec))
+- *(editor)* Drop the previous key's payload when switching ([#166](https://github.com/orhun/git-cliff/issues/166)) - ([eef1492](https://github.com/vicanso/zedis/commit/eef1492567c4e5707faf054ffd9d50ed8387299d))
+- *(editor)* Close the ops form before the destructive confirm ([#164](https://github.com/orhun/git-cliff/issues/164)) - ([7f594cc](https://github.com/vicanso/zedis/commit/7f594cc7752e48db09909d6cc612cecc53b10aaa))
+- *(editor)* Add Remove TTL to the key-bar dropdown ([#160](https://github.com/orhun/git-cliff/issues/160)) - ([c3b727c](https://github.com/vicanso/zedis/commit/c3b727c44dcab74bd0437101e7db70368f0d08ce))
+- *(features)* List the limited commands first in the capabilities dialog ([#174](https://github.com/orhun/git-cliff/issues/174)) - ([46c662a](https://github.com/vicanso/zedis/commit/46c662ab215341246a59108a09761132a608c890))
+- *(key-tree)* Scan a regex keyword in every query mode and across the whole keyspace ([#167](https://github.com/orhun/git-cliff/issues/167)) - ([3193c6d](https://github.com/vicanso/zedis/commit/3193c6da887cdd8af64b45e32820207fce52893e))
+- *(key-tree)* Refresh the TTL chip when a key is selected - ([55ea547](https://github.com/vicanso/zedis/commit/55ea5474cca3796a2ee838d4a54c96666b8b0e05))
+- *(key-tree)* Rescan when the keyword filter is cleared ([#165](https://github.com/orhun/git-cliff/issues/165)) - ([ab477e2](https://github.com/vicanso/zedis/commit/ab477e236340cc731443eead61b396d49711a52a))
+- *(key-tree, about)* Cap the TTL chip at ">99y" and copy system info in one press ([#190](https://github.com/orhun/git-cliff/issues/190)) - ([d65ee9d](https://github.com/vicanso/zedis/commit/d65ee9d2ad3907932c1b91a03bfac3403cf3aedd))
+- *(kv-table)* Fit columns to the table's own width and draw the copy button over the cell ([#182](https://github.com/orhun/git-cliff/issues/182)) - ([96a1de0](https://github.com/vicanso/zedis/commit/96a1de06b514b1fcad89ecad91876a5a9c4337ab))
+- *(kv-table)* Size the entry panel from its own pane and keep the table's naming column ([#182](https://github.com/orhun/git-cliff/issues/182)) - ([c03d779](https://github.com/vicanso/zedis/commit/c03d779adafce54038f9a0006f2e2e0d8f8c0f4a))
+- *(memory-analysis)* Tick count axes in whole numbers and keep the results across navigation ([#175](https://github.com/orhun/git-cliff/issues/175)) - ([7265c99](https://github.com/vicanso/zedis/commit/7265c99766432ec4f1a3a9aef30d7bcfcb14077c))
+- *(palette, value-search)* Leave the focus in the page after a ⌘K / ⌘P jump and keep value-search hits across navigation - ([c2b9c6a](https://github.com/vicanso/zedis/commit/c2b9c6af6515fd498843ed691cca0bb04a8b8230))
+- *(server-info)* Wrap the toolbar instead of scrolling it sideways - ([63b18c8](https://github.com/vicanso/zedis/commit/63b18c8ee527c158540e5f1a9a6a12165cc60d07))
+- *(settings)* Clamp key scan count to 1000–100000 ([#170](https://github.com/orhun/git-cliff/issues/170)) - ([2997830](https://github.com/vicanso/zedis/commit/2997830d873fca095a7f20802b6b489f78286340))
+- *(settings)* Replace the font-size slider with a NumberInput ([#163](https://github.com/orhun/git-cliff/issues/163)) - ([c52b250](https://github.com/vicanso/zedis/commit/c52b250e4cbf3426a615f4eccecffd333d354c28))
+- *(settings)* Export local data through a save dialog ([#161](https://github.com/orhun/git-cliff/issues/161)) - ([1953894](https://github.com/vicanso/zedis/commit/1953894dc63c8cb590fe74cf92f1ea780de349bc))
+- *(shortcuts)* Draw workspace tab 1–8 with one modifier name ([#172](https://github.com/orhun/git-cliff/issues/172)) - ([78e4a42](https://github.com/vicanso/zedis/commit/78e4a420e9c2cc80fe4e32d537945ca9fe9b84a1))
+- *(status-bar)* Count the keys the tree lists, not the keys loaded ([#189](https://github.com/orhun/git-cliff/issues/189)) - ([bd85793](https://github.com/vicanso/zedis/commit/bd857939e76f291ebb5970fdd89536c57b1bc139))
+- *(status-bar)* Refresh DBSIZE immediately after add/delete ([#159](https://github.com/orhun/git-cliff/issues/159)) - ([ea21748](https://github.com/vicanso/zedis/commit/ea217486d94e8b66e319c923a951c4e9eb4bc0fd))
+- *(stream, key-tree, editor, db)* Place a new entry by sort order, refresh the open key after a batch TTL, carry local records across a rename, name the confirm buttons (#180 #185 #186 #188) - ([55f9822](https://github.com/vicanso/zedis/commit/55f98221d850751ecf59c8b5432034b0e2df1a9e))
+- *(trash)* Show a restored key in the tree and recount ([#173](https://github.com/orhun/git-cliff/issues/173)) - ([1f3f63b](https://github.com/vicanso/zedis/commit/1f3f63b041f0dd6d9ef13a8015c807ff01679f89))
+- *(ui)* Focus the rename field, fit tool-page tables to their width, and keep focus when overlays close - ([7d31fb0](https://github.com/vicanso/zedis/commit/7d31fb0ea5f9b72c139663044f6fe69d3ab1e461))
+
+### 📚 Documentation
+
+- Plain wording in both languages, renamed headings, and corrections to outdated statements - ([02afaba](https://github.com/vicanso/zedis/commit/02afaba5ee933b9a0dda9448a19793b6ab2e67b6))
+- Update readme - ([cac767d](https://github.com/vicanso/zedis/commit/cac767df8fd68b0a3181bc25131d1663b2bbfecb))
+- Redraw the diagram as code sharing, with the running processes outlined around the shared code - ([6f2c2ab](https://github.com/vicanso/zedis/commit/6f2c2abd46d95be3461dbb268edde2c2934d85be))
+- Show the shared Redis layer in the architecture diagram and label the bridge as HTTP to RESP - ([fea5048](https://github.com/vicanso/zedis/commit/fea5048fb4cdc57facbdf3f6ec1e8f3f2fafe279))
+- Slim the READMEs into a landing page and move the web guide and the Valkey matrix into docs - ([1bc9bfc](https://github.com/vicanso/zedis/commit/1bc9bfca63ddc3ceeae953f92ec1d39aa4077528))
+- Update document - ([97d3cf4](https://github.com/vicanso/zedis/commit/97d3cf44f50ba4b86f2491ed70a2c94b79e8ab9b))
+
+### ⚙️ Miscellaneous Tasks
+
+- *(integration)* Add a Dragonfly smoke lane - ([dc8de4e](https://github.com/vicanso/zedis/commit/dc8de4ef80ec40f763c0df1cfa9e618a4f29856a))
+- *(signpath)* Drop the Authenticode description and URL the open source subscription writes itself - ([43bd3dd](https://github.com/vicanso/zedis/commit/43bd3dd1f085d153bc5adb74d47a07460321fc9c))
+- *(signpath)* Sign a tag only once SIGNPATH_RELEASE_SIGNING is on, and bring the runbook in line with the onboarding - ([312f7a1](https://github.com/vicanso/zedis/commit/312f7a18980e4503b23b4b67c85159fad3ffdab3))
+
 ## [0.12.4](https://github.com/vicanso/zedis/compare/v0.12.2..v0.12.4) - 2026-10-07
 
 ### ⛰️  Features
