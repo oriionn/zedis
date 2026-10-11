@@ -14,7 +14,8 @@
 
 use gpui::{ClipboardItem, Image, Render, SharedString, Window, img, prelude::*, px};
 use gpui_kit::component::{
-    ActiveTheme, Sizable, StyledExt, button::Button, h_flex, label::Label, scroll::ScrollableElement, v_flex,
+    ActiveTheme, Icon, IconName, Sizable, StyledExt, button::Button, h_flex, label::Label, scroll::ScrollableElement,
+    v_flex,
 };
 use std::sync::Arc;
 
@@ -78,6 +79,8 @@ pub struct AboutConfig {
 /// and an optional system information panel.
 pub struct ZedisAboutPage {
     config: AboutConfig,
+    /// What the Copy System Info button last put on the clipboard, shown
+    /// under the buttons so the person sees what they are about to paste.
     system_info: Option<String>,
 }
 
@@ -137,23 +140,24 @@ impl Render for ZedisAboutPage {
             ));
         }
         if self.config.system_info_collector.is_some() {
-            links_row = links_row.child(
-                Button::new("sysinfo")
-                    .label("System Info")
-                    .small()
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        if let Some(collector) = &this.config.system_info_collector {
-                            this.system_info = Some(collector(window, cx));
-                            cx.notify();
-                        }
-                    })),
-            );
+            // One press copies. It used to open the panel below, whose own
+            // Copy button was the second press — and what people did instead
+            // was post a screenshot of this window (#190).
+            links_row = links_row.child(Button::new("sysinfo").label("Copy System Info").small().on_click(
+                cx.listener(|this, _, window, cx| {
+                    if let Some(collector) = &this.config.system_info_collector {
+                        let info = collector(window, cx);
+                        cx.write_to_clipboard(ClipboardItem::new_string(info.clone()));
+                        this.system_info = Some(info);
+                        cx.notify();
+                    }
+                }),
+            ));
         }
         page = page.child(links_row);
 
         // System info panel
         if let Some(info) = &self.system_info {
-            let info_for_copy = info.clone();
             page = page.child(
                 v_flex()
                     .my_2()
@@ -167,14 +171,16 @@ impl Render for ZedisAboutPage {
                     .gap_1()
                     .relative()
                     .child(
-                        h_flex().justify_end().absolute().right_2().top_2().child(
-                            Button::new("copy-sysinfo")
-                                .label("Copy")
-                                .xsmall()
-                                .on_click(move |_, _window, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(info_for_copy.clone()));
-                                }),
-                        ),
+                        // The panel is the receipt: what was copied, and
+                        // that it was.
+                        h_flex()
+                            .absolute()
+                            .right_2()
+                            .top_2()
+                            .gap_1()
+                            .items_center()
+                            .child(Icon::new(IconName::Check).small().text_color(cx.theme().success))
+                            .child(Label::new("Copied").text_xs().text_color(cx.theme().success)),
                     )
                     .children(info.lines().map(|line| {
                         Label::new(line.to_string())

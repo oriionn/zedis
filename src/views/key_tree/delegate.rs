@@ -622,9 +622,14 @@ impl ListDelegate for KeyTreeDelegate {
                                                     // Plain TTL text (no chip chrome) —
                                                     // calm and right-aligned, matching
                                                     // the design.
+                                                    // One line whatever it
+                                                    // says: a label that wraps
+                                                    // makes the row two lines
+                                                    // tall (#190).
                                                     Label::new(chip_label)
                                                         .text_size(px(10.))
                                                         .w(px(TTL_CHIP_WIDTH))
+                                                        .whitespace_nowrap()
                                                         .text_right()
                                                         .text_color(chip_color)
                                                         .flex_none(),

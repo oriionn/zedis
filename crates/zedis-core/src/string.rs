@@ -59,16 +59,25 @@ pub fn fast_contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
     haystack.to_lowercase().contains(needle_lower)
 }
 /// Compact, human-readable duration with **floor** to one decimal place:
-/// `6.9d`, `23.4h`, `4.5m`, `12s`. We deliberately avoid `{:.1}` rounding
+/// `1.9y`, `6.9d`, `23.4h`, `4.5m`, `12s`. We deliberately avoid `{:.1}` rounding
 /// because it can carry e.g. 6.99 days up to `7.0d`, contradicting the
 /// Key Tree's `format_ttl_chip` (which floors to `6d`). The integer part
 /// here always agrees with the chip's single-letter form.
 const SECONDS_PER_DAY: u64 = 86400;
 const SECONDS_PER_HOUR: u64 = 3600;
 const SECONDS_PER_MINUTE: u64 = 60;
+const SECONDS_PER_YEAR: u64 = 365 * SECONDS_PER_DAY;
+/// From here a duration reads in years, where the Key Tree's chip starts to:
+/// 700 days is `1.9y`, and a TTL of 56,831 years is that — it read
+/// `20743315.0d` (#190).
+const YEARS_FROM_SECONDS: u64 = 700 * SECONDS_PER_DAY;
 
 pub fn format_duration(duration: Duration) -> String {
     let seconds = duration.as_secs();
+
+    if seconds >= YEARS_FROM_SECONDS {
+        return format_floor_tenths(seconds, SECONDS_PER_YEAR, 'y');
+    }
 
     if seconds >= SECONDS_PER_DAY {
         return format_floor_tenths(seconds, SECONDS_PER_DAY, 'd');
@@ -194,6 +203,10 @@ mod tests {
         // integer part agreeing with the Key Tree chip's "6d".
         assert_eq!(format_duration(Duration::from_secs(604_000)), "6.9d");
         assert_eq!(format_duration(Duration::from_secs(7 * 86_400)), "7.0d");
+        // Days up to where the tree's chip turns to years, then years.
+        assert_eq!(format_duration(Duration::from_secs(699 * 86_400)), "699.0d");
+        assert_eq!(format_duration(Duration::from_secs(700 * 86_400)), "1.9y");
+        assert_eq!(format_duration(Duration::from_secs(1_792_222_416_000)), "56831.0y");
         // Sub-day precision is preserved (we lose it only when below 1m).
         assert_eq!(format_duration(Duration::from_secs(3600 + 1800)), "1.5h");
         // Just under an hour falls into the minute branch and still floors.

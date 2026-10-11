@@ -126,9 +126,12 @@ pub fn ttl_chip_kind(ttl_secs: i64) -> Option<TtlChipKind> {
     }
 }
 
+/// The most years the tree's chip counts; past them it reads `>99y`.
+const TTL_CHIP_MAX_YEARS: i64 = 99;
+
 /// Compact TTL chip label used in the Key Tree. Two-digit cap on the
-/// number, then a unit letter — `12s`, `4m`, `23h`, `7d`, `52w`, `3y`.
-/// `∞` is used for perm keys.
+/// number, then a unit letter — `12s`, `4m`, `23h`, `7d`, `52w`, `3y` —
+/// and `>99y` for a century or more. `∞` is used for perm keys.
 ///
 /// Returns `None` only for `-2` (missing key — no chip rendered).
 pub fn format_ttl_chip(ttl_secs: i64) -> Option<String> {
@@ -154,7 +157,15 @@ pub fn format_ttl_chip(ttl_secs: i64) -> Option<String> {
         // 100–699 days: 14w–99w, still two digits.
         format!("{}w", ttl_secs / (7 * 86400))
     } else {
-        format!("{}y", ttl_secs / (365 * 86400))
+        // Years have no tier above them, and a TTL can be any number of
+        // them: milliseconds handed to `EXPIRE` as seconds is 56,831 years,
+        // which wrapped in the chip's fixed width, made the row two lines
+        // tall and laid it over the next (#190). How many is the key bar's
+        // to say; here "more than a lifetime" is enough.
+        match ttl_secs / (365 * 86400) {
+            years if years > TTL_CHIP_MAX_YEARS => format!(">{TTL_CHIP_MAX_YEARS}y"),
+            years => format!("{years}y"),
+        }
     };
     Some(s)
 }
@@ -252,6 +263,19 @@ mod tests {
         // From 700 days on, years — still at most two digits + unit.
         assert_eq!(chip(format_ttl_chip(700 * 86400)).as_deref(), Some("1y"));
         assert_eq!(chip(format_ttl_chip(3 * 365 * 86400)).as_deref(), Some("3y"));
+    }
+
+    /// The chip is a fixed width, and years are the last unit: past 99 of
+    /// them it says so instead of growing a digit per order of magnitude.
+    #[test]
+    fn chip_stops_counting_years_at_a_century() {
+        let years = |n: i64| chip(format_ttl_chip(n * 365 * 86400));
+        assert_eq!(years(99).as_deref(), Some("99y"));
+        assert_eq!(years(100).as_deref(), Some(">99y"));
+        // A Unix time in milliseconds, given to `EXPIRE` as seconds (#190).
+        assert_eq!(chip(format_ttl_chip(1_792_222_416_000)).as_deref(), Some(">99y"));
+        // And the furthest a TTL goes.
+        assert_eq!(chip(format_ttl_chip(i64::MAX)).as_deref(), Some(">99y"));
     }
 
     #[test]
