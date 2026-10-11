@@ -42,7 +42,7 @@ use gpui_kit::component::{
 use std::rc::Rc;
 use std::time::Duration;
 use tracing::{error, info};
-use zedis_ui::{TextColumn, ZedisTextTable};
+use zedis_ui::{TextColumn, ZedisTextTable, fitted_table};
 
 /// Cap on retained messages. The list is a ring buffer (like the Monitor
 /// view's `MAX_RECORDS`) so subscribing to a hot channel can't grow
@@ -92,15 +92,17 @@ fn build_table(window: &mut Window, cx: &mut gpui::App) -> ZedisTextTable {
     // 200px clipped the seconds.
     let timestamp_width = 230.;
     let channel_width = 150.;
-    let remaining_width = content_width.as_f32() - timestamp_width - channel_width - 10.;
+    // The message has what the two before it leave, and no less than this.
+    let message_width = 200.;
     let columns = vec![
         TextColumn::new("timestamp", i18n_pubsub_editor(cx, "timestamp"), timestamp_width),
         TextColumn::new("channel", i18n_pubsub_editor(cx, "channel"), channel_width),
-        TextColumn::new("message", i18n_pubsub_editor(cx, "message"), remaining_width),
+        TextColumn::new("message", i18n_pubsub_editor(cx, "message"), message_width).fills(),
     ];
     ZedisTextTable::new(columns, i18n_common(cx, "copied_to_clipboard"))
         .copy_tooltip(i18n_common(cx, "copy_cell_tooltip"))
         .max_rows(MAX_MESSAGES)
+        .fitted_to(content_width)
 }
 
 /// Main Pub/Sub editor component.
@@ -720,12 +722,13 @@ impl Render for ZedisPubsubEditor {
                         ))
                     })
                     .when(!is_empty, |this| {
-                        this.child(
+                        this.child(fitted_table(
+                            &self.table_state,
                             DataTable::new(&self.table_state)
                                 .stripe(true)
                                 .bordered(false)
                                 .scrollbar_visible(true, true),
-                        )
+                        ))
                     }),
             )
             // PUBLISH mutates server state (Capability::PublishMessage);

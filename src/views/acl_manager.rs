@@ -58,7 +58,7 @@ use gpui_kit::component::{
 use rust_i18n::t;
 use std::time::Duration;
 use tracing::error;
-use zedis_ui::{TextColumn, ZedisDialog, ZedisTextTable};
+use zedis_ui::{TextColumn, ZedisDialog, ZedisTextTable, fitted_table};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -123,14 +123,14 @@ fn log_cells(entry: &AclLogEntry) -> Vec<SharedString> {
 /// The security-log grid: fixed columns with the client info taking the
 /// rest, filtered and exported through the shared text table.
 fn log_table(window: &mut Window, cx: &mut gpui::App) -> ZedisTextTable {
-    let content_width = content_area_width(window, cx).as_f32();
     let time_w = 190.;
     let user_w = 130.;
     let reason_w = 110.;
     let object_w = 200.;
     let context_w = 110.;
     let count_w = 90.;
-    let client_w = (content_width - time_w - user_w - reason_w - object_w - context_w - count_w - 26.).max(200.);
+    // The client info has what the others leave, and no less than this.
+    let client_w = 200.;
     let title = |key: &'static str| i18n_acl(cx, key);
     let columns = vec![
         TextColumn::new(COL_LOG_TIME, title(COL_LOG_TIME), time_w).sort_by_cell(LOG_CELL_WHEN),
@@ -139,10 +139,11 @@ fn log_table(window: &mut Window, cx: &mut gpui::App) -> ZedisTextTable {
         TextColumn::new(COL_LOG_OBJECT, title(COL_LOG_OBJECT), object_w).sortable(),
         TextColumn::new(COL_LOG_CONTEXT, title(COL_LOG_CONTEXT), context_w).sortable(),
         TextColumn::new(COL_LOG_COUNT, title(COL_LOG_COUNT), count_w).sort_by_cell(LOG_CELL_COUNT),
-        TextColumn::new(COL_LOG_CLIENT, title(COL_LOG_CLIENT), client_w),
+        TextColumn::new(COL_LOG_CLIENT, title(COL_LOG_CLIENT), client_w).fills(),
     ];
     ZedisTextTable::new(columns, i18n_common(cx, "copied_to_clipboard"))
         .copy_tooltip(i18n_common(cx, "copy_cell_tooltip"))
+        .fitted_to(content_area_width(window, cx))
 }
 
 /// How many `ACL LOG` entries are read at a time. The server's own
@@ -770,11 +771,14 @@ impl gpui::Render for ZedisAclManager {
                     )
                     .into_any_element()
             } else {
-                DataTable::new(&self.log_table)
-                    .stripe(true)
-                    .bordered(false)
-                    .scrollbar_visible(true, true)
-                    .into_any_element()
+                fitted_table(
+                    &self.log_table,
+                    DataTable::new(&self.log_table)
+                        .stripe(true)
+                        .bordered(false)
+                        .scrollbar_visible(true, true),
+                )
+                .into_any_element()
             };
             return v_flex()
                 .size_full()

@@ -58,7 +58,9 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use zedis_ui::{CellAction, CellActionProvider, CellRenderer, TextColumn, ZedisDialog, ZedisDivider, ZedisTextTable};
+use zedis_ui::{
+    CellAction, CellActionProvider, CellRenderer, TextColumn, ZedisDialog, ZedisDivider, ZedisTextTable, fitted_table,
+};
 
 // One file per tab that has a life of its own.
 mod commandlog;
@@ -423,22 +425,15 @@ fn build_table(
     // ellipsizes. Fixed instead of stretchy so the chip stays compact next
     // to client info.
     let correlated_width = 136.;
-    // Subtract a small gutter (10 px) so the table doesn't overflow horizontally.
-    // `args` is the flexible column; floor it so a narrow window scrolls the
-    // table horizontally instead of collapsing the column to nothing.
-    let remaining_width = (content_width.as_f32()
-        - timestamp_width
-        - duration_width
-        - command_width
-        - client_width
-        - correlated_width
-        - 10.)
-        .max(200.);
+    // `args` is the filling column: it has what the others leave, and no
+    // less than this — a narrow window scrolls the table sideways instead
+    // of collapsing the column to nothing.
+    let args_width = 200.;
     let widths = [
         timestamp_width,
         duration_width,
         command_width,
-        remaining_width,
+        args_width,
         client_width,
         correlated_width,
     ];
@@ -458,6 +453,7 @@ fn build_table(
                 // The duration column shows "12ms" but sorts by the raw value.
                 COLUMN_DURATION => column.sort_by_cell(CELL_DURATION_MS),
                 COLUMN_TIMESTAMP | COLUMN_COMMAND | COLUMN_CLIENT => column.sortable(),
+                COLUMN_ARGS => column.fills(),
                 _ => column,
             }
         })
@@ -488,6 +484,7 @@ fn build_table(
         .copy_tooltip(i18n_common(cx, "copy_cell_tooltip"))
         .cell_render(chip)
         .cell_action(show_script)
+        .fitted_to(content_width)
 }
 
 /// The digest an `EVALSHA` / `EVALSHA_RO` row names — its first argument,
@@ -1474,12 +1471,13 @@ impl gpui::Render for ZedisSlowlogEditor {
                                 )
                             })
                             .when(!is_empty, |this| {
-                                this.child(
+                                this.child(fitted_table(
+                                    &self.table_state,
                                     DataTable::new(&self.table_state)
                                         .stripe(true)
                                         .bordered(false)
                                         .scrollbar_visible(true, true),
-                                )
+                                ))
                             })
                     })
                     .when(self.current_tab == PerformanceTab::TopCommands, |this| {

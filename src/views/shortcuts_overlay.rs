@@ -32,18 +32,34 @@ pub struct ZedisShortcutsOverlay {
     /// independent global action handler with no `Window`, so focusing
     /// is deferred to render (same pattern as the command palette).
     pending_focus: bool,
+    /// What had the focus when the overlay opened: it gets it back.
+    prev_focus: Option<FocusHandle>,
+    /// The page under the overlay — where the focus goes when nothing had
+    /// it. Handed over by the root with the active tab (`bind_to_page`).
+    page_focus: FocusHandle,
+    /// Set by a close that has no `Window` (⌘/ again); the next render
+    /// hands the focus back.
+    pending_restore: bool,
     /// Scroll handle for the (possibly overflowing) shortcuts list.
     scroll_handle: ScrollHandle,
 }
 
 impl ZedisShortcutsOverlay {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(page_focus: FocusHandle, cx: &mut Context<Self>) -> Self {
         Self {
             open: false,
             focus_handle: cx.focus_handle(),
             pending_focus: false,
+            prev_focus: None,
+            page_focus,
+            pending_restore: false,
             scroll_handle: ScrollHandle::new(),
         }
+    }
+
+    /// Follow the active tab: its page is where a close leaves the focus.
+    pub fn bind_to_page(&mut self, page_focus: FocusHandle) {
+        self.page_focus = page_focus;
     }
 
     /// Open the overlay (or close it if already open). Invoked from the
@@ -56,17 +72,28 @@ impl ZedisShortcutsOverlay {
             // The ScrollHandle keeps its offset across open/close; reset
             // so the list starts at the top each time.
             self.scroll_handle.set_offset(gpui::Point::default());
+        } else {
+            self.pending_restore = true;
         }
         cx.notify();
     }
 
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open = false;
-        // The open overlay holds focus; the closed render drops that
-        // element, orphaning focus. Blur returns it to the window root
-        // so the ⌘/ keybinding keeps a dispatch path to reopen.
-        window.blur(cx);
+        self.hand_focus_back(window, cx);
         cx.notify();
+    }
+
+    /// The open overlay holds the focus and the closed one draws nothing,
+    /// so a close has to put the focus somewhere: back where it was, or on
+    /// the page. It used to blur, which left the window with nothing
+    /// focused — Esc, ⌘J and the rest had no path to a handler until
+    /// something was clicked (the ⌘K palette's rule, `hand_focus_on`).
+    fn hand_focus_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.prev_focus.take() {
+            Some(prev) => prev.focus(window, cx),
+            None => self.page_focus.focus(window, cx),
+        }
     }
 }
 
@@ -79,6 +106,9 @@ impl Focusable for ZedisShortcutsOverlay {
 impl Render for ZedisShortcutsOverlay {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.open {
+            if std::mem::take(&mut self.pending_restore) {
+                self.hand_focus_back(window, cx);
+            }
             // Zero-footprint when closed.
             return div().into_any_element();
         }
@@ -87,6 +117,7 @@ impl Render for ZedisShortcutsOverlay {
         // focus the backdrop so it captures Esc on the first render.
         if self.pending_focus {
             self.pending_focus = false;
+            self.prev_focus = window.focused(cx);
             self.focus_handle.focus(window, cx);
         }
 

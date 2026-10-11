@@ -64,7 +64,7 @@ use web_time::Instant;
 use zedis_core::keysizes::{KeysizesDist, KeysizesUnit};
 use zedis_core::rdb::RdbParser;
 use zedis_ui::ZedisTextTable;
-use zedis_ui::{ZedisDivider, help_popover, hint_banner};
+use zedis_ui::{ZedisDivider, fitted_table, help_popover, hint_banner};
 
 mod render;
 /// Maximum rows kept per table.

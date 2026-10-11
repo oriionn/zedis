@@ -44,7 +44,7 @@ use gpui_kit::component::{
     v_flex,
 };
 use std::sync::Arc;
-use zedis_ui::{TextColumn, ZedisTextTable};
+use zedis_ui::{TextColumn, ZedisTextTable, fitted_table};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -263,12 +263,14 @@ impl ZedisTimeSeriesExplorer {
     }
 
     fn build_table(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let content_width = content_area_width(window, cx).as_f32();
         let numeric_w = 110.0;
         let labels_w = 240.0;
-        let key_w = (content_width - labels_w - numeric_w * 4.0 - 40.).max(160.);
+        // The key has what the others leave, and no less than this.
+        let key_w = 160.;
         let columns = vec![
-            TextColumn::new("key", i18n_timeseries(cx, "explorer_col_key"), key_w).sortable(),
+            TextColumn::new("key", i18n_timeseries(cx, "explorer_col_key"), key_w)
+                .sortable()
+                .fills(),
             TextColumn::new("labels", i18n_timeseries(cx, "explorer_col_labels"), labels_w),
             TextColumn::new("samples", i18n_timeseries(cx, "explorer_col_samples"), numeric_w)
                 .sortable()
@@ -305,7 +307,8 @@ impl ZedisTimeSeriesExplorer {
             })
             .collect();
         let mut table = ZedisTextTable::new(columns, i18n_common(cx, "copied_to_clipboard"))
-            .copy_tooltip(i18n_common(cx, "copy_cell_tooltip"));
+            .copy_tooltip(i18n_common(cx, "copy_cell_tooltip"))
+            .fitted_to(content_area_width(window, cx));
         table.set_rows(rows);
         self.table_state = Some(cx.new(|cx| TableState::new(table, window, cx)));
     }
@@ -480,7 +483,12 @@ impl Render for ZedisTimeSeriesExplorer {
                     )
                 })
                 .when_some(self.table_state.clone(), |this, table| {
-                    this.child(div().flex_1().w_full().child(DataTable::new(&table).bordered(false)))
+                    this.child(
+                        div()
+                            .flex_1()
+                            .w_full()
+                            .child(fitted_table(&table, DataTable::new(&table).bordered(false))),
+                    )
                 })
                 .into_any_element()
         };

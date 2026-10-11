@@ -45,7 +45,7 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use std::time::Instant;
 use tracing::error;
-use zedis_ui::{CellAction, CellActionProvider, TextColumn, ZedisDialog, ZedisTextTable};
+use zedis_ui::{CellAction, CellActionProvider, TextColumn, ZedisDialog, ZedisTextTable, fitted_table};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -198,14 +198,18 @@ fn build_table(server_state: Entity<ZedisServerState>, window: &mut Window, cx: 
     let db_width = 80.;
     let client_width = 220.;
     let cmd_width = 120.;
-    let remaining = content_width.as_f32() - ts_width - node_width - db_width - client_width - cmd_width - 10.;
-    let args_width = remaining.max(200.);
+    // The arguments have what the others leave, and no less than this.
+    let args_width = 200.;
     let widths = [ts_width, node_width, db_width, client_width, cmd_width, args_width];
 
     let columns = COLUMN_KEYS
         .iter()
         .zip(widths)
-        .map(|(&key, width)| TextColumn::new(key, i18n_monitor(cx, key), width).sortable())
+        .enumerate()
+        .map(|(ix, (&key, width))| {
+            let column = TextColumn::new(key, i18n_monitor(cx, key), width).sortable();
+            if ix == ARGS_COLUMN { column.fills() } else { column }
+        })
         .collect();
 
     // Args cell: the first argument is the key for most commands — offer a
@@ -240,6 +244,7 @@ fn build_table(server_state: Entity<ZedisServerState>, window: &mut Window, cx: 
         // The timestamp is never what someone searches for.
         .filter_columns(&[COL_NODE, COL_DB, COL_CLIENT, COL_COMMAND, COL_ARGS])
         .cell_action(jump)
+        .fitted_to(content_width)
 }
 
 // ── Main view ────────────────────────────────────────────────────────
@@ -828,12 +833,13 @@ impl Render for ZedisMonitor {
                         )
                     })
                     .when(!is_empty, |this| {
-                        this.child(
+                        this.child(fitted_table(
+                            &self.table_state,
                             DataTable::new(&self.table_state)
                                 .stripe(true)
                                 .bordered(false)
                                 .scrollbar_visible(true, true),
-                        )
+                        ))
                     }),
             )
             // The toolbar Export dropdown dispatches these; handle them

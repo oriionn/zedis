@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::value::{DataFormat, RedisBytesValue, ViewMode, ViewerFailure, detect_format};
+use super::value::{DataFormat, RedisBytesValue, ViewMode, ViewerFailure, ViewerKind, detect_format};
 #[cfg(not(target_family = "wasm"))]
 use crate::db::{ProtoManager, ScriptManager};
 use crate::helpers::{configured_time_zone, format_datetime_in, format_datetime_other_zone};
@@ -419,27 +419,37 @@ type ViewerOutcome = (Option<(DataFormat, SharedString)>, Option<ViewerFailure>)
 /// them. Both live on disk and the second is a process, so the browser has
 /// neither and every key goes straight to the native format handling.
 ///
-/// A script that fails (missing program, non-zero exit, timeout, output cap)
-/// falls back to native format handling, which is the right thing to show
-/// and looks exactly like "no viewer matched this key" — so the failure is
-/// handed back with it, for the editor to say.
+/// A viewer that fails — a schema the bytes do not fit, a script whose
+/// program is missing, exits non-zero, times out or says too much — falls
+/// back to the next one and then to native format handling, which is the
+/// right thing to show and looks exactly like "no viewer matched this key".
+/// So the failure is handed back with it, for the editor to say: the first
+/// one, where both a binding and a script matched and failed.
 #[cfg(not(target_family = "wasm"))]
 fn configured_viewer(server_id: &str, key: &str, data: &[u8]) -> ViewerOutcome {
-    if let Some(id) = ProtoManager::match_key_to_name(server_id, key)
-        && let Ok(decoded) = ProtoManager::decode_data(&id, data)
-    {
-        return (Some((DataFormat::Protobuf, SharedString::from(decoded))), None);
+    let mut failure = None;
+    if let Some(id) = ProtoManager::match_key_to_name(server_id, key) {
+        match ProtoManager::decode_data(&id, data) {
+            Ok(decoded) => return (Some((DataFormat::Protobuf, SharedString::from(decoded))), None),
+            Err(e) => {
+                warn!(id, key, error = %e, "proto binding could not decode the value, falling back");
+                // The binding as the user named it; its id says nothing to them.
+                let rule = ProtoManager::get_proto(&id).map_or(id, |config| config.name);
+                failure = Some(viewer_failure(ViewerKind::Proto, rule, &e.to_string()));
+            }
+        }
     }
     let Some(id) = ScriptManager::match_key_to_id(server_id, key) else {
-        return (None, None);
+        return (None, failure);
     };
     match ScriptManager::execute(&id, key, data) {
-        Ok(output) => (Some((DataFormat::Script, SharedString::from(output))), None),
+        Ok(output) => (Some((DataFormat::Script, SharedString::from(output))), failure),
         Err(e) => {
             warn!(id, key, error = %e, "script viewer failed, falling back to native formatting");
             // The rule as the user named it; its id says nothing to them.
             let rule = ScriptManager::get(&id).map_or(id, |config| config.name);
-            (None, Some(viewer_failure(rule, &e.to_string())))
+            let script = viewer_failure(ViewerKind::Script, rule, &e.to_string());
+            (None, Some(failure.unwrap_or(script)))
         }
     }
 }
@@ -449,11 +459,12 @@ fn configured_viewer(_server_id: &str, _key: &str, _data: &[u8]) -> ViewerOutcom
     (None, None)
 }
 
-/// A script's failure as the notice words it: the storage layer's
-/// "Invalid: " is its own classification, not something the script said.
+/// A viewer's failure as the notice words it: the storage layer's
+/// "Invalid: " is its own classification, not something the viewer said.
 #[cfg(not(target_family = "wasm"))]
-fn viewer_failure(rule: String, error: &str) -> ViewerFailure {
+fn viewer_failure(kind: ViewerKind, rule: String, error: &str) -> ViewerFailure {
     ViewerFailure {
+        kind,
         rule: rule.into(),
         error: error.strip_prefix("Invalid: ").unwrap_or(error).to_string().into(),
     }
@@ -468,9 +479,11 @@ mod tests {
     #[test]
     fn a_failed_viewer_is_reported_in_the_scripts_own_words() {
         let failure = viewer_failure(
+            ViewerKind::Script,
             "fn-hexdump".to_string(),
             "Invalid: script exited with error: sh: xxd: command not found",
         );
+        assert_eq!(failure.kind, ViewerKind::Script);
         assert_eq!(failure.rule.as_ref(), "fn-hexdump");
         assert_eq!(
             failure.error.as_ref(),
@@ -478,7 +491,9 @@ mod tests {
         );
         // Anything else is passed on as it came.
         assert_eq!(
-            viewer_failure("r".to_string(), "IO error: denied").error.as_ref(),
+            viewer_failure(ViewerKind::Proto, "r".to_string(), "IO error: denied")
+                .error
+                .as_ref(),
             "IO error: denied"
         );
     }

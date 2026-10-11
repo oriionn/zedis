@@ -30,9 +30,9 @@ use crate::{
     },
     states::{
         ConnectionErrorKind, DataFormat, HINT_EDITOR_GUIDE, KeyType, LinkProblem, MAX_INLINE_VALUE_SIZE, ServerEvent,
-        VALUE_PREVIEW_BYTES, ZedisGlobalStore, ZedisServerState, dialog_button_props, i18n_bitmap, i18n_common,
-        i18n_copy, i18n_editor, i18n_expire_at, i18n_geo_map, i18n_key_ops, i18n_shortcuts, i18n_status_bar,
-        update_app_state_and_save_quiet,
+        VALUE_PREVIEW_BYTES, ViewerKind, ZedisGlobalStore, ZedisServerState, dialog_button_props, i18n_bitmap,
+        i18n_common, i18n_copy, i18n_editor, i18n_expire_at, i18n_geo_map, i18n_key_ops, i18n_shortcuts,
+        i18n_status_bar, update_app_state_and_save_quiet,
     },
     views::{
         BitmapEvent, DiffCloseCallback, GeoMapEvent, ZedisBitmapEditor, ZedisBytesEditor, ZedisCopyKeyDialog,

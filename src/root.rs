@@ -249,10 +249,11 @@ impl Zedis {
         };
         let command_palette =
             cx.new(|cx| ZedisCommandPalette::new(server_state.clone(), page_focus.clone(), window, cx));
-        let recent_keys_palette = cx.new(|cx| ZedisRecentKeysPalette::new(server_state, page_focus, window, cx));
+        let recent_keys_palette =
+            cx.new(|cx| ZedisRecentKeysPalette::new(server_state, page_focus.clone(), window, cx));
         #[cfg(not(target_family = "wasm"))]
-        let desktop = DesktopOnly::new(window, cx);
-        let shortcuts_overlay = cx.new(ZedisShortcutsOverlay::new);
+        let desktop = DesktopOnly::new(page_focus.clone(), window, cx);
+        let shortcuts_overlay = cx.new(|cx| ZedisShortcutsOverlay::new(page_focus, cx));
         let global_state = cx.global::<ZedisGlobalStore>().state();
         cx.subscribe(&global_state, |this, _server_state, event, cx| {
             match event {
@@ -546,7 +547,8 @@ impl Zedis {
 
     /// Point the ⌘K / ⌘P palettes at the active tab — its server state, so
     /// they search the right connection's keys after a tab switch, and its
-    /// page, which is where they leave the focus.
+    /// page, which is where they and the other overlays (⌘/, ⌘⇧F) leave
+    /// the focus.
     fn rebind_palettes(&mut self, cx: &mut Context<Self>) {
         let (server_state, page_focus) = {
             let content = self.tabs[self.active_tab].content.read(cx);
@@ -556,7 +558,13 @@ impl Zedis {
             palette.bind_to_tab(server_state.clone(), page_focus.clone());
         });
         self.recent_keys_palette
-            .update(cx, |palette, _| palette.bind_to_tab(server_state, page_focus));
+            .update(cx, |palette, _| palette.bind_to_tab(server_state, page_focus.clone()));
+        #[cfg(not(target_family = "wasm"))]
+        self.desktop
+            .multi_search
+            .update(cx, |search, _| search.bind_to_page(page_focus.clone()));
+        self.shortcuts_overlay
+            .update(cx, |overlay, _| overlay.bind_to_page(page_focus));
     }
 
     /// Project the active tab's connection into the global store so the

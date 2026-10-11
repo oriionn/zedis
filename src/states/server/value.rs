@@ -515,8 +515,17 @@ impl ViewMode {
 /// rule looks ignored, and the reason is a line in the log (#187).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ViewerFailure {
+    pub kind: ViewerKind,
     pub rule: SharedString,
     pub error: SharedString,
+}
+
+/// Which of the two configured viewers a [`ViewerFailure`] is about: the
+/// notice names a proto binding and a script differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewerKind {
+    Proto,
+    Script,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]

@@ -1438,6 +1438,12 @@ impl<T: ZedisKvFetcher> Render for ZedisKvTable<T> {
         }
         self.panel_was_open = panel_open;
 
+        // The cells draw their hover button on the row's colour, and only
+        // the table's state knows which row it paints as selected.
+        let open_row = self.table_state.read(cx).selected_row();
+        self.table_state
+            .update(cx, |state, _| state.delegate_mut().set_open_row(open_row));
+
         // The columns are fitted to the table's own width, as it was last
         // laid out: opening the entry panel, dragging its handle or resizing
         // the window gives the table another one, and the columns follow on

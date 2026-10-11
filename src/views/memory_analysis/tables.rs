@@ -23,6 +23,12 @@ use std::rc::Rc;
 use zedis_ui::{CellAction, CellActionProvider, TextColumn, ZedisTextTable};
 
 const TYPE_KEY_WIDTH: f32 = 140.;
+/// The least the prefix / key column is drawn at; under it the table
+/// scrolls sideways.
+const NAME_COLUMN_MIN_WIDTH: f32 = 200.;
+/// The page's side paddings around each table: what the table is narrower
+/// than the page by, for its first frame.
+const PAGE_PADDING: f32 = 16.;
 const MEMORY_KEY_WIDTH: f32 = 200.;
 const COUNT_KEY_WIDTH: f32 = 150.;
 const TTL_KEY_WIDTH: f32 = 120.;
@@ -95,21 +101,13 @@ pub(super) fn prefix_table(
     window: &mut Window,
     cx: &mut gpui::App,
 ) -> ZedisTextTable {
-    let content_width = content_area_width(window, cx).as_f32();
-    // Padding offsets keep the table from growing a horizontal scrollbar.
-    let padding_offset = 16.0;
-    let scrollbar_offset = 10.0;
-    let prefix_w = content_width
-        - COUNT_KEY_WIDTH
-        - MEMORY_KEY_WIDTH
-        - TYPE_KEY_WIDTH
-        - TTL_KEY_WIDTH
-        - PERM_KEY_WIDTH
-        - padding_offset
-        - scrollbar_offset;
     let title = |key: &'static str| i18n_memory_analysis(cx, key);
     let columns = vec![
-        TextColumn::new(COL_PREFIX, title(COL_PREFIX), prefix_w).sortable(),
+        // The prefix has what the figures leave, and follows the table's
+        // width (`fitted_table`).
+        TextColumn::new(COL_PREFIX, title(COL_PREFIX), NAME_COLUMN_MIN_WIDTH)
+            .sortable()
+            .fills(),
         TextColumn::new(COL_KEY_COUNT, title(COL_KEY_COUNT), COUNT_KEY_WIDTH).sort_by_cell(PREFIX_CELL_KEY_COUNT),
         TextColumn::new(COL_MEMORY, title(COL_MEMORY), MEMORY_KEY_WIDTH).sort_by_cell(PREFIX_CELL_MEMORY_BYTES),
         TextColumn::new(COL_AVG_TTL, title(COL_AVG_TTL), TTL_KEY_WIDTH).sort_by_cell(PREFIX_CELL_AVG_TTL_SECS),
@@ -153,6 +151,7 @@ pub(super) fn prefix_table(
     ZedisTextTable::new(columns, i18n_common(cx, "copied_to_clipboard"))
         .copy_tooltip(i18n_common(cx, "copy_cell_tooltip"))
         .cell_action(jump)
+        .fitted_to(content_area_width(window, cx) - px(PAGE_PADDING))
 }
 
 /// The single-key Top-N table. The key cell opens the key in the editor —
@@ -163,19 +162,11 @@ pub(super) fn single_key_table(
     window: &mut Window,
     cx: &mut gpui::App,
 ) -> ZedisTextTable {
-    let content_width = content_area_width(window, cx).as_f32();
-    let padding_offset = 16.0;
-    let scrollbar_offset = 10.0;
-    let key_w = content_width
-        - MEMORY_KEY_WIDTH
-        - TTL_KEY_WIDTH
-        - TYPE_KEY_WIDTH
-        - HEAT_KEY_WIDTH
-        - padding_offset
-        - scrollbar_offset;
     let title = |key: &'static str| i18n_memory_analysis(cx, key);
     let columns = vec![
-        TextColumn::new(COL_KEY, title(COL_KEY), key_w).sortable(),
+        TextColumn::new(COL_KEY, title(COL_KEY), NAME_COLUMN_MIN_WIDTH)
+            .sortable()
+            .fills(),
         TextColumn::new(COL_MEMORY, title(COL_MEMORY), MEMORY_KEY_WIDTH).sort_by_cell(KEY_CELL_MEMORY_BYTES),
         TextColumn::new(COL_TTL, title(COL_TTL), TTL_KEY_WIDTH).sort_by_cell(KEY_CELL_TTL_SECS),
         TextColumn::new(COL_KEY_TYPE, title(COL_KEY_TYPE), TYPE_KEY_WIDTH).sortable(),
@@ -200,4 +191,5 @@ pub(super) fn single_key_table(
     ZedisTextTable::new(columns, i18n_common(cx, "copied_to_clipboard"))
         .copy_tooltip(i18n_common(cx, "copy_cell_tooltip"))
         .cell_action(jump)
+        .fitted_to(content_area_width(window, cx) - px(PAGE_PADDING))
 }

@@ -103,11 +103,22 @@ pub struct ZedisMultiSearch {
     task: Option<Task<()>>,
     focus_handle: FocusHandle,
     pending_focus: bool,
+    /// What had the focus when the palette opened: a dismissal gives it
+    /// back.
+    prev_focus: Option<FocusHandle>,
+    /// The page under the palette — where the focus goes when nothing had
+    /// it, and after a jump to a hit. Handed over by the root with the
+    /// active tab (`bind_to_page`).
+    page_focus: FocusHandle,
+    /// Set by a close that leaves the hand-over to the next render: one
+    /// without a `Window` (⌘⇧F again), or a jump, whose page has to be
+    /// the one on screen by then.
+    pending_restore: bool,
     _subscriptions: Vec<Subscription>,
 }
 
 impl ZedisMultiSearch {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(page_focus: FocusHandle, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let query = cx.new(|cx| InputState::new(window, cx).placeholder(i18n_multi_search(cx, "placeholder")));
         let scan_count_input = cx.new(|cx| InputState::new(window, cx));
         let mut subscriptions = Vec::new();
@@ -146,6 +157,9 @@ impl ZedisMultiSearch {
             task: None,
             focus_handle: cx.focus_handle(),
             pending_focus: false,
+            prev_focus: None,
+            page_focus,
+            pending_restore: false,
             _subscriptions: subscriptions,
         }
     }
@@ -181,16 +195,37 @@ impl ZedisMultiSearch {
             }
             // Rebuilt in `render` (dropdown creation needs a Window).
             self.group_select = None;
+        } else {
+            self.pending_restore = true;
         }
         cx.notify();
     }
 
+    /// Follow the active tab: its page is where a close leaves the focus.
+    pub fn bind_to_page(&mut self, page_focus: FocusHandle) {
+        self.page_focus = page_focus;
+    }
+
+    /// Dismiss (Esc / backdrop) and give the focus back.
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open = false;
-        // Return focus to the window root so global hotkeys keep a
-        // dispatch path (same as the command palette).
-        window.blur(cx);
+        self.hand_focus_on(window, cx);
         cx.notify();
+    }
+
+    /// The open palette holds the focus and the closed one draws nothing,
+    /// so a close has to put the focus somewhere — the ⌘K palette's rule:
+    /// back to what had it on a dismissal, and after a jump on to the page,
+    /// but only while the palette still holds it (the page a jump went to
+    /// may have focused something of its own). It used to blur, which left
+    /// the window with nothing focused: Esc, ⌘J and the rest had no path to
+    /// a handler until something was clicked.
+    fn hand_focus_on(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.prev_focus.take() {
+            Some(prev) => prev.focus(window, cx),
+            None if self.focus_handle.contains_focused(window, cx) => self.page_focus.focus(window, cx),
+            None => {}
+        }
     }
 
     fn clear_results(&mut self) {
@@ -426,7 +461,7 @@ impl ZedisMultiSearch {
         export_to_file_global(cx, csv.into_bytes(), "multi-search.csv", success, error);
     }
 
-    fn execute(&mut self, row: &HitRow, window: &mut Window, cx: &mut Context<Self>) {
+    fn execute(&mut self, row: &HitRow, cx: &mut Context<Self>) {
         let server_id = row.server_id.to_string();
         let db = row.db;
         let key = row.key.to_string();
@@ -444,7 +479,12 @@ impl ZedisMultiSearch {
                 }
             });
         });
-        self.close(window, cx);
+        // Not a dismissal: the focus goes on to the page the hit is on,
+        // which is the active one only by the next render.
+        self.open = false;
+        self.prev_focus = None;
+        self.pending_restore = true;
+        cx.notify();
     }
 
     fn set_scope_kind(&mut self, kind: ScopeKind, window: &mut Window, cx: &mut Context<Self>) {
@@ -647,9 +687,9 @@ impl ZedisMultiSearch {
                         .group(copy_group.clone())
                         .when(is_stripe, |this| this.bg(stripe_bg))
                         .hover(move |s| s.bg(hover))
-                        .on_click(move |_, window, cx| {
+                        .on_click(move |_, _, cx| {
                             let row = row_for_click.clone();
-                            entity.update(cx, |this, cx| this.execute(&row, window, cx));
+                            entity.update(cx, |this, cx| this.execute(&row, cx));
                         })
                         .child(KeyTypeBadge::new(KeyType::from(row.key_type.as_ref())).plain(true))
                         .child(
@@ -747,11 +787,15 @@ impl ZedisMultiSearch {
 impl Render for ZedisMultiSearch {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.open {
+            if std::mem::take(&mut self.pending_restore) {
+                self.hand_focus_on(window, cx);
+            }
             return div().into_any_element();
         }
 
         if self.pending_focus {
             self.pending_focus = false;
+            self.prev_focus = window.focused(cx);
             self.query.update(cx, |state, cx| {
                 // Keep the previous query (its results are still listed
                 // below) but select it whole, so typing immediately starts

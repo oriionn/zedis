@@ -50,7 +50,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::error;
-use zedis_ui::{CellRenderer, CellStyle, CellStyleProvider, RowPredicate, TextColumn, ZedisDialog, ZedisTextTable};
+use zedis_ui::{
+    CellRenderer, CellStyle, CellStyleProvider, RowPredicate, TextColumn, ZedisDialog, ZedisTextTable, fitted_table,
+};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -353,23 +355,9 @@ fn build_table(
     // CLIENT KILL is gated by the capability matrix.
     let can_kill = Capability::KillClient.allowed(readonly);
     let action_width = if can_kill { ACTION_COLUMN_WIDTH } else { 0. };
-    let remaining_width = content_width.as_f32()
-        - id_width
-        - name_width
-        - user_width
-        - age_width
-        - idle_width
-        - db_width
-        - flags_width
-        - lib_width
-        - qbuf_width
-        - tot_mem_width
-        - action_width
-        - addr_width
-        - 10.;
-    // `cmd` is the flexible column, but a narrow window must not drive it to
-    // zero (or negative) — the table scrolls horizontally instead.
-    let cmd_width = remaining_width.max(160.);
+    // `cmd` is the filling column: it has what the others leave, and no
+    // less than this — in a narrow window the table scrolls sideways.
+    let cmd_width = 160.;
     let widths = [
         id_width,
         addr_width,
@@ -395,7 +383,8 @@ fn build_table(
                 COLUMN_IDLE => column.sort_by_cell(CELL_IDLE),
                 COLUMN_QBUF => column.sort_by_cell(CELL_QBUF),
                 COLUMN_TOT_MEM => column.sort_by_cell(CELL_TOT_MEM),
-                COLUMN_ADDR | COLUMN_USER | COLUMN_DB | COLUMN_FLAGS | COLUMN_CMD | COLUMN_LIB => column.sortable(),
+                COLUMN_CMD => column.sortable().fills(),
+                COLUMN_ADDR | COLUMN_USER | COLUMN_DB | COLUMN_FLAGS | COLUMN_LIB => column.sortable(),
                 _ => column,
             }
         })
@@ -526,6 +515,7 @@ fn build_table(
         ])
         .cell_style(style)
         .cell_render(render)
+        .fitted_to(content_width)
 }
 
 /// The structured part of the filter — `min_idle` / `min_age` in seconds
@@ -1304,12 +1294,13 @@ impl gpui::Render for ZedisClientsManager {
                         )
                     })
                     .when(!is_empty, |this| {
-                        this.child(
+                        this.child(fitted_table(
+                            &self.table_state,
                             DataTable::new(&self.table_state)
                                 .stripe(true)
                                 .bordered(false)
                                 .scrollbar_visible(true, true),
-                        )
+                        ))
                     }),
             )
             .into_any_element()

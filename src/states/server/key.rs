@@ -1675,6 +1675,13 @@ impl ZedisServerState {
                         if this.key.as_ref() == Some(&old_done) {
                             this.select_key(new_done.clone(), cx);
                         }
+                        // A clobbering RENAME leaves the database one key
+                        // short — the one that had the name. Ask for the
+                        // total now, as a delete does: the status bar read
+                        // 25/26 until the heartbeat's next `DBSIZE`.
+                        if overwrite {
+                            this.refresh_dbsize_now(cx);
+                        }
                         cx.emit(ServerEvent::KeyTreeUpdated);
                     }
                     Ok(false) => {

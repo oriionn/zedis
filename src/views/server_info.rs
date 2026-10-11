@@ -46,12 +46,15 @@ use gpui_kit::component::{
 };
 use std::rc::Rc;
 use tracing::{error, info};
-use zedis_ui::{CellStyle, CellStyleProvider, TextColumn, ZedisDivider, ZedisTextTable, help_popover};
+use zedis_ui::{CellStyle, CellStyleProvider, TextColumn, ZedisDivider, ZedisTextTable, fitted_table, help_popover};
 
 use crate::assets::CustomIconName;
 
 const SECTION_COL_WIDTH: f32 = 220.;
 const FIELD_COL_WIDTH: f32 = 300.;
+/// The least the value column is drawn at; under it the table scrolls
+/// sideways.
+const VALUE_COL_MIN_WIDTH: f32 = 200.;
 
 /// One `field: value` line of an INFO reply, tagged with its section (and
 /// node address on clusters).
@@ -138,15 +141,18 @@ impl InfoRow {
 /// Three text columns; the section column is muted, as it repeats down
 /// every row of a section.
 fn build_table(window: &mut Window, cx: &mut gpui::App) -> ZedisTextTable {
-    let content_width = content_area_width(window, cx).as_f32();
-    let value_w = content_width - SECTION_COL_WIDTH - FIELD_COL_WIDTH - 26.;
+    // The value has what the two naming columns leave, and follows the
+    // table's width from there (`fitted_table`).
     let columns = [
-        ("section", SECTION_COL_WIDTH),
-        ("field", FIELD_COL_WIDTH),
-        ("value", value_w),
+        ("section", SECTION_COL_WIDTH, false),
+        ("field", FIELD_COL_WIDTH, false),
+        ("value", VALUE_COL_MIN_WIDTH, true),
     ]
     .into_iter()
-    .map(|(key, w)| TextColumn::new(key, i18n_server_info(cx, key), w))
+    .map(|(key, width, fills)| {
+        let column = TextColumn::new(key, i18n_server_info(cx, key), width);
+        if fills { column.fills() } else { column }
+    })
     .collect();
     let muted_section: CellStyleProvider = Rc::new(|col_ix, _cells, cx| CellStyle {
         color: (col_ix == 0).then(|| cx.theme().muted_foreground),
@@ -155,6 +161,7 @@ fn build_table(window: &mut Window, cx: &mut gpui::App) -> ZedisTextTable {
     ZedisTextTable::new(columns, i18n_common(cx, "copied_to_clipboard"))
         .copy_tooltip(i18n_common(cx, "copy_cell_tooltip"))
         .cell_style(muted_section)
+        .fitted_to(content_area_width(window, cx))
 }
 
 /// Raw INFO browser view — see the module docs.
@@ -656,12 +663,13 @@ impl Render for ZedisServerInfo {
                         )
                     })
                     .when(!is_empty, |this| {
-                        this.child(
+                        this.child(fitted_table(
+                            &self.table_state,
                             DataTable::new(&self.table_state)
                                 .stripe(true)
                                 .bordered(false)
                                 .scrollbar_visible(true, true),
-                        )
+                        ))
                     }),
             )
     }

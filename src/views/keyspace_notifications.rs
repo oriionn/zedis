@@ -54,7 +54,8 @@ use std::rc::Rc;
 use std::time::Instant;
 use tracing::error;
 use zedis_ui::{
-    CellRenderer, CellStyle, CellStyleProvider, RowPredicate, TextColumn, ZedisDialog, ZedisTextTable, help_popover,
+    CellRenderer, CellStyle, CellStyleProvider, RowPredicate, TextColumn, ZedisDialog, ZedisTextTable, fitted_table,
+    help_popover,
 };
 
 const KEYSPACE_PATTERN: &str = "__keyspace@*__:*";
@@ -159,14 +160,18 @@ fn build_table(server_state: Entity<ZedisServerState>, window: &mut Window, cx: 
     let db_width = 60.;
     let event_width = 120.;
     let source_width = 90.;
-    let remaining = content_width.as_f32() - time_width - db_width - event_width - source_width - 10.;
-    let key_width = remaining.max(200.);
+    // The key has what the others leave, and no less than this.
+    let key_width = 200.;
     let widths = [time_width, db_width, key_width, event_width, source_width];
 
     let columns = KEYSPACE_COLUMNS
         .iter()
         .zip(widths)
-        .map(|(&key, width)| TextColumn::new(key, i18n_keyspace_notifications(cx, key), width))
+        .enumerate()
+        .map(|(ix, (&key, width))| {
+            let column = TextColumn::new(key, i18n_keyspace_notifications(cx, key), width);
+            if ix == KEY_COLUMN { column.fills() } else { column }
+        })
         .collect();
 
     let style: CellStyleProvider = Rc::new(|col_ix, cells, cx| {
@@ -229,6 +234,7 @@ fn build_table(server_state: Entity<ZedisServerState>, window: &mut Window, cx: 
         .max_rows(RING_BUFFER_CAPACITY)
         .cell_style(style)
         .cell_render(open_key)
+        .fitted_to(content_width)
 }
 
 /// The structured filter as a row predicate over the cells — `None` when
@@ -1231,12 +1237,13 @@ impl ZedisKeyspaceNotifications {
     }
 
     fn render_message_table(&self) -> impl IntoElement {
-        div().flex_1().w_full().min_h_0().child(
+        div().flex_1().w_full().min_h_0().child(fitted_table(
+            &self.table_state,
             DataTable::new(&self.table_state)
                 .stripe(true)
                 .bordered(false)
                 .scrollbar_visible(true, true),
-        )
+        ))
     }
 }
 

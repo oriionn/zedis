@@ -1320,10 +1320,13 @@ impl gpui::Render for ZedisMemoryAnalysis {
                 // Prefix groups table, under the breadcrumb naming the level
                 // it is showing.
                 if has_prefix || !self.prefix_root.is_empty() {
-                    let table = DataTable::new(&self.prefix_table)
-                        .stripe(true)
-                        .bordered(true)
-                        .scrollbar_visible(false, false);
+                    let table = fitted_table(
+                        &self.prefix_table,
+                        DataTable::new(&self.prefix_table)
+                            .stripe(true)
+                            .bordered(true)
+                            .scrollbar_visible(false, false),
+                    );
 
                     if let Some(breadcrumb) = self.render_prefix_breadcrumb(cx) {
                         body = body.child(breadcrumb);
@@ -1339,10 +1342,13 @@ impl gpui::Render for ZedisMemoryAnalysis {
 
                 // Single keys table
                 if has_single {
-                    let table = DataTable::new(&self.single_table)
-                        .stripe(true)
-                        .bordered(true)
-                        .scrollbar_visible(false, false);
+                    let table = fitted_table(
+                        &self.single_table,
+                        DataTable::new(&self.single_table)
+                            .stripe(true)
+                            .bordered(true)
+                            .scrollbar_visible(false, false),
+                    );
 
                     body = body.child(self.render_table_section(
                         "single_table_title",

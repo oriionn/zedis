@@ -1377,7 +1377,15 @@ impl ZedisStatusBar {
                                 cx.notify();
                             })),
                     )
-                    .child(Label::new(server_state.size.clone()).text_color(status_text).mr_2())
+                    .child({
+                        // Two bare numbers: the tooltip says which is which.
+                        let key_count_tooltip = i18n_status_bar(cx, "key_count_tooltip");
+                        div()
+                            .id("zedis-status-bar-key-count")
+                            .mr_2()
+                            .tooltip(move |window, cx| Tooltip::new(key_count_tooltip.clone()).build(window, cx))
+                            .child(Label::new(server_state.size.clone()).text_color(status_text))
+                    })
                     .child(
                         div()
                             .child(

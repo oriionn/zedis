@@ -28,18 +28,24 @@
 //! crate has no i18n — so a panel rebuilds the table on a locale change,
 //! which the route switch already does.
 
-use gpui::{AnyElement, App, ClipboardItem, Edges, Hsla, SharedString, Window, prelude::*, px};
+use gpui::{
+    AnyElement, App, Bounds, ClipboardItem, Div, Edges, Entity, Hsla, Pixels, SharedString, Window, canvas, div,
+    prelude::*, px,
+};
 use gpui_kit::component::{
     ActiveTheme, Icon, IconName, StyledExt, WindowExt,
     button::{Button, ButtonVariants},
     h_flex,
     label::Label,
     notification::Notification,
-    table::{Column, ColumnSort, TableDelegate, TableState},
+    table::{Column, ColumnSort, DataTable, TableDelegate, TableState},
 };
 use std::collections::VecDeque;
 use std::rc::Rc;
 use zedis_core::string::fast_contains_ignore_case;
+
+/// What the columns leave free at the table's edge, for its scrollbar.
+const EDGE_RESERVE: f32 = 10.;
 
 /// One column: a stable `key` (what exports and sort callers name), the
 /// title to draw, and a width in pixels.
@@ -48,6 +54,9 @@ pub struct TextColumn {
     key: &'static str,
     title: SharedString,
     width: f32,
+    /// Takes the room the other columns leave; `width` is then the least
+    /// it is drawn at.
+    fills: bool,
     sortable: bool,
     numeric: bool,
     /// Cell index the sort reads (a payload cell holding the raw value);
@@ -62,11 +71,25 @@ impl TextColumn {
             key,
             title: title.into(),
             width,
+            fills: false,
             sortable: false,
             numeric: false,
             sort_cell: None,
             padded: true,
         }
+    }
+
+    /// This column takes the room the others leave — the one a row is read
+    /// for (a command's arguments, a value). Its `width` becomes the least
+    /// it is drawn at: in a table too narrow for that, the table scrolls
+    /// sideways. Several filling columns share the room evenly.
+    ///
+    /// The table has to be drawn with [`fitted_table`] for the column to
+    /// follow its width; a panel used to work the width out itself, once,
+    /// from the window as it was when the panel opened.
+    pub fn fills(mut self) -> Self {
+        self.fills = true;
+        self
     }
 
     /// Clicking the header sorts by this column.
@@ -167,6 +190,45 @@ pub struct ZedisTextTable {
     cell_style: Option<CellStyleProvider>,
     cell_render: Option<CellRenderer>,
     row_filter: Option<RowPredicate>,
+    /// The table width the filling columns were last fitted to.
+    fitted_width: Option<Pixels>,
+}
+
+/// Draw `table` — a `DataTable` over `state` — so that its filling columns
+/// ([`TextColumn::fills`]) follow the width it is laid out at: a window
+/// resized, or a sidebar folded, gives the table another width, and the
+/// columns are fitted to it on the next frame. Takes the place the bare
+/// `DataTable` had (both fill their parent).
+///
+/// A refit lays every column out again, so widths dragged by hand last
+/// until the table's own width next changes.
+pub fn fitted_table(state: &Entity<TableState<ZedisTextTable>>, table: DataTable<ZedisTextTable>) -> Div {
+    let state = state.clone();
+    let probe = canvas(
+        move |bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App| {
+            let width = bounds.size.width;
+            if state.read(cx).delegate().fitted_width == Some(width) {
+                return;
+            }
+            // After layout is where the width is known, and too late to
+            // change this frame's columns: the next one has them.
+            let state = state.clone();
+            window.on_next_frame(move |_, cx| {
+                state.update(cx, |table, cx| {
+                    if table.delegate_mut().fit_to(width) {
+                        table.refresh(cx);
+                    }
+                    cx.notify();
+                });
+            });
+        },
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full();
+    div().relative().size_full().child(table).child(probe)
 }
 
 impl ZedisTextTable {
@@ -205,7 +267,47 @@ impl ZedisTextTable {
             cell_style: None,
             cell_render: None,
             row_filter: None,
+            fitted_width: None,
         }
+    }
+
+    /// Fit the filling columns for the first frame, from the caller's
+    /// estimate of the table's width — [`fitted_table`] measures the real
+    /// one after it. Without this they start at their least width and grow
+    /// a frame later.
+    pub fn fitted_to(mut self, width: Pixels) -> Self {
+        self.fit_to(width);
+        self
+    }
+
+    /// Give the filling columns what the others leave of a table `width`
+    /// wide, shared evenly and never under their own width. Answers whether
+    /// a column's width changed.
+    fn fit_to(&mut self, width: Pixels) -> bool {
+        self.fitted_width = Some(width);
+        let filling = self.columns.iter().filter(|column| column.fills).count();
+        if filling == 0 {
+            return false;
+        }
+        let fixed: f32 = self
+            .columns
+            .iter()
+            .filter(|column| !column.fills)
+            .map(|column| column.width)
+            .sum();
+        let share = (width.as_f32() - EDGE_RESERVE - fixed) / filling as f32;
+        let mut changed = false;
+        for (column, drawn) in self.columns.iter().zip(self.gpui_columns.iter_mut()) {
+            if !column.fills {
+                continue;
+            }
+            let width = px(share.max(column.width));
+            if drawn.width != width {
+                drawn.width = width;
+                changed = true;
+            }
+        }
+        changed
     }
 
     pub fn cell_style(mut self, provider: CellStyleProvider) -> Self {
@@ -333,6 +435,13 @@ impl ZedisTextTable {
             ColumnSort::Descending => Some((col_ix, false)),
             ColumnSort::Default => None,
         };
+        // The header's arrow is drawn from the table's own copy of these,
+        // which a refit replaces with ours: keep ours saying the same.
+        for (ix, column) in self.gpui_columns.iter_mut().enumerate() {
+            if column.sort.is_some() {
+                column.sort = Some(if ix == col_ix { sort } else { ColumnSort::Default });
+            }
+        }
         self.refilter();
     }
 
@@ -613,7 +722,59 @@ impl TableDelegate for ZedisTextTable {
 #[cfg(test)]
 mod tests {
     use super::{ColumnSort, TextColumn, ZedisTextTable};
-    use gpui::SharedString;
+    use gpui::{SharedString, px};
+
+    /// A filling column has what the others leave of the table's width and
+    /// never less than its own; the others keep theirs. A panel used to
+    /// work this out once, from the window as it was when it opened.
+    #[test]
+    fn a_filling_column_takes_what_the_others_leave() {
+        let mut table = ZedisTextTable::new(
+            vec![
+                TextColumn::new("time", "Time", 180.),
+                TextColumn::new("args", "Args", 200.).fills(),
+                TextColumn::new("client", "Client", 220.),
+            ],
+            "copied",
+        );
+        let widths = |table: &ZedisTextTable| -> Vec<f32> {
+            table.gpui_columns.iter().map(|column| column.width.as_f32()).collect()
+        };
+        assert_eq!(widths(&table), vec![180., 200., 220.]);
+
+        assert!(table.fit_to(px(1000.)));
+        assert_eq!(widths(&table), vec![180., 590., 220.]);
+        // The same width again is no change, and no reason to redraw.
+        assert!(!table.fit_to(px(1000.)));
+        // Narrower than everything at its least: the column keeps that,
+        // and the table scrolls sideways.
+        assert!(table.fit_to(px(500.)));
+        assert_eq!(widths(&table), vec![180., 200., 220.]);
+
+        // Nothing fills: the widths are the ones that were asked for.
+        let mut fixed = ZedisTextTable::new(vec![TextColumn::new("a", "A", 100.)], "copied");
+        assert!(!fixed.fit_to(px(1000.)));
+    }
+
+    /// A refit hands the table its columns again, so they have to carry
+    /// the sort its header shows — the arrow would otherwise go back to
+    /// "unsorted" over rows that are still sorted.
+    #[test]
+    fn the_columns_carry_the_sort_the_header_shows() {
+        let mut table = ZedisTextTable::new(
+            vec![
+                TextColumn::new("a", "A", 100.).sortable(),
+                TextColumn::new("b", "B", 100.).sortable(),
+                TextColumn::new("c", "C", 100.),
+            ],
+            "copied",
+        );
+        table.set_sort(1, ColumnSort::Descending);
+        let sorts: Vec<_> = table.gpui_columns.iter().map(|column| column.sort).collect();
+        assert!(matches!(sorts[0], Some(ColumnSort::Default)));
+        assert!(matches!(sorts[1], Some(ColumnSort::Descending)));
+        assert!(sorts[2].is_none());
+    }
 
     fn row(cells: &[&str]) -> Vec<SharedString> {
         cells.iter().map(|c| SharedString::from(c.to_string())).collect()

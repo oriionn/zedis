@@ -31,10 +31,10 @@ impl ZedisEditor {
         };
         self.rename_input_state.update(cx, |state, cx| {
             state.set_value(key.clone(), window, cx);
-            state.focus(window, cx);
         });
         let input_child = self.rename_input_state.clone();
         let input_ok = self.rename_input_state.clone();
+        let input_focus = self.rename_input_state.clone();
         let server_state = self.server_state.clone();
         let old = key.clone();
         ZedisDialog::new(i18n_editor(cx, "rename_title"))
@@ -67,6 +67,11 @@ impl ZedisEditor {
                 true
             })
             .open(window, cx);
+        // After the dialog is open, not before: opening one takes the focus
+        // for itself, so a field focused first was left without it — the
+        // name could not be typed over until it was clicked — and was what
+        // the dialog gave the focus back to when it closed.
+        input_focus.update(cx, |state, cx| state.focus(window, cx));
     }
 
     /// Confirm dialog shown when a rename would overwrite an existing key;

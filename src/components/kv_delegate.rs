@@ -182,6 +182,10 @@ pub struct ZedisKvDelegate<T: ZedisKvFetcher> {
     /// that can renumber rows (a delete, a filter, a new key). `load_more`
     /// only appends, so a selection survives paging.
     selected_rows: HashSet<usize>,
+    /// The row the table draws as selected — the one open in the entry
+    /// panel. Mirrored from the table's state before each render
+    /// (`set_open_row`), which a cell cannot read while it is being drawn.
+    open_row: Option<usize>,
 }
 
 /// A column's own paddings, inside the table's. The two leading columns hold
@@ -245,10 +249,16 @@ impl<T: ZedisKvFetcher> ZedisKvDelegate<T> {
             fetcher,
             processing: Rc::new(Cell::new(false)),
             selected_rows: HashSet::new(),
+            open_row: None,
         }
     }
 
     /// The ticked rows, ascending — the order `remove_many` is handed them.
+    /// Tell the cells which row the table draws as selected.
+    pub fn set_open_row(&mut self, row: Option<usize>) {
+        self.open_row = row;
+    }
+
     pub fn selected_rows(&self) -> Vec<usize> {
         let mut rows: Vec<usize> = self.selected_rows.iter().copied().collect();
         rows.sort_unstable();
@@ -476,9 +486,17 @@ impl<T: ZedisKvFetcher + 'static> TableDelegate for ZedisKvDelegate<T> {
         let chip_text = cx.theme().foreground.opacity(0.7);
         let group_name: SharedString = format!("td-{}-{}", row_ix, col_ix).into();
         let copied_message = i18n_common(cx, "copied_to_clipboard");
-        // The fill under the hover button: the hovered row's own colour, made
-        // opaque so the text it sits on does not show through.
-        let copy_bg = cx.theme().background.blend(cx.theme().table_hover);
+        // The fill under the hover button: the row's own colour, made opaque
+        // so the text it sits on does not show through. A selected row keeps
+        // its selection colour under the pointer; any other takes the hover.
+        let row_fill = if self.open_row != Some(row_ix) {
+            cx.theme().table_hover
+        } else if cx.theme().list.active_highlight {
+            cx.theme().table_active
+        } else {
+            cx.theme().accent
+        };
+        let copy_bg = cx.theme().background.blend(row_fill);
         let copy_inset = column.paddings.map(|paddings| paddings.right).unwrap_or_default();
         base.relative()
             .group(group_name.clone())

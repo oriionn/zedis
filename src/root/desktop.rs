@@ -21,7 +21,7 @@
 //! first*).
 
 use super::*;
-use gpui::Subscription;
+use gpui::{FocusHandle, Subscription};
 
 /// The desktop-only state of the [`Zedis`] root.
 pub(crate) struct DesktopOnly {
@@ -48,12 +48,12 @@ pub(crate) struct DesktopOnly {
 }
 
 impl DesktopOnly {
-    pub(super) fn new(window: &mut Window, cx: &mut Context<Zedis>) -> Self {
+    pub(super) fn new(page_focus: FocusHandle, window: &mut Window, cx: &mut Context<Zedis>) -> Self {
         let activation = cx.observe_window_activation(window, |zedis, window, cx| {
             zedis.on_window_activation(window.is_window_active(), cx);
         });
         Self {
-            multi_search: cx.new(|cx| ZedisMultiSearch::new(window, cx)),
+            multi_search: cx.new(|cx| ZedisMultiSearch::new(page_focus, window, cx)),
             pending_update: None,
             update_task: None,
             download_task: None,

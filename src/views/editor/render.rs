@@ -1000,17 +1000,15 @@ impl Render for ZedisEditor {
 
         let viewer_notice = viewer_failure.map(|failure| {
             let locale = cx.global::<ZedisGlobalStore>().read(cx).locale();
-            let title = t!(
-                "editor.script_failed_title",
-                name = failure.rule.as_ref(),
-                locale = locale
-            )
-            .to_string();
-            // What the script said, then what is on screen instead — on a
-            // line of its own, since the first is the script's wording and
+            let (title_key, fallback_key) = match failure.kind {
+                ViewerKind::Proto => ("editor.proto_failed_title", "proto_failed_fallback"),
+                ViewerKind::Script => ("editor.script_failed_title", "script_failed_fallback"),
+            };
+            let title = t!(title_key, name = failure.rule.as_ref(), locale = locale).to_string();
+            // What the viewer said, then what is on screen instead — on a
+            // line of its own, since the first is the viewer's wording and
             // ends wherever it ends.
-            let message: SharedString =
-                format!("{}\n{}", failure.error, i18n_editor(cx, "script_failed_fallback")).into();
+            let message: SharedString = format!("{}\n{}", failure.error, i18n_editor(cx, fallback_key)).into();
             div()
                 .flex_none()
                 .px_2()
