@@ -6,14 +6,14 @@
     <title>Zedis — 面向大 keyspace 的原生 Redis 客户端</title>
     <meta
       name="description"
-      content="打开百万级 key 不卡死的原生 Redis 客户端。智能解码、集群、离线 RDB、原始 INFO、终端 AI 助手；支持从 Redis Insight / ARDM / Tiny RDM 一次导入连接。"
+      content="打开百万级 key 不卡死的原生 Redis 客户端。智能解码、集群、离线 RDB、原始 INFO、AI 命令助手；支持从 Redis Insight / ARDM / Tiny RDM 一次导入连接。"
     />
     <link rel="canonical" href="https://zedis.net/zh/" />
     <meta name="theme-color" content="#0c0f14" />
     <meta property="og:title" content="Zedis — 面向大 keyspace 的原生 Redis 客户端" />
     <meta
       property="og:description"
-      content="百万级 key 不卡死。智能解码、集群、离线 RDB、AI 命令助手；一次导入 Insight / ARDM / Tiny RDM。原生 GPU 加速，无遥测。"
+      content="百万级 key 不卡死。智能解码、集群、离线 RDB、AI 命令助手；连接可从 Redis Insight / ARDM / Tiny RDM 一次导入。原生 GPU 加速，无遥测。"
     />
     <meta property="og:type" content="website" />
     <meta property="og:url" content="https://zedis.net/zh/" />
@@ -154,8 +154,8 @@
         <div class="wrap">
           <p class="migrate-banner">
             <strong>已经在用 Redis Insight、ARDM 或 Tiny RDM？</strong>
-            粘贴导出（或 Tiny RDM 的 <code>connections.yaml</code>）——地址、TLS、SSH、分组一次到位。密钥随后进入
-            Zedis 的按机器加密存储。
+            粘贴导出内容（或 Tiny RDM 的 <code>connections.yaml</code>）——地址、TLS、SSH 和分组一次导入。密码和私钥随后由
+            Zedis 用本机专属的密钥加密保存。
           </p>
         </div>
       </section>
@@ -169,13 +169,13 @@
               <span class="proof-step">1</span>
               <h3>迁入连接</h3>
               <p>
-                Redis Insight、Another Redis Desktop Manager、Tiny RDM，或 <code>redis://</code> URI。分组与隧道一并映射。
+                Redis Insight、Another Redis Desktop Manager、Tiny RDM，或 <code>redis://</code> URI。分组和隧道也会一并带过来。
               </p>
             </article>
             <article class="proof-card">
               <span class="proof-step">2</span>
               <h3>生产更安心</h3>
-              <p>环境标签、只读锁、破坏操作升级确认、密钥加密落盘——纯本地，无遥测。</p>
+              <p>环境标签、只读锁、破坏性命令多一道确认、密码和私钥加密保存——数据只存本机，无遥测。</p>
             </article>
             <article class="proof-card">
               <span class="proof-step">3</span>
@@ -190,13 +190,13 @@
 
       <section id="features">
         <div class="wrap">
-          <h2 class="section-title">你能得到什么</h2>
-          <p class="section-sub">产品能力浓缩。完整巡览见 GitHub。</p>
+          <h2 class="section-title">功能一览</h2>
+          <p class="section-sub">这里只列重点，完整介绍见 GitHub。</p>
           <div class="grid-3">
             <article class="card">
               <div class="icon">🦀</div>
-              <h3>原生 &amp; 快</h3>
-              <p>虚拟滚动 SCAN、百万键树、浅色 / 深色 / 跟随系统及 6 套内置主题——macOS、Windows、Linux。</p>
+              <h3>原生，而且快</h3>
+              <p>虚拟滚动 SCAN、百万 key 的树形列表、浅色 / 深色 / 跟随系统及 6 套内置主题——macOS、Windows、Linux。</p>
             </article>
             <article class="card">
               <div class="icon">🧠</div>
@@ -210,22 +210,22 @@
             </article>
             <article class="card">
               <div class="icon">🔑</div>
-              <h3>Keys &amp; 批量</h3>
+              <h3>Key 管理与批量操作</h3>
               <p>
-                命名空间树、标签、回收站、JSON 树编辑、查找替换、Tools 导出与前缀过滤（二进制 / JSON / CSV）、跨服复制与对比——单个 key 或整个前缀。
+                命名空间树、标签、回收站、JSON 树编辑、查找替换、按前缀过滤导出（二进制 / JSON / CSV）、跨服务器复制与对比——单个 key 或整个前缀。
               </p>
             </article>
             <article class="card">
               <div class="icon">🔐</div>
               <h3>隐私优先</h3>
-              <p>按机器加密的连接密钥、ACL 编辑、标签与历史只存本地文件。无账号、无遥测。</p>
+              <p>密码和私钥用本机专属的密钥加密、ACL 编辑、标签与历史只存本地文件。无账号、无遥测。</p>
             </article>
             <article class="card">
               <div class="icon">🧭</div>
               <h3>Valkey 与受限服务端</h3>
               <p>
-                Redis 与 Valkey 都是一等公民 &mdash;&mdash; 每个版本门槛都有自己的 Valkey 下限。连接后自动探测能力：代理、ElastiCache
-                / Azure / Tair、Dragonfly / KeyDB 上跑不了的功能会灰显<em>并说明原因</em>，而不是报错。
+                Redis 和 Valkey 同等对待：哪些功能可用，按两者各自的版本分别判断，不会给服务器发它不支持的命令。连接后还会自动探测
+                &mdash;&mdash; 在代理、ElastiCache / Azure / Tair、Dragonfly / KeyDB 上用不了的功能会变灰，<em>并告诉你原因</em>，而不是点了才报错。
               </p>
             </article>
             <article class="card">
@@ -233,14 +233,14 @@
               <h3>连接一切</h3>
               <p>
                 TLS/SSL、SSH 隧道、Cluster 与 Sentinel。分阶段的 DNS &rarr; TCP &rarr; TLS &rarr; AUTH
-                诊断，链路还能在故障转移后自行重连。
+                诊断，连接还能在故障转移后自动重连。
               </p>
             </article>
             <article class="card">
               <div class="icon">⌨️</div>
               <h3>重度用户</h3>
               <p>
-                ⌘K 面板、⌘P 最近键、⌘⇧F 多库搜索、redis-cli + <code>?</code> AI 助手、Batch 模式。
+                ⌘K 命令面板、⌘P 最近打开的 key、⌘⇧F 多库搜索，redis-cli 终端里输入 <code>?</code> 可以问 AI 助手，还有 Batch 模式。
               </p>
             </article>
             <article class="card">
@@ -248,14 +248,14 @@
               <h3>浏览器里也能用</h3>
               <p>
                 同一套代码编译成 WebAssembly，一个约 26&nbsp;MB 的 Docker 镜像即可自托管 &mdash;&mdash;
-                部署在 Redis 旁边，整个团队从标签页上手。MCP 入口让 Claude Code、Cursor 以只读账号读取 Redis &mdash;&mdash;
-                只能读。
+                部署在 Redis 旁边，整个团队打开浏览器标签页就能用。内置的 MCP 服务让 Claude Code、Cursor 用只读账号读
+                Redis，而且只能读。目前是早期预览。
               </p>
             </article>
           </div>
           <p class="feat-more">
             <a href="https://github.com/vicanso/zedis/blob/main/docs/FEATURES_zh.md" target="_blank" rel="noopener"
-              >完整功能巡览（GitHub）→</a
+              >完整功能介绍（GitHub）→</a
             >
           </p>
         </div>
@@ -364,7 +364,7 @@
                 <button type="button" class="copy-btn" data-copy="cmd-aur">复制</button>
               </div>
               <p class="install-alt">
-                或从 Releases 使用
+                以上是 Arch Linux（AUR）。其他发行版从 Releases 下载
                 <a href="https://github.com/vicanso/zedis/releases/latest" target="_blank" rel="noopener"
                   >.deb / .rpm / AppImage / tarball</a
                 >（x86_64 与 aarch64）。
@@ -378,7 +378,10 @@
                 >
                 <button type="button" class="copy-btn" data-copy="cmd-cargo">复制</button>
               </div>
-              <p class="install-alt">crates.io 可能滞后（GPUI 为 git 依赖）。推荐 git 或 Releases。</p>
+              <p class="install-alt">
+                这条命令编译的是最新源码。安装已发布的版本用：
+                <code>cargo install --locked zedis-gui</code>。
+              </p>
             </div>
             <div class="install-card">
               <h3>浏览器（自托管）</h3>
@@ -387,7 +390,7 @@
                 <button type="button" class="copy-btn" data-copy="cmd-docker">复制</button>
               </div>
               <p class="install-alt">
-                打开 <code>localhost:7379</code>，以 <code>admin</code> 登录。试用之外请去掉
+                打开 <code>localhost:7379</code>，用 <code>admin</code> / <code>change-me</code> 登录。正式使用请去掉
                 <code>--insecure-cookie</code> 并在前面加一层 HTTPS &mdash;&mdash; 见
                 <a
                   href="https://github.com/vicanso/zedis/blob/main/docs/WEB_zh.md"
@@ -415,7 +418,7 @@
         <div class="wrap">
           <h2 class="section-title">开源</h2>
           <p>
-            Zedis 基于 Apache-2.0。欢迎 Issue 与 PR——提交即表示同意项目 CLA。近期变更见
+            Zedis 以 Apache-2.0 许可证开源。欢迎 Issue 与 PR——提交即表示同意项目 CLA。近期变更见
             <a href="https://github.com/vicanso/zedis/blob/main/CHANGELOG.md" target="_blank" rel="noopener"
               >更新日志</a
             >。
@@ -435,7 +438,7 @@
 
     <footer class="footer">
       <div class="wrap footer-inner">
-        <span>© Zedis · v0.12.4 · Apache-2.0 · Hosted on GitHub Pages</span>
+        <span>© Zedis · v0.12.4 · Apache-2.0 · 托管于 GitHub Pages</span>
         <span>
           <a href="../" onclick="try{localStorage.setItem('zedis-lang','en')}catch(e){}">English</a>
           ·

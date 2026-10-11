@@ -6,14 +6,14 @@
     <title>Zedis — Native Redis GUI for large keyspaces</title>
     <meta
       name="description"
-      content="Native Redis GUI that opens million-key databases without freezing. Smart decoding, clusters, offline RDB, raw INFO, AI CLI help. Import from Redis Insight, ARDM, or Tiny RDM."
+      content="Native Redis GUI that opens million-key databases without freezing. Smart decoding, clusters, offline RDB, raw INFO, AI command help. Import from Redis Insight, ARDM, or Tiny RDM."
     />
     <link rel="canonical" href="https://zedis.net/" />
     <meta name="theme-color" content="#0c0f14" />
     <meta property="og:title" content="Zedis — Native Redis GUI for large keyspaces" />
     <meta
       property="og:description"
-      content="Million-key Redis without freezes. Smart decoding, clusters, offline RDB, AI command help. Import Insight / ARDM / Tiny RDM. GPU-accelerated, no telemetry."
+      content="Million-key Redis without freezes. Smart decoding, clusters, offline RDB, AI command help. Import from Redis Insight / ARDM / Tiny RDM. GPU-accelerated, no telemetry."
     />
     <meta property="og:type" content="website" />
     <meta property="og:url" content="https://zedis.net/" />
@@ -158,7 +158,7 @@
           <p class="hero-caption">
             Built with the same GPUI stack as
             <a href="https://zed.dev" target="_blank" rel="noopener">Zed</a>
-            — native speed, not a web shell.
+            — native speed, not a wrapped web app.
           </p>
         </div>
       </section>
@@ -177,7 +177,7 @@
         <div class="wrap">
           <h2 class="section-title">One minute to your real setup</h2>
           <p class="section-sub">
-            Import connections → open a prod-tagged server read-only → browse keys that actually decode.
+            Import connections → open a prod-tagged server read-only → see values that are actually decoded.
           </p>
           <div class="proof-grid">
             <article class="proof-card">
@@ -185,22 +185,23 @@
               <h3>Migrate in</h3>
               <p>
                 Redis Insight, Another Redis Desktop Manager, Tiny RDM, or a <code>redis://</code> URI. Groups and
-                tunnels map over.
+                tunnels carry over.
               </p>
             </article>
             <article class="proof-card">
               <span class="proof-step">2</span>
               <h3>Stay safe on prod</h3>
               <p>
-                Env tags, read-only lock, escalated confirms, encrypted secrets at rest — nothing phones home.
+                Env tags, read-only lock, extra confirmation for destructive commands, encrypted secrets at rest —
+                data stays on your machine, no telemetry.
               </p>
             </article>
             <article class="proof-card">
               <span class="proof-step">3</span>
               <h3>See real values</h3>
               <p>
-                JSON / JSONPath, Protobuf, MessagePack, Java / pickle / JWT, compression, images, hex — plus Streams,
-                Pub/Sub, Geo, and more.
+                JSON / JSONPath, Protobuf, MessagePack, Java / pickle / JWT, compression, images, hex — plus dedicated
+                views for Streams, Pub/Sub, Geo, and more.
               </p>
             </article>
           </div>
@@ -210,7 +211,7 @@
       <section id="features">
         <div class="wrap">
           <h2 class="section-title">What you get</h2>
-          <p class="section-sub">Condensed map of the product. Full tour on GitHub.</p>
+          <p class="section-sub">Just the highlights. The full tour is on GitHub.</p>
           <div class="grid-3">
             <article class="card">
               <div class="icon">🦀</div>
@@ -230,7 +231,7 @@
               <h3>Observability</h3>
               <p>
                 Live metrics + 7-day history with CSV export, memory analyzer (live or offline RDB) with
-                type / encoding shares, MEMORY &amp; LATENCY DOCTOR, HOTKEYS, Slow Log, MONITOR, raw INFO, cluster
+                a type / encoding breakdown, MEMORY &amp; LATENCY DOCTOR, HOTKEYS, Slow Log, MONITOR, raw INFO, cluster
                 and replication tools.
               </p>
             </article>
@@ -238,7 +239,7 @@
               <div class="icon">🔑</div>
               <h3>Keys &amp; bulk ops</h3>
               <p>
-                Namespace tree, tags, recycle bin, JSON tree editing, find &amp; replace, Tools export with prefix
+                Namespace tree, tags, recycle bin, JSON tree editing, find &amp; replace, export with a prefix
                 filter (binary / JSON / CSV), cross-server copy &amp; diff &mdash; one key or a whole prefix.
               </p>
             </article>
@@ -254,9 +255,10 @@
               <div class="icon">🧭</div>
               <h3>Valkey &amp; limited servers</h3>
               <p>
-                Redis and Valkey both first-class &mdash; every version gate has a Valkey floor of its own. A capability
-                probe greys out what proxies, ElastiCache / Azure / Tair or Dragonfly / KeyDB can&rsquo;t run &mdash;
-                <em>with the reason</em> &mdash; instead of erroring.
+                Redis and Valkey are both first-class: features are enabled by each one&rsquo;s own version, so no server
+                is sent a command it doesn&rsquo;t support. A check on connect greys out what proxies,
+                ElastiCache / Azure / Tair or Dragonfly / KeyDB can&rsquo;t run &mdash; <em>with the reason</em> &mdash;
+                instead of erroring.
               </p>
             </article>
             <article class="card">
@@ -264,15 +266,15 @@
               <h3>Connect anything</h3>
               <p>
                 TLS/SSL, SSH tunnels, Cluster &amp; Sentinel. Staged DNS &rarr; TCP &rarr; TLS &rarr; AUTH diagnostics,
-                and a link that reconnects itself through a failover.
+                and a connection that reconnects on its own after a failover.
               </p>
             </article>
             <article class="card">
               <div class="icon">⌨️</div>
               <h3>Power-user UX</h3>
               <p>
-                ⌘K palette, ⌘P recent keys, ⌘⇧F multi-db search, redis-cli + <code>?</code> AI assistant, batch
-                mode.
+                ⌘K palette, ⌘P recent keys, ⌘⇧F multi-db search, a redis-cli terminal where <code>?</code> asks an AI
+                assistant, plus batch mode.
               </p>
             </article>
             <article class="card">
@@ -280,8 +282,8 @@
               <h3>In the browser too</h3>
               <p>
                 The same app compiled to WebAssembly, self-hosted from one ~26&nbsp;MB Docker image &mdash; host it
-                next to your Redis and the whole team works from a tab. Its MCP door lets Claude Code or Cursor read
-                &mdash; and only read &mdash; through a read-only account.
+                next to your Redis and the whole team works from a tab. Its MCP server lets Claude Code or Cursor read
+                your Redis &mdash; and only read &mdash; through a read-only account. Early preview.
               </p>
             </article>
           </div>
@@ -296,7 +298,7 @@
       <section id="screenshots" class="alt">
         <div class="wrap">
           <h2 class="section-title">Screenshots</h2>
-          <p class="section-sub">Main surfaces at a glance. Click for full size.</p>
+          <p class="section-sub">Main screens at a glance. Click for full size.</p>
           <div class="shots">
             <a class="shot" href="images/key-browser.png" target="_blank" rel="noopener">
               <figure>
@@ -342,8 +344,8 @@
         <div class="wrap">
           <h2 class="section-title">Desktop app or browser tab</h2>
           <p class="section-sub">
-            The UI and the Redis layer are one codebase. The desktop app links both; in the browser, zedis-bridge
-            only turns the page's HTTP calls into Redis commands.
+            The UI and the Redis layer are one codebase. The desktop app compiles both into one program; in the
+            browser, zedis-bridge only turns the page's HTTP calls into Redis commands.
           </p>
           <figure class="arch">
             <img
@@ -397,7 +399,7 @@
                 <button type="button" class="copy-btn" data-copy="cmd-aur">Copy</button>
               </div>
               <p class="install-alt">
-                Or use
+                That is Arch Linux (AUR). Elsewhere, use
                 <a href="https://github.com/vicanso/zedis/releases/latest" target="_blank" rel="noopener"
                   >.deb / .rpm / AppImage / tarball</a
                 >
@@ -412,7 +414,10 @@
                 >
                 <button type="button" class="copy-btn" data-copy="cmd-cargo">Copy</button>
               </div>
-              <p class="install-alt">crates.io may lag (GPUI is a git dependency). Prefer git or Releases.</p>
+              <p class="install-alt">
+                This builds the current source. For the released version:
+                <code>cargo install --locked zedis-gui</code>.
+              </p>
             </div>
             <div class="install-card">
               <h3>Browser (self-hosted)</h3>
@@ -421,7 +426,7 @@
                 <button type="button" class="copy-btn" data-copy="cmd-docker">Copy</button>
               </div>
               <p class="install-alt">
-                Open <code>localhost:7379</code> and sign in as <code>admin</code>. Past a trial, drop
+                Open <code>localhost:7379</code> and sign in as <code>admin</code> / <code>change-me</code>. Beyond a trial, drop
                 <code>--insecure-cookie</code> and put HTTPS in front &mdash; see the
                 <a href="https://github.com/vicanso/zedis/blob/main/docs/WEB.md" target="_blank" rel="noopener"
                   >Web version</a

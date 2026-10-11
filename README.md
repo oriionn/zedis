@@ -69,13 +69,13 @@ Other distributions: `.deb`, `.rpm`, an AppImage and a plain tarball (x86_64 and
 <details>
 <summary><strong>Build from source with Cargo</strong></summary>
 
-Zedis depends on an unreleased (git) version of GPUI, which crates.io does not allow — so the crates.io build may lag behind. For the newest version use a package manager above, a [release download](https://github.com/vicanso/zedis/releases), or the `--git` command.
+`cargo install` from crates.io gives you the released version. For the newest code before it is released, build from GitHub with `--git`.
 
 ```bash
-# From crates.io — may be an older version
+# The released version, from crates.io
 cargo install --locked zedis-gui
 
-# Latest: build straight from GitHub (resolves the git dependencies)
+# The newest code, built straight from GitHub
 cargo install --git https://github.com/vicanso/zedis --locked zedis-gui
 ```
 
@@ -148,7 +148,7 @@ Open <http://localhost:7379> as `admin` / `change-me`. That command is a plain-h
 
 ## 🔀 Redis and Valkey
 
-Valkey is first-class, not a compatibility mode. Each version-gated feature has its own Redis floor and Valkey floor, so a server is never sent a command it did not ship. What only Valkey has — `COMMANDLOG`, atomic slot migration, multiple databases in cluster — has a panel. Copy works both ways even though `DUMP` payloads do not. CI runs Redis 6.2–8 and Valkey 8.0–9.1 on every change. Dragonfly and Garnet connect too: each is named in its own version, and the commands it does not have are probed and left out (Garnet, for one, has no streams). A smoke lane in CI keeps both connecting; neither is held to the full matrix.
+Valkey is first-class, not a compatibility mode. Whether a version-dependent feature is available is decided by Redis's and Valkey's own version numbers, separately, so a server is never sent a command it did not ship. What only Valkey has — `COMMANDLOG`, atomic slot migration, multiple databases in cluster — has a panel. Copy works both ways even though the two cannot read each other's `DUMP` payloads. CI runs Redis 6.2–8 and Valkey 8.0–9.1 on every change. Dragonfly and Garnet connect too: each is shown under its own name and version, and the commands it does not have are detected and left out (Garnet, for one, has no streams). CI also runs a short connection test against both; neither is held to the full test matrix.
 
 📖 **[Compatibility matrix →](./docs/REDIS_VALKEY.md)**
 

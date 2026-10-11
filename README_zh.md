@@ -17,7 +17,7 @@
   <a href="#-功能">功能</a> ·
   <a href="#-安装">安装</a> ·
   <a href="#-web-版自托管">Web 版</a> ·
-  <a href="./docs/FEATURES_zh.md">完整功能巡览</a> ·
+  <a href="./docs/FEATURES_zh.md">完整功能介绍</a> ·
   <a href="https://zedis.net/zh/">官网</a>
 </p>
 
@@ -33,7 +33,7 @@
 
 - 🧠 **看得懂你的数据** —— 自动解压、自动解码：JSON、Protobuf、MessagePack、JWT、图片等等，每种 Redis 类型和模块都有专用查看器。
 - 📊 **可观测性就在同一个窗口** —— 实时指标、内存分析、热点 key、慢日志、`MONITOR`、集群健康。
-- 🔐 **生产环境锁得住** —— Prod 连接默认锁写，破坏性命令要输入服务器名，密钥按机器加密，没有任何遥测。
+- 🔐 **生产环境锁得住** —— Prod 连接默认锁写，破坏性命令要输入服务器名，密码和私钥按机器加密，没有任何遥测。
 - 🌐 **连你真正在跑的东西** —— TLS、SSH、Cluster、Sentinel；Redis 与 Valkey 同为一等公民；Dragonfly、Garnet、代理和云托管缺什么会灰显并说明原因。
 - ⌨️ **给天天盯着 Redis 的人** —— ⌘K、带补全的 redis-cli、AI 命令助手、跨服务器复制与对比，同一套应用也能跑在浏览器里。
 
@@ -69,13 +69,13 @@ yay -S zedis-bin
 <details>
 <summary><strong>用 Cargo 从源码编译</strong></summary>
 
-Zedis 依赖的是 GPUI 的未发布（git）版本，而 crates.io 不允许带 git 依赖发布，所以 crates.io 上的版本可能滞后。想用最新版，请用上面的包管理器、[下载发布版](https://github.com/vicanso/zedis/releases)，或使用下面的 `--git` 命令。
+从 crates.io 用 `cargo install` 安装到的是已发布的版本。想用还没发布的最新代码，用下面的 `--git` 命令从 GitHub 编译。
 
 ```bash
-# 来自 crates.io —— 可能是较旧的版本
+# 已发布的版本，来自 crates.io
 cargo install --locked zedis-gui
 
-# 最新版：直接从 GitHub 源码编译（会解析 git 依赖）
+# 最新代码：直接从 GitHub 源码编译
 cargo install --git https://github.com/vicanso/zedis --locked zedis-gui
 ```
 
@@ -146,13 +146,13 @@ docker run -d --name zedis-web -p 7379:7379 \
 
 ## 🔀 Redis 与 Valkey
 
-Valkey 在这里是一等公民，不是兼容模式。每个依赖版本的功能都为两者分别设了门槛，服务器不会收到它没有实现的命令。Valkey 独有的功能（`COMMANDLOG`、原子槽迁移、集群多数据库）都有对应面板。Redis 与 Valkey 之间的复制两个方向都能落地，即使 `DUMP` 载荷互不相认。每次改动都会跑 Redis 6.2–8 和 Valkey 8.0–9.1 的集成测试。Dragonfly 和 Garnet 也能连接：会按各自的版本号识别并显示，它们没有的命令经探测后不再提供（比如 Garnet 没有 Stream）。CI 里各有一条冒烟测试保证连得上、基本操作可用，但不按完整矩阵要求。
+Valkey 在这里是一等公民，不是兼容模式。依赖版本的功能能不能用，按两者各自的版本分别判断，服务器不会收到它没有实现的命令。Valkey 独有的功能（`COMMANDLOG`、原子槽迁移、集群多数据库）都有对应面板。Redis 与 Valkey 之间的复制两个方向都能成功，即使两边的 `DUMP` 载荷互不兼容。每次改动都会跑 Redis 6.2–8 和 Valkey 8.0–9.1 的集成测试。Dragonfly 和 Garnet 也能连接：会按各自的版本号识别并显示，它们没有的命令经探测后不再提供（比如 Garnet 没有 Stream）。CI 里各有一条冒烟测试保证连得上、基本操作可用，但不按完整矩阵要求。
 
 📖 **[兼容矩阵 →](./docs/REDIS_VALKEY_zh.md)**
 
 ## 📚 文档
 
-- **[完整功能巡览](./docs/FEATURES_zh.md)** —— 每个面板、查看器和快捷键。
+- **[完整功能介绍](./docs/FEATURES_zh.md)** —— 每个面板、查看器和快捷键。
 - **[Web 版：自托管指南](./docs/WEB_zh.md)** —— 部署、账号、SSO、审计日志与 MCP。
 - **[Redis 与 Valkey](./docs/REDIS_VALKEY_zh.md)** —— 两者的差异，以及它们之间的复制如何工作。
 - **[安全策略](./SECURITY.md)** · **[更新日志](./CHANGELOG.md)**
