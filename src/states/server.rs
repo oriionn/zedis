@@ -441,6 +441,10 @@ pub struct ZedisServerState {
 
     /// Every loaded key and its type ([`LoadedKeys`]).
     keys: LoadedKeys,
+    /// How many keys the tree lists, where that is not all of `keys`: a
+    /// filter the tree applies itself (a tag, a TTL range, a regex) narrowed
+    /// them. Written by the tree after each build — `set_listed_keys`.
+    listed_keys: Option<usize>,
 
     /// Parallel map of per-key TTL in seconds, populated alongside `keys`
     /// during SCAN. `-1` = no expiry, `-2` = missing (key vanished between
@@ -652,6 +656,7 @@ impl ZedisServerState {
         self.cursors = None;
         if !keep_rows {
             self.keys.clear();
+            self.listed_keys = None;
             // Fresh Arc instead of `make_mut(..).clear()` — when a build still
             // holds the old snapshot, `make_mut` would copy the whole map just
             // to empty it.
@@ -714,6 +719,7 @@ impl ZedisServerState {
         self.version = SharedString::default();
         self.nodes = (0, 0);
         self.keys.clear();
+        self.listed_keys = None;
         self.key_ttls = Arc::new(AHashMap::new());
         // History is scoped to the current server session; drop it when
         // we move to a different server to avoid restoring stale bytes
@@ -1446,9 +1452,23 @@ impl ZedisServerState {
         self.dbsize
     }
 
-    /// Get the count of scanned/loaded keys
-    pub fn scan_count(&self) -> usize {
-        self.keys.len()
+    /// How many keys the tree lists: the loaded ones, less what a filter of
+    /// the tree's own hides. The first number of the status bar's
+    /// "listed / in the database" — with a keyword it always was the keys
+    /// that matched, and with a tag or a TTL filter it stayed at everything
+    /// loaded, 25/25 beside a tree of one key (#189).
+    pub fn listed_count(&self) -> usize {
+        self.listed_keys.unwrap_or(self.keys.len())
+    }
+
+    /// The tree's report after a build: `listed` keys of the ones loaded
+    /// when it started. `None` when it lists them all, so that the count
+    /// follows a scan page by page instead of a build behind it.
+    pub fn set_listed_keys(&mut self, listed: Option<usize>, cx: &mut Context<Self>) {
+        if self.listed_keys != listed {
+            self.listed_keys = listed;
+            cx.emit(ServerEvent::KeysListed);
+        }
     }
 
     /// Get the last measured latency to the server

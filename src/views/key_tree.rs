@@ -826,7 +826,8 @@ impl ZedisKeyTree {
                         &key_ttls_snapshot,
                         &metadata_snapshot,
                     );
-                    let mut items = new_key_tree_items(KeyTreeBuildInput {
+                    let loaded = keys_snapshot.len();
+                    let (mut items, listed) = new_key_tree_items(KeyTreeBuildInput {
                         keys: keys_input,
                         keyword,
                         sort,
@@ -853,11 +854,16 @@ impl ZedisKeyTree {
                     let mut items = append_load_more_rows(items, &incomplete_prefixes, &load_more_label, &separator);
                     fill_parent_indices(&mut items);
                     tracing::debug!("Key tree build time: {:?}", start.elapsed());
-                    items
+                    // What the status bar counts. Nothing to say while the
+                    // tree lists every loaded key: the count then follows
+                    // the scan itself.
+                    (items, (listed != loaded).then_some(listed))
                 });
 
-                let result = task.await;
+                let (result, listed) = task.await;
                 let _ = view_handle.update(cx, |view: &mut ZedisKeyTree, cx| {
+                    view.server_state
+                        .update(cx, |state, cx| state.set_listed_keys(listed, cx));
                     // Scroll a jumped-to key into view now that the rebuilt
                     // rows exist. A key that is filtered out (or not scanned
                     // yet) simply has no row — drop the request instead of

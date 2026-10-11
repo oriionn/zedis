@@ -344,6 +344,9 @@ pub enum ServerEvent {
 
     /// Key tree has been updated
     KeyTreeUpdated,
+    /// The tree lists a different number of the loaded keys than it did
+    /// (`ZedisServerState::listed_count`).
+    KeysListed,
     /// A rename's destination key already exists; the editor confirms an
     /// overwrite before issuing a clobbering RENAME. Carries (old, new).
     RenameTargetExists(SharedString, SharedString),

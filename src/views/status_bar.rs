@@ -82,11 +82,12 @@ fn product_line(flavor: ServerFlavor, own_version: &str, version: &str) -> Strin
 /// the button width constant instead.
 const LATENCY_LABEL_CHARS: usize = 5;
 
-/// Formats the database size and scan count string "count/total".
+/// The key count, "listed/total": the keys the tree lists of the ones the
+/// database holds.
 #[inline]
-fn format_size(dbsize: Option<u64>, scan_count: usize) -> SharedString {
+fn format_size(dbsize: Option<u64>, listed: usize) -> SharedString {
     if let Some(dbsize) = dbsize {
-        format!("{}/{}", group_thousands(scan_count as u64), group_thousands(dbsize))
+        format!("{}/{}", group_thousands(listed as u64), group_thousands(dbsize))
     } else {
         "--".to_string()
     }
@@ -473,12 +474,12 @@ impl ZedisStatusBar {
                 }
                 ServerEvent::KeyScanFinished => {
                     let state = server_state.read(cx);
-                    this.state.server_state.size = format_size(state.dbsize(), state.scan_count());
+                    this.state.server_state.size = format_size(state.dbsize(), state.listed_count());
                     this.state.server_state.scan_finished = true;
                 }
-                ServerEvent::KeyScanPaged => {
+                ServerEvent::KeyScanPaged | ServerEvent::KeysListed => {
                     let state = server_state.read(cx);
-                    this.state.server_state.size = format_size(state.dbsize(), state.scan_count());
+                    this.state.server_state.size = format_size(state.dbsize(), state.listed_count());
                 }
                 ServerEvent::ErrorOccurred(error) => {
                     debug!(
@@ -658,7 +659,7 @@ impl ZedisStatusBar {
         let supports_topology = state.supports_topology();
         self.state.server_state = StatusBarServerState {
             server_id: state.server_id().to_string().into(),
-            size: format_size(state.dbsize(), state.scan_count()),
+            size: format_size(state.dbsize(), state.listed_count()),
             latency: format_latency(Some(Duration::from_millis(redis_info.metrics.latency_ms)), cx),
             health: state.connection_health(),
             last_connection_error: state.last_connection_error(),

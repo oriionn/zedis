@@ -321,7 +321,11 @@ pub(super) struct KeyTreeBuildInput<'a> {
 /// in `update_key_tree`, the tag union sorts its own output), so the
 /// per-rebuild O(N log N) sort that used to live here is gone: an
 /// expand/collapse or filter change now only pays the linear passes.
-pub(super) fn new_key_tree_items(input: KeyTreeBuildInput<'_>) -> Vec<KeyTreeItem> {
+///
+/// Answers the rows and how many keys they stand for — the ones that passed
+/// the keyword. The rows are no measure of that: a closed folder is one row
+/// for all the keys under it.
+pub(super) fn new_key_tree_items(input: KeyTreeBuildInput<'_>) -> (Vec<KeyTreeItem>, usize) {
     let KeyTreeBuildInput {
         keys,
         keyword,
@@ -339,7 +343,9 @@ pub(super) fn new_key_tree_items(input: KeyTreeBuildInput<'_>) -> Vec<KeyTreeIte
         "new_key_tree_items requires key-sorted input"
     );
     if flat {
-        return flat_key_items(keys, &keyword, sort, key_ttls, metadata);
+        let items = flat_key_items(keys, &keyword, sort, key_ttls, metadata);
+        let listed = items.len();
+        return (items, listed);
     }
     // The folder passes reason about a literal prefix; a regex has none, so
     // they see "no keyword" and the per-key test below does the filtering.
@@ -369,10 +375,12 @@ pub(super) fn new_key_tree_items(input: KeyTreeBuildInput<'_>) -> Vec<KeyTreeIte
     // visible at the same tree level.
     let mut promoted_leaves: Vec<(SharedString, KeyType, SharedString, usize)> = Vec::new();
 
+    let mut listed = 0_usize;
     for (key, key_type) in keys {
         if !keyword.matches(key.as_ref()) {
             continue;
         }
+        listed += 1;
         let ttl_for_leaf = key_ttls.get(&key).copied();
         let (tag_for_leaf, note_for_leaf) = match metadata.get(key.as_ref()) {
             Some(m) => (m.tag, SharedString::from(m.note.clone())),
@@ -554,7 +562,7 @@ pub(super) fn new_key_tree_items(input: KeyTreeBuildInput<'_>) -> Vec<KeyTreeIte
 
     build_sorted_list("", &mut children_map, &mut result, sort);
 
-    result
+    (result, listed)
 }
 
 /// Flat mode: every key is one depth-0 row labelled with its full name.
@@ -1013,6 +1021,46 @@ mod local_filter_tests {
             &std::collections::HashMap::new(),
         );
         assert!(out.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod listed_count_tests {
+    use super::*;
+
+    /// What the status bar counts is the keys the tree lists, not its rows:
+    /// with every folder closed three keys are one row, and a keyword that
+    /// one of them fails leaves two — the bar read 25/25 beside a tree of
+    /// one key (#189).
+    #[test]
+    fn the_build_counts_the_keys_it_lists() {
+        let build = |keyword: KeywordMatch, flat: bool| {
+            let keys = ["user:1", "user:2", "user:30"]
+                .into_iter()
+                .map(|key| (SharedString::from(key), KeyType::String))
+                .collect();
+            new_key_tree_items(KeyTreeBuildInput {
+                keys,
+                keyword,
+                sort: KeySort::NameAsc,
+                flat,
+                expanded_items: AHashSet::new(),
+                suppressed: AHashSet::new(),
+                separator: ":",
+                max_key_tree_depth: 5,
+                key_ttls: &AHashMap::new(),
+                metadata: &std::collections::HashMap::new(),
+            })
+        };
+
+        let (rows, listed) = build(KeywordMatch::All, false);
+        assert_eq!((rows.len(), listed), (1, 3), "one closed folder, three keys");
+        let (_, listed) = build(KeywordMatch::Contains("user:3".into()), false);
+        assert_eq!(listed, 1);
+        let (rows, listed) = build(KeywordMatch::Contains("user:3".into()), true);
+        assert_eq!((rows.len(), listed), (1, 1), "a flat list is a row a key");
+        let (_, listed) = build(KeywordMatch::Contains("order".into()), false);
+        assert_eq!(listed, 0);
     }
 }
 
