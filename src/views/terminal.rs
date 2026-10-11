@@ -1417,7 +1417,10 @@ impl Render for ZedisTerminal {
                         .w_full()
                         .items_center()
                         .gap_1()
-                        .pr_1()
+                        // The prompt starts where the search row's text does
+                        // (`px_2`): it sat against the pane's edge while the
+                        // Batch button kept its own padding off the other.
+                        .pl_2()
                         .child(
                             // `prefix` is an `Input` adornment and a
                             // `Textarea` has none, so the `>` marker sits

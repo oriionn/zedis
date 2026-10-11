@@ -46,7 +46,7 @@ use gpui_kit::component::{
 };
 use std::rc::Rc;
 use tracing::{error, info};
-use zedis_ui::{CellStyle, CellStyleProvider, TextColumn, ZedisDivider, ZedisTextTable, fitted_table, help_popover};
+use zedis_ui::{CellStyle, CellStyleProvider, TextColumn, ZedisTextTable, fitted_table, help_popover};
 
 use crate::assets::CustomIconName;
 
@@ -472,80 +472,80 @@ impl ZedisServerInfo {
                 )
                 .child(Label::new(value).text_sm().font_weight(gpui::FontWeight::MEDIUM))
         };
-        let functions = ZedisDivider::new()
+        let stats = h_flex()
             .gap_4()
+            .items_center()
+            .when(self.display_total > 0, |this| {
+                this.child(stat_item(
+                    cx,
+                    "fields",
+                    format!("{}/{}", self.visible_count, self.display_total).into(),
+                ))
+            })
+            .when_some(self.refreshed_at.clone(), |this, at| {
+                this.child(stat_item(cx, "refreshed_at", at))
+            });
+        let controls = h_flex()
+            .gap_3()
+            .items_center()
+            .child(Input::new(&self.filter_input_state).small().w(px(260.)))
             .child(
-                h_flex()
-                    .gap_4()
-                    .items_center()
-                    .when(self.display_total > 0, |this| {
-                        this.child(stat_item(
-                            cx,
-                            "fields",
-                            format!("{}/{}", self.visible_count, self.display_total).into(),
-                        ))
-                    })
-                    .when_some(self.refreshed_at.clone(), |this, at| {
-                        this.child(stat_item(cx, "refreshed_at", at))
-                    }),
+                Button::new("server-info-snapshot")
+                    .outline()
+                    .small()
+                    .label(i18n_server_info(cx, "snapshot"))
+                    .tooltip(i18n_server_info(cx, "snapshot_tooltip"))
+                    .disabled(self.rows.is_empty())
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.take_snapshot(cx);
+                    })),
             )
+            .when(has_file_dialogs(), |this| {
+                this.child(
+                    Button::new("server-info-export")
+                        .outline()
+                        .small()
+                        .icon(Icon::new(CustomIconName::Download))
+                        .label(i18n_common(cx, "export"))
+                        .disabled(self.visible_count == 0)
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.export_csv(cx);
+                        })),
+                )
+            })
             .child(
-                h_flex()
-                    .gap_3()
-                    .items_center()
-                    .child(Input::new(&self.filter_input_state).small().w(px(260.)))
-                    .child(
-                        Button::new("server-info-snapshot")
-                            .outline()
-                            .small()
-                            .label(i18n_server_info(cx, "snapshot"))
-                            .tooltip(i18n_server_info(cx, "snapshot_tooltip"))
-                            .disabled(self.rows.is_empty())
-                            .on_click(cx.listener(|this, _, _window, cx| {
-                                this.take_snapshot(cx);
-                            })),
-                    )
-                    .when(has_file_dialogs(), |this| {
-                        this.child(
-                            Button::new("server-info-export")
-                                .outline()
-                                .small()
-                                .icon(Icon::new(CustomIconName::Download))
-                                .label(i18n_common(cx, "export"))
-                                .disabled(self.visible_count == 0)
-                                .on_click(cx.listener(|this, _, _window, cx| {
-                                    this.export_csv(cx);
-                                })),
-                        )
-                    })
-                    .child(
-                        Button::new("server-info-refresh")
-                            .outline()
-                            .small()
-                            .icon(Icon::new(CustomIconName::RotateCw))
-                            .loading(self.loading)
-                            .disabled(self.loading)
-                            .label(i18n_server_info(cx, "refresh"))
-                            .on_click(cx.listener(|this, _, _window, cx| {
-                                this.refresh(cx);
-                            })),
-                    ),
+                Button::new("server-info-refresh")
+                    .outline()
+                    .small()
+                    .icon(Icon::new(CustomIconName::RotateCw))
+                    .loading(self.loading)
+                    .disabled(self.loading)
+                    .label(i18n_server_info(cx, "refresh"))
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.refresh(cx);
+                    })),
             );
 
+        // One row where it fits; where it does not, the filter and the
+        // buttons drop to a second row — the slow log header's shape. The
+        // bar used to be a fixed 40px that scrolled sideways, and nothing
+        // said so: at 980px the filter box was cut in two and Snapshot,
+        // Export and Refresh were past the window's edge.
         h_flex()
-            .id("server-info-toolbar")
             .w_full()
             .flex_none()
-            .h(px(40.))
+            .min_h(px(40.))
             .px_4()
-            .gap_2()
+            .py(px(6.))
+            .gap_x_4()
+            .gap_y_2()
             .items_center()
+            .flex_wrap()
+            .justify_between()
             .border_b_1()
             .border_color(cx.theme().border)
-            .overflow_x_scroll()
-            .child(nav.flex_none())
-            .child(div().flex_1())
-            .child(functions.flex_none())
+            .child(h_flex().flex_none().gap_4().items_center().child(nav).child(stats))
+            .child(controls.flex_none())
     }
 
     /// Pill shown while a snapshot is held: when it was taken, the diff
