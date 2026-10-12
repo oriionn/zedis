@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Line diff for the value diff view, and the side-by-side layout it is
-//! drawn from.
+//! Line diff for the value diff view, and the patch it is drawn from.
 //!
 //! Hand-rolled instead of pulling `similar` or `diff-rs`, matching the
 //! project's policy of preferring in-crate implementations for
@@ -25,10 +24,12 @@
 //!
 //! [`line_diff`] answers ops in order: each either matches a left/right line
 //! pair (`Equal`), shows a deleted-only left line (`Delete`), or an
-//! inserted-only right line (`Insert`). [`side_by_side`] pairs the deletions
-//! and insertions of a change up into rows, [`fold_runs`] finds the unchanged
-//! stretches worth folding, and [`layout_rows`] cuts it all into the fixed-
-//! height rows a virtualized list draws.
+//! inserted-only right line (`Insert`). [`whole_patch`] writes them out as one
+//! unified patch that holds every line of both texts, which is what the view
+//! hands to gpui-kit's `Diff` component: the comparing stays here, the
+//! drawing — panes, folds, wrapping, the words that changed within a line —
+//! is the component's. [`wrap_line`] is what is left of the old layout, for
+//! the plain block of text the view still lists itself.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -241,175 +242,90 @@ fn lcs_diff(left: &[&str], right: &[&str], a: Range<usize>, b: Range<usize>, out
     out.extend(ops.into_iter().rev());
 }
 
-/// One row of the side-by-side view: the line shown on each side, if any.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SideBySideRow {
-    pub left: Option<u32>,
-    pub right: Option<u32>,
-    /// Part of a change (a deleted line, an inserted one, or a pair of them)
-    /// rather than an unchanged line.
-    pub changed: bool,
-}
-
-/// The rows a side-by-side view draws for `ops`. The deletions and
-/// insertions of one change are paired up in order — the first removed
-/// line beside the first added one — so a line that was edited shows its
-/// old and new text on one row, where drawing each op as its own row put
-/// every edit on two rows, each half empty.
-pub fn side_by_side(ops: &[DiffOp]) -> Vec<SideBySideRow> {
-    let mut rows = Vec::with_capacity(ops.len());
-    let mut deleted: Vec<u32> = Vec::new();
-    let mut inserted: Vec<u32> = Vec::new();
-    let flush = |rows: &mut Vec<SideBySideRow>, deleted: &mut Vec<u32>, inserted: &mut Vec<u32>| {
-        for k in 0..deleted.len().max(inserted.len()) {
-            rows.push(SideBySideRow {
-                left: deleted.get(k).copied(),
-                right: inserted.get(k).copied(),
-                changed: true,
-            });
-        }
-        deleted.clear();
-        inserted.clear();
-    };
-    for op in ops {
-        match *op {
-            DiffOp::Equal(l, r) => {
-                flush(&mut rows, &mut deleted, &mut inserted);
-                rows.push(SideBySideRow {
-                    left: Some(l as u32),
-                    right: Some(r as u32),
-                    changed: false,
-                });
-            }
-            DiffOp::Delete(l) => deleted.push(l as u32),
-            DiffOp::Insert(r) => inserted.push(r as u32),
-        }
-    }
-    flush(&mut rows, &mut deleted, &mut inserted);
-    rows
-}
-
-/// The stretches of unchanged rows a view may fold away, as row ranges.
-/// Each keeps `context` rows beside every change (none at the very top or
-/// bottom, where there is nothing to give context to) and hides at least
-/// `min_hidden` rows — folding two lines behind a one-line marker saves
-/// nothing.
-pub fn fold_runs(rows: &[SideBySideRow], context: usize, min_hidden: usize) -> Vec<Range<usize>> {
-    let mut runs = Vec::new();
-    let mut i = 0;
-    while i < rows.len() {
-        if rows[i].changed {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < rows.len() && !rows[i].changed {
-            i += 1;
-        }
-        let from = if start == 0 { 0 } else { start + context };
-        let to = if i == rows.len() { i } else { i.saturating_sub(context) };
-        if to > from && to - from >= min_hidden {
-            runs.push(from..to);
-        }
-    }
-    runs
-}
-
-/// A row of the laid-out diff: what one line of a virtualized list shows.
+/// Both texts as one unified patch: see [`whole_patch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LayoutRow {
-    /// Part of `rows[row]`: `chunk` 0 is where its line numbers go, a
-    /// later one continues a line too long for the width. `left` / `right`
-    /// are the byte ranges of that side's line shown here, `None` where
-    /// the side has no line or nothing left of it.
-    Line {
-        row: u32,
-        chunk: u32,
-        left: Option<Range<u32>>,
-        right: Option<Range<u32>>,
-    },
-    /// `folds[fold]`, folded: `hidden` unchanged rows behind one marker.
-    Fold { fold: u32, hidden: u32 },
+pub struct WholePatch {
+    /// `--- a/<name>`, `+++ b/<name>`, then one hunk with every line of both
+    /// sides in it.
+    pub text: String,
+    /// Lines only the left side has, and lines only the right side has.
+    pub removed: usize,
+    pub added: usize,
+    /// Runs of changed lines: what "next change" steps through.
+    pub changes: usize,
 }
 
-/// A diff cut into rows: the rows, and where each change starts among them
-/// (the first row of every run of changed rows), for "next change".
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DiffLayout {
-    pub rows: Vec<LayoutRow>,
-    pub changes: Vec<usize>,
-}
+/// What marks a line whose `\r\n` ending is part of the change.
+const CARRIAGE_RETURN_MARK: char = '\u{240D}';
+/// The unified format's own line for a side that ends without a newline.
+const NO_FINAL_NEWLINE: &str = "\\ No newline at end of file\n";
 
-/// Lay `rows` out for a view `columns` wide per side: the folds in `folds`
-/// that `expanded` does not open become one row each, and a line wider than
-/// the view continues on the rows below it — every row the same height, as
-/// a virtualized list needs. Wrapping happens here, once per width, so the
-/// view only slices the ranges it is handed.
-pub fn layout_rows<L: AsRef<str>, R: AsRef<str>>(
-    rows: &[SideBySideRow],
-    left_lines: &[L],
-    right_lines: &[R],
-    folds: &[Range<usize>],
-    expanded: &[bool],
-    columns: usize,
-) -> DiffLayout {
-    let mut layout = DiffLayout {
-        rows: Vec::with_capacity(rows.len()),
-        changes: Vec::new(),
-    };
-    let mut folds = folds.iter().enumerate().peekable();
-    let mut previous_changed = false;
-    let mut i = 0;
-    while i < rows.len() {
-        if let Some(&(fold, range)) = folds.peek()
-            && range.start == i
-        {
-            folds.next();
-            if !expanded.get(fold).copied().unwrap_or(false) {
-                layout.rows.push(LayoutRow::Fold {
-                    fold: fold as u32,
-                    hidden: range.len() as u32,
-                });
-                i = range.end;
-                previous_changed = false;
-                continue;
-            }
-        }
-        let row = rows[i];
-        if row.changed && !previous_changed {
-            layout.changes.push(layout.rows.len());
-        }
-        previous_changed = row.changed;
-        let left = row
-            .left
-            .and_then(|index| left_lines.get(index as usize))
-            .map(|line| wrap_line(line.as_ref(), columns));
-        let right = row
-            .right
-            .and_then(|index| right_lines.get(index as usize))
-            .map(|line| wrap_line(line.as_ref(), columns));
-        let chunks = left
-            .as_ref()
-            .map_or(0, Vec::len)
-            .max(right.as_ref().map_or(0, Vec::len))
-            .max(1);
-        let span = |chunks: &Option<Vec<Range<usize>>>, chunk: usize| {
-            chunks
-                .as_ref()
-                .and_then(|chunks| chunks.get(chunk))
-                .map(|range| range.start as u32..range.end as u32)
+/// `left` and `right` as one unified patch named `name`, with every line of
+/// both in a single hunk — the unchanged ones as context — so a viewer can
+/// fold them and open them again without asking for more.
+///
+/// Every line is written behind its ` `, `-` or `+`, so a value that looks
+/// like a patch itself (`--- a`, `@@ -1 +1 @@`) is only ever a line of
+/// content. Two things a patch line cannot show are said another way, and
+/// only where they are the change: a `\r\n` ending is drawn as `␍` on a line
+/// that differs, and a final newline one side lacks is the format's own "No
+/// newline at end of file". Where both sides agree neither is mentioned.
+pub fn whole_patch(name: &str, left: &str, right: &str) -> WholePatch {
+    let left_lines: Vec<&str> = left.split_inclusive('\n').collect();
+    let right_lines: Vec<&str> = right.split_inclusive('\n').collect();
+    let ops = line_diff(left, right);
+    let unterminated = |text: &str| !text.is_empty() && !text.ends_with('\n');
+    let endings_differ = unterminated(left) != unterminated(right);
+    let start = |count: usize| usize::from(count > 0);
+
+    let mut text = String::with_capacity(left.len() + right.len() / 4 + ops.len() + 64);
+    text.push_str(&format!(
+        "--- a/{name}\n+++ b/{name}\n@@ -{},{} +{},{} @@\n",
+        start(left_lines.len()),
+        left_lines.len(),
+        start(right_lines.len()),
+        right_lines.len()
+    ));
+    let (mut removed, mut added, mut changes) = (0, 0, 0);
+    let mut in_change = false;
+    for op in &ops {
+        let (mark, raw, last_of_its_side) = match *op {
+            DiffOp::Equal(l, _) => (' ', left_lines[l], false),
+            DiffOp::Delete(l) => ('-', left_lines[l], l + 1 == left_lines.len() && unterminated(left)),
+            DiffOp::Insert(r) => ('+', right_lines[r], r + 1 == right_lines.len() && unterminated(right)),
         };
-        for chunk in 0..chunks {
-            layout.rows.push(LayoutRow::Line {
-                row: i as u32,
-                chunk: chunk as u32,
-                left: span(&left, chunk),
-                right: span(&right, chunk),
-            });
+        let changed = mark != ' ';
+        match mark {
+            '-' => removed += 1,
+            '+' => added += 1,
+            _ => {}
         }
-        i += 1;
+        if changed && !in_change {
+            changes += 1;
+        }
+        in_change = changed;
+
+        let line = raw.strip_suffix('\n').unwrap_or(raw);
+        let (line, carriage_return) = match line.strip_suffix('\r') {
+            Some(line) => (line, true),
+            None => (line, false),
+        };
+        text.push(mark);
+        text.push_str(line);
+        if changed && carriage_return {
+            text.push(CARRIAGE_RETURN_MARK);
+        }
+        text.push('\n');
+        if endings_differ && last_of_its_side {
+            text.push_str(NO_FINAL_NEWLINE);
+        }
     }
-    layout
+    WholePatch {
+        text,
+        removed,
+        added,
+        changes,
+    }
 }
 
 /// `line` cut into pieces of at most `columns` columns, as byte ranges: at
@@ -543,10 +459,7 @@ pub fn kv_diff(old: &[(String, String)], new: &[(String, String)]) -> Vec<KvDiff
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DiffLayout, DiffOp, KvDelta, LayoutRow, SideBySideRow, fold_runs, kv_diff, layout_rows, line_diff,
-        side_by_side, wrap_line,
-    };
+    use super::{DiffOp, KvDelta, kv_diff, line_diff, whole_patch, wrap_line};
 
     /// Every left line exactly once, in order, from `Equal` / `Delete`;
     /// every right line likewise from `Equal` / `Insert`; and an `Equal`
@@ -685,59 +598,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_edit_sits_beside_what_it_replaced() {
-        let ops = [
-            DiffOp::Equal(0, 0),
-            DiffOp::Delete(1),
-            DiffOp::Delete(2),
-            DiffOp::Insert(1),
-            DiffOp::Equal(3, 2),
-            DiffOp::Insert(3),
-        ];
-        let row = |left, right, changed| SideBySideRow { left, right, changed };
-        assert_eq!(
-            side_by_side(&ops),
-            [
-                row(Some(0), Some(0), false),
-                row(Some(1), Some(1), true),
-                row(Some(2), None, true),
-                row(Some(3), Some(2), false),
-                row(None, Some(3), true),
-            ]
-        );
-    }
-
     /// `(start, end)` pairs as ranges — a one-range literal reads as "the
     /// whole range" to clippy.
     fn ranges(pairs: &[(usize, usize)]) -> Vec<std::ops::Range<usize>> {
         pairs.iter().map(|&(start, end)| start..end).collect()
-    }
-
-    fn unchanged(count: usize) -> Vec<SideBySideRow> {
-        (0..count as u32)
-            .map(|i| SideBySideRow {
-                left: Some(i),
-                right: Some(i),
-                changed: false,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn unchanged_stretches_fold_but_keep_their_context() {
-        let mut rows = unchanged(20);
-        rows[10].changed = true;
-        // Top: from the first row; bottom: to the last; three rows of context
-        // on the side of the change.
-        assert_eq!(fold_runs(&rows, 3, 4), ranges(&[(0, 7), (14, 20)]));
-        // A stretch that would hide fewer rows than the minimum stays open.
-        assert_eq!(fold_runs(&rows, 3, 7), ranges(&[(0, 7)]));
-        let mut between = unchanged(20);
-        between[2].changed = true;
-        between[17].changed = true;
-        assert_eq!(fold_runs(&between, 3, 4), ranges(&[(6, 14)]));
-        assert!(fold_runs(&unchanged(0), 3, 4).is_empty());
     }
 
     #[test]
@@ -753,38 +617,64 @@ mod tests {
     }
 
     #[test]
-    fn the_layout_folds_wraps_and_marks_where_changes_start() {
-        let left = ["a", "b", "c", "d", "e", "f", "g", "h", "old", "i"];
-        let right = ["a", "b", "c", "d", "e", "f", "g", "h", "brand-new-line", "i"];
-        let ops = line_diff(&(left.join("\n") + "\n"), &(right.join("\n") + "\n"));
-        let rows = side_by_side(&ops);
-        let folds = fold_runs(&rows, 2, 3);
-        assert_eq!(folds, ranges(&[(0, 6)]));
-        let line = |row: u32, chunk: u32, left: Option<std::ops::Range<u32>>, right: Option<std::ops::Range<u32>>| {
-            LayoutRow::Line {
-                row,
-                chunk,
-                left,
-                right,
-            }
-        };
-        let DiffLayout { rows: laid, changes } = layout_rows(&rows, &left, &right, &folds, &[false], 8);
+    fn a_patch_holds_every_line_and_counts_what_changed() {
+        let patch = whole_patch("value", "a\nb\nc\nd\n", "a\nB\nc\nd\ne\n");
         assert_eq!(
-            laid,
+            patch.text,
+            "--- a/value\n+++ b/value\n@@ -1,4 +1,5 @@\n a\n-b\n+B\n c\n d\n+e\n"
+        );
+        assert_eq!((patch.removed, patch.added, patch.changes), (1, 2, 2));
+        // Nothing to compare against: the hunk starts at line 0 of that side.
+        let created = whole_patch("value", "", "x\ny\n");
+        assert_eq!(created.text, "--- a/value\n+++ b/value\n@@ -0,0 +1,2 @@\n+x\n+y\n");
+        assert_eq!((created.removed, created.added, created.changes), (0, 2, 1));
+        // The same text is all context.
+        let same = whole_patch("value", "a\nb", "a\nb");
+        assert_eq!(same.text, "--- a/value\n+++ b/value\n@@ -1,2 +1,2 @@\n a\n b\n");
+        assert_eq!((same.removed, same.added, same.changes), (0, 0, 0));
+    }
+
+    /// What a patch line cannot show is said where it is the change, and
+    /// nowhere else: a value in CRLF throughout reads like any other.
+    #[test]
+    fn an_ending_that_changed_is_said_and_one_that_did_not_is_not() {
+        let crlf = whole_patch("value", "x\r\ny\r\n", "x\r\nz\r\n");
+        assert!(crlf.text.ends_with("@@\n x\n-y\u{240D}\n+z\u{240D}\n"), "{}", crlf.text);
+        let to_lf = whole_patch("value", "a\r\nb\n", "a\nb\n");
+        assert!(to_lf.text.ends_with("@@\n-a\u{240D}\n+a\n b\n"), "{}", to_lf.text);
+
+        let newline_added = whole_patch("value", "a\nb", "a\nb\n");
+        assert!(
+            newline_added
+                .text
+                .ends_with("@@\n a\n-b\n\\ No newline at end of file\n+b\n"),
+            "{}",
+            newline_added.text
+        );
+        // Neither side ends in a newline, as most values do not: no remark.
+        assert!(!whole_patch("value", "a\nb", "a\nc").text.contains("No newline"));
+    }
+
+    /// A value may hold lines that are patch syntax themselves; behind their
+    /// mark they are content, and the hunk's counts still add up.
+    #[test]
+    fn a_value_that_looks_like_a_patch_is_only_lines() {
+        let left = "--- a/x\n+++ b/x\n@@ -1 +1 @@\n\\ No newline at end of file\n\n";
+        let right = "--- a/x\n+++ b/y\n@@ -1 +1 @@\n\\ No newline at end of file\n\n";
+        let patch = whole_patch("value", left, right);
+        let body: Vec<&str> = patch.text.lines().skip(3).collect();
+        assert_eq!(
+            body,
             [
-                LayoutRow::Fold { fold: 0, hidden: 6 },
-                line(6, 0, Some(0..1), Some(0..1)),
-                line(7, 0, Some(0..1), Some(0..1)),
-                line(8, 0, Some(0..3), Some(0..8)),
-                line(8, 1, None, Some(8..14)),
-                line(9, 0, Some(0..1), Some(0..1)),
+                " --- a/x",
+                "-+++ b/x",
+                "++++ b/y",
+                " @@ -1 +1 @@",
+                " \\ No newline at end of file",
+                " "
             ]
         );
-        assert_eq!(changes, [3]);
-        // Opened, the fold is its rows again.
-        let open = layout_rows(&rows, &left, &right, &folds, &[true], 80);
-        assert_eq!(open.rows.len(), 10);
-        assert_eq!(open.changes, [8]);
+        assert_eq!(patch.text.lines().nth(2), Some("@@ -1,5 +1,5 @@"));
     }
 
     #[test]

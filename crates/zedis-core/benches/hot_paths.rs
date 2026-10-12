@@ -34,7 +34,7 @@
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
-use zedis_core::diff::{fold_runs, layout_rows, line_diff, side_by_side};
+use zedis_core::diff::{line_diff, whole_patch};
 use zedis_core::fuzzy::{fuzzy_score_prepared, prepare_fuzzy_query};
 use zedis_core::jsonpath::run_jsonpath;
 use zedis_core::key_segments::{folder_prefixes, single_child_expanded_set, split_key_segments};
@@ -246,29 +246,9 @@ fn bench_value_diff(c: &mut Criterion) {
         b.iter(|| black_box(line_diff(black_box(&left), black_box(&right)).len()))
     });
 
-    let rows = side_by_side(&line_diff(&left, &right));
-    let folds = fold_runs(&rows, 3, 4);
-    let left_lines: Vec<&str> = left.lines().collect();
-    let right_lines: Vec<&str> = right.lines().collect();
-    let folded = vec![false; folds.len()];
-    c.bench_function("value_diff_layout_120k_lines_folded", |b| {
-        b.iter(|| {
-            black_box(
-                layout_rows(&rows, &left_lines, &right_lines, &folds, &folded, 80)
-                    .rows
-                    .len(),
-            )
-        })
-    });
-    let expanded = vec![true; folds.len()];
-    c.bench_function("value_diff_layout_120k_lines_expanded", |b| {
-        b.iter(|| {
-            black_box(
-                layout_rows(&rows, &left_lines, &right_lines, &folds, &expanded, 80)
-                    .rows
-                    .len(),
-            )
-        })
+    // What the view hands the Diff component: the ops again, written out.
+    c.bench_function("value_diff_whole_patch_120k_lines", |b| {
+        b.iter(|| black_box(whole_patch("value", black_box(&left), black_box(&right)).text.len()))
     });
 }
 
