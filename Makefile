@@ -14,6 +14,14 @@ lint:
 	cargo clippy --all-targets --all -- --deny=warnings
 	python3 scripts/asset-rev.py check
 
+# The GPUI Fast build (the `gpui-fast` feature — the macOS `-fast` images):
+# clippy for what sits behind the feature, which `make lint` never compiles,
+# then the app crate's tests on that engine. Run it after touching anything
+# gated on the feature, or the engine wiring in `lib.rs`.
+lint-fast:
+	cargo clippy --all-targets --features gpui-fast -- --deny=warnings
+	ZEDIS_CONFIG_DIR="$$(mktemp -d)" cargo test --features gpui-fast
+
 # Configure the repository-local git filters `.gitattributes` names. Run once
 # per clone; `git add` does not re-clean files already staged, so anything
 # caught by `make lint` needs staging again afterwards.

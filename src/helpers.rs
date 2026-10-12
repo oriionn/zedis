@@ -16,6 +16,7 @@ mod action;
 #[cfg(not(target_family = "wasm"))]
 mod ai;
 mod app_identity;
+mod build_variant;
 /// `async-channel`, the background loops' batch pipe (see the module doc
 /// for why it is not `smol::channel`).
 pub mod channel;
@@ -50,6 +51,7 @@ pub use action::*;
 #[cfg(not(target_family = "wasm"))]
 pub use ai::{AiEndpoint, analyze_report, suggest_command};
 pub use app_identity::with_app_identity;
+pub use build_variant::BuildVariant;
 pub use color::card_background;
 #[cfg(test)]
 pub use color::contrast_ratio;

@@ -12,6 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// GPUI Fast (`gpui-fast`, see the root manifest): the kit under the name
+// `gpui`, so these widgets are written against the engine the components
+// they wrap are built on.
+#[cfg(feature = "gpui-fast")]
+extern crate gpui_kit as gpui;
+
 mod about;
 mod card;
 mod dialog;

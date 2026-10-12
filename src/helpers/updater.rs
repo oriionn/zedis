@@ -30,6 +30,15 @@
 //! so Gatekeeper never re-inspects the copy — what the SHA-256 vouched for is
 //! what runs.
 //!
+//! macOS ships two images of the app, the default one and a `-fast` one on
+//! GPUI Fast ([`BuildVariant`]), and an install stays on the one it came
+//! from: the Fast build asks for the `dmg-fast` row and takes nothing else.
+//! That image has a kind of its own, not a flag beside `dmg`, because every
+//! release before it installs the *first* `dmg` row for its `os`/`arch` and
+//! would have taken whichever image the manifest happened to list first. A
+//! release with no Fast image offers that build the release page, never the
+//! other image.
+//!
 //! If the manifest is missing (e.g. a release predating it), we fall back to the
 //! GitHub Releases API to at least detect a new version; the UI then opens the
 //! release page instead of an in-app download.
@@ -41,6 +50,7 @@
 //!
 //! Network + filesystem only; the dialog/toast orchestration lives in `main.rs`.
 
+use super::build_variant::BuildVariant;
 use super::proxy::app_proxy;
 use super::update_info::{Delivery, UpdateAsset, UpdateInfo};
 use crate::error::Error;
@@ -116,6 +126,10 @@ const REACH_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_DOWNLOAD: u64 = 512 * 1024 * 1024;
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const USER_AGENT: &str = concat!("zedis/", env!("CARGO_PKG_VERSION"));
+
+/// What marks the GPUI Fast image, in its file name (`Zedis-<arch>-fast.dmg`)
+/// and in the kind of its `latest.json` row (`dmg-fast`).
+const FAST_SUFFIX: &str = "-fast";
 
 /// `latest.json` shape (see `.github/workflows/publish.yml`).
 #[derive(Debug, Deserialize)]
@@ -194,13 +208,17 @@ fn assets_from_api(assets: &[GithubAsset]) -> Vec<ManifestAsset> {
 
 /// `(os, arch, kind)` of a file publish.yml uploads, with the kinds its
 /// `latest.json` rows use. The names are not one pattern — the macOS image
-/// is `Zedis-<arch>.dmg`, the AppImage `zedis-<arch>.AppImage.tar.gz`, the
+/// is `Zedis-<arch>.dmg` (`Zedis-<arch>-fast.dmg` for the GPUI Fast one, a
+/// kind of its own), the AppImage `zedis-<arch>.AppImage.tar.gz`, the
 /// rest `zedis-<os>-<arch>.<ext>` with two-part extensions among them — and
 /// reading them all as `zedis-<os>-<arch>.<kind>` found no macOS or AppImage
 /// build at all, so the nightly never offered an in-app install there.
 fn asset_identity(name: &str) -> Option<(&'static str, String, &'static str)> {
-    if let Some(arch) = name.strip_prefix("Zedis-").and_then(|rest| rest.strip_suffix(".dmg")) {
-        return Some(("macos", arch.to_string(), "dmg"));
+    if let Some(rest) = name.strip_prefix("Zedis-").and_then(|rest| rest.strip_suffix(".dmg")) {
+        return Some(match rest.strip_suffix(FAST_SUFFIX) {
+            Some(arch) => ("macos", arch.to_string(), "dmg-fast"),
+            None => ("macos", rest.to_string(), "dmg"),
+        });
     }
     let rest = name.strip_prefix("zedis-")?;
     if let Some(arch) = rest.strip_suffix(".AppImage.tar.gz") {
@@ -540,21 +558,43 @@ fn newer_version(raw: &str) -> Result<Option<String>> {
     Ok(Some(latest.to_string()))
 }
 
-/// Pick the installer for this machine: the preferred packaging for the OS
-/// (`dmg` / `msi` / `appimage`), else any asset for the same `os`/`arch`.
+/// Pick the installer for this machine and this build: the preferred
+/// packaging for the OS (`dmg` / `msi` / `appimage`), else any asset for the
+/// same `os`/`arch`.
 fn pick_asset(assets: &[ManifestAsset]) -> Option<UpdateAsset> {
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
+    pick_asset_for(
+        assets,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        BuildVariant::current(),
+    )
+}
+
+/// [`pick_asset`] for a named machine and variant.
+///
+/// The standard build never takes a GPUI Fast image, and the Fast build
+/// takes only one. A release without it (its job may fail without failing
+/// the release) leaves that build no asset, which the caller turns into a
+/// link to the release page: installing the other image instead would end
+/// the Fast install for good, the next check being the standard build's.
+fn pick_asset_for(assets: &[ManifestAsset], os: &str, arch: &str, variant: BuildVariant) -> Option<UpdateAsset> {
     let preferred_kind = match os {
         "macos" => "dmg",
         "windows" => "msi",
         "linux" => "appimage",
         _ => return None,
     };
-    let chosen = assets
-        .iter()
-        .find(|a| a.os == os && a.arch == arch && a.kind == preferred_kind)
-        .or_else(|| assets.iter().find(|a| a.os == os && a.arch == arch))?;
+    let mut here = assets.iter().filter(|a| a.os == os && a.arch == arch);
+    let chosen = match variant {
+        BuildVariant::Standard => here
+            .clone()
+            .find(|a| a.kind == preferred_kind)
+            .or_else(|| here.find(|a| !a.kind.ends_with(FAST_SUFFIX)))?,
+        BuildVariant::Fast => {
+            let kind = format!("{preferred_kind}{FAST_SUFFIX}");
+            here.find(|a| a.kind == kind)?
+        }
+    };
     Some(UpdateAsset {
         url: chosen.url.clone(),
         sha256: chosen.sha256.clone(),
@@ -1242,8 +1282,74 @@ mod tests {
         ];
         // Matches this os/arch even when the preferred kind is absent; never
         // picks an asset for a different os/arch.
-        let chosen = pick_asset(&assets).expect("an asset for this platform");
+        let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
+        let chosen = pick_asset_for(&assets, os, arch, BuildVariant::Standard).expect("an asset for this platform");
         assert_eq!(chosen.name, "other");
+    }
+
+    fn mac_image(arch: &str, kind: &str, name: &str) -> ManifestAsset {
+        ManifestAsset {
+            os: "macos".to_string(),
+            arch: arch.to_string(),
+            kind: kind.to_string(),
+            name: name.to_string(),
+            url: format!("https://x/{name}"),
+            sha256: "c".to_string(),
+            size: 3,
+        }
+    }
+
+    /// Each build updates to its own image, whichever the manifest lists
+    /// first, and a release that lacks one offers that build nothing to
+    /// install: a Fast install is not moved to the standard image, nor the
+    /// other way round.
+    #[test]
+    fn an_install_stays_on_the_image_it_came_from() {
+        let standard = mac_image("aarch64", "dmg", "Zedis-aarch64.dmg");
+        let fast = mac_image("aarch64", "dmg-fast", "Zedis-aarch64-fast.dmg");
+        let intel_fast = mac_image("x86_64", "dmg-fast", "Zedis-x86_64-fast.dmg");
+        let pick = |assets: &[ManifestAsset], variant| {
+            pick_asset_for(assets, "macos", "aarch64", variant).map(|asset| asset.name)
+        };
+        for assets in [
+            [
+                mac_image("aarch64", "dmg", "Zedis-aarch64.dmg"),
+                mac_image("aarch64", "dmg-fast", "Zedis-aarch64-fast.dmg"),
+            ],
+            [
+                mac_image("aarch64", "dmg-fast", "Zedis-aarch64-fast.dmg"),
+                mac_image("aarch64", "dmg", "Zedis-aarch64.dmg"),
+            ],
+        ] {
+            assert_eq!(
+                pick(&assets, BuildVariant::Standard).as_deref(),
+                Some("Zedis-aarch64.dmg")
+            );
+            assert_eq!(
+                pick(&assets, BuildVariant::Fast).as_deref(),
+                Some("Zedis-aarch64-fast.dmg")
+            );
+        }
+        // The Fast job failed for this arch: nothing to install in the app.
+        assert_eq!(pick(&[standard, intel_fast], BuildVariant::Fast), None);
+        // And the standard build's any-asset fallback is not a way in.
+        assert_eq!(pick(&[fast], BuildVariant::Standard), None);
+    }
+
+    /// What keeps a release from before the Fast image on the standard one:
+    /// it installs the first `dmg` row for its arch, and reads the arch of a
+    /// nightly's file off the name. The Fast image is neither a `dmg` row nor
+    /// a name that parses to a plain arch the old way.
+    #[test]
+    fn the_fast_image_is_invisible_to_a_release_from_before_it() {
+        let (os, arch, kind) = asset_identity("Zedis-aarch64-fast.dmg").expect("an installer");
+        assert_eq!((os, arch.as_str(), kind), ("macos", "aarch64", "dmg-fast"));
+        assert_ne!(kind, "dmg");
+        // The old reading of the name: everything between `Zedis-` and `.dmg`.
+        let old_arch = "Zedis-aarch64-fast.dmg"
+            .strip_prefix("Zedis-")
+            .and_then(|rest| rest.strip_suffix(".dmg"));
+        assert_eq!(old_arch, Some("aarch64-fast"), "no machine reports that arch");
     }
 
     /// The in-place swap ejects/replaces on the strength of this
@@ -1426,6 +1532,8 @@ mod tests {
         for (name, expected) in [
             ("Zedis-aarch64.dmg", Some(("macos", "aarch64", "dmg"))),
             ("Zedis-x86_64.dmg", Some(("macos", "x86_64", "dmg"))),
+            ("Zedis-aarch64-fast.dmg", Some(("macos", "aarch64", "dmg-fast"))),
+            ("Zedis-x86_64-fast.dmg", Some(("macos", "x86_64", "dmg-fast"))),
             ("zedis-windows-x86_64.msi", Some(("windows", "x86_64", "msi"))),
             ("zedis-windows-x86_64.msi.zip", Some(("windows", "x86_64", "msizip"))),
             ("zedis-windows-aarch64.zip", Some(("windows", "aarch64", "zip"))),

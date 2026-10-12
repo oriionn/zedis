@@ -24,13 +24,13 @@ use crate::dialogs::*;
 #[cfg(not(target_family = "wasm"))]
 use crate::helpers::channel;
 use crate::helpers::pacing;
+#[cfg(not(target_family = "wasm"))]
+use crate::helpers::{BuildVariant, CrashReport, UpdateInfo, get_or_create_config_dir, is_app_store_build};
 use crate::helpers::{
     ConfigRecovery, DEFAULT_UI_FONT_SIZE, DiagnosticsAction, EditorAction, MemuAction, NavAction, UI_FONT_SIZE_MAX,
     UI_FONT_SIZE_MIN, WindowAction, WorkspaceTabAction, ZoomAction, apply_default_ui_font_size, humanize_keystroke,
     unix_ts_millis,
 };
-#[cfg(not(target_family = "wasm"))]
-use crate::helpers::{CrashReport, UpdateInfo, get_or_create_config_dir, is_app_store_build};
 #[cfg(not(target_family = "wasm"))]
 use crate::helpers::{
     Delivery, DiagnosticsInput, download_and_verify, export_diagnostics, fetch_latest_release, install_update,
@@ -431,7 +431,8 @@ impl Zedis {
             let info = platform_info();
             let store = cx.global::<ZedisGlobalStore>().read(cx);
             let mut summary = format!(
-                "Zedis diagnostics\nversion: {VERSION} ({GIT_SHA})\nos: {}-{}\narch: {}\nconfig_dir: {}\nlocale: {}\ntheme: {:?} / {:?}\napp_store_build: {}\ntime: {}\n",
+                "Zedis diagnostics\nversion: {VERSION} ({GIT_SHA})\nrenderer: {}\nos: {}-{}\narch: {}\nconfig_dir: {}\nlocale: {}\ntheme: {:?} / {:?}\napp_store_build: {}\ntime: {}\n",
+                BuildVariant::current().renderer(),
                 info.os_type,
                 info.version,
                 info.architecture,

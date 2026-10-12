@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::assets::Assets;
-use crate::helpers::platform_info;
+use crate::helpers::{BuildVariant, platform_info};
 use crate::views::secondary_window::{active_window_display, open_secondary_window};
 use chrono::{Datelike, Local};
 use gpui::{
@@ -80,6 +80,7 @@ fn collect_system_info(window: &Window) -> String {
     let mut lines = vec![
         format!("Version: {VERSION}"),
         format!("Git SHA: {GIT_SHA}"),
+        format!("Renderer: {}", BuildVariant::current().renderer()),
         format!("OS: {} {}", os.os_type, os.version),
         format!("Arch: {}", os.architecture),
         format!("Locale: {locale}"),
@@ -111,7 +112,7 @@ fn build_config() -> AboutConfig {
         lines: vec![
             AboutLine::sm("A modern Redis client built with GPUI"),
             AboutLine::sm(format!("Version {VERSION}")),
-            AboutLine::xs("Built with Rust & GPUI"),
+            AboutLine::xs(format!("Built with Rust & {}", BuildVariant::current().renderer())),
             AboutLine::xs("Licensed under Apache License 2.0"),
             AboutLine::xs(format!("Git SHA: {GIT_SHA}")),
             AboutLine::xs(format!("© {years} Tree xie. All rights reserved.")),

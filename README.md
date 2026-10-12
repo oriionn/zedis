@@ -49,6 +49,8 @@ Already on Redis Insight, ARDM or Tiny RDM? **Paste the export and every connect
 brew install --cask zedis
 ```
 
+**GPUI Fast build (experimental).** Every [release](https://github.com/vicanso/zedis/releases/latest) also carries `Zedis-<arch>-fast.dmg`: the same app on GPUI Fast, gpui-kit's optional rendering engine. It installs over the standard app and keeps your settings, *About → Copy System Info* says which one is running (`Renderer: GPUI Fast`), and it updates itself to the Fast image of each new release. To go back, install the standard `.dmg` from the same page.
+
 ### Windows
 
 ```bash

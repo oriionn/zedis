@@ -93,6 +93,13 @@ jobs:
           make lint
       - name: test
         run: make test
+      - name: lint + test the GPUI Fast build
+        # The `-fast` images publish.yml ships are the `gpui-fast` feature,
+        # which nothing above compiles: without this, what sits behind it
+        # is first built by a release. One arch is enough — the feature
+        # swaps the engine, not anything per-architecture.
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: make lint-fast
 
   # clippy + tests on the other two shipping platforms. macOS alone never
   # compiles the platform forks — the SSH-agent path, the Linux key-file /

@@ -19,3 +19,8 @@ gpui = { workspace = true }
 gpui-kit = { workspace = true }
 indexmap = { workspace = true }
 zedis-core = { workspace = true }
+
+[features]
+# GPUI Fast in place of the default engine: see `gpui-fast` in the root
+# manifest, which is the only thing that turns this on.
+gpui-fast = ["gpui-kit/gpui-fast"]

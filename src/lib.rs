@@ -11,13 +11,24 @@
 #[cfg(not(target_family = "wasm"))]
 use crate::connection::install_crypto_provider;
 use crate::connection::sign_out_of_bridge;
+// The GPUI Fast build (`gpui-fast`): gpui-kit re-exports the Fast engine,
+// and the kit under the name `gpui` is what makes every `gpui::…` path in
+// this crate, and what GPUI's macros expand to, name the engine the
+// components are built on. Without the feature `gpui` is the `gpui-pre`
+// dependency, as it always was.
+#[cfg(feature = "gpui-fast")]
+extern crate gpui_kit as gpui;
+
+#[cfg(all(feature = "gpui-fast", target_family = "wasm"))]
+compile_error!("`gpui-fast` is a desktop build: zedis-web names the default engine's web platform");
+
 use crate::connection::{get_server, get_servers};
 use crate::db::LuaScriptManager;
 #[cfg(not(target_family = "wasm"))]
 use crate::db::{ProtoManager, ScriptManager, init_database, open_failure_kind};
 #[cfg(not(target_family = "wasm"))]
 use crate::helpers::{
-    CrashContext, InstanceMessage, InstanceRole, MultiSearchAction, UpdateAction, claim_instance,
+    BuildVariant, CrashContext, InstanceMessage, InstanceRole, MultiSearchAction, UpdateAction, claim_instance,
     get_or_create_config_dir, init_logger, install_panic_hook, instance_messages, is_app_store_build, logs_dir,
     platform_info, post_instance_message, register_editing_rules, register_extra_languages, release_instance,
     set_configured_proxy, take_instance_server, take_pending_crash,
@@ -103,6 +114,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     install_panic_hook(CrashContext {
         version: VERSION,
         git_sha: GIT_SHA,
+        renderer: BuildVariant::current().renderer(),
         os: os.clone(),
         arch: arch.clone(),
     });
@@ -117,6 +129,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     info!(
         version = VERSION,
         git_sha = GIT_SHA,
+        renderer = BuildVariant::current().renderer(),
         os,
         arch,
         config_dir,
@@ -140,7 +153,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // (Functions / EVAL editors); add others by extending the helper.
     register_extra_languages();
     init_embedded_commands();
+    // The Fast build takes its platform from the kit, which hands out the
+    // one that belongs to its engine.
+    #[cfg(not(feature = "gpui-fast"))]
     let app = gpui_platform::application().with_assets(assets::Assets);
+    #[cfg(feature = "gpui-fast")]
+    let app = gpui_kit::platform::application().with_assets(assets::Assets);
     // redis:// links: macOS delivers them as Apple Events through the
     // registered scheme (`osx_url_schemes`) — possibly before the window
     // exists, so they queue for `launch`. The other platforms start a second

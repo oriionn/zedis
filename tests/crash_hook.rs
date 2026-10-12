@@ -38,6 +38,7 @@ fn the_installed_hook_writes_a_report_for_a_panicking_thread() {
     install_panic_hook(CrashContext {
         version: "0.0.0",
         git_sha: "deadbeef",
+        renderer: "GPUI",
         os: "TestOS-1".into(),
         arch: "arm64".into(),
     });

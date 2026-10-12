@@ -49,6 +49,8 @@
 brew install --cask zedis
 ```
 
+**GPUI Fast 版（实验性）。** 每个 [release](https://github.com/vicanso/zedis/releases/latest) 还附带 `Zedis-<arch>-fast.dmg`：同一个应用，改用 gpui-kit 的可选渲染引擎 GPUI Fast。它直接覆盖安装普通版并保留设置；*关于 → Copy System Info* 里的 `Renderer: GPUI Fast` 表示当前运行的是这个版本；之后的自动更新也会继续取 fast 包。想换回普通版，从同一页面下载普通的 `.dmg` 安装即可。
+
 ### Windows
 
 ```bash

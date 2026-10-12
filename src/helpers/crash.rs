@@ -57,6 +57,9 @@ pub struct CrashReport {
 pub struct CrashContext {
     pub version: &'static str,
     pub git_sha: &'static str,
+    /// The engine the build draws with (`BuildVariant::renderer`): a
+    /// crash in drawing code means something else on each.
+    pub renderer: &'static str,
     pub os: String,
     pub arch: String,
 }
@@ -116,6 +119,7 @@ fn format_report(context: &CrashContext, message: &str, location: &str, thread: 
         "Zedis crash report\n\
          time: {}\n\
          version: {} ({})\n\
+         renderer: {}\n\
          os: {}\n\
          arch: {}\n\
          thread: {}\n\
@@ -126,6 +130,7 @@ fn format_report(context: &CrashContext, message: &str, location: &str, thread: 
         Local::now().to_rfc3339(),
         context.version,
         context.git_sha,
+        context.renderer,
         context.os,
         context.arch,
         thread,
@@ -200,6 +205,7 @@ mod tests {
         CrashContext {
             version: "0.0.0",
             git_sha: "deadbeef",
+            renderer: "GPUI",
             os: "TestOS-1".into(),
             arch: "arm64".into(),
         }
@@ -218,6 +224,7 @@ mod tests {
         );
         let text = fs::read_to_string(&written).expect("read report");
         assert!(text.contains("version: 0.0.0 (deadbeef)"));
+        assert!(text.contains("renderer: GPUI\n"));
         assert!(text.contains("location: src/x.rs:1:2"));
         assert!(text.contains("backtrace:\n  0: frame"));
 

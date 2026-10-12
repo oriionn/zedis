@@ -152,16 +152,50 @@ jobs:
     if: needs.prepare_vars.outputs.should_build == 'true' && github.event.inputs.targets != 'docker'
     name: macos-${{ matrix.dmg_suffix }}
     runs-on: ${{ matrix.os }}
+    # The GPUI Fast images are a second form of the same app, and a new
+    # one: a leg that fails to build, sign or notarize must not take the
+    # release with it. `checksums` then has no `dmg-fast` row for that
+    # arch, and a Fast install is shown the release page for that version
+    # instead of an in-app install (helpers/updater.rs).
+    continue-on-error: ${{ matrix.variant == 'fast' }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
+            arch: aarch64
+            variant: standard
             dmg_suffix: aarch64
+            kind: dmg
+            features: mimalloc
           - os: macos-15-intel
             target: x86_64-apple-darwin
+            arch: x86_64
+            variant: standard
             dmg_suffix: x86_64
+            kind: dmg
+            features: mimalloc
+          # The same app on GPUI Fast (the `gpui-fast` cargo feature), as
+          # `Zedis-<arch>-fast.dmg`: same name and bundle id inside, so it
+          # installs over the standard app and keeps its settings. Its
+          # manifest kind is `dmg-fast`, a kind of its own, because every
+          # release before it installs the first `dmg` row for its arch and
+          # would have taken whichever image came first.
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            arch: aarch64
+            variant: fast
+            dmg_suffix: aarch64-fast
+            kind: dmg-fast
+            features: mimalloc,gpui-fast
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            arch: x86_64
+            variant: fast
+            dmg_suffix: x86_64-fast
+            kind: dmg-fast
+            features: mimalloc,gpui-fast
     steps:
       - uses: actions/checkout@v7
       - name: setup node
@@ -173,7 +207,7 @@ jobs:
       - name: rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: macos-build-${{ matrix.target }}
+          key: macos-build-${{ matrix.target }}${{ matrix.variant == 'fast' && '-fast' || '' }}
       - name: install tools
         # Lint has its own workflow (lint.yml) on every push, so the release
         # build skips clippy/rustfmt/typos entirely. The cache restore above
@@ -207,7 +241,7 @@ jobs:
           # set as default keychain
           security list-keychains -d user -s "$KEYCHAIN_PATH"
       - name: release
-        run: cargo bundle --release --target ${{ matrix.target }} --features mimalloc
+        run: cargo bundle --release --target ${{ matrix.target }} --features ${{ matrix.features }}
       - name: smoke test (first frame must paint)
         # Boots the real binary in ZEDIS_SMOKE_TEST mode: exit 0 once the
         # first frame paints, exit 2 if none does within 30s — the failure
@@ -291,18 +325,21 @@ jobs:
           NAME="$(basename "$DMG_NAME")"
           SHA="$(shasum -a 256 "$DMG_NAME" | awk '{print $1}')"
           SIZE="$(stat -f%z "$DMG_NAME")"
-          echo "macos ${{ matrix.dmg_suffix }} dmg $NAME $SHA $SIZE" > "meta/macos-${{ matrix.dmg_suffix }}.txt"
-      - name: upload checksum meta (macos)
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: actions/upload-artifact@v7
-        with:
-          name: meta-macos-${{ matrix.dmg_suffix }}
-          path: meta/macos-${{ matrix.dmg_suffix }}.txt
+          echo "macos ${{ matrix.arch }} ${{ matrix.kind }} $NAME $SHA $SIZE" > "meta/macos-${{ matrix.dmg_suffix }}.txt"
       - name: upload asset
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           DMG_NAME="release/${{ env.APP_NAME }}-${{ matrix.dmg_suffix }}.dmg"
           ./.github/workflows/upload_asset.sh "$DMG_NAME" "$GITHUB_TOKEN"
+      - name: upload checksum meta (macos)
+        # After the image, not before: this file is the image's row in
+        # latest.json, and a leg that may fail without failing the release
+        # must not leave a row for a file the release does not carry.
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v7
+        with:
+          name: meta-macos-${{ matrix.dmg_suffix }}
+          path: meta/macos-${{ matrix.dmg_suffix }}.txt
       - name: Release Nightly Assets
         # main pushes only — a tag push must not overwrite the nightly
         # release with stable-build artifacts.
