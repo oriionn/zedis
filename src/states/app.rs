@@ -1678,18 +1678,12 @@ mod upgrade_fixtures {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::helpers::override_config_dir;
+    // Before any test triggers `persist_nav`: a stray background save must
+    // never touch the real `zedis.toml`.
+    use crate::test_support::isolate_config;
     use gpui::{Subscription, TestAppContext};
     use std::cell::RefCell;
     use std::rc::Rc;
-
-    /// Redirect state persistence into a temp dir before any test triggers
-    /// `persist_nav` — a stray background save must never touch the real
-    /// `zedis.toml`.
-    fn isolate_config() {
-        let dir = std::env::temp_dir().join(format!("zedis-test-config-{}", std::process::id()));
-        override_config_dir(dir);
-    }
 
     /// Recorded `(server_id, db)` of every `ServerSelected` emission.
     type SelectedRecorder = Rc<RefCell<Vec<(String, usize)>>>;

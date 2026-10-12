@@ -67,6 +67,8 @@ pub mod i18n_loader;
 pub mod root;
 pub mod startup;
 pub mod states;
+#[cfg(test)]
+mod test_support;
 // An OS allow-list would follow the build into the browser ("not linux"), so
 // the family gate is the outer one — the same shape the `tray-icon`
 // dependency carries in Cargo.toml.

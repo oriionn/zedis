@@ -18,6 +18,9 @@
 
 use super::*;
 
+/// The rename dialog's field, by which a UI test finds it.
+const RENAME_INPUT_ID: &str = "rename-key-input";
+
 impl ZedisEditor {
     /// Open the rename dialog, prefilled with the current key name. OK
     /// fires a `RENAMENX`; a destination collision comes back via
@@ -46,7 +49,7 @@ impl ZedisEditor {
                     .ok_text(i18n_common(cx, "confirm"))
                     .cancel_text(i18n_common(cx, "cancel")),
             )
-            .child(move || Input::new(&input_child))
+            .child(move || Input::new(&input_child).id(RENAME_INPUT_ID))
             .on_ok(move |_, _window, cx| {
                 let typed = input_ok.read(cx).value();
                 // Unchanged is decided before trimming: a key whose name
@@ -382,5 +385,58 @@ impl ZedisEditor {
             });
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RENAME_INPUT_ID, ZedisEditor};
+    use crate::states::ZedisServerState;
+    use crate::test_support::init_ui;
+    use gpui::{AppContext, TestAppContext, px, size};
+    use gpui_kit::component::Root;
+    use gpui_kit::test::TestWindowExt;
+
+    /// The rename dialog opens ready to type over the name: the field holds
+    /// the key's name and the focus. It used to be focused *before* the
+    /// dialog opened, which takes the focus for itself — the name could not
+    /// be typed over until the field was clicked.
+    #[gpui::test]
+    fn the_rename_dialog_opens_with_its_field_focused(cx: &mut TestAppContext) {
+        init_ui(cx);
+        // A selected key and no server: the dialog needs only the name, and
+        // the load that selecting starts finds no such entry and gives up.
+        let server_state = cx.new(|_| ZedisServerState::default());
+        server_state.update(cx, |state, cx| state.select_key("user:1".into(), cx));
+
+        let mut editor = None;
+        let handle = cx.open_window(size(px(900.), px(600.)), |window, cx| {
+            let view = cx.new(|cx| ZedisEditor::new(server_state.clone(), window, cx));
+            editor = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let editor = editor.expect("the window built the editor");
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find(RENAME_INPUT_ID).is_none(), "no dialog yet");
+            editor.update(cx, |editor, cx| editor.open_rename_dialog(window, cx));
+        })
+        .expect("the window is open");
+        // Opening a dialog and focusing a field are both deferred: they
+        // happen once the update that asked for them has returned.
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let field = window.find(RENAME_INPUT_ID);
+            assert_eq!(field.value(), Some("user:1"));
+            assert_eq!(field.focused(), Some(true));
+
+            // And typing goes into it, with no click first.
+            window.input("0", cx);
+            assert_eq!(window.find(RENAME_INPUT_ID).value(), Some("user:10"));
+        })
+        .expect("the window is open");
     }
 }

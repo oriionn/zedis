@@ -237,6 +237,11 @@ rust-embed = { version = "8.12.0", default-features = false, features = [
 # only test targets pay for the test-support build of gpui; release
 # builds are unaffected (dev-dependencies are excluded there).
 gpui = { workspace = true, features = ["test-support"] }
+# `gpui_kit::test` — find a control by its id in a headless window, click,
+# type, and read back focus, value and bounds (the gpui-kit skill's
+# `references/gpui/test.md`). Same source and version as the normal
+# dependency, as the kit asks.
+gpui-kit = { workspace = true, features = ["test-support"] }
 
 [workspace.dependencies]
 ahash = "0.8.12"

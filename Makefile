@@ -80,8 +80,14 @@ deny:
 fmt:
 	cargo fmt
 
+# The run gets a scratch config directory of its own. A test that touches
+# configuration already points itself at one (`override_config_dir`, or
+# `test_support::init_ui` in the app crate); this is for the one that forgets:
+# it then reads an empty server list instead of the real `redis-servers.toml`,
+# and never asks the OS keychain for the key that decrypts it — on macOS a
+# password prompt per run, a test binary being unsigned and new on each build.
 test:
-	cargo test --workspace
+	ZEDIS_CONFIG_DIR="$$(mktemp -d)" cargo test --workspace
 
 # Criterion benches for the pure hot paths (crates/zedis-core/benches):
 # fuzzy scan, RDB parse, JSONPath. No CI baseline — run before and after
