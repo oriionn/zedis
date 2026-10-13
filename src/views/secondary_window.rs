@@ -20,7 +20,7 @@ use gpui::{
     SharedString, Window, WindowOptions, div, prelude::*, px,
 };
 use gpui_kit::component::{ActiveTheme, Root, StyledExt, h_flex, label::Label, v_flex};
-use std::{any::TypeId, collections::HashMap};
+use std::{any::TypeId, collections::HashMap, rc::Rc};
 
 /// The `DisplayId` of the monitor the main (active) window is currently on, or
 /// `None` if there's no active window. Pass it to `Bounds::centered` so a
@@ -42,26 +42,33 @@ const TITLE_STRIP_HEIGHT: Pixels = px(28.);
 /// so with the app set to Light on a Dark system (or the reverse) Settings
 /// opened with a dark bar over a light page. The native bar is made
 /// transparent — it still drags, and keeps its traffic lights — the window
-/// grows by the strip so the content keeps its size, and the title comes
-/// back for [`SecondaryWindow`] to draw.
+/// grows by the strip so the content keeps its size, and the answer says
+/// that [`SecondaryWindow`] is to draw the title.
 #[cfg(target_os = "macos")]
-fn own_title_strip(mut options: WindowOptions) -> (WindowOptions, Option<SharedString>) {
+fn own_title_strip(mut options: WindowOptions) -> (WindowOptions, bool) {
     let Some(titlebar) = options.titlebar.as_mut() else {
-        return (options, None);
+        return (options, false);
     };
     titlebar.appears_transparent = true;
-    let title = titlebar.title.clone();
     if let Some(WindowBounds::Windowed(bounds)) = options.window_bounds.as_mut() {
         bounds.size.height += TITLE_STRIP_HEIGHT;
     }
-    (options, title)
+    (options, true)
 }
 /// Elsewhere the system's title bar stays: Windows and the Linux desktops
 /// draw the window controls in it.
 #[cfg(not(target_os = "macos"))]
-fn own_title_strip(options: WindowOptions) -> (WindowOptions, Option<SharedString>) {
-    (options, None)
+fn own_title_strip(options: WindowOptions) -> (WindowOptions, bool) {
+    (options, false)
 }
+
+/// A secondary window's title, asked for again on every render.
+///
+/// Settings is where the language is changed, and its title was translated
+/// once, when the window opened: everything under it turned German and the
+/// bar above went on saying "Settings". A title is therefore what it is read
+/// from, not a string.
+type WindowTitle = Rc<dyn Fn(&App) -> SharedString>;
 
 /// Global registry that tracks open secondary windows by their content type.
 /// Allows [`open_secondary_window`] to reuse an existing window instead of
@@ -86,19 +93,33 @@ impl SecondaryWindowRegistry {
 /// in one place rather than repeated per-window.
 struct SecondaryWindow<V: Render + 'static> {
     focus_handle: FocusHandle,
-    /// The window's title, when this view draws the title strip itself
-    /// (macOS — see [`own_title_strip`]).
-    title: Option<SharedString>,
+    title: WindowTitle,
+    /// What the system was last told the title is: the window's name in
+    /// the window list, and the title bar itself where the system draws
+    /// it (Windows, Linux).
+    system_title: SharedString,
+    /// Whether this view draws the title strip itself (macOS — see
+    /// [`own_title_strip`]).
+    draws_title_strip: bool,
     content: Entity<V>,
 }
 
 impl<V: Render + 'static> SecondaryWindow<V> {
-    fn new(content: Entity<V>, title: Option<SharedString>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        content: Entity<V>,
+        title: WindowTitle,
+        draws_title_strip: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
         Self {
             focus_handle,
+            // The window was opened under this title.
+            system_title: title(cx),
             title,
+            draws_title_strip,
             content,
         }
     }
@@ -111,8 +132,13 @@ impl<V: Render + 'static> Focusable for SecondaryWindow<V> {
 }
 
 impl<V: Render + 'static> Render for SecondaryWindow<V> {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let title_strip = self.title.clone().map(|title| {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let title = (self.title)(cx);
+        if title != self.system_title {
+            window.set_window_title(&title);
+            self.system_title = title.clone();
+        }
+        let title_strip = self.draws_title_strip.then(|| {
             h_flex()
                 .flex_none()
                 .w_full()
@@ -152,8 +178,17 @@ impl<V: Render + 'static> Render for SecondaryWindow<V> {
 /// `(window, cx)` and should return the content entity.  The window is
 /// automatically wrapped with [`Root`] (required by gpui_component widgets)
 /// and [`SecondaryWindow`] (focus + ESC handling).
-pub fn open_secondary_window<V, F>(options: WindowOptions, cx: &mut App, build: F)
-where
+///
+/// `title` is what the window is called, and is asked again whenever the
+/// window is drawn — hand it the lookup (`|cx| i18n_settings(cx, "title")`),
+/// not its answer, so a language change reaches the title too. It is written
+/// into `options.titlebar` here; a caller leaves that title unset.
+pub fn open_secondary_window<V, F>(
+    mut options: WindowOptions,
+    title: impl Fn(&App) -> SharedString + 'static,
+    cx: &mut App,
+    build: F,
+) where
     V: Render + 'static,
     F: FnOnce(&mut Window, &mut App) -> Entity<V> + 'static,
 {
@@ -172,14 +207,69 @@ where
     // Stamp Wayland app_id + default title/icon so secondary windows (About,
     // Settings, …) group with the main window and don't show the generic
     // "Wayland (W)" icon on KDE (issue #106). Caller-supplied title wins.
+    let title: WindowTitle = Rc::new(title);
+    if let Some(titlebar) = options.titlebar.as_mut() {
+        titlebar.title = Some(title(cx));
+    }
     let options = with_app_identity(options);
-    let (options, title) = own_title_strip(options);
+    let (options, draws_title_strip) = own_title_strip(options);
 
     if let Ok(handle) = cx.open_window(options, move |window, cx| {
         let content = build(window, cx);
-        let wrapper = cx.new(|cx| SecondaryWindow::new(content, title, window, cx));
+        let wrapper = cx.new(|cx| SecondaryWindow::new(content, title, draws_title_strip, window, cx));
         cx.new(|cx| Root::new(wrapper, window, cx))
     }) {
         SecondaryWindowRegistry::get(cx).0.insert(type_id, handle.into());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::init_ui;
+    use gpui::{TestAppContext, size};
+    use gpui_kit::test::TestWindowExt;
+    use std::cell::Cell;
+
+    struct Blank;
+
+    impl Render for Blank {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    /// The title is what it is read from at each draw, and the system is told
+    /// when it changes: Settings opened in English and switched to German
+    /// kept "Settings" over a German page, because the title was a string
+    /// made when the window opened.
+    #[gpui::test]
+    fn the_title_follows_what_it_is_read_from(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let language = Rc::new(Cell::new("Settings"));
+        let source = language.clone();
+        let mut wrapper = None;
+        let handle = cx.open_window(size(px(400.), px(300.)), |window, cx| {
+            let content = cx.new(|_| Blank);
+            let title: WindowTitle = Rc::new(move |_| source.get().into());
+            let view = cx.new(|cx| SecondaryWindow::new(content, title, true, window, cx));
+            wrapper = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let wrapper = wrapper.expect("the window built its wrapper");
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(wrapper.read(cx).system_title, "Settings");
+        })
+        .expect("the window is open");
+
+        // What saving a language does: every window is drawn again.
+        language.set("Einstellungen");
+        cx.update(|cx| cx.refresh_windows());
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(wrapper.read(cx).system_title, "Einstellungen");
+        })
+        .expect("the window is open");
     }
 }

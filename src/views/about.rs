@@ -135,14 +135,13 @@ pub fn open_about_window(cx: &mut App) {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(display, window_size, cx))),
             is_movable: true,
             is_resizable: false,
-            titlebar: Some(TitlebarOptions {
-                title: Some("About Zedis".into()),
-                ..Default::default()
-            }),
+            titlebar: Some(TitlebarOptions::default()),
             focus: true,
             kind: WindowKind::Normal,
             ..Default::default()
         },
+        // English, like the page under it.
+        |_| "About Zedis".into(),
         cx,
         |_window, cx| cx.new(|_cx| ZedisAboutPage::new(build_config())),
     );

@@ -252,6 +252,11 @@ pub struct ZedisSettingEditor {
     /// whatever contains this view: in the browser's dialog Escape then
     /// closed nothing, having never reached the dialog.
     focus_handle: FocusHandle,
+    /// The language the lists and fields below were built in. Their
+    /// entries and placeholders are strings made in `new` — the font
+    /// lists' "default" entry, the time zones' names — so a language
+    /// change, made in this very view, builds them again (see `render`).
+    built_in: String,
     ui_font_select: Entity<ZedisSelect>,
     mono_font_select: Entity<ZedisSelect>,
     /// Index → value for each dropdown (index 0 = the "default" entry = `None`).
@@ -794,6 +799,7 @@ impl ZedisSettingEditor {
         Self {
             section: SettingsSection::default(),
             focus_handle: cx.focus_handle(),
+            built_in: cx.global::<ZedisGlobalStore>().read(cx).locale().to_string(),
             _subscriptions: subscriptions,
             ui_font_select,
             mono_font_select,
@@ -951,6 +957,15 @@ impl Render for ZedisSettingEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(rem) = cx.global::<ZedisGlobalStore>().read(cx).font_rem_px() {
             window.set_rem_size(rem);
+        }
+        // The language changed under what `new` built: build it again, on
+        // the section the user is looking at. The focus was in the list the
+        // change was made from, which goes with the old build.
+        if cx.global::<ZedisGlobalStore>().read(cx).locale() != self.built_in {
+            let section = self.section;
+            *self = Self::new(window, cx);
+            self.section = section;
+            self.focus_handle.focus(window, cx);
         }
 
         let page = SectionRows::new(self.section)
@@ -1351,22 +1366,21 @@ pub fn open_settings(window: &mut Window, cx: &mut App) {
 #[cfg(not(target_family = "wasm"))]
 pub fn open_settings_window(cx: &mut App) {
     let window_size = size(px(700.), px(560.));
-    let title = i18n_settings(cx, "title");
     // Center on the monitor the main window is on (not always the primary).
     let display = active_window_display(cx);
     open_secondary_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(display, window_size, cx))),
-            titlebar: Some(TitlebarOptions {
-                title: Some(title),
-                ..Default::default()
-            }),
+            titlebar: Some(TitlebarOptions::default()),
             // Resizable down to where a row still has its text and its
             // control side by side.
             window_min_size: Some(size(px(700.), px(480.))),
             focus: true,
             ..Default::default()
         },
+        // The lookup, not its answer: the language is changed in this
+        // very window, and its title has to change with the page.
+        |cx| i18n_settings(cx, "title"),
         cx,
         |window, cx| cx.new(|cx| ZedisSettingEditor::new(window, cx)),
     );
@@ -1375,6 +1389,52 @@ pub fn open_settings_window(cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::init_ui;
+    use gpui::TestAppContext;
+    use gpui_kit::component::Root;
+    use gpui_kit::test::TestWindowExt;
+
+    /// The page is built in one language — the lists' entries and the
+    /// fields' placeholders are made in `new` — so a language change builds
+    /// it again, and leaves the user on the section they were reading. The
+    /// font lists went on saying "System default" over a German page.
+    #[gpui::test]
+    fn a_language_change_builds_the_page_again_on_the_same_section(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let mut view = None;
+        let handle = cx.open_window(size(px(700.), px(560.)), |window, cx| {
+            let editor = cx.new(|cx| ZedisSettingEditor::new(window, cx));
+            view = Some(editor.clone());
+            Root::new(editor, window, cx)
+        });
+        let view = view.expect("the window built the page");
+        let first_build = cx
+            .update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                view.update(cx, |view, _| view.section = SettingsSection::System);
+                view.read(cx).ui_font_select.entity_id()
+            })
+            .expect("the window is open");
+
+        let other = if cx.update(|cx| cx.global::<ZedisGlobalStore>().read(cx).locale() == "de") {
+            "en"
+        } else {
+            "de"
+        };
+        cx.update(|cx| {
+            let store = cx.global::<ZedisGlobalStore>().clone();
+            store.update(cx, |state, _| state.set_locale(other.to_string()));
+            cx.refresh_windows();
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let view = view.read(cx);
+            assert_eq!(view.built_in, other);
+            assert_ne!(view.ui_font_select.entity_id(), first_build, "the lists are new ones");
+            assert_eq!(view.section, SettingsSection::System);
+        })
+        .expect("the window is open");
+    }
 
     #[test]
     fn parse_font_rem_px_accepts_whole_pixels_in_range() {
