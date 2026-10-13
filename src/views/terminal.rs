@@ -23,11 +23,11 @@ use crate::{
     db::get_cmd_history_manager,
     error::Error,
     helpers::{
-        TerminalAction, get_download_dir, get_mono_font_family, get_or_create_config_dir,
+        TerminalAction, get_download_dir, get_mono_font_family, get_or_create_config_dir, has_pubsub,
         starts_with_ignore_ascii_case, write_file_atomic,
     },
     states::{
-        ServerEvent, WriteGate, ZedisGlobalStore, ZedisServerState, i18n_common, i18n_terminal,
+        ServerEvent, ServerView, WriteGate, ZedisGlobalStore, ZedisServerState, i18n_common, i18n_terminal,
         update_app_state_and_save_quiet,
     },
     views::{bridge_danger, confirm_dangerous_command},
@@ -71,14 +71,58 @@ const ZEDIS_LOGO: &str = r#" __________ ____ ___ ____
 /// panel, which is not internationalized.
 const BLOCKING_REJECT_MSG: &str = "Blocking commands (BLPOP / BRPOP / BLMOVE / BRPOPLPUSH / BLMPOP / BZPOPMIN / BZPOPMAX / BZMPOP / XREAD BLOCK / XREADGROUP BLOCK / WAIT / WAITAOF) are not run here: they would park the terminal's connection until data arrives, and the response timeout would cut the wait short and leave the connection out of step with its replies. Use the live key tail or the Monitor view for blocking reads.";
 
+/// Shown when a line would turn the terminal's connection into a stream it
+/// does not read (see [`refusal`]): the terminal sends a command and reads
+/// one reply. English like the message above, and for the same reason.
+const SUBSCRIBE_REJECT_MSG: &str = "SUBSCRIBE / PSUBSCRIBE / SSUBSCRIBE are not run here: a subscribed connection only receives what is published, which a terminal that reads one reply per command never shows, and every later line would be refused until UNSUBSCRIBE.";
+const MONITOR_REJECT_MSG: &str = "MONITOR is not run here: it turns the connection into a stream of every command the server receives, which a terminal that reads one reply per command cannot show.";
+const REPLICATION_REJECT_MSG: &str =
+    "SYNC / PSYNC are not run here: they turn the connection into a replication stream, not a reply.";
+
+/// Why a parsed line is never sent, if it is one the terminal cannot run: a
+/// command that parks the connection ([`is_blocking_command`]) or one that
+/// turns it into a stream — a subscription, `MONITOR`, a replication
+/// handshake. `SUBSCRIBE` used to be sent like any other line: it answered
+/// `[subscribe, channel, 1]`, nothing published ever appeared, and the next
+/// line was refused by the server until `UNSUBSCRIBE` (#191). Where the app
+/// has a panel for the job, the reason names it.
+fn refusal(cmd_name: &str, args: &[String]) -> Option<String> {
+    if is_blocking_command(cmd_name, args) {
+        return Some(BLOCKING_REJECT_MSG.to_string());
+    }
+    let (reason, instead) = match cmd_name.to_ascii_uppercase().as_str() {
+        "SUBSCRIBE" | "PSUBSCRIBE" | "SSUBSCRIBE" => (
+            SUBSCRIBE_REJECT_MSG,
+            if has_pubsub() {
+                " Use Pubsub Mode instead (≡ › Observability › Pubsub Mode)."
+            } else {
+                " The web version has no Pub/Sub panel."
+            },
+        ),
+        "MONITOR" => (
+            MONITOR_REJECT_MSG,
+            if ServerView::Monitor.in_this_build() {
+                " Use Live Monitor instead (≡ › Observability › Live Monitor)."
+            } else {
+                " The web version has no Monitor panel."
+            },
+        ),
+        "SYNC" | "PSYNC" => (REPLICATION_REJECT_MSG, ""),
+        _ => return None,
+    };
+    Some(format!("{reason}{instead}"))
+}
+
 /// The first line of `input` that is a write (`is_write_command` — whatever
 /// the read-only allowlist does not name, so an unknown command counts), as
-/// typed. A line that does not parse is left to the run, which reports it.
+/// typed. A line that does not parse is left to the run, which reports it,
+/// and so is one the terminal refuses ([`refusal`]): it is never sent, so
+/// there is nothing to unlock or confirm for it.
 fn first_write_line(input: &str) -> Option<String> {
     input.lines().map(str::trim).find_map(|line| {
         let parts = shlex::split(line)?;
         let (name, args) = parts.split_first()?;
-        is_write_command(name, args).then(|| line.to_string())
+        (is_write_command(name, args) && refusal(name, args).is_none()).then(|| line.to_string())
     })
 }
 
@@ -899,6 +943,7 @@ impl ZedisTerminal {
                     && let Some(parts) = shlex::split(line)
                     && let Some(cmd_name) = parts.first()
                     && is_write_command(cmd_name, &parts[1..])
+                    && refusal(cmd_name, &parts[1..]).is_none()
                 {
                     blocking = Some((line.to_string(), DangerKind::GenericWrite));
                     break;
@@ -1086,11 +1131,11 @@ impl ZedisTerminal {
                     }
                     let cmd_name = parts[0].clone();
                     let args = parts[1..].to_vec();
-                    // Refuse blocking commands before touching the connection —
-                    // they would park it until data arrives.
-                    if is_blocking_command(&cmd_name, &args) {
+                    // Refuse, before touching the connection, what would park it
+                    // until data arrives or turn it into a stream.
+                    if let Some(reason) = refusal(&cmd_name, &args) {
                         return Ok(LineOutcome {
-                            reply: LineReply::Message(BLOCKING_REJECT_MSG.to_string()),
+                            reply: LineReply::Message(reason),
                             selected_db: None,
                         });
                     }
@@ -1567,8 +1612,8 @@ impl Render for ZedisTerminal {
 #[cfg(test)]
 mod tests {
     use super::{
-        Block, LineReply, ReplyFormat, TerminalReply, TranscriptEntry, first_write_line, strip_redis_cli_prefix,
-        transcript_entries_for,
+        BLOCKING_REJECT_MSG, Block, LineReply, ReplyFormat, TerminalReply, TranscriptEntry, first_write_line, refusal,
+        strip_redis_cli_prefix, transcript_entries_for,
     };
 
     /// The line a read-only or locked connection holds the input back for.
@@ -1673,6 +1718,49 @@ mod tests {
         assert!(queue.is_none());
         let entries = transcript_entries_for(&mut queue, "EXEC".into(), reply("EXEC", &[], b"*-1\r\n"));
         assert!(matches!(entries.as_slice(), [TranscriptEntry::Command { .. }]));
+    }
+
+    /// What the terminal cannot run is refused with its reason, and the
+    /// reason names the panel that does the job. A subscription used to be
+    /// sent: nothing published ever showed, and the connection refused
+    /// every later line (#191).
+    #[test]
+    fn a_line_that_would_take_the_connection_over_is_refused() {
+        let args = |words: &[&str]| words.iter().map(|word| word.to_string()).collect::<Vec<_>>();
+        for name in ["SUBSCRIBE", "psubscribe", "SSubscribe"] {
+            let reason = refusal(name, &args(&["news"])).expect("refused");
+            assert!(reason.contains("Pubsub Mode"), "{name}: {reason}");
+        }
+        let monitor = refusal("monitor", &[]).expect("refused");
+        assert!(monitor.contains("Live Monitor"), "{monitor}");
+        assert!(refusal("PSYNC", &args(&["?", "-1"])).is_some());
+        assert!(refusal("sync", &[]).is_some());
+        assert_eq!(
+            refusal("BLPOP", &args(&["queue", "0"])).as_deref(),
+            Some(BLOCKING_REJECT_MSG)
+        );
+        assert!(refusal("XREAD", &args(&["BLOCK", "0", "STREAMS", "s", "$"])).is_some());
+
+        // Everything around them still runs: publishing, asking who
+        // listens, leaving a subscription that was never entered.
+        for (name, rest) in [
+            ("PUBLISH", vec!["news", "hi"]),
+            ("PUBSUB", vec!["CHANNELS"]),
+            ("UNSUBSCRIBE", vec![]),
+            ("XREAD", vec!["STREAMS", "s", "0"]),
+            ("GET", vec!["k"]),
+        ] {
+            assert_eq!(refusal(name, &args(&rest)), None, "{name}");
+        }
+    }
+
+    /// A refused line is never sent, so it is not the write a locked
+    /// connection asks to unlock for; a real write beside it still is.
+    #[test]
+    fn a_refused_line_is_not_a_write_to_unlock_for() {
+        assert_eq!(first_write_line("SUBSCRIBE news\nGET k"), None);
+        assert_eq!(first_write_line("BLPOP queue 0"), None);
+        assert_eq!(first_write_line("SUBSCRIBE news\nSET k v").as_deref(), Some("SET k v"));
     }
 
     #[test]

@@ -1374,6 +1374,11 @@ impl ZedisServerState {
         self.value.as_ref().is_some_and(|v| v.key_type == KeyType::Channel)
     }
     /// Sets the channel mode for current server.
+    ///
+    /// The Pub/Sub panel is the editor's, and the terminal is drawn in the
+    /// editor's place: opened from a menu while the terminal was up, the
+    /// mode changed underneath and the menu item appeared to do nothing
+    /// (#191). Like selecting a key, it takes the terminal off.
     pub fn change_channel_mode(&mut self, cx: &mut Context<Self>) {
         self.next_value_epoch();
         self.value = Some(RedisValue {
@@ -1381,6 +1386,10 @@ impl ZedisServerState {
             ..Default::default()
         });
         self.key = None;
+        if self.terminal {
+            self.terminal = false;
+            cx.emit(ServerEvent::TerminalToggled(false));
+        }
         cx.notify();
     }
 
@@ -2234,6 +2243,21 @@ mod auto_refresh_tests {
     /// The bin lists one server's deleted keys across all its databases.
     /// Only the ones restored into the server and database on screen are
     /// rows of this tree (#173 — until then none of them were).
+    /// Pubsub Mode is the editor's panel: reached from a menu while the
+    /// terminal covers the editor, it has to take the terminal off, or the
+    /// menu item appears to do nothing (#191).
+    #[gpui::test]
+    fn pubsub_mode_takes_the_terminal_off_the_editor(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| ZedisServerState::default());
+        state.update(cx, |state, cx| {
+            state.toggle_terminal(cx);
+            assert!(state.is_terminal());
+            state.change_channel_mode(cx);
+            assert!(state.is_channel_mode());
+            assert!(!state.is_terminal());
+        });
+    }
+
     #[gpui::test]
     fn a_restored_key_is_a_row_only_in_the_tree_it_belongs_to(cx: &mut gpui::TestAppContext) {
         let here = RestoredKey {
