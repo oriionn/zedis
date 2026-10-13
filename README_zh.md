@@ -49,7 +49,9 @@
 brew install --cask zedis
 ```
 
-**GPUI Fast 版（实验性）。** 每个 [release](https://github.com/vicanso/zedis/releases/latest) 还附带 `Zedis-<arch>-fast.dmg`：同一个应用，改用 gpui-kit 的可选渲染引擎 GPUI Fast。它直接覆盖安装普通版并保留设置；*关于 → Copy System Info* 里的 `Renderer: GPUI Fast` 表示当前运行的是这个版本；之后的自动更新也会继续取 fast 包。想换回普通版，从同一页面下载普通的 `.dmg` 安装即可。
+**GPUI Fast 版 —— 先以试用的形式提供，暂时只有 macOS。** 每个 [release](https://github.com/vicanso/zedis/releases/latest) 还附带 `Zedis-<arch>-fast.dmg`（Apple Silicon 与 Intel）：同一个应用，改用 gpui-kit 的可选渲染引擎 GPUI Fast 绘制。提供它是为了先在真实使用中验证这个引擎，之后再决定怎么用；Windows 和 Linux 目前没有 fast 版，Homebrew 安装的也是普通版。按我们的实测，它在大部分场景下的 CPU 占用都低于普通版：滚动 Config、Metrics 这类页面时约低 20%，数据表格和编辑器低几个百分点，key 树持平；内存占用约多 20%。
+
+它直接覆盖安装普通版并保留设置，之后的自动更新也会继续取 fast 包。*关于 → Copy System Info* 里的 `Renderer: GPUI Fast` 表示当前运行的是这个版本，反馈问题时请附上这段信息。想换回普通版，从同一页面下载普通的 `.dmg` 安装即可。
 
 ### Windows
 
