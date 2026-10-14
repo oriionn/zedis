@@ -46,6 +46,7 @@ use gpui::{
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, IconName, IndexPath, Sizable, StyledExt, WindowExt,
     button::{Button, ButtonVariants, DropdownButton},
+    checkbox::Checkbox,
     h_flex,
     input::{Input, InputEvent, InputState},
     label::Label,

@@ -17,6 +17,9 @@
 
 use super::*;
 
+/// The selection checkbox of a key row, with the row's index.
+const ROW_CHECKBOX_ID: &str = "ktree-check";
+
 /// The keys between two rows, in visual order. Folders and the synthetic
 /// "Load more" row are skipped: a folder id is a prefix, and every batch op
 /// reads a selected id as a key name. The two ends may come in either
@@ -100,6 +103,19 @@ impl KeyTreeDelegate {
         retain_picks_with_rows(&mut self.selected_items, &self.items);
         self.range_base = self.selected_items.clone();
         self.range_anchor = None;
+    }
+
+    /// Pick or unpick one key and move the Shift anchor to its row, as a
+    /// secondary-modifier click does. The row's checkbox hands it the state
+    /// it was ticked to; a row click toggles.
+    pub(super) fn set_pick(&mut self, id: SharedString, picked: bool, row: usize) {
+        if picked {
+            self.selected_items.insert(id);
+        } else {
+            self.selected_items.remove(&id);
+        }
+        self.range_anchor = Some(row);
+        self.range_base = self.selected_items.clone();
     }
 
     pub(super) fn toggle_multiple_selection(&mut self, cx: &mut Context<ListState<Self>>) {
@@ -311,8 +327,11 @@ impl ListDelegate for KeyTreeDelegate {
         let edit_tag_id = entry.id.clone();
         let del_id = entry.id.clone();
         // Inline delete only on leaf keys (folders use their context-menu
-        // delete) and only when writes are allowed.
-        let show_inline_delete = !is_folder && Capability::DeleteKey.allowed(readonly);
+        // delete), only when writes are allowed, and never beside the
+        // selection checkbox: the row-hover button is drawn over the row's
+        // end, which is where the checkbox sits, so ticking a key opened
+        // its delete confirmation (#196). The context menu still deletes.
+        let show_inline_delete = !is_folder && !show_check_icon && Capability::DeleteKey.allowed(readonly);
         // When the row shows a TTL chip, scope the inline delete to that chip
         // slot (hover the chip to swap it for the delete) instead of revealing
         // on hover of the whole row. Rows without a chip fall back to row-hover.
@@ -598,13 +617,25 @@ impl ListDelegate for KeyTreeDelegate {
                                         })
                                         .child(row_label),
                                 )
+                                // A checkbox of its own, not a picture of one: it
+                                // picks the key whether or not the mode is on (a
+                                // selection made with modifier clicks shows it
+                                // too, where the row's plain click opens the key),
+                                // and the row's click does not also run.
                                 .when(show_check_icon, |this| {
-                                    let check_icon = if selected {
-                                        CustomIconName::SquareCheck
-                                    } else {
-                                        CustomIconName::Square
-                                    };
-                                    this.child(Icon::new(check_icon))
+                                    let pick_id = entry.id.clone();
+                                    let row = ix.row;
+                                    this.child(
+                                        Checkbox::new((ROW_CHECKBOX_ID, ix.row))
+                                            .checked(selected)
+                                            .tab_stop(false)
+                                            .flex_none()
+                                            .on_click(cx.listener(move |state, picked: &bool, _, cx| {
+                                                cx.stop_propagation();
+                                                state.delegate_mut().set_pick(pick_id.clone(), *picked, row);
+                                                cx.notify();
+                                            })),
+                                    )
                                 })
                                 .when_some(ttl_chip, |this, (chip_label, chip_color)| {
                                     this.child(
@@ -618,22 +649,26 @@ impl ListDelegate for KeyTreeDelegate {
                                             .relative()
                                             .flex_none()
                                             .child(
-                                                div().group_hover("ktree-ttl", |s| s.invisible()).child(
-                                                    // Plain TTL text (no chip chrome) —
-                                                    // calm and right-aligned, matching
-                                                    // the design.
-                                                    // One line whatever it
-                                                    // says: a label that wraps
-                                                    // makes the row two lines
-                                                    // tall (#190).
-                                                    Label::new(chip_label)
-                                                        .text_size(px(10.))
-                                                        .w(px(TTL_CHIP_WIDTH))
-                                                        .whitespace_nowrap()
-                                                        .text_right()
-                                                        .text_color(chip_color)
-                                                        .flex_none(),
-                                                ),
+                                                div()
+                                                    .when(show_inline_delete, |this| {
+                                                        this.group_hover("ktree-ttl", |s| s.invisible())
+                                                    })
+                                                    .child(
+                                                        // Plain TTL text (no chip chrome) —
+                                                        // calm and right-aligned, matching
+                                                        // the design.
+                                                        // One line whatever it
+                                                        // says: a label that wraps
+                                                        // makes the row two lines
+                                                        // tall (#190).
+                                                        Label::new(chip_label)
+                                                            .text_size(px(10.))
+                                                            .w(px(TTL_CHIP_WIDTH))
+                                                            .whitespace_nowrap()
+                                                            .text_right()
+                                                            .text_color(chip_color)
+                                                            .flex_none(),
+                                                    ),
                                             )
                                             .when(show_inline_delete, |this| {
                                                 let del_id = del_id.clone();
@@ -764,19 +799,18 @@ impl ListDelegate for KeyTreeDelegate {
             return;
         }
         let id = item.id.clone();
-        if self.selected_items.contains(&id) {
-            self.selected_items.remove(&id);
-        } else {
-            self.selected_items.insert(id);
-        }
-        self.range_anchor = Some(ix.row);
-        self.range_base = self.selected_items.clone();
+        let picked = !self.selected_items.contains(&id);
+        self.set_pick(id, picked, ix.row);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::init_ui;
+    use gpui::{TestAppContext, size};
+    use gpui_kit::component::Root;
+    use gpui_kit::test::TestWindowExt;
 
     fn leaf(id: &str) -> KeyTreeItem {
         KeyTreeItem {
@@ -868,5 +902,87 @@ mod tests {
         assert!(narrow.contains(&SharedString::from("kept")));
         assert!(narrow.contains(&SharedString::from("user:2")));
         assert_eq!(narrow.len(), 3);
+    }
+
+    /// Draws the list alone: the rows and their controls are the
+    /// delegate's, the tree around it is not needed to click them.
+    struct RowsHarness {
+        list: Entity<ListState<KeyTreeDelegate>>,
+    }
+
+    impl Render for RowsHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            v_flex().size_full().child(List::new(&self.list))
+        }
+    }
+
+    fn picks(list: &Entity<ListState<KeyTreeDelegate>>, cx: &mut TestAppContext) -> Vec<String> {
+        list.read_with(cx, |state, _| {
+            let mut picks: Vec<String> = state.delegate().selected_items.iter().map(|k| k.to_string()).collect();
+            picks.sort();
+            picks
+        })
+    }
+
+    /// A row's checkbox picks its key, and only that: in multi-select mode
+    /// the row-hover delete was drawn over it, so ticking a key opened its
+    /// delete confirmation (#196); and with picks made by modifier clicks
+    /// and the mode off, the checkbox was a picture whose click opened the
+    /// key. The clicks are real pointer events, hit-tested.
+    #[gpui::test]
+    fn a_row_checkbox_picks_its_key(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let server_state = cx.new(|_| ZedisServerState::default());
+        let mut list = None;
+        let handle = cx.open_window(size(px(400.), px(300.)), |window, cx| {
+            let delegate = KeyTreeDelegate {
+                items: vec![leaf("a"), leaf("b")],
+                enabled_multiple_selection: true,
+                selected_items: AHashSet::new(),
+                range_anchor: None,
+                range_base: AHashSet::new(),
+                readonly: false,
+                server_state: server_state.clone(),
+            };
+            let state = cx.new(|cx| ListState::new(delegate, window, cx));
+            list = Some(state.clone());
+            let view = cx.new(|_| RowsHarness { list: state });
+            Root::new(view, window, cx)
+        });
+        let list = list.expect("the window built the list");
+
+        // In the mode: once picks it — the row's own click, which also
+        // toggles there, would have put it back — and again unpicks it.
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click((ROW_CHECKBOX_ID, 0usize), cx);
+        })
+        .expect("the window is open");
+        cx.run_until_parked();
+        assert_eq!(picks(&list, cx), ["a"]);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find((ROW_CHECKBOX_ID, 0usize)).checked(), Some(true));
+            window.click((ROW_CHECKBOX_ID, 0usize), cx);
+        })
+        .expect("the window is open");
+        cx.run_until_parked();
+        assert!(picks(&list, cx).is_empty());
+
+        // Mode off, a pick made by a modifier click: the column is still
+        // drawn, and its checkbox adds to the picks.
+        list.update(cx, |state, cx| {
+            let delegate = state.delegate_mut();
+            delegate.enabled_multiple_selection = false;
+            delegate.set_pick("b".into(), true, 1);
+            cx.notify();
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click((ROW_CHECKBOX_ID, 0usize), cx);
+        })
+        .expect("the window is open");
+        cx.run_until_parked();
+        assert_eq!(picks(&list, cx), ["a", "b"]);
     }
 }
