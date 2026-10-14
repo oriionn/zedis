@@ -16,6 +16,7 @@ use crate::helpers::keybinding_overrides;
 use crate::states::SettingsAction;
 use gpui::Action;
 use gpui::KeyBinding;
+use gpui::SharedString;
 // `input::Copy` and not an import of it: the name would shadow the trait.
 #[cfg(target_family = "wasm")]
 use gpui_kit::component::input;
@@ -59,6 +60,30 @@ pub enum MemuAction {
 #[derive(Clone, Copy, PartialEq, Debug, Deserialize, JsonSchema, Action)]
 pub enum NavAction {
     Back,
+}
+
+/// What the sidebar's menu on a connection does (#204). Handled on the
+/// window root: it is on every focus path, so the menu's action reaches it
+/// wherever the focus was, and it holds the workspace tabs a disconnect
+/// goes to.
+#[derive(Clone, PartialEq, Debug, Deserialize, JsonSchema, Action)]
+pub enum SidebarServerAction {
+    Open(SharedString),
+    OpenInNewTab(SharedString),
+    Edit(SharedString),
+    Clone(SharedString),
+    /// The connection diagnostics window — offered where the build has
+    /// it ([`has_connection_diagnostics`](crate::helpers::has_connection_diagnostics)).
+    Diagnose(SharedString),
+    /// Into `group`; empty for no group.
+    MoveToGroup {
+        id: SharedString,
+        group: SharedString,
+    },
+    /// Every workspace tab on the connection.
+    Disconnect(SharedString),
+    Reconnect(SharedString),
+    Delete(SharedString),
 }
 
 /// Jump to a workspace tab by index. Bound as ⌘1–⌘8 / Ctrl+1–8

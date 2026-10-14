@@ -16,12 +16,18 @@ use crate::{
     assets::{Assets, CustomIconName},
     connection::get_servers,
     constants::{EDITOR_KEY_BAR_HEIGHT, STATUS_BAR_HEIGHT},
-    helpers::{humanize_keystroke, is_quiet_tag, resolve_tag_chip, resolve_tag_color, unique_monograms},
+    helpers::{
+        SidebarServerAction, has_connection_diagnostics, humanize_keystroke, is_quiet_tag, resolve_tag_chip,
+        resolve_tag_color, unique_monograms,
+    },
     states::{
         ConnectionHealth, GlobalEvent, Route, ZedisGlobalStore, i18n_servers, i18n_sidebar, update_app_state_and_save,
     },
 };
-use gpui::{Context, Hsla, Image, ImageFormat, SharedString, Subscription, Window, div, img, prelude::*, px, rgb};
+use gpui::{
+    Context, DismissEvent, Hsla, Image, ImageFormat, SharedString, Subscription, WeakEntity, Window, div, img,
+    prelude::*, px, rgb,
+};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
@@ -30,6 +36,7 @@ use gpui_kit::component::{
     h_flex,
     label::Label,
     list::ListItem,
+    menu::{ContextMenuExt, PopupMenu},
     v_flex,
 };
 use rust_i18n::t;
@@ -58,6 +65,11 @@ struct SidebarState {
     /// (`Zedis::sync_sidebar_health`); a server without a tab is absent
     /// and gets no dot.
     health: HashMap<String, ConnectionHealth>,
+
+    /// The connection whose menu is open. Its row draws no tooltip
+    /// meanwhile: the pointer is still on the row, and the tooltip a
+    /// right-click cleared came back over the menu at the next move.
+    menu_open: Option<SharedString>,
 }
 
 #[derive(Clone, Default)]
@@ -83,6 +95,98 @@ struct SidebarServerEntry {
     tag: SharedString,
     /// The stored colour key the label maps to; `None` when untagged.
     tag_color_key: Option<String>,
+}
+
+/// What a connection's menu in the list offers, and about which connection.
+struct ServerMenu {
+    sidebar: WeakEntity<ZedisSidebar>,
+    id: SharedString,
+    /// The group it is in; `None` for none.
+    group: Option<String>,
+    /// Every named group the list shows.
+    groups: Vec<String>,
+    ungrouped: SharedString,
+    /// The link toggle: `Some(true)` offers Disconnect, `Some(false)`
+    /// Reconnect, `None` (no workspace tab on it) neither.
+    link: Option<bool>,
+}
+
+impl ServerMenu {
+    fn build(&self, menu: PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>) -> PopupMenu {
+        // Built as it opens: the row lets its tooltip go until it closes.
+        let sidebar = self.sidebar.clone();
+        let _ = sidebar.update(cx, |sidebar, cx| {
+            sidebar.state.menu_open = Some(self.id.clone());
+            cx.notify();
+        });
+        cx.subscribe_self(move |_, _: &DismissEvent, cx| {
+            let _ = sidebar.update(cx, |sidebar, cx| {
+                sidebar.state.menu_open = None;
+                cx.notify();
+            });
+        })
+        .detach();
+        let id = self.id.clone();
+        let action = |make: fn(SharedString) -> SidebarServerAction| Box::new(make(id.clone()));
+        let menu = menu
+            .menu(i18n_sidebar(cx, "server_open"), action(SidebarServerAction::Open))
+            .menu(
+                i18n_sidebar(cx, "server_open_new_tab"),
+                action(SidebarServerAction::OpenInNewTab),
+            )
+            .separator()
+            .menu(i18n_sidebar(cx, "server_edit"), action(SidebarServerAction::Edit))
+            .menu(i18n_sidebar(cx, "server_clone"), action(SidebarServerAction::Clone))
+            .when(has_connection_diagnostics(), |menu| {
+                menu.menu(
+                    i18n_sidebar(cx, "server_diagnose"),
+                    action(SidebarServerAction::Diagnose),
+                )
+            });
+        // Offered while there is somewhere else to go: another group, or
+        // out of the one it is in. A new group is the form's to name.
+        let elsewhere = self.group.is_some() || self.groups.iter().any(|group| Some(group) != self.group.as_ref());
+        let menu = if elsewhere {
+            let (id, current, groups, ungrouped) = (
+                self.id.clone(),
+                self.group.clone(),
+                self.groups.clone(),
+                self.ungrouped.clone(),
+            );
+            menu.submenu(
+                i18n_sidebar(cx, "server_move_to_group"),
+                window,
+                cx,
+                move |submenu, _, _| {
+                    let to = |group: &str| {
+                        Box::new(SidebarServerAction::MoveToGroup {
+                            id: id.clone(),
+                            group: group.to_string().into(),
+                        })
+                    };
+                    let submenu = groups.iter().fold(submenu, |submenu, group| {
+                        submenu.menu_with_check(group.clone(), current.as_ref() == Some(group), to(group))
+                    });
+                    submenu.menu_with_check(ungrouped.clone(), current.is_none(), to(""))
+                },
+            )
+        } else {
+            menu
+        };
+        let menu = menu.separator();
+        let menu = match self.link {
+            Some(true) => menu.menu(
+                i18n_sidebar(cx, "server_disconnect"),
+                action(SidebarServerAction::Disconnect),
+            ),
+            Some(false) => menu.menu(
+                i18n_sidebar(cx, "server_reconnect"),
+                action(SidebarServerAction::Reconnect),
+            ),
+            None => menu,
+        };
+        menu.menu(i18n_sidebar(cx, "server_delete"), action(SidebarServerAction::Delete))
+    }
 }
 
 /// Sidebar navigation component
@@ -469,6 +573,16 @@ impl ZedisSidebar {
             Vec::new().into_iter()
         };
 
+        let sidebar = cx.entity().downgrade();
+        // Where a connection can be moved to from its menu: every named group,
+        // once, in the order the list shows them.
+        let mut named_groups: Vec<String> = Vec::new();
+        for group in self.state.sections.iter().filter_map(|section| section.group.clone()) {
+            if !named_groups.contains(&group) {
+                named_groups.push(group);
+            }
+        }
+
         // --- Group sections ---
         for (section_idx, section) in self.state.sections.iter().enumerate() {
             let is_collapsed = collapsed_keys.contains(&section.key);
@@ -710,6 +824,21 @@ impl ZedisSidebar {
                         });
                     });
 
+                // The row's menu (#204): what the app does with a connection
+                // elsewhere, one right-click from the list.
+                let menu = ServerMenu {
+                    sidebar: sidebar.clone(),
+                    id: entry.id.clone(),
+                    group: section.group.clone(),
+                    groups: named_groups.clone(),
+                    ungrouped: ungrouped_label.clone(),
+                    link: match health {
+                        ConnectionHealth::Connected | ConnectionHealth::Reconnecting => Some(true),
+                        ConnectionHealth::Offline => Some(false),
+                        ConnectionHealth::Unknown => None,
+                    },
+                };
+
                 // ListItem doesn't impl InteractiveElement, so the
                 // tooltip lives on a thin stateful wrapper.
                 let wrap_id = SharedString::from(format!("sidebar-srv-w-{}", entry.id));
@@ -724,25 +853,29 @@ impl ZedisSidebar {
                         // icon's accent. It also wore a bar down its left edge,
                         // a second mark for what the fill already said.
                         .child(item)
-                        .tooltip({
-                            let name = tooltip_text.clone();
-                            let hint = new_tab_hint.clone();
-                            let dup_hint = dup_tab_hint.clone();
-                            move |window, cx| {
-                                let name = name.clone();
-                                let hint = hint.clone();
-                                let dup_hint = dup_hint.clone();
-                                Tooltip::element(move |_window, cx| {
-                                    let muted = cx.theme().muted_foreground;
-                                    v_flex()
-                                        .gap_0p5()
-                                        .child(name.clone())
-                                        .child(div().text_xs().text_color(muted).child(hint.clone()))
-                                        .child(div().text_xs().text_color(muted).child(dup_hint.clone()))
-                                })
-                                .build(window, cx)
-                            }
+                        .when(self.state.menu_open.as_ref() != Some(&entry.id), |this| {
+                            this.tooltip({
+                                let name = tooltip_text.clone();
+                                let hint = new_tab_hint.clone();
+                                let dup_hint = dup_tab_hint.clone();
+                                move |window, cx| {
+                                    let name = name.clone();
+                                    let hint = hint.clone();
+                                    let dup_hint = dup_hint.clone();
+                                    Tooltip::element(move |_window, cx| {
+                                        let muted = cx.theme().muted_foreground;
+                                        v_flex()
+                                            .gap_0p5()
+                                            .child(name.clone())
+                                            .child(div().text_xs().text_color(muted).child(hint.clone()))
+                                            .child(div().text_xs().text_color(muted).child(dup_hint.clone()))
+                                    })
+                                    .build(window, cx)
+                                }
+                            })
                         })
+                        // Last: it wraps the row, and what it returns takes no tooltip.
+                        .context_menu(move |popup, window, cx| menu.build(popup, window, cx))
                         .into_any_element(),
                 );
             }

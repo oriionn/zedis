@@ -27,9 +27,9 @@ use crate::helpers::pacing;
 #[cfg(not(target_family = "wasm"))]
 use crate::helpers::{BuildVariant, CrashReport, UpdateInfo, get_or_create_config_dir, is_app_store_build};
 use crate::helpers::{
-    ConfigRecovery, DEFAULT_UI_FONT_SIZE, DiagnosticsAction, EditorAction, MemuAction, NavAction, UI_FONT_SIZE_MAX,
-    UI_FONT_SIZE_MIN, WindowAction, WorkspaceTabAction, ZoomAction, apply_default_ui_font_size, humanize_keystroke,
-    unix_ts_millis,
+    ConfigRecovery, DEFAULT_UI_FONT_SIZE, DiagnosticsAction, EditorAction, MemuAction, NavAction, SidebarServerAction,
+    UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN, WindowAction, WorkspaceTabAction, ZoomAction, apply_default_ui_font_size,
+    humanize_keystroke, unix_ts_millis,
 };
 #[cfg(not(target_family = "wasm"))]
 use crate::helpers::{
@@ -51,15 +51,16 @@ use crate::states::{
 use crate::states::{WindowPlacement, save_app_state};
 #[cfg(not(target_family = "wasm"))]
 use crate::views::{
-    ExportSource, ZedisMultiSearch, open_compare_window, open_migration_export_window, open_migration_import_window,
+    ExportSource, ZedisMultiSearch, open_compare_window, open_connection_diagnostics, open_migration_export_window,
+    open_migration_import_window,
 };
 use crate::views::{
     ZedisCommandPalette, ZedisContent, ZedisRecentKeysPalette, ZedisShortcutsOverlay, ZedisSidebar, ZedisTitleBar,
-    confirm_dangerous_command, open_features_dialog, open_settings, open_trash_dialog,
+    confirm_dangerous_command, confirm_remove_server, open_features_dialog, open_settings, open_trash_dialog,
 };
 use crate::window_setup::*;
 use gpui::{
-    Action, Bounds, Entity, MouseButton, Pixels, Point, SharedString, Subscription, Task, Window, div, prelude::*,
+    Action, App, Bounds, Entity, MouseButton, Pixels, Point, SharedString, Subscription, Task, Window, div, prelude::*,
 };
 use std::collections::HashMap;
 // Only the custom-drawn title bar path uses this (Linux/FreeBSD keep
@@ -182,6 +183,19 @@ pub struct Zedis {
     /// `render`, one notification each.
     pub(crate) pending_config_recoveries: Vec<ConfigRecovery>,
 }
+
+/// The connection diagnostics window for a saved connection — the
+/// sidebar's Diagnose Connection.
+#[cfg(not(target_family = "wasm"))]
+fn diagnose_connection(server_id: &str, window: &mut Window, cx: &mut App) {
+    if let Ok(server) = get_server(server_id) {
+        open_connection_diagnostics(server, window, cx);
+    }
+}
+/// Not in the browser, whose menu never offers it
+/// (`has_connection_diagnostics`).
+#[cfg(target_family = "wasm")]
+fn diagnose_connection(_server_id: &str, _window: &mut Window, _cx: &mut App) {}
 
 impl Zedis {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -585,6 +599,50 @@ impl Zedis {
                 state.connect_server(id, db, cx);
             }
         });
+    }
+
+    /// The sidebar's menu on a connection (#204): each item is what the app
+    /// already does from elsewhere — the row's click, the card's Edit, Clone
+    /// and Delete, the status bar's link toggle — reached from the list.
+    fn on_sidebar_server_action(&mut self, action: &SidebarServerAction, window: &mut Window, cx: &mut Context<Self>) {
+        let store = cx.global::<ZedisGlobalStore>().clone();
+        match action {
+            SidebarServerAction::Open(id) => store.update(cx, |state, cx| {
+                let db = state.open_db_for(id);
+                state.connect_server(id.to_string(), db, cx);
+            }),
+            SidebarServerAction::OpenInNewTab(id) => store.update(cx, |state, cx| {
+                let db = state.open_db_for(id);
+                state.open_server_in_new_tab(id.to_string(), db, cx);
+            }),
+            SidebarServerAction::Edit(id) => store.update(cx, |state, cx| state.edit_server(id, cx)),
+            SidebarServerAction::Clone(id) => store.update(cx, |state, cx| state.clone_server(id, cx)),
+            SidebarServerAction::Diagnose(id) => diagnose_connection(id, window, cx),
+            SidebarServerAction::MoveToGroup { id, group } => store.update(cx, |state, cx| {
+                state.set_server_group(id, Some(group.to_string()), cx);
+            }),
+            SidebarServerAction::Disconnect(id) | SidebarServerAction::Reconnect(id) => {
+                let disconnect = matches!(action, SidebarServerAction::Disconnect(_));
+                // Every tab on the connection: the sidebar's dot is theirs
+                // together, and one left connected would keep it green.
+                let states: Vec<_> = self
+                    .tabs
+                    .iter()
+                    .filter(|tab| tab.server_id == id.as_ref())
+                    .map(|tab| tab.content.read(cx).server_state())
+                    .collect();
+                for state in states {
+                    state.update(cx, |state, cx| {
+                        if disconnect {
+                            state.disconnect(cx);
+                        } else {
+                            state.reconnect(cx);
+                        }
+                    });
+                }
+            }
+            SidebarServerAction::Delete(id) => confirm_remove_server(id, window, cx),
+        }
     }
 
     /// Close a tab, dropping its content entity (which tears down the tab's
@@ -1243,6 +1301,9 @@ impl Render for Zedis {
             }))
             // ⌘1–⌘8 / Ctrl+1–8: jump to the Nth workspace tab (1-based key).
             // No-op when that index is not open yet (or already active).
+            .on_action(cx.listener(|this, e: &SidebarServerAction, window, cx| {
+                this.on_sidebar_server_action(e, window, cx);
+            }))
             .on_action(cx.listener(|this, e: &WorkspaceTabAction, window, cx| {
                 let WorkspaceTabAction::Select(ix) = *e;
                 if ix < this.tabs.len() {

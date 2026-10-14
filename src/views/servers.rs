@@ -27,8 +27,9 @@ use crate::helpers::{
     has_file_dialogs, is_share_token, resolve_path, resolve_tag_chip, unix_ts,
 };
 use crate::states::{
-    EDIT_SERVER_QUERY, GlobalEvent, NotificationAction, Route, ZedisGlobalStore, dialog_button_props,
-    escalate_dangerous_body, get_session_option, i18n_common, i18n_servers, update_app_state_and_save,
+    CLONE_SERVER_QUERY, EDIT_SERVER_QUERY, GlobalEvent, NotificationAction, Route, ZedisGlobalStore,
+    dialog_button_props, escalate_dangerous_body, get_session_option, i18n_common, i18n_servers,
+    update_app_state_and_save,
 };
 #[cfg(not(target_family = "wasm"))]
 use crate::views::open_connection_diagnostics;
@@ -152,17 +153,63 @@ impl ServerSort {
 /// for one never opened on this machine.
 /// The entry whose form the route's query asks the connections page to open:
 /// a blank one for `new` (the tray's New Connection), the named one for
-/// `EDIT_SERVER_QUERY` (the editor's link panel). `None` when it asks for
-/// neither, or names an entry that is gone.
-fn form_asked_for(query: Option<&HashMap<String, String>>) -> Option<RedisServer> {
+/// `EDIT_SERVER_QUERY` (the editor's link panel, the sidebar's menu), a copy
+/// of the named one for `CLONE_SERVER_QUERY` (the sidebar's menu). `None`
+/// when it asks for none of them, or names an entry that is gone.
+fn form_asked_for(query: Option<&HashMap<String, String>>, locale: &str) -> Option<RedisServer> {
     let query = query?;
     if let Some(server_id) = query.get(EDIT_SERVER_QUERY) {
         return get_server(server_id).ok();
+    }
+    if let Some(server_id) = query.get(CLONE_SERVER_QUERY) {
+        return get_server(server_id).ok().map(|server| clone_of(&server, locale));
     }
     query.contains_key("new").then(|| RedisServer {
         port: DEFAULT_REDIS_PORT,
         ..Default::default()
     })
+}
+
+/// The add form's starting point for a copy of `server`: everything but the
+/// identity — the TLS material, SSH tunnel and credentials are the part
+/// worth copying, and also the part nobody wants to retype. An empty id is
+/// what the form reads as "new", so saving creates a second entry.
+fn clone_of(server: &RedisServer, locale: &str) -> RedisServer {
+    RedisServer {
+        id: String::new(),
+        name: t!("servers.clone_name", name = server.name.as_str(), locale = locale).to_string(),
+        updated_at: None,
+        // Placed at the end of its group, the way an import is — the copy
+        // has no earned position.
+        sort_order: None,
+        ..server.clone()
+    }
+}
+
+/// Ask before removing a saved connection, and remove it on yes — the
+/// connection card's and the sidebar's Delete. The destructive shape:
+/// Delete is the danger button and Return answers Cancel.
+pub(crate) fn confirm_remove_server(server_id: &str, window: &mut Window, cx: &mut App) {
+    let name = get_server(server_id)
+        .map(|found| found.name)
+        .unwrap_or_else(|_| "--".to_string());
+    let server_id = server_id.to_string();
+    let locale = cx.global::<ZedisGlobalStore>().read(cx).locale().to_string();
+    let message = t!("servers.remove_prompt", server = name, locale = locale).to_string();
+    ZedisDialog::new_alert(
+        i18n_servers(cx, "remove_server_title"),
+        escalate_dangerous_body(cx, &server_id, message),
+    )
+    .danger()
+    .ok_text(i18n_common(cx, "delete"))
+    .cancel_text(i18n_common(cx, "cancel"))
+    .on_ok(move |_, _window, cx| {
+        cx.update_global::<ZedisGlobalStore, ()>(|store, cx| {
+            store.update(cx, |state, cx| state.remove_server(&server_id, cx));
+        });
+        true
+    })
+    .open(window, cx);
 }
 
 fn last_connected_map(servers: &[RedisServer]) -> HashMap<String, i64> {
@@ -262,7 +309,8 @@ impl ZedisServers {
                 // the page was clicked or reloaded.
                 GlobalEvent::ServerListUpdated => cx.notify(),
                 GlobalEvent::RouteChanged(Route::Home) => {
-                    if let Some(server) = form_asked_for(state.read(cx).get_route_query()) {
+                    let state = state.read(cx);
+                    if let Some(server) = form_asked_for(state.get_route_query(), state.locale()) {
                         this.pending_server_form = Some(server);
                         cx.notify();
                     }
@@ -270,7 +318,8 @@ impl ZedisServers {
                 _ => {}
             }
         }));
-        if let Some(server) = form_asked_for(global_state.read(cx).get_route_query()) {
+        let state = global_state.read(cx);
+        if let Some(server) = form_asked_for(state.get_route_query(), state.locale()) {
             cx.defer_in(window, move |this, window, cx| {
                 this.add_or_update_server_dialog(&server, window, cx);
             });
@@ -336,37 +385,6 @@ impl ZedisServers {
     }
 
     /// Show confirmation dialog and remove server from configuration
-    fn remove_server(&mut self, window: &mut Window, cx: &mut Context<Self>, server_id: &str) {
-        let mut server = "--".to_string();
-        if let Ok(servers) = get_servers()
-            && let Some(found) = servers.iter().find(|item| item.id == server_id)
-        {
-            server = found.name.clone();
-        }
-        let server_id = server_id.to_string();
-
-        // let server = server.to_string();
-        let locale = cx.global::<ZedisGlobalStore>().read(cx).locale().to_string();
-
-        let message = t!("servers.remove_prompt", server = server, locale = locale).to_string();
-
-        ZedisDialog::new_alert(
-            i18n_servers(cx, "remove_server_title"),
-            escalate_dangerous_body(cx, &server_id, message),
-        )
-        .button_props(dialog_button_props(cx))
-        .on_ok(move |_, window, cx| {
-            cx.update_global::<ZedisGlobalStore, ()>(|store, cx| {
-                store.update(cx, |state, cx| {
-                    state.remove_server(&server_id, cx);
-                });
-            });
-            window.close_dialog(cx);
-            true
-        })
-        .open(window, cx);
-    }
-
     /// Welcoming empty state for the Home view when no servers are configured.
     ///
     /// The first thing a brand-new user saw was otherwise a near-blank page
@@ -1134,25 +1152,13 @@ impl Render for ZedisServers {
                         this.export_server_dialog(&server, window, cx);
                     }
                 }
-                ServersCardAction::Delete(id) => this.remove_server(window, cx, id.as_ref()),
+                ServersCardAction::Delete(id) => confirm_remove_server(id, window, cx),
                 ServersCardAction::Clone(id) => {
                     if let Ok(servers) = get_servers()
                         && let Some(server) = servers.iter().find(|s| s.id == id.as_ref())
                     {
                         let locale = cx.global::<ZedisGlobalStore>().read(cx).locale().to_string();
-                        // An empty id is what the dialog reads as "new", so
-                        // saving creates a second entry instead of editing
-                        // the one that was copied.
-                        let copy = RedisServer {
-                            id: String::new(),
-                            name: t!("servers.clone_name", name = server.name.as_str(), locale = &locale).to_string(),
-                            updated_at: None,
-                            // Placed at the end of its group, the way an import
-                            // is — the copy has no earned position.
-                            sort_order: None,
-                            ..server.clone()
-                        };
-                        this.add_or_update_server_dialog(&copy, window, cx);
+                        this.add_or_update_server_dialog(&clone_of(server, &locale), window, cx);
                     }
                 }
             }))
@@ -1180,6 +1186,35 @@ mod path_import_tests {
         // An existing non-.json file is NOT read — only .json paths are slurped.
         let non_json = "/etc/hosts";
         assert_eq!(resolve_import_input(non_json).expect("non-json"), non_json);
+    }
+}
+
+#[cfg(test)]
+mod clone_tests {
+    use super::{RedisServer, clone_of};
+
+    /// A copy is a new entry — no id, no place, no edit time — with
+    /// everything else the original had, under a name that says it is a
+    /// copy: the card's Clone and the sidebar's both build it here.
+    #[test]
+    fn a_clone_is_a_new_entry_with_the_same_settings() {
+        let original = RedisServer {
+            id: "orig".to_string(),
+            name: "cache".to_string(),
+            host: "10.0.0.5".to_string(),
+            port: 6380,
+            group: Some("prod".to_string()),
+            sort_order: Some(2),
+            ..Default::default()
+        };
+        let copy = clone_of(&original, "en");
+        assert!(copy.id.is_empty() && copy.sort_order.is_none() && copy.updated_at.is_none());
+        assert_ne!(copy.name, original.name);
+        assert!(copy.name.contains("cache"), "{}", copy.name);
+        assert_eq!(
+            (copy.host.as_str(), copy.port, copy.group.as_deref()),
+            ("10.0.0.5", 6380, Some("prod"))
+        );
     }
 }
 

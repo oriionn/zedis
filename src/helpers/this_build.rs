@@ -77,6 +77,17 @@ pub const fn has_pubsub() -> bool {
     false
 }
 
+/// The connection diagnostics window — a second window, which a page
+/// cannot open, and a probe the bridge does not run.
+#[cfg(not(target_family = "wasm"))]
+pub const fn has_connection_diagnostics() -> bool {
+    true
+}
+#[cfg(target_family = "wasm")]
+pub const fn has_connection_diagnostics() -> bool {
+    false
+}
+
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use super::*;
@@ -89,5 +100,6 @@ mod tests {
         assert!(has_file_dialogs());
         assert!(reads_clipboard_on_demand());
         assert!(has_pubsub());
+        assert!(has_connection_diagnostics());
     }
 }

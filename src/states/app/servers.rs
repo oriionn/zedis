@@ -35,6 +35,40 @@ impl ZedisAppState {
         self.go_with_query(Route::Home, query, cx);
     }
 
+    /// Open the add form pre-filled from `server_id` — the TLS material,
+    /// tunnel and credentials copied, a new entry once saved — through
+    /// the route, as [`Self::edit_server`] does (`CLONE_SERVER_QUERY`).
+    pub fn clone_server(&mut self, server_id: &str, cx: &mut Context<Self>) {
+        let mut query = HashMap::new();
+        query.insert(CLONE_SERVER_QUERY.to_string(), server_id.to_string());
+        self.go_with_query(Route::Home, query, cx);
+    }
+
+    /// Move a connection into `group` (`None`: no group), at the end of
+    /// it — the sidebar's Move to Group. The entry is otherwise saved as it
+    /// was; moving it where it already is changes nothing.
+    pub fn set_server_group(&mut self, server_id: &str, group: Option<String>, cx: &mut Context<Self>) {
+        let server_id = server_id.to_string();
+        cx.spawn(async move |handle, cx| {
+            let task = cx.background_spawn(async move {
+                let mut servers = get_servers()?;
+                if move_to_group(&mut servers, &server_id, group) {
+                    save_servers(servers).await?;
+                }
+                Ok::<(), Error>(())
+            });
+            let result: Result<()> = task.await;
+            if let Err(e) = &result {
+                error!(error = %e, "Failed to move server to another group");
+            }
+            handle.update(cx, |_this, cx| {
+                cx.emit(GlobalEvent::ServerListUpdated);
+                cx.notify();
+            })
+        })
+        .detach();
+    }
+
     /// Open a blank server form: the connections page, asked through the
     /// route (`new`). The selection is kept, as for [`Self::edit_server`].
     pub fn new_server(&mut self, cx: &mut Context<Self>) {
@@ -395,5 +429,57 @@ impl ZedisAppState {
             })
         })
         .detach();
+    }
+}
+
+/// Put `server_id` in `group` (`None`, or only spaces: no group), at the end
+/// of it, the way an import lands. `false` when there is no such entry or it
+/// is in that group already: nothing to save.
+fn move_to_group(servers: &mut [RedisServer], server_id: &str, group: Option<String>) -> bool {
+    let named = |group: Option<&str>| group.map(str::trim).filter(|group| !group.is_empty()).map(String::from);
+    let group = named(group.as_deref());
+    let Some(server) = servers.iter_mut().find(|server| server.id == server_id) else {
+        return false;
+    };
+    if named(server.group.as_deref()) == group {
+        return false;
+    }
+    server.group = group;
+    server.sort_order = None;
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::move_to_group;
+    use crate::connection::RedisServer;
+
+    fn entry(id: &str, group: Option<&str>) -> RedisServer {
+        RedisServer {
+            id: id.to_string(),
+            group: group.map(String::from),
+            sort_order: Some(3),
+            ..Default::default()
+        }
+    }
+
+    /// The sidebar's Move to Group (#204): into a group or out of every one,
+    /// to the end of it, and nothing to save where it already is.
+    #[test]
+    fn a_connection_moves_to_the_end_of_another_group() {
+        let mut servers = vec![entry("a", Some("prod")), entry("b", None)];
+
+        assert!(move_to_group(&mut servers, "b", Some("prod".into())));
+        assert_eq!(servers[1].group.as_deref(), Some("prod"));
+        assert_eq!(servers[1].sort_order, None, "at the end of its new group");
+
+        assert!(move_to_group(&mut servers, "a", Some("  ".into())), "blank is no group");
+        assert_eq!(servers[0].group, None);
+
+        assert!(
+            !move_to_group(&mut servers, "b", Some(" prod ".into())),
+            "already there"
+        );
+        assert!(!move_to_group(&mut servers, "gone", None), "no such entry");
     }
 }

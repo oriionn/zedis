@@ -178,6 +178,10 @@ const UPDATE_CHECK_INTERVAL: i64 = 2 * 24 * 60 * 60;
 /// Route query key that asks the connections page to open one entry's form;
 /// its value is the server id (`ZedisAppState::edit_server`).
 pub const EDIT_SERVER_QUERY: &str = "edit";
+/// Route query key that asks the connections page to open the add form
+/// pre-filled from one entry; its value is the server id
+/// (`ZedisAppState::clone_server`).
+pub const CLONE_SERVER_QUERY: &str = "clone";
 pub const HINT_WELCOME: &str = "welcome";
 /// The shortcut / tips card under the editor's "no key selected" screen,
 /// once its close button has been used.

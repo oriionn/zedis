@@ -175,6 +175,7 @@ pub use search_manager::ZedisSearchManager;
 pub use server_info::ZedisServerInfo;
 pub use server_load::ZedisServerLoad;
 pub use servers::ZedisServers;
+pub(crate) use servers::confirm_remove_server;
 pub use set_editor::ZedisSetEditor;
 pub use setting_editor::open_settings;
 #[cfg(not(target_family = "wasm"))]
