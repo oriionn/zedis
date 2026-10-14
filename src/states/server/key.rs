@@ -169,6 +169,22 @@ pub fn recycles_deleted_keys(soft_delete: bool, count: usize) -> bool {
     soft_delete && count <= TRASH_MAX_BULK_KEYS
 }
 
+/// The keys a delete removed: named one by one (a key, a multi-selection),
+/// or everything under a folder's prefix.
+enum DeletedKeys {
+    Named(AHashSet<SharedString>),
+    Prefix(String),
+}
+
+impl DeletedKeys {
+    fn contains(&self, key: &str) -> bool {
+        match self {
+            Self::Named(keys) => keys.contains(key),
+            Self::Prefix(prefix) => key.starts_with(prefix.as_str()),
+        }
+    }
+}
+
 /// Hard ceiling on the per-page target after the per-master multiplier, so a
 /// large cluster can't try to pull (and client-side tree-build) an unbounded
 /// batch in a single load. "Load more" still fetches keys beyond this.
@@ -496,6 +512,41 @@ impl ZedisServerState {
         if self.key_ttls.contains_key(key) {
             Arc::make_mut(&mut self.key_ttls).remove(key);
         }
+    }
+
+    /// Everything a delete that went through leaves behind, however its keys
+    /// were named: out of the loaded keys, the edit history and the recent
+    /// keys, the tree rebuilt, and the open key closed when it was one of
+    /// them — left open, it showed a value that was gone, and a field edited
+    /// there wrote the key back (#197). The one-key, multi-selection and
+    /// folder deletes each did their own share of this, and each missed a
+    /// different part.
+    fn forget_deleted_keys(&mut self, deleted: DeletedKeys, cx: &mut Context<Self>) {
+        match &deleted {
+            DeletedKeys::Named(keys) => keys.iter().for_each(|key| self.forget_loaded_key(key)),
+            DeletedKeys::Prefix(_) => self.forget_loaded_keys_where(|key| deleted.contains(key)),
+        }
+        self.histories.retain_keys(|key| !deleted.contains(key));
+        if self.key.as_ref().is_some_and(|key| deleted.contains(key)) {
+            self.key = None;
+            self.value = None;
+            self.next_value_epoch();
+        }
+        // Force refresh of the key tree view
+        self.key_tree_id = Uuid::now_v7().to_string().into();
+        self.refresh_dbsize_now(cx);
+        // So the recent-keys list does not offer a key that is gone.
+        let scope = recent_keys_scope(self.server_id.as_str(), self.db);
+        cx.background_spawn(async move {
+            let manager = get_recent_keys_manager();
+            let Ok(records) = manager.records(&scope) else {
+                return;
+            };
+            for key in records.iter().filter(|key| deleted.contains(key)) {
+                let _ = manager.remove_record(&scope, key);
+            }
+        })
+        .detach();
     }
 
     /// [`Self::forget_loaded_key`] for every loaded key `gone` accepts.
@@ -1478,24 +1529,7 @@ impl ZedisServerState {
             },
             move |this, result, cx| {
                 if let Ok(()) = result {
-                    this.forget_loaded_key(&remove_key);
-                    this.histories.forget(&remove_key);
-                    this.refresh_dbsize_now(cx);
-                    // Drop from MRU so the dropdown doesn't offer a gone key.
-                    let scope = recent_keys_scope(this.server_id.as_str(), this.db);
-                    let mru_key = remove_key.to_string();
-                    cx.background_spawn(async move {
-                        let _ = get_recent_keys_manager().remove_record(&scope, &mru_key);
-                    })
-                    .detach();
-                    // Force refresh of the key tree view
-                    this.key_tree_id = Uuid::now_v7().to_string().into();
-                    // Deselect if the deleted key was selected
-                    if this.key == Some(remove_key) {
-                        this.key = None;
-                        this.value = None;
-                        this.next_value_epoch();
-                    }
+                    this.forget_deleted_keys(DeletedKeys::Named(AHashSet::from_iter([remove_key])), cx);
                 }
                 cx.emit(ServerEvent::KeyTreeUpdated);
                 cx.notify();
@@ -1530,19 +1564,20 @@ impl ZedisServerState {
             move |this, result, cx| {
                 match result {
                     Ok(true) => {
-                        this.forget_loaded_keys_where(|key| key.starts_with(prefix.as_str()));
-                        this.histories.retain_keys(|key| !key.starts_with(prefix.as_str()));
-                        // Force refresh of the key tree view
-                        this.key_tree_id = Uuid::now_v7().to_string().into();
-                        this.refresh_dbsize_now(cx);
+                        this.forget_deleted_keys(DeletedKeys::Prefix(prefix.clone()), cx);
                     }
                     // The walk stopped at its round limit: some keys may
                     // still be there. Scan the folder again rather than take
-                    // every loaded key under it out of the tree as deleted.
+                    // every loaded key under it out of the tree as deleted,
+                    // and load the open key again if it was under it, so the
+                    // editor shows whether it is still there.
                     Ok(false) => {
                         this.histories.retain_keys(|key| !key.starts_with(prefix.as_str()));
                         this.refresh_prefix(prefix.clone().into(), cx);
                         this.refresh_dbsize_now(cx);
+                        if let Some(key) = this.key.clone().filter(|key| key.starts_with(prefix.as_str())) {
+                            this.reload_value(key, cx);
+                        }
                     }
                     Err(_) => {}
                 }
@@ -1630,29 +1665,7 @@ impl ZedisServerState {
             },
             move |this, result, cx| {
                 if let Ok(()) = result {
-                    this.forget_loaded_keys_where(|key| remove_keys.contains(key));
-                    this.histories.retain_keys(|key| !remove_keys.contains(key));
-                    // Out of the MRU, as the one-key delete does.
-                    let scope = recent_keys_scope(this.server_id.as_str(), this.db);
-                    let mru_keys: Vec<String> = remove_keys.iter().map(|key| key.to_string()).collect();
-                    cx.background_spawn(async move {
-                        let manager = get_recent_keys_manager();
-                        for key in &mru_keys {
-                            let _ = manager.remove_record(&scope, key);
-                        }
-                    })
-                    .detach();
-                    // Force refresh of the key tree view
-                    this.key_tree_id = Uuid::now_v7().to_string().into();
-                    // The open key closes when it was one of them, as for one
-                    // key: left open, it showed a value that was gone, and a
-                    // field edited there wrote the key back.
-                    if this.key.as_ref().is_some_and(|key| remove_keys.contains(key)) {
-                        this.key = None;
-                        this.value = None;
-                        this.next_value_epoch();
-                    }
-                    this.refresh_dbsize_now(cx);
+                    this.forget_deleted_keys(DeletedKeys::Named(remove_keys), cx);
                 }
                 cx.emit(ServerEvent::KeyTreeUpdated);
                 cx.notify();
@@ -2230,7 +2243,51 @@ async fn load_module_value(
 
 #[cfg(test)]
 mod bulk_delete_tests {
-    use super::{TRASH_MAX_BULK_KEYS, recycles_deleted_keys};
+    use super::{DeletedKeys, TRASH_MAX_BULK_KEYS, recycles_deleted_keys};
+    use crate::states::{KeyType, RedisValue, ZedisServerState};
+    use ahash::AHashSet;
+    use gpui::{AppContext, SharedString, TestAppContext};
+
+    fn named(keys: &[&str]) -> DeletedKeys {
+        DeletedKeys::Named(
+            keys.iter()
+                .map(|key| SharedString::from(key.to_string()))
+                .collect::<AHashSet<_>>(),
+        )
+    }
+
+    fn open(state: &mut ZedisServerState, key: &str) {
+        state.key = Some(SharedString::from(key.to_string()));
+        state.value = Some(RedisValue::default());
+    }
+
+    /// A delete closes the open key when it removed it, whichever way the
+    /// keys were named — a multi-selection left it open, showing a value that
+    /// was gone (#197), and so did a folder — and leaves any other key open.
+    #[gpui::test]
+    fn a_delete_closes_the_open_key_it_removed(cx: &mut TestAppContext) {
+        let state = cx.new(|_| ZedisServerState::default());
+        state.update(cx, |state, cx| {
+            for key in ["cart:2001", "cart:2002", "user:1", "user:2", "order:1"] {
+                state.keys.insert(SharedString::from(key), KeyType::Hash);
+            }
+
+            open(state, "cart:2002");
+            state.forget_deleted_keys(named(&["cart:2001"]), cx);
+            assert_eq!(state.key.as_deref(), Some("cart:2002"), "not one of them");
+            state.forget_deleted_keys(named(&["cart:2001", "cart:2002"]), cx);
+            assert!(state.key.is_none() && state.value.is_none(), "one of a multi-selection");
+
+            open(state, "user:1");
+            state.forget_deleted_keys(DeletedKeys::Prefix("order:".into()), cx);
+            assert_eq!(state.key.as_deref(), Some("user:1"), "another folder");
+            state.forget_deleted_keys(DeletedKeys::Prefix("user:".into()), cx);
+            assert!(state.key.is_none() && state.value.is_none(), "under the folder");
+
+            let left: Vec<&str> = state.keys.keys().map(|key| key.as_ref()).collect();
+            assert!(left.is_empty(), "every deleted key leaves the tree: {left:?}");
+        });
+    }
 
     /// A selection deleted together goes to the bin like one key does,
     /// up to a sweep's size, and never with the bin switched off (#195).
