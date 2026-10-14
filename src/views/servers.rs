@@ -32,6 +32,7 @@ use crate::states::{
 };
 #[cfg(not(target_family = "wasm"))]
 use crate::views::open_connection_diagnostics;
+use crate::views::placeholders::Placeholders;
 use crate::views::{ZedisExportServersDialog, export_filename, export_to_file_global};
 use gpui::{
     Action, Anchor, App, ClipboardItem, Entity, ExternalPaths, FocusHandle, Focusable, SharedString, Subscription,
@@ -205,6 +206,8 @@ pub struct ZedisServers {
     /// Toolbar search box — live-filters the card grid by name / host /
     /// description.
     search_state: Entity<InputState>,
+    /// Re-words the placeholders above after a language change (#198).
+    placeholders: Placeholders,
     _subscriptions: Vec<Subscription>,
     /// Live subscription on the import dialog's text input — replaced each
     /// time the dialog opens so a pasted file path is read back into the box.
@@ -275,11 +278,9 @@ impl ZedisServers {
 
         // Toolbar search box — re-render the grid on each change so the
         // filter is live.
-        let search_state = cx.new(|cx| {
-            InputState::new(window, cx)
-                .clean_on_escape()
-                .placeholder(i18n_servers(cx, "search_placeholder"))
-        });
+        let search_state = cx.new(|cx| InputState::new(window, cx).clean_on_escape());
+        let mut placeholders = Placeholders::new(cx);
+        placeholders.add(&search_state, |cx| i18n_servers(cx, "search_placeholder"), window, cx);
         subscriptions.push(
             cx.subscribe_in(&search_state, window, |this, _state, event, _window, cx| match event {
                 InputEvent::Change => cx.notify(),
@@ -301,6 +302,7 @@ impl ZedisServers {
             pending_server_form: None,
             focus_handle,
             search_state,
+            placeholders,
             _subscriptions: subscriptions,
             import_input_sub: None,
         }
@@ -651,6 +653,7 @@ impl Render for ZedisServers {
     /// - 800-1200px: 2 columns
     /// - > 1200px: 3 columns
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.placeholders.follow(window, cx);
         let width = window.viewport_size().width;
 
         if let Some(server) = self.pending_server_form.take() {

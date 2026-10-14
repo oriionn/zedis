@@ -14,6 +14,7 @@
 
 #[cfg(not(target_family = "wasm"))]
 use crate::connection::get_server;
+use crate::views::placeholders::Placeholders;
 #[cfg(not(target_family = "wasm"))]
 use crate::views::{ExportSource, open_migration_export_window};
 use crate::{
@@ -252,6 +253,8 @@ pub struct ZedisKeyTree {
 
     /// Input field state for keyword filtering
     keyword_state: Entity<InputState>,
+    /// Re-words the placeholders above after a language change (#198).
+    placeholders: Placeholders,
 
     /// Whether to enter add key mode
     should_enter_add_key_mode: Option<bool>,
@@ -404,15 +407,18 @@ impl ZedisKeyTree {
         );
 
         // Initialize keyword search input with placeholder
-        let keyword_state = cx.new(|cx| {
-            InputState::new(window, cx)
-                .clean_on_escape()
-                // Placeholder carries the focus shortcut (`EditorAction::Search`
-                // as bound) so the affordance is discoverable right where it
-                // lands. Single-line — a `\n` in a placeholder panics the
-                // wrapped-lines cache (see CLAUDE.md).
-                .placeholder(with_hot_key("search", &i18n_common(cx, "keyword_placeholder")))
-        });
+        let keyword_state = cx.new(|cx| InputState::new(window, cx).clean_on_escape());
+        // Placeholder carries the focus shortcut (`EditorAction::Search` as
+        // bound) so the affordance is discoverable right where it lands.
+        // Single-line — a `\n` in a placeholder panics the wrapped-lines
+        // cache (see CLAUDE.md).
+        let mut placeholders = Placeholders::new(cx);
+        placeholders.add(
+            &keyword_state,
+            |cx| with_hot_key("search", &i18n_common(cx, "keyword_placeholder")).into(),
+            window,
+            cx,
+        );
         // initial focus
         keyword_state.update(cx, |state, cx| {
             state.focus(window, cx);
@@ -498,6 +504,7 @@ impl ZedisKeyTree {
             current_keyword: cx.new(|_cx| SharedString::default()),
             key_tree_list_state,
             keyword_state,
+            placeholders,
             server_state,
             should_enter_add_key_mode: None,
             auto_refresh_task: None,

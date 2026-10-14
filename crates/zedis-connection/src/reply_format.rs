@@ -51,15 +51,6 @@ impl ReplyFormat {
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|f| f.as_str() == name)
     }
-
-    /// The toolbar label.
-    pub fn label(self) -> &'static str {
-        match self {
-            ReplyFormat::Text => "Text",
-            ReplyFormat::Table => "Table",
-            ReplyFormat::Json => "JSON",
-        }
-    }
 }
 
 /// Longest cell drawn before it is cut with `…`; a value column is for

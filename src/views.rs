@@ -60,6 +60,7 @@ mod monitor;
 mod multi_search;
 mod panel_poll;
 mod persistence;
+mod placeholders;
 mod probabilistic_editor;
 #[cfg(not(target_family = "wasm"))]
 mod proto_editor;

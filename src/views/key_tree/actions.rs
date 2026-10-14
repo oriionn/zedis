@@ -91,6 +91,7 @@ pub(super) enum KeyTreeAction {
 impl Render for ZedisKeyTree {
     /// Main render method - displays search bar and tree structure
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.placeholders.follow(window, cx);
         if let Some(scroll_to_index) = self.state.scroll_to_index.take() {
             self.key_tree_list_state.update(cx, |state, cx| {
                 state.scroll_to_item(scroll_to_index, ScrollStrategy::Top, window, cx);

@@ -963,6 +963,7 @@ impl ZedisEditor {
 impl Render for ZedisEditor {
     /// Main render method - displays key info bar and appropriate editor
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.placeholders.follow(window, cx);
         let server_state = self.server_state.read(cx);
         let is_channel_mode = server_state.is_channel_mode();
         let no_key_selected = !is_channel_mode && server_state.key().is_none();

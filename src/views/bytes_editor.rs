@@ -20,6 +20,7 @@ use crate::states::{
     DataFormat, MAX_INLINE_VALUE_SIZE, RedisBytesValue, ServerEvent, ViewMode, ZedisGlobalStore, ZedisServerState,
     i18n_editor, soft_wrap_fits,
 };
+use crate::views::placeholders::Placeholders;
 use bytes::Bytes;
 use gpui::{App, Entity, Image, ObjectFit, SharedString, Subscription, Window, img, px, relative};
 use gpui::{div, hsla, prelude::*};
@@ -109,6 +110,8 @@ pub struct ZedisBytesEditor {
 
     /// JSONPath query input (only relevant when `is_json_value` is true).
     jsonpath_input: Entity<EditorState>,
+    /// Re-words the placeholders above after a language change (#198).
+    placeholders: Placeholders,
 
     /// Lazily-parsed JSON document shared with the JSONPath completion
     /// provider. Fed (raw text only) by `update_editor_data`; the DOM
@@ -445,7 +448,6 @@ impl ZedisBytesEditor {
         // dismisses the menu before it ever clears the text.
         let jsonpath_input = cx.new(|cx| {
             EditorState::new(window, cx)
-                .placeholder(i18n_editor(cx, "jsonpath_placeholder"))
                 .line_number(false)
                 .indent_guides(false)
                 // `folding` defaults to true and reserves the fold-icon
@@ -462,6 +464,13 @@ impl ZedisBytesEditor {
                 .submit_on_enter(true)
                 .clean_on_escape()
         });
+        let mut placeholders = Placeholders::new(cx);
+        placeholders.add(
+            &jsonpath_input,
+            |cx| i18n_editor(cx, "jsonpath_placeholder"),
+            window,
+            cx,
+        );
         {
             // Context-aware key autocomplete. The provider shares the
             // lazily-parsed document with the editor via `jsonpath_doc`.
@@ -503,6 +512,7 @@ impl ZedisBytesEditor {
             server_state,
             readonly,
             jsonpath_input,
+            placeholders,
             jsonpath_doc,
             jsonpath_result: None,
             jsonpath_open: false,
@@ -820,6 +830,7 @@ impl Render for ZedisBytesEditor {
     /// - Monospace font for code readability
     /// - Customizable font size
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.placeholders.follow(window, cx);
         if self.soft_wrap_changed {
             let wrap = self.soft_wrap && self.wrap_fits;
             self.editor.update(cx, |this, cx| {

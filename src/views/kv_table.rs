@@ -28,7 +28,7 @@ use crate::{
     },
     views::{
         JsonTreeEvent, JsonTreeTarget, ZedisJsonTree, export_to_file, key_op_title_key, open_key_op_dialog,
-        open_score_filter_dialog,
+        open_score_filter_dialog, placeholders::Placeholders,
     },
 };
 use gpui::{
@@ -304,6 +304,8 @@ pub struct ZedisKvTable<T: ZedisKvFetcher> {
     table_state: Entity<TableState<ZedisKvDelegate<T>>>,
     /// Input field state for keyword search/filter
     keyword_state: Entity<InputState>,
+    /// Re-words the placeholders above after a language change (#198).
+    placeholders: Placeholders,
     /// The keyword the rows on screen were fetched with: empty until a
     /// filter runs, and again once the key changes.
     applied_keyword: SharedString,
@@ -537,11 +539,9 @@ impl<T: ZedisKvFetcher> ZedisKvTable<T> {
         }));
 
         // Initialize keyword search input field
-        let keyword_state = cx.new(|cx| {
-            InputState::new(window, cx)
-                .clean_on_escape()
-                .placeholder(i18n_common(cx, "keyword_placeholder"))
-        });
+        let keyword_state = cx.new(|cx| InputState::new(window, cx).clean_on_escape());
+        let mut placeholders = Placeholders::new(cx);
+        placeholders.add(&keyword_state, |cx| i18n_common(cx, "keyword_placeholder"), window, cx);
 
         // Enter filters. Emptying the box after a filter ran — its ×,
         // Escape, or deleting to empty — shows every row again, which only
@@ -614,6 +614,7 @@ impl<T: ZedisKvFetcher> ZedisKvTable<T> {
         Self {
             table_state,
             keyword_state,
+            placeholders,
             applied_keyword: SharedString::default(),
             items_count,
             total_count,
@@ -1439,6 +1440,7 @@ impl<T: ZedisKvFetcher> ZedisKvTable<T> {
 }
 impl<T: ZedisKvFetcher> Render for ZedisKvTable<T> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.placeholders.follow(window, cx);
         let text_color = cx.theme().muted_foreground;
 
         // The panel has just closed — by Cancel, Escape, a save, the row

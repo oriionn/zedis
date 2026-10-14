@@ -291,14 +291,32 @@ fn render_entry(entry: &TranscriptEntry, format: ReplyFormat) -> String {
     out
 }
 
+/// The reply-format switcher's label, in the UI language — the format
+/// itself is the connection crate's, its name for a person is not.
+fn reply_format_label(format: ReplyFormat, cx: &App) -> SharedString {
+    i18n_terminal(
+        cx,
+        match format {
+            ReplyFormat::Text => "format_text",
+            ReplyFormat::Table => "format_table",
+            ReplyFormat::Json => "format_json",
+        },
+    )
+}
+
 /// Fold one executed line into the `MULTI` bookkeeping and produce its
 /// transcript entries. `queue` is `Some` between a successful `MULTI` and
 /// its `EXEC` / `DISCARD`; every line Redis answers `QUEUED` joins it, and
 /// `EXEC`'s array reply is then laid out against those commands as one
 /// [`TranscriptEntry::Exec`] block instead of a bare list. `EXEC` after a
-/// `WATCH` conflict answers nil — said in words, since a bare `(nil)` reads
-/// as a missing key.
-fn transcript_entries_for(queue: &mut Option<Vec<String>>, line: String, reply: LineReply) -> Vec<TranscriptEntry> {
+/// `WATCH` conflict answers nil — said in words (`watch_aborted`, in the UI
+/// language), since a bare `(nil)` reads as a missing key.
+fn transcript_entries_for(
+    queue: &mut Option<Vec<String>>,
+    line: String,
+    reply: LineReply,
+    watch_aborted: &str,
+) -> Vec<TranscriptEntry> {
     // An `EXEC` or `DISCARD` the server refused as a whole (`EXECABORT`
     // after a queued syntax error, "EXEC without MULTI") still ends the
     // transaction; the terminal must not go on queueing into it.
@@ -322,7 +340,7 @@ fn transcript_entries_for(queue: &mut Option<Vec<String>>, line: String, reply: 
                     if answer.is_nil() {
                         return vec![
                             TranscriptEntry::Command { line, reply },
-                            TranscriptEntry::Text("(transaction aborted: a key under WATCH changed)".to_string()),
+                            TranscriptEntry::Text(watch_aborted.to_string()),
                         ];
                     }
                 }
@@ -604,14 +622,13 @@ impl ZedisTerminal {
         self.terminal_db = None;
     }
 
-    fn reset_cmd_state(&mut self, _cx: &mut Context<Self>) {
+    fn reset_cmd_state(&mut self, cx: &mut Context<Self>) {
         self.transcript.clear();
         self.multi_queue = None;
         self.push_entry(TranscriptEntry::Text(ZEDIS_LOGO.replace("{VERSION}", VERSION)));
-        // Hardcoded English like the rest of this panel (not i18n'd).
-        self.push_entry(TranscriptEntry::Text(
-            "Type \"? <question>\" to ask AI for a command (endpoint configured in Settings).".to_string(),
-        ));
+        // In the language of the moment; a banner already in the transcript
+        // is history, and Clear writes it again.
+        self.push_entry(TranscriptEntry::Text(i18n_terminal(cx, "ai_hint").to_string()));
     }
 
     /// Append to the transcript, dropping the oldest blocks past the cap,
@@ -1163,7 +1180,8 @@ impl ZedisTerminal {
                     errors += 1;
                 }
                 let _ = handle.update(cx, |this, cx| {
-                    for entry in transcript_entries_for(&mut this.multi_queue, line_clone, reply) {
+                    let watch_aborted = i18n_terminal(cx, "watch_aborted");
+                    for entry in transcript_entries_for(&mut this.multi_queue, line_clone, reply, &watch_aborted) {
                         this.push_entry(entry);
                     }
                     if let Some(db) = selected_db {
@@ -1331,7 +1349,7 @@ impl Render for ZedisTerminal {
                     .outline()
                     .children(ReplyFormat::ALL.into_iter().enumerate().map(|(ix, format)| {
                         Button::new(("term-reply-format", ix))
-                            .label(format.label())
+                            .label(reply_format_label(format, cx))
                             .selected(format == reply_format)
                     }))
                     .on_click(cx.listener(|this, clicks: &Vec<usize>, _window, cx| {
@@ -1364,7 +1382,7 @@ impl Render for ZedisTerminal {
                     })
                     .child(
                         Button::new("term-clear-output")
-                            .label("Clear")
+                            .label(i18n_terminal(cx, "clear"))
                             .ghost()
                             .small()
                             .on_click(cx.listener(|this, _, _window, cx| {
@@ -1392,18 +1410,19 @@ impl Render for ZedisTerminal {
                             .readonly(true)
                             .appearance(false)
                             .bordered(false)
-                            .context_menu(|menu, _window, _cx| {
+                            .context_menu(|menu, _window, cx| {
                                 let menu = menu
-                                    .menu("Copy", Box::new(Copy))
-                                    .menu("Select All", Box::new(SelectAll))
+                                    .menu(i18n_terminal(cx, "menu_copy"), Box::new(Copy))
+                                    .menu(i18n_terminal(cx, "menu_select_all"), Box::new(SelectAll))
                                     .separator()
-                                    .menu("Copy Output", Box::new(TerminalAction::CopyAll));
+                                    .menu(i18n_terminal(cx, "menu_copy_output"), Box::new(TerminalAction::CopyAll));
                                 let menu = if has_file_dialogs() {
-                                    menu.menu("Save Output…", Box::new(TerminalAction::Save))
+                                    menu.menu(i18n_terminal(cx, "menu_save_output"), Box::new(TerminalAction::Save))
                                 } else {
                                     menu
                                 };
-                                menu.separator().menu("Clear", Box::new(TerminalAction::Clear))
+                                menu.separator()
+                                    .menu(i18n_terminal(cx, "clear"), Box::new(TerminalAction::Clear))
                             }),
                     ),
                 ),
@@ -1429,7 +1448,7 @@ impl Render for ZedisTerminal {
                     // (reverse-i-search)`<query>`: <matched command>
                     let match_label = match &current_match {
                         Some(m) => Label::new(m.clone()).text_color(cx.theme().foreground),
-                        None => Label::new("(no match)").text_color(muted),
+                        None => Label::new(i18n_terminal(cx, "no_match")).text_color(muted),
                     };
                     h_flex()
                         .w_full()
@@ -1493,7 +1512,7 @@ impl Render for ZedisTerminal {
                         )
                         .child(
                             Button::new("term-mode-batch")
-                                .label("Batch")
+                                .label(i18n_terminal(cx, "batch"))
                                 .ghost()
                                 .small()
                                 .on_click(cx.listener(|this, _, window, cx| this.toggle_batch_mode(window, cx))),
@@ -1532,7 +1551,7 @@ impl Render for ZedisTerminal {
                                 .border_color(border)
                                 .child(
                                     Button::new("term-batch-run")
-                                        .label("Run")
+                                        .label(i18n_terminal(cx, "run"))
                                         .primary()
                                         .small()
                                         .on_click(cx.listener(|this, _, window, cx| this.run_batch(window, cx))),
@@ -1686,19 +1705,22 @@ mod tests {
 
     #[test]
     fn multi_exec_becomes_one_block_of_commands_and_replies() {
+        // The sentence a WATCH conflict is said in; the view hands it in,
+        // in the UI language.
+        const ABORTED: &str = "(aborted under WATCH)";
         let mut queue = None;
         let queued = |line: &str| reply(line.split(' ').next().unwrap_or_default(), &[], b"+QUEUED\r\n");
 
-        let entries = transcript_entries_for(&mut queue, "MULTI".into(), reply("MULTI", &[], b"+OK\r\n"));
+        let entries = transcript_entries_for(&mut queue, "MULTI".into(), reply("MULTI", &[], b"+OK\r\n"), ABORTED);
         assert!(matches!(entries.as_slice(), [TranscriptEntry::Command { .. }]));
         assert_eq!(queue.as_deref(), Some(&[][..]));
 
-        transcript_entries_for(&mut queue, "SET a 1".into(), queued("SET a 1"));
-        transcript_entries_for(&mut queue, "INCR a".into(), queued("INCR a"));
+        transcript_entries_for(&mut queue, "SET a 1".into(), queued("SET a 1"), ABORTED);
+        transcript_entries_for(&mut queue, "INCR a".into(), queued("INCR a"), ABORTED);
         assert_eq!(queue.as_deref().map(<[String]>::len), Some(2));
 
         let exec = reply("EXEC", &[], b"*2\r\n+OK\r\n:2\r\n");
-        let entries = transcript_entries_for(&mut queue, "EXEC".into(), exec);
+        let entries = transcript_entries_for(&mut queue, "EXEC".into(), exec, ABORTED);
         assert!(queue.is_none(), "EXEC closes the transaction");
         let rendered = render_transcript(entries, ReplyFormat::Text);
         assert_eq!(
@@ -1708,15 +1730,15 @@ mod tests {
 
         // A WATCH conflict: EXEC answers nil, which is said in words.
         let mut queue = Some(vec!["SET a 1".to_string()]);
-        let entries = transcript_entries_for(&mut queue, "EXEC".into(), reply("EXEC", &[], b"*-1\r\n"));
+        let entries = transcript_entries_for(&mut queue, "EXEC".into(), reply("EXEC", &[], b"*-1\r\n"), ABORTED);
         assert!(queue.is_none());
-        assert!(render_transcript(entries, ReplyFormat::Text).contains("key under WATCH changed"));
+        assert!(render_transcript(entries, ReplyFormat::Text).contains(ABORTED));
 
         // DISCARD drops the queue; EXEC outside a MULTI is a plain command.
         let mut queue = Some(vec!["SET a 1".to_string()]);
-        transcript_entries_for(&mut queue, "DISCARD".into(), reply("DISCARD", &[], b"+OK\r\n"));
+        transcript_entries_for(&mut queue, "DISCARD".into(), reply("DISCARD", &[], b"+OK\r\n"), ABORTED);
         assert!(queue.is_none());
-        let entries = transcript_entries_for(&mut queue, "EXEC".into(), reply("EXEC", &[], b"*-1\r\n"));
+        let entries = transcript_entries_for(&mut queue, "EXEC".into(), reply("EXEC", &[], b"*-1\r\n"), ABORTED);
         assert!(matches!(entries.as_slice(), [TranscriptEntry::Command { .. }]));
     }
 

@@ -14,6 +14,7 @@
 
 #[cfg(not(target_family = "wasm"))]
 use crate::views::ZedisPubsubEditor;
+use crate::views::placeholders::Placeholders;
 // The link panel's Diagnose button opens the desktop's diagnostics window.
 use crate::{
     assets::CustomIconName,
@@ -166,6 +167,8 @@ pub struct ZedisEditor {
 
     /// Rename dialog input — holds the proposed new key name.
     rename_input_state: Entity<InputState>,
+    /// Re-words the placeholders above after a language change (#198).
+    placeholders: Placeholders,
     /// Pending overwrite confirmation: `Some((old, new))` after a RENAMENX
     /// found the destination occupied. Consumed on the next render (which
     /// has a `Window`) to open the confirm dialog.
@@ -333,11 +336,14 @@ impl ZedisEditor {
                 .placeholder(i18n_common(cx, "ttl_placeholder"))
         });
 
-        let rename_input_state = cx.new(|cx| {
-            InputState::new(window, cx)
-                .clean_on_escape()
-                .placeholder(i18n_editor(cx, "rename_placeholder"))
-        });
+        let rename_input_state = cx.new(|cx| InputState::new(window, cx).clean_on_escape());
+        let mut placeholders = Placeholders::new(cx);
+        placeholders.add(
+            &rename_input_state,
+            |cx| i18n_editor(cx, "rename_placeholder"),
+            window,
+            cx,
+        );
 
         // Subscribe to server events to track when keys are selected
         subscriptions.push(
@@ -489,6 +495,7 @@ impl ZedisEditor {
             ttl_edit_mode: false,
             ttl_input_state,
             rename_input_state,
+            placeholders,
             pending_overwrite_confirm: None,
             pending_rename_dialog: false,
             should_enter_ttl_edit_mode: None,
