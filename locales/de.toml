@@ -1,4 +1,5 @@
 [common]
+clients_connected_blocked = "Verbundene / blockierte Clients"
 deep_link_invalid = "Dieser Redis-Link kann nicht geöffnet werden: %{error}"
 tab_close = "Tab schließen"
 tab_close_others = "Andere Tabs schließen"
@@ -597,7 +598,6 @@ export_keys_menu = "Geladene Keys exportieren…"
 compare_keys_menu = "Mit anderem Server vergleichen…"
 metric_latency_hint = "Round-Trip-Latenz"
 metric_memory_hint = "Belegter Speicher"
-clients_stat_tooltip = "Blockierte / verbundene Clients"
 slowlog_stat_tooltip = "Neue / geladene Slow-Log-Einträge"
 
 
@@ -774,7 +774,6 @@ url_scheme_failed = "Das redis://-Schema konnte nicht registriert werden: %{erro
 [metrics]
 title = "Metriken"
 memory = "Speicher"
-clients = "Clients"
 ops = "OPS"
 latency = "Latenz"
 hit_rate = "Trefferrate"

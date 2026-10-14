@@ -1,4 +1,5 @@
 [common]
+clients_connected_blocked = "已连接 / 阻塞客户端"
 deep_link_invalid = "无法打开该 Redis 链接：%{error}"
 tab_close = "关闭标签页"
 tab_close_others = "关闭其他标签页"
@@ -596,7 +597,6 @@ export_keys_menu = "导出已加载的键…"
 compare_keys_menu = "与另一台服务器对比…"
 metric_latency_hint = "往返延迟"
 metric_memory_hint = "已用内存"
-clients_stat_tooltip = "阻塞 / 已连接客户端"
 slowlog_stat_tooltip = "新增 / 已加载慢日志条数"
 
 [list_editor]
@@ -773,7 +773,6 @@ url_scheme_failed = "无法注册 redis:// 协议：%{error}"
 [metrics]
 title = "指标"
 memory = "内存"
-clients = "连接数"
 ops = "OPS"
 latency = "延迟"
 hit_rate = "命中率"

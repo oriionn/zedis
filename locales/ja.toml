@@ -1,4 +1,5 @@
 [common]
+clients_connected_blocked = "接続中 / ブロック中のクライアント"
 deep_link_invalid = "この Redis リンクを開けません: %{error}"
 tab_close = "タブを閉じる"
 tab_close_others = "他のタブを閉じる"
@@ -597,7 +598,6 @@ export_keys_menu = "読み込み済みキーをエクスポート…"
 compare_keys_menu = "別のサーバーと比較…"
 metric_latency_hint = "往復レイテンシ"
 metric_memory_hint = "使用メモリ"
-clients_stat_tooltip = "ブロック中 / 接続中のクライアント"
 slowlog_stat_tooltip = "新規 / 読み込み済みスローログ件数"
 
 
@@ -774,7 +774,6 @@ url_scheme_failed = "redis:// スキームを登録できませんでした: %{e
 [metrics]
 title = "メトリクス"
 memory = "メモリ"
-clients = "クライアント"
 ops = "OPS"
 latency = "レイテンシ"
 hit_rate = "ヒット率"

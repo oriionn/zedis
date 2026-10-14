@@ -24,7 +24,8 @@ use crate::{
     },
     constants::STATUS_BAR_HEIGHT,
     helpers::{
-        format_lag_bytes, get_mono_font_family, group_thousands, has_pubsub, pacing, resolve_tag_chip, with_hot_key,
+        client_counts, format_lag_bytes, get_mono_font_family, group_thousands, has_pubsub, pacing, resolve_tag_chip,
+        with_hot_key,
     },
     states::{
         ConnectionErrorKind, ConnectionHealth, ErrorMessage, RedisKeySpaceStats, ReplicaInfo, SOFT_WRAP_MAX_BYTES,
@@ -630,11 +631,7 @@ impl ZedisStatusBar {
         let clients = if redis_info.metrics.connected_clients == 0 {
             "--".to_string()
         } else {
-            format!(
-                "{} / {}",
-                group_thousands(redis_info.metrics.blocked_clients),
-                group_thousands(redis_info.metrics.connected_clients)
-            )
+            client_counts(redis_info.metrics.connected_clients, redis_info.metrics.blocked_clients)
         };
         let used_memory = if redis_info.metrics.used_memory == 0 {
             "--".to_string()
@@ -1599,7 +1596,10 @@ impl ZedisStatusBar {
                         icon_color: status_text,
                         tooltip: SharedString::from(format!(
                             "{} · {}",
-                            stat_hint("clients_stat_tooltip"),
+                            // The Metrics page's card says the same: one label.
+                            info_reason
+                                .clone()
+                                .unwrap_or_else(|| i18n_common(cx, "clients_connected_blocked")),
                             i18n_status_bar(cx, "toggle_clients_tooltip")
                         )),
                         view: ServerView::Clients,

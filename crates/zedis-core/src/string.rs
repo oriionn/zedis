@@ -163,6 +163,14 @@ pub fn group_thousands(n: u64) -> String {
     out
 }
 
+/// A server's clients as the status bar and the Metrics page both show
+/// them: connected, then the blocked ones among them. The two used to put
+/// them in opposite orders, and "0 / 9" in one place was "9 / 0" in the
+/// other (#201).
+pub fn client_counts(connected: u64, blocked: u64) -> String {
+    format!("{} / {}", group_thousands(connected), group_thousands(blocked))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +181,12 @@ mod tests {
         assert_eq!(split_label("::1:7000"), ("::1", 7000));
         assert_eq!(split_label("[fe80::1]:7001"), ("fe80::1", 7001));
         assert_eq!(split_label("redis.internal"), ("redis.internal", 0));
+    }
+
+    #[test]
+    fn client_counts_put_the_connected_first() {
+        assert_eq!(client_counts(9, 0), "9 / 0");
+        assert_eq!(client_counts(12_345, 2), "12,345 / 2");
     }
 
     #[test]

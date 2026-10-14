@@ -15,7 +15,7 @@
 use crate::assets::CustomIconName;
 use crate::connection::{ServerCommand, get_server};
 use crate::helpers::has_file_dialogs;
-use crate::helpers::{build_csv, format_unix_millis_with, get_mono_font_family, pacing};
+use crate::helpers::{build_csv, client_counts, format_unix_millis_with, get_mono_font_family, pacing};
 use crate::states::{RedisMetrics, ServerView, get_metrics_cache, load_persisted_metrics};
 use crate::states::{
     ZedisGlobalStore, ZedisServerState, back_to_editor_tooltip, content_area_width, i18n_common, i18n_metrics,
@@ -566,7 +566,7 @@ impl ZedisMetrics {
             humansize::format_size(m.used_memory, humansize::FormatSizeOptions::default().decimal_places(0))
         };
 
-        let clients = format!("{} / {}", m.connected_clients, m.blocked_clients);
+        let clients = client_counts(m.connected_clients, m.blocked_clients);
 
         let ops = format!("{} ops/s", m.instantaneous_ops_per_sec);
 
@@ -597,7 +597,8 @@ impl ZedisMetrics {
             .gap_2()
             .grid_cols(columns * 2)
             .child(self.render_stat_card(cx, i18n_metrics(cx, "memory"), memory))
-            .child(self.render_stat_card(cx, i18n_metrics(cx, "clients"), clients))
+            // Named like the status bar's chip, the pair in the same order.
+            .child(self.render_stat_card(cx, i18n_common(cx, "clients_connected_blocked"), clients))
             .child(self.render_stat_card(cx, i18n_metrics(cx, "ops"), ops))
             .child(self.render_stat_card(cx, i18n_metrics(cx, "latency"), latency))
             .child(self.render_stat_card(cx, i18n_metrics(cx, "hit_rate"), hit_rate))
