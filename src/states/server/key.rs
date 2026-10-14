@@ -33,8 +33,9 @@ use crate::connection::{
     scan_page, server_supports, set_keys_ttl, set_ttl_matching, snapshot_key,
 };
 use crate::db::{
-    TRASH_MAX_PAYLOAD, TRASH_MAX_VALUE_MEMORY, TRASH_RETENTION_MS, TrashEntry, get_favorites_manager,
-    get_key_metadata_manager, get_recent_keys_manager, insert_trash_entry, purge_trash, recent_keys_scope,
+    TRASH_MAX_BULK_KEYS, TRASH_MAX_PAYLOAD, TRASH_MAX_VALUE_MEMORY, TRASH_RETENTION_MS, TrashEntry,
+    get_favorites_manager, get_key_metadata_manager, get_recent_keys_manager, insert_trash_entry, purge_trash,
+    recent_keys_scope,
 };
 use crate::states::{QueryMode, ZedisGlobalStore, i18n_key_tree, i18n_status_bar};
 use crate::{
@@ -156,6 +157,16 @@ async fn stash_key_to_trash(at: &ServerDb, key: &str) {
     if let Err(e) = purge_trash(server_id, unix_ts_millis() - TRASH_RETENTION_MS) {
         warn!(error = %e, "trash: purge failed");
     }
+}
+
+/// Whether deleting `count` keys at once puts them in the recycle bin: the
+/// bin is on (`soft_delete`, never in the browser) and the selection is not
+/// a sweep ([`TRASH_MAX_BULK_KEYS`]). The confirmation and the delete both
+/// ask this, so what the dialog says is what the delete does. A delete of a
+/// multi-selection used to skip the bin whatever its size, under a one-key
+/// delete that promised a restore (#195).
+pub fn recycles_deleted_keys(soft_delete: bool, count: usize) -> bool {
+    soft_delete && count <= TRASH_MAX_BULK_KEYS
 }
 
 /// Hard ceiling on the per-page target after the per-master multiplier, so a
@@ -1602,18 +1613,45 @@ impl ZedisServerState {
 
     pub fn unlink_keys(&mut self, keys: Vec<SharedString>, cx: &mut Context<Self>) {
         let at = self.at_confirmed();
+        let stash = recycles_deleted_keys(cx.global::<ZedisGlobalStore>().read(cx).soft_delete(), keys.len());
         // A set, not the Vec: the removal below asks it once per loaded key.
         let remove_keys: AHashSet<SharedString> = keys.iter().cloned().collect();
         self.spawn_with_arg(
             ServerTask::DeleteKeys,
             format!("{} keys", remove_keys.len()),
-            move || async move { Ok(delete_keys(&at, keys.into_iter().map(|k| k.to_string()).collect()).await?) },
+            move || async move {
+                // Each one as the one-key delete stashes it, before any is gone.
+                if stash {
+                    for key in &keys {
+                        stash_key_to_trash(&at, key.as_str()).await;
+                    }
+                }
+                Ok(delete_keys(&at, keys.into_iter().map(|k| k.to_string()).collect()).await?)
+            },
             move |this, result, cx| {
                 if let Ok(()) = result {
                     this.forget_loaded_keys_where(|key| remove_keys.contains(key));
                     this.histories.retain_keys(|key| !remove_keys.contains(key));
+                    // Out of the MRU, as the one-key delete does.
+                    let scope = recent_keys_scope(this.server_id.as_str(), this.db);
+                    let mru_keys: Vec<String> = remove_keys.iter().map(|key| key.to_string()).collect();
+                    cx.background_spawn(async move {
+                        let manager = get_recent_keys_manager();
+                        for key in &mru_keys {
+                            let _ = manager.remove_record(&scope, key);
+                        }
+                    })
+                    .detach();
                     // Force refresh of the key tree view
                     this.key_tree_id = Uuid::now_v7().to_string().into();
+                    // The open key closes when it was one of them, as for one
+                    // key: left open, it showed a value that was gone, and a
+                    // field edited there wrote the key back.
+                    if this.key.as_ref().is_some_and(|key| remove_keys.contains(key)) {
+                        this.key = None;
+                        this.value = None;
+                        this.next_value_epoch();
+                    }
                     this.refresh_dbsize_now(cx);
                 }
                 cx.emit(ServerEvent::KeyTreeUpdated);
@@ -2188,6 +2226,21 @@ async fn load_module_value(
         ..Default::default()
     })));
     Ok(value)
+}
+
+#[cfg(test)]
+mod bulk_delete_tests {
+    use super::{TRASH_MAX_BULK_KEYS, recycles_deleted_keys};
+
+    /// A selection deleted together goes to the bin like one key does,
+    /// up to a sweep's size, and never with the bin switched off (#195).
+    #[test]
+    fn a_hand_made_selection_goes_to_the_bin() {
+        assert!(recycles_deleted_keys(true, 2));
+        assert!(recycles_deleted_keys(true, TRASH_MAX_BULK_KEYS));
+        assert!(!recycles_deleted_keys(true, TRASH_MAX_BULK_KEYS + 1));
+        assert!(!recycles_deleted_keys(false, 2));
+    }
 }
 
 #[cfg(test)]

@@ -17,7 +17,8 @@
 //! of `key_tree.rs`.
 
 use super::*;
-use crate::states::ModuleTypeId;
+use crate::db::TRASH_MAX_BULK_KEYS;
+use crate::states::{ModuleTypeId, recycles_deleted_keys};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Action)]
 pub(super) enum KeyTreeAction {
@@ -357,13 +358,31 @@ impl Render for ZedisKeyTree {
                             .collect::<Vec<SharedString>>()
                     });
                     let server_state = this.server_state.clone();
-                    let locale = cx.global::<ZedisGlobalStore>().read(cx).locale();
-                    let text = t!("key_tree.delete_keys_prompt", keys = keys.join(", "), locale = locale).to_string();
+                    let store = cx.global::<ZedisGlobalStore>().read(cx);
+                    let locale = store.locale().to_string();
+                    let soft_delete = store.soft_delete();
+                    let prompt = t!("key_tree.delete_keys_prompt", keys = keys.join(", "), locale = locale);
+                    // Whether they come back, as the one-key delete says (#195).
+                    let consequence = if recycles_deleted_keys(soft_delete, keys.len()) {
+                        t!("key_tree.delete_keys_body_bin", locale = locale)
+                    } else if soft_delete {
+                        t!(
+                            "key_tree.delete_keys_body_too_many",
+                            max = TRASH_MAX_BULK_KEYS,
+                            locale = locale
+                        )
+                    } else {
+                        t!("danger.delete_key_body", locale = locale)
+                    };
                     let server_id = this.server_state.read(cx).server_id().to_string();
-                    let text = escalate_dangerous_body(cx, &server_id, text);
+                    let text = escalate_dangerous_body(cx, &server_id, format!("{prompt}\n\n{consequence}"));
 
+                    // The destructive shape: Delete is the danger button and
+                    // Return answers Cancel, as for one key.
                     ZedisDialog::new_alert(i18n_key_tree(cx, "delete_keys_title"), text)
-                        .button_props(dialog_button_props(cx))
+                        .danger()
+                        .ok_text(i18n_common(cx, "delete"))
+                        .cancel_text(i18n_common(cx, "cancel"))
                         .on_ok(move |_, _, cx| {
                             server_state.update(cx, |state, cx| {
                                 state.unlink_keys(keys.clone(), cx);

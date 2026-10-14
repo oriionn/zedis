@@ -45,6 +45,13 @@ pub const TRASH_MAX_PAYLOAD: usize = 1024 * 1024;
 /// fold; mid-size values fall through to the exact [`TRASH_MAX_PAYLOAD`]
 /// check after DUMP.
 pub const TRASH_MAX_VALUE_MEMORY: i64 = 4 * 1024 * 1024;
+/// The most keys one bulk delete puts in the bin. A selection made by hand
+/// is a handful of keys; past this many it is a sweep, every key costs a
+/// `MEMORY USAGE` + `DUMP` + `PTTL` before the delete can start and up to
+/// [`TRASH_MAX_PAYLOAD`] of local disk — so a bigger one is deleted for good,
+/// and its confirmation says so. A folder delete and a flush are never
+/// stashed at all.
+pub const TRASH_MAX_BULK_KEYS: usize = 100;
 
 /// `#[serde(default)]` for the same reason as [`crate::ProtoConfig`], even
 /// though these rows expire after 24h.
