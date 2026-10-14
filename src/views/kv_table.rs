@@ -14,7 +14,7 @@
 
 use crate::connection::Capability;
 use crate::helpers::has_file_dialogs;
-use crate::helpers::{bytes_to_hex_text, get_mono_font_family};
+use crate::helpers::{bytes_to_hex_text, clearing_an_applied_filter, get_mono_font_family};
 use crate::{
     assets::CustomIconName,
     components::{
@@ -304,6 +304,9 @@ pub struct ZedisKvTable<T: ZedisKvFetcher> {
     table_state: Entity<TableState<ZedisKvDelegate<T>>>,
     /// Input field state for keyword search/filter
     keyword_state: Entity<InputState>,
+    /// The keyword the rows on screen were fetched with: empty until a
+    /// filter runs, and again once the key changes.
+    applied_keyword: SharedString,
     /// Number of currently loaded items
     items_count: usize,
     /// Total number of items available
@@ -524,6 +527,8 @@ impl<T: ZedisKvFetcher> ZedisKvTable<T> {
                 ServerEvent::KeySelected(_) => {
                     this.edit_row = None;
                     this.key_changed = Some(true);
+                    // Another key's rows are fetched unfiltered.
+                    this.applied_keyword = SharedString::default();
                     this.table_state
                         .update(cx, |state, _| state.delegate_mut().clear_selection());
                 }
@@ -538,11 +543,17 @@ impl<T: ZedisKvFetcher> ZedisKvTable<T> {
                 .placeholder(i18n_common(cx, "keyword_placeholder"))
         });
 
-        // Subscribe to input events to trigger search on Enter
-        subscriptions.push(cx.subscribe(&keyword_state, |this, _, event, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
-                this.handle_filter(cx);
+        // Enter filters. Emptying the box after a filter ran — its ×,
+        // Escape, or deleting to empty — shows every row again, which only
+        // Enter in the empty box used to (#194).
+        subscriptions.push(cx.subscribe(&keyword_state, |this, input, event, cx| match event {
+            InputEvent::PressEnter { .. } => this.handle_filter(cx),
+            InputEvent::Change
+                if clearing_an_applied_filter(input.read(cx).value().as_ref(), this.applied_keyword.as_ref()) =>
+            {
+                this.handle_filter(cx)
             }
+            _ => {}
         }));
 
         let readonly = server_state.read(cx).readonly();
@@ -603,6 +614,7 @@ impl<T: ZedisKvFetcher> ZedisKvTable<T> {
         Self {
             table_state,
             keyword_state,
+            applied_keyword: SharedString::default(),
             items_count,
             total_count,
             done,
@@ -1115,6 +1127,7 @@ impl<T: ZedisKvFetcher> ZedisKvTable<T> {
         }
 
         let keyword = self.keyword_state.read(cx).value();
+        self.applied_keyword = keyword.clone();
         self.loading = true;
         // A different keyword means different rows behind the same indices,
         // so neither the open editor nor the ticks can carry over. (Adding a

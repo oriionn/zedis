@@ -50,9 +50,30 @@ pub fn parse_lines(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether a filter box that has just changed to `input` has to run its
+/// query again, unfiltered: it is empty, and `applied` — the keyword the
+/// rows on screen were fetched with — is not. That is the box's ×, Escape
+/// (`clean_on_escape`) or deleting to empty after a filter ran. A box that
+/// searches on Enter heard none of them: the field emptied and the rows
+/// stayed filtered until Enter was pressed in it (#194). A draft never
+/// submitted leaves `applied` empty, so typing and deleting it asks nothing.
+pub fn clearing_an_applied_filter(input: &str, applied: &str) -> bool {
+    input.is_empty() && !applied.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emptying_the_box_after_a_filter_ran_runs_it_unfiltered() {
+        assert!(clearing_an_applied_filter("", "user"));
+        // Already unfiltered: nothing to ask again.
+        assert!(!clearing_an_applied_filter("", ""));
+        // Text left in the box, or a draft never submitted.
+        assert!(!clearing_an_applied_filter("u", "user"));
+        assert!(!clearing_an_applied_filter("draft", ""));
+    }
 
     #[test]
     fn the_small_shared_helpers_do_what_their_copies_did() {

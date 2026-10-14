@@ -26,9 +26,9 @@ use crate::{
         get_search_history_manager, recent_keys_scope,
     },
     helpers::{
-        EditorAction, TtlChipKind, TtlFilter, folder_prefixes, format_ttl_chip, get_mono_font_family, group_thousands,
-        has_file_dialogs, has_pubsub, single_child_expanded_set, split_key_segments, theme_color_for_tag,
-        ttl_chip_kind, ttl_secs, validate_long_string, with_hot_key,
+        EditorAction, TtlChipKind, TtlFilter, clearing_an_applied_filter, folder_prefixes, format_ttl_chip,
+        get_mono_font_family, group_thousands, has_file_dialogs, has_pubsub, single_child_expanded_set,
+        split_key_segments, theme_color_for_tag, ttl_chip_kind, ttl_secs, validate_long_string, with_hot_key,
     },
     states::{
         GlobalEvent, KeyType, KeyTypeFilter, LoadedKeys, ProbKind, QueryMode, ServerEvent, ServerView,
@@ -264,15 +264,6 @@ pub struct ZedisKeyTree {
     _subscriptions: Vec<Subscription>,
 }
 
-/// Whether emptying the keyword box should start an unfiltered SCAN.
-///
-/// The loaded set is the last query's hits (`MATCH *keyword*`). Clearing after
-/// that query has to ask the server again; a draft never submitted leaves
-/// `scanned_keyword` empty and must not fire a SCAN.
-fn keyword_clear_starts_scan(input: &str, scanned_keyword: &str) -> bool {
-    input.is_empty() && !scanned_keyword.is_empty()
-}
-
 impl ZedisKeyTree {
     /// Narrow the tree to the keys tagged `filter`, or back to all of them.
     /// Local: the tree is rebuilt from the keys already scanned and the
@@ -451,7 +442,7 @@ impl ZedisKeyTree {
                     view.handle_filter(true, cx);
                 }
                 InputEvent::Change
-                    if keyword_clear_starts_scan(input.read(cx).value().as_ref(), view.state.keyword.as_ref()) =>
+                    if clearing_an_applied_filter(input.read(cx).value().as_ref(), view.state.keyword.as_ref()) =>
                 {
                     view.handle_filter(true, cx);
                 }
@@ -1202,26 +1193,5 @@ impl ZedisKeyTree {
                 });
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod keyword_clear_tests {
-    use super::keyword_clear_starts_scan;
-
-    #[test]
-    fn empty_after_a_match_scan_starts_one() {
-        assert!(keyword_clear_starts_scan("", "user"));
-    }
-
-    #[test]
-    fn already_unfiltered_does_not() {
-        assert!(!keyword_clear_starts_scan("", ""));
-    }
-
-    #[test]
-    fn leftover_text_does_not() {
-        assert!(!keyword_clear_starts_scan("u", "user"));
-        assert!(!keyword_clear_starts_scan("draft", ""));
     }
 }

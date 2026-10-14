@@ -614,10 +614,14 @@ impl ZedisClientsManager {
         let age_state = cx.new(|cx| InputState::new(window, cx).clean_on_escape().placeholder("age>=s"));
 
         for state in [&keyword_state, &idle_state, &age_state] {
-            subscriptions.push(cx.subscribe(state, |this, _, event, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.handle_filter(cx);
-                }
+            subscriptions.push(cx.subscribe(state, |this, input, event, cx| match event {
+                InputEvent::PressEnter { .. } => this.handle_filter(cx),
+                // ×, Escape or deleting to empty takes that box's part of the
+                // filter off at once, as in the value tables (#194). The
+                // filter runs over the rows already fetched, so running it
+                // again when nothing changes costs nothing.
+                InputEvent::Change if input.read(cx).value().is_empty() => this.handle_filter(cx),
+                _ => {}
             }));
         }
 
