@@ -19,7 +19,7 @@
 
 use gpui::{Background, ElementId, Hsla, IntoElement, SharedString, transparent_black};
 use gpui_kit::component::chart::{AreaChart, BarChart, LineChart};
-use std::{rc::Rc, sync::Arc};
+use std::sync::Arc;
 
 /// What every chart takes: which one it is, the x labels, the y range and
 /// how its values read.
@@ -37,9 +37,92 @@ pub(crate) struct ChartParams {
     pub y_min: f64,
     pub y_max: f64,
     /// A value as the axis labels and the tooltip show it.
-    pub y_format: Box<dyn Fn(f64) -> String>,
+    pub y_label: ValueLabel,
     /// Label every `tick_margin`-th sample on the x axis.
     pub tick_margin: usize,
+}
+
+/// How a value reads on the y axis and in the tooltip: a number with a fixed
+/// count of decimals and a unit after it. The decimals are also the finest
+/// step a line chart's axis is ticked in ([`nice_axis`]), which is what
+/// keeps two ticks from reading the same.
+#[derive(Clone, Copy)]
+pub(crate) struct ValueLabel {
+    decimals: usize,
+    unit: &'static str,
+}
+
+impl ValueLabel {
+    /// A number with `decimals` decimals.
+    pub(crate) const fn decimals(decimals: usize) -> Self {
+        Self { decimals, unit: "" }
+    }
+
+    /// The same, followed by `unit` (`"%"`, `" ms"`).
+    pub(crate) const fn unit(self, unit: &'static str) -> Self {
+        Self { unit, ..self }
+    }
+
+    pub(crate) fn format(self, value: f64) -> String {
+        format!("{value:.decimals$}{}", self.unit, decimals = self.decimals)
+    }
+}
+
+/// The most steps a line chart's y axis is divided into.
+const MAX_AXIS_STEPS: f64 = 5.0;
+
+/// A line chart's y axis: from `min` to `max` in `ticks - 1` equal steps.
+#[derive(Debug, PartialEq)]
+struct Axis {
+    min: f64,
+    max: f64,
+    ticks: usize,
+}
+
+/// The axis a line between `lo` and `hi` is drawn on: ticks at round values
+/// — steps of 1, 2, 2.5 or 5 times a power of ten — at most
+/// [`MAX_AXIS_STEPS`] of them, and none finer than the last decimal the
+/// labels show (a 2.5 only where that decimal can say it).
+///
+/// gpui-kit spaces a line chart's ticks evenly in pixels and labels each
+/// with the value at its height, and the top one sat in the padding above
+/// the range: on the memory chart of a small server, 1.9 MB to 4.0 MB in
+/// five ticks read "5, 4, 3, 3, 2" in whole megabytes (#200). Here the
+/// range is widened to whole steps and drawn without that padding, so each
+/// tick sits on a value its label can name.
+fn nice_axis(lo: f64, hi: f64, decimals: usize) -> Axis {
+    let finest = 10f64.powi(-(decimals as i32));
+    if !lo.is_finite() || !hi.is_finite() {
+        return Axis {
+            min: 0.0,
+            max: finest,
+            ticks: 2,
+        };
+    }
+    let hi = hi.max(lo + finest);
+    // Snap to the labels' precision, so a step of 0.1 is 0.1 and not
+    // 0.30000000000000004 by the third tick.
+    let snap = |value: f64| (value / finest).round() * finest;
+    let mut magnitude = 10f64.powf(((hi - lo) / MAX_AXIS_STEPS).log10().floor()).max(finest);
+    loop {
+        for multiple in [1.0, 2.0, 2.5, 5.0] {
+            // 2.5 times a power of ten has one decimal more than the power.
+            if multiple == 2.5 && magnitude < 10.0 * finest * (1.0 - 1e-9) {
+                continue;
+            }
+            let step = snap(multiple * magnitude);
+            let min = snap((lo / step + 1e-9).floor() * step);
+            let steps = ((hi - min) / step - 1e-9).ceil().max(1.0);
+            if steps <= MAX_AXIS_STEPS {
+                return Axis {
+                    min,
+                    max: snap(min + steps * step),
+                    ticks: steps as usize + 1,
+                };
+            }
+        }
+        magnitude *= 10.0;
+    }
 }
 
 /// One series of a chart that draws several (see [`make_series_chart`]).
@@ -99,37 +182,30 @@ fn value_at(values: Arc<Vec<f64>>) -> impl Fn(&usize) -> f64 + 'static {
     move |index| values.get(*index).copied().unwrap_or_default()
 }
 
-/// One series as a line.
+/// One series as a line, on a [`nice_axis`] around `y_min..y_max` that ends
+/// at its top tick — a percentage's 0–100 axis ends at 100, where the
+/// chart's own padding above the range used to read "105%".
 pub(crate) fn make_line_chart(params: ChartParams, values: Arc<Vec<f64>>, stroke: Hsla) -> impl IntoElement {
-    line_chart(params, values, stroke, false)
-}
-
-/// One series as a line whose axis ends exactly at `y_max`: for a value with
-/// a hard ceiling — a percentage. A chart keeps a little room above its
-/// domain and labels it, which on a 0–100 axis reads "105%".
-pub(crate) fn make_bounded_line_chart(params: ChartParams, values: Arc<Vec<f64>>, stroke: Hsla) -> impl IntoElement {
-    line_chart(params, values, stroke, true)
-}
-
-fn line_chart(params: ChartParams, values: Arc<Vec<f64>>, stroke: Hsla, bounded: bool) -> impl IntoElement {
     let len = params.dates.len().min(values.len());
-    let format: Rc<dyn Fn(f64) -> String> = Rc::from(params.y_format);
-    let tooltip = format.clone();
-    let chart = LineChart::new(0..len)
+    let label = params.y_label;
+    let axis = nice_axis(params.y_min, params.y_max, label.decimals);
+    LineChart::new(0..len)
         .id(params.id)
         .x(sample_at(&params.dates))
         .y(value_at(values))
         .stroke(stroke)
         .tick_margin(params.tick_margin)
-        .y_domain(params.y_min, params.y_max)
+        .y_domain(axis.min, axis.max)
+        .y_tick_count(axis.ticks)
+        .y_padding(0., 0.)
         .y_axis(true)
-        .y_tick_format(move |value| format(value))
-        .tooltip_value(move |_, value| tooltip(value).into());
-    if bounded { chart.y_padding(0., 0.) } else { chart }
+        .y_tick_format(move |value| label.format(value))
+        .tooltip_value(move |_, value| label.format(value).into())
 }
 
 /// Several series on one set of axes, each with its own colour and, when it
-/// has one, the area under it — the hover tooltip has a row for each.
+/// has one, the area under it — the hover tooltip has a row for each. The
+/// axis is a [`nice_axis`], as a single line's is.
 ///
 /// Also the multi-line chart: `LineChart` draws one series, and overlaying
 /// several would draw the axes and the grid once per series, darker with each
@@ -137,16 +213,18 @@ fn line_chart(params: ChartParams, values: Arc<Vec<f64>>, stroke: Hsla, bounded:
 /// the baseline rather than stacked, and a series without a fill is a line
 /// (1px, where a `LineChart`'s is 2px).
 pub(crate) fn make_series_chart(params: ChartParams, series: Vec<ChartSeries>, step_after: bool) -> impl IntoElement {
-    let format: Rc<dyn Fn(f64) -> String> = Rc::from(params.y_format);
-    let tooltip = format.clone();
+    let label = params.y_label;
+    let axis = nice_axis(params.y_min, params.y_max, label.decimals);
     let mut chart = AreaChart::new(0..params.dates.len())
         .id(params.id)
         .x(sample_at(&params.dates))
         .tick_margin(params.tick_margin)
-        .y_domain(params.y_min, params.y_max)
+        .y_domain(axis.min, axis.max)
+        .y_tick_count(axis.ticks)
+        .y_padding(0., 0.)
         .y_axis(true)
-        .y_tick_format(move |value| format(value))
-        .tooltip_value(move |_, _, value| tooltip(value).into());
+        .y_tick_format(move |value| label.format(value))
+        .tooltip_value(move |_, _, value| label.format(value).into());
     for series in series {
         chart = chart
             .y(value_at(series.values))
@@ -202,10 +280,10 @@ const ROUNDING_UNSEEN_FROM: f64 = 100.0;
 /// tick — past [`ROUNDING_UNSEEN_FROM`] every tick is labelled, below it only
 /// the whole ones — so an axis never names its quarters and skips its middle.
 /// "Whole" allows for the chart's own arithmetic, which places ticks in `f32`.
-fn tick_label(value: f64, tallest: f64, format: &dyn Fn(f64) -> String) -> String {
+fn tick_label(value: f64, tallest: f64, label: ValueLabel) -> String {
     let whole = value.round();
     if tallest >= ROUNDING_UNSEEN_FROM || (value - whole).abs() < 1e-3 {
-        format(whole)
+        label.format(whole)
     } else {
         String::new()
     }
@@ -219,8 +297,7 @@ fn tick_label(value: f64, tallest: f64, format: &dyn Fn(f64) -> String) -> Strin
 /// ([`count_axis_ticks`]). A series with fractions keeps the default axis.
 pub(crate) fn make_bar_chart(params: ChartParams, values: Arc<Vec<f64>>, fill: Hsla) -> impl IntoElement {
     let len = params.dates.len().min(values.len());
-    let format: Rc<dyn Fn(f64) -> String> = Rc::from(params.y_format);
-    let tooltip = format.clone();
+    let label = params.y_label;
     let drawn = &values[..len];
     let tallest = drawn.iter().copied().fold(0.0_f64, f64::max);
     let counts = drawn.iter().all(|value| *value >= 0.0 && value.fract() == 0.0);
@@ -239,12 +316,12 @@ pub(crate) fn make_bar_chart(params: ChartParams, values: Arc<Vec<f64>>, fill: H
         .value_tick_count(ticks)
         .value_tick_format(move |value| {
             if counts {
-                tick_label(value, tallest, format.as_ref())
+                tick_label(value, tallest, label)
             } else {
-                format(value)
+                label.format(value)
             }
         })
-        .tooltip_value(move |_, value| tooltip(value).into())
+        .tooltip_value(move |_, value| label.format(value).into())
 }
 
 #[cfg(test)]
@@ -282,21 +359,125 @@ mod tests {
     /// key cannot be seen, and then all of them have one.
     #[test]
     fn a_tick_between_two_counts_is_not_labelled_as_one_of_them() {
-        let plain = |value: f64| format!("{value:.0}");
+        let plain = ValueLabel::decimals(0);
         // Tallest bar 11, five ticks: 0, 2.75, 5.5, 8.25, 11.
-        assert_eq!(tick_label(11.0, 11.0, &plain), "11");
-        assert_eq!(tick_label(8.25, 11.0, &plain), "");
-        assert_eq!(tick_label(5.5, 11.0, &plain), "");
-        assert_eq!(tick_label(0.0, 11.0, &plain), "0");
+        assert_eq!(tick_label(11.0, 11.0, plain), "11");
+        assert_eq!(tick_label(8.25, 11.0, plain), "");
+        assert_eq!(tick_label(5.5, 11.0, plain), "");
+        assert_eq!(tick_label(0.0, 11.0, plain), "0");
         // The chart's own f32 arithmetic.
-        assert_eq!(tick_label(2.999_999_8, 5.0, &plain), "3");
+        assert_eq!(tick_label(2.999_999_8, 5.0, plain), "3");
         // One answer per axis: 53 names neither its quarters nor its middle,
         // 101 names both.
-        assert_eq!(tick_label(13.25, 53.0, &plain), "");
-        assert_eq!(tick_label(26.5, 53.0, &plain), "");
-        assert_eq!(tick_label(25.25, 101.0, &plain), "25");
-        assert_eq!(tick_label(50.5, 101.0, &plain), "51");
-        assert_eq!(tick_label(25_000.75, 100_003.0, &plain), "25001");
+        assert_eq!(tick_label(13.25, 53.0, plain), "");
+        assert_eq!(tick_label(26.5, 53.0, plain), "");
+        assert_eq!(tick_label(25.25, 101.0, plain), "25");
+        assert_eq!(tick_label(50.5, 101.0, plain), "51");
+        assert_eq!(tick_label(25_000.75, 100_003.0, plain), "25001");
+    }
+
+    /// The ticks of a line chart's axis are round values its labels can
+    /// tell apart: a small server's memory read "5, 4, 3, 3, 2" (#200).
+    #[test]
+    fn a_line_axis_is_ticked_at_values_its_labels_tell_apart() {
+        let axis = |lo, hi, decimals| nice_axis(lo, hi, decimals);
+        // The memory chart of #200, in whole megabytes: 1..4, a tick a unit.
+        assert_eq!(
+            axis(1.9, 4.0, 0),
+            Axis {
+                min: 1.0,
+                max: 4.0,
+                ticks: 4
+            }
+        );
+        // A hundred and more: steps of 250, not 246.8.
+        assert_eq!(
+            axis(0.0, 1234.0, 0),
+            Axis {
+                min: 0.0,
+                max: 1250.0,
+                ticks: 6
+            }
+        );
+        // A percentage ends at 100.
+        assert_eq!(
+            axis(0.0, 100.0, 0),
+            Axis {
+                min: 0.0,
+                max: 100.0,
+                ticks: 6
+            }
+        );
+        // One decimal: halves, never the quarters it cannot write.
+        assert_eq!(
+            axis(0.0, 2.3, 1),
+            Axis {
+                min: 0.0,
+                max: 2.5,
+                ticks: 6
+            }
+        );
+        // Two can write a quarter.
+        assert_eq!(
+            axis(0.0, 1.0, 2),
+            Axis {
+                min: 0.0,
+                max: 1.0,
+                ticks: 6
+            }
+        );
+        assert_eq!(
+            axis(0.0, 1.1, 2),
+            Axis {
+                min: 0.0,
+                max: 1.25,
+                ticks: 6
+            }
+        );
+        // Below zero, and a range thinner than one label step.
+        assert_eq!(
+            axis(-5.5, 2.2, 2),
+            Axis {
+                min: -6.0,
+                max: 4.0,
+                ticks: 6
+            }
+        );
+        assert_eq!(
+            axis(0.0, 0.01, 0),
+            Axis {
+                min: 0.0,
+                max: 1.0,
+                ticks: 2
+            }
+        );
+        assert_eq!(
+            axis(f64::NAN, 1.0, 0),
+            Axis {
+                min: 0.0,
+                max: 1.0,
+                ticks: 2
+            }
+        );
+
+        // Whatever the range, no two ticks read the same.
+        for (lo, hi, decimals) in [
+            (1.9, 4.0, 0),
+            (2.83, 2.97, 0),
+            (0.0, 3.3, 0),
+            (0.0, 0.7, 1),
+            (1.0, 1.65, 2),
+        ] {
+            let Axis { min, max, ticks } = axis(lo, hi, decimals);
+            assert!(min <= lo && max >= hi, "{lo}..{hi} in {min}..{max}");
+            let label = ValueLabel::decimals(decimals);
+            let labels: Vec<String> = (0..ticks)
+                .map(|i| label.format(min + (max - min) * i as f64 / (ticks - 1) as f64))
+                .collect();
+            let mut distinct = labels.clone();
+            distinct.dedup();
+            assert_eq!(distinct, labels, "{lo}..{hi}");
+        }
     }
 
     #[test]

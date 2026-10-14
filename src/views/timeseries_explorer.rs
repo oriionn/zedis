@@ -32,7 +32,7 @@ use crate::states::{
     ServerView, ZedisGlobalStore, ZedisServerState, back_to_editor_tooltip, content_area_width, i18n_common,
     i18n_timeseries,
 };
-use crate::views::{ChartParams, ChartSeries, format_timestamp_ms, make_series_chart, value_range};
+use crate::views::{ChartParams, ChartSeries, ValueLabel, format_timestamp_ms, make_series_chart, value_range};
 use gpui::{Context, Entity, SharedString, Subscription, Task, Window, div, prelude::*, px};
 use gpui_kit::component::{
     ActiveTheme, Disableable, IconName, Sizable, StyledExt,
@@ -349,7 +349,7 @@ impl ZedisTimeSeriesExplorer {
             y_min,
             dates,
             y_max,
-            y_format: Box::new(|v: f64| format!("{v:.2}")),
+            y_label: ValueLabel::decimals(2),
             tick_margin,
         };
         div()

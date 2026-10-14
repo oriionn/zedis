@@ -629,7 +629,7 @@ impl ZedisMemoryAnalysis {
             y_min: 0.0,
             dates: series.dates.clone(),
             y_max,
-            y_format: Box::new(|v| format!("{v:.2}")),
+            y_label: ValueLabel::decimals(2),
             tick_margin,
         };
         let chart = make_line_chart(params, series.values.clone(), stroke);
@@ -686,7 +686,7 @@ impl ZedisMemoryAnalysis {
             y_min: 0.0,
             dates: Arc::new(dates),
             y_max,
-            y_format: Box::new(|v| format!("{v:.0}")),
+            y_label: ValueLabel::decimals(0),
             tick_margin: 1,
         };
         let chart = make_bar_chart(params, Arc::new(values), theme.chart_1);
@@ -987,7 +987,7 @@ impl ZedisMemoryAnalysis {
             y_min: 0.0,
             dates: Arc::new(dates),
             y_max,
-            y_format: Box::new(|v| format!("{v:.0}")),
+            y_label: ValueLabel::decimals(0),
             tick_margin: 1,
         };
 

@@ -34,7 +34,7 @@ use crate::states::{
     ServerEvent, ServerView, ZedisGlobalStore, ZedisServerState, back_to_editor_tooltip, content_area_width,
     dialog_button_props, escalate_dangerous_body, i18n_common, i18n_slowlog_editor,
 };
-use crate::views::{ChartParams, format_timestamp_ms, make_line_chart};
+use crate::views::{ChartParams, ValueLabel, format_timestamp_ms, make_line_chart};
 use crate::views::{ServerReport, export_to_file, open_server_report_dialog};
 use ahash::AHashMap;
 use gpui::{

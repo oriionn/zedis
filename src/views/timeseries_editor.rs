@@ -37,7 +37,7 @@ use crate::{
     },
     error::Error,
     states::{ZedisGlobalStore, ZedisServerState, dialog_button_props, i18n_common, i18n_timeseries},
-    views::{ChartParams, make_line_chart, value_range},
+    views::{ChartParams, ValueLabel, make_line_chart, value_range},
 };
 use gpui::{Context, Entity, SharedString, Task, Window, div, prelude::*, px};
 use gpui_kit::component::{
@@ -578,7 +578,7 @@ impl ZedisTimeSeriesEditor {
             y_min,
             dates: Arc::new(dates),
             y_max,
-            y_format: Box::new(|v: f64| format!("{v:.2}")),
+            y_label: ValueLabel::decimals(2),
             tick_margin,
         };
         let chart = make_line_chart(params, Arc::new(values), cx.theme().chart_1);

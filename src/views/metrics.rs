@@ -21,14 +21,15 @@ use crate::states::{
     ZedisGlobalStore, ZedisServerState, back_to_editor_tooltip, content_area_width, i18n_common, i18n_metrics,
 };
 use crate::views::{
-    ChartParams, ChartSeries, ServerReport, export_to_file, make_bounded_line_chart, make_line_chart,
-    make_series_chart, open_server_report_dialog,
+    ChartParams, ChartSeries, ServerReport, ValueLabel, export_to_file, make_line_chart, make_series_chart,
+    open_server_report_dialog,
 };
 use core::f64;
 use gpui::{
     App, Entity, Pixels, SharedString, Subscription, Task, Window, div, linear_color_stop, linear_gradient, prelude::*,
     px,
 };
+use gpui_kit::base::plot::label::{TEXT_SIZE, measure_text_width};
 use gpui_kit::component::h_flex;
 use gpui_kit::component::{
     ActiveTheme, IconName, Sizable, StyledExt,
@@ -199,14 +200,19 @@ fn chart_plot_width(content_width: f32, columns: u16) -> f32 {
     (card - CARD_PADDING_AND_Y_AXIS).max(0.)
 }
 
-/// Label every how-many-th of `samples` so the labels — `label_chars` wide,
-/// in the axis' small mono face — fit in `chart_width` with a gap between
-/// them. Scales with the UI font size, which the axis labels follow.
-fn tick_margin_for(samples: usize, label_chars: usize, chart_width: f32, font_px: f32) -> usize {
-    const CHAR_WIDTH: f32 = 6.;
-    const LABEL_GAP: f32 = 20.;
-    let label_width = (label_chars as f32 * CHAR_WIDTH + LABEL_GAP) * font_px / 14.;
-    let fits = (chart_width / label_width).floor().max(1.);
+/// Label every how-many-th of `samples` so that labels `label_width` wide
+/// (measured: the axis draws them at a fixed size, whatever the UI font
+/// size) fit in `chart_width` with a gap between them.
+///
+/// A label and a half apart, not one: the chart right-aligns the label of
+/// its last point to the edge, and centres the one before it, so when the
+/// newest sample is one that carries a label — one beat in every
+/// `tick_margin` — that pair needs half a label more room than any other,
+/// and ran together as "22:12:0422:16:51" (#200).
+fn tick_margin_for(samples: usize, label_width: f32, chart_width: f32) -> usize {
+    const LABEL_GAP: f32 = 12.;
+    let spacing = label_width * 1.5 + LABEL_GAP;
+    let fits = (chart_width / spacing).floor().max(1.);
     ((samples as f32 / fits).ceil() as usize).max(1)
 }
 
@@ -515,24 +521,23 @@ impl ZedisMetrics {
         id: &'static str,
         dates: Arc<Vec<SharedString>>,
         y_max: f64,
-        y_format: impl Fn(f64) -> String + 'static,
+        y_label: ValueLabel,
     ) -> ChartParams {
         // A series that never left zero arrives with its floor for a maximum,
         // and an axis from 0 to that reads "0" on every tick. It gets 0–1 and
         // decimals instead (two: the ticks fall on quarters): a flat line on
         // a scale, not five zeros.
         let flat = y_max <= FLAT_SERIES_MAX;
-        let y_format: Box<dyn Fn(f64) -> String> = if flat {
-            Box::new(|value| format!("{value:.2}"))
-        } else {
-            Box::new(y_format)
-        };
+        let y_label = if flat { ValueLabel::decimals(2) } else { y_label };
         ChartParams {
             id: id.into(),
             y_min: 0.0,
             dates,
-            y_max: if flat { 1.0 } else { y_max },
-            y_format,
+            // A little room above the peak, which the axis rounds up to its
+            // next tick: it ends on a tick, so a peak of a whole step (1 ms,
+            // 2 clients) was otherwise drawn along the top edge.
+            y_max: if flat { 1.0 } else { y_max * 1.05 },
+            y_label,
             tick_margin: self.tick_margin,
         }
     }
@@ -617,7 +622,7 @@ impl ZedisMetrics {
         let chart_2 = cx.theme().chart_2;
         let bg = cx.theme().background;
         let chart = make_series_chart(
-            self.chart_params("metrics-cpu", dates, max_val, |v| format!("{:.1}%", v)),
+            self.chart_params("metrics-cpu", dates, max_val, ValueLabel::decimals(1).unit("%")),
             vec![
                 ChartSeries {
                     name: i18n_metrics(cx, "series_system"),
@@ -657,7 +662,7 @@ impl ZedisMetrics {
         // A line on an axis drawn around the samples: as bars from zero, a
         // steady 500 MB was a solid wall and a 5 MB climb did not show.
         let (y_min, y_max) = memory_axis(self.metrics_chart_data.min_memory, self.metrics_chart_data.max_memory);
-        let mut params = self.chart_params("metrics-memory", dates, y_max, |v| format!("{:.0}", v));
+        let mut params = self.chart_params("metrics-memory", dates, y_max, ValueLabel::decimals(0));
         params.y_min = y_min;
         let chart = make_line_chart(params, values, cx.theme().chart_2);
         self.render_chart_card(cx, label, chart)
@@ -675,7 +680,7 @@ impl ZedisMetrics {
         let max_val = self.metrics_chart_data.max_latency_ms.max(0.01);
         let stroke = cx.theme().chart_2;
         let chart = make_line_chart(
-            self.chart_params("metrics-latency", dates, max_val, |v| format!("{:.0}", v)),
+            self.chart_params("metrics-latency", dates, max_val, ValueLabel::decimals(0)),
             values,
             stroke,
         );
@@ -698,7 +703,7 @@ impl ZedisMetrics {
         let chart_1 = cx.theme().chart_1;
         let chart_2 = cx.theme().chart_2;
         let chart = make_series_chart(
-            self.chart_params("metrics-clients", dates, max_val, |v| format!("{:.0}", v)),
+            self.chart_params("metrics-clients", dates, max_val, ValueLabel::decimals(0)),
             vec![
                 ChartSeries {
                     name: i18n_metrics(cx, "series_connected"),
@@ -730,7 +735,7 @@ impl ZedisMetrics {
         let max_val = self.metrics_chart_data.max_fragmentation.max(0.01);
         let stroke = cx.theme().chart_2;
         let chart = make_line_chart(
-            self.chart_params("metrics-fragmentation", dates, max_val, |v| format!("{:.2}", v)),
+            self.chart_params("metrics-fragmentation", dates, max_val, ValueLabel::decimals(2)),
             values,
             stroke,
         );
@@ -749,7 +754,7 @@ impl ZedisMetrics {
         let max_val = self.metrics_chart_data.max_total_commands_processed.max(0.01);
         let stroke = cx.theme().chart_2;
         let chart = make_line_chart(
-            self.chart_params("metrics-commands", dates, max_val, |v| format!("{:.0}", v)),
+            self.chart_params("metrics-commands", dates, max_val, ValueLabel::decimals(0)),
             values,
             stroke,
         );
@@ -770,7 +775,7 @@ impl ZedisMetrics {
         let chart_1 = cx.theme().chart_1;
         let chart_2 = cx.theme().chart_2;
         let chart = make_series_chart(
-            self.chart_params("metrics-net", dates, max_val, |v| format!("{:.0}", v)),
+            self.chart_params("metrics-net", dates, max_val, ValueLabel::decimals(0)),
             vec![
                 ChartSeries {
                     name: i18n_metrics(cx, "series_in"),
@@ -856,11 +861,10 @@ impl ZedisMetrics {
         // A line on a fixed 0–100% axis. As bars from zero, a rate that sat
         // at 100% — the usual one — was a solid block that said nothing.
         let stroke = cx.theme().chart_2;
-        let chart = make_bounded_line_chart(
-            self.chart_params("metrics-hit-rate", dates, 100.0, |v| format!("{:.0}%", v)),
-            values,
-            stroke,
-        );
+        let mut params = self.chart_params("metrics-hit-rate", dates, 100.0, ValueLabel::decimals(0).unit("%"));
+        // A percentage ends at 100, without the room above a peak.
+        params.y_max = 100.0;
+        let chart = make_line_chart(params, values, stroke);
         self.render_chart_card(cx, label, chart)
     }
 
@@ -876,7 +880,7 @@ impl ZedisMetrics {
         let max_val = self.metrics_chart_data.max_evicted_keys.max(0.01);
         let chart_2 = cx.theme().chart_2;
         let chart = make_series_chart(
-            self.chart_params("metrics-evicted", dates, max_val, |v| format!("{:.0}", v)),
+            self.chart_params("metrics-evicted", dates, max_val, ValueLabel::decimals(0)),
             vec![ChartSeries {
                 name: i18n_metrics(cx, "evicted_keys"),
                 values,
@@ -895,10 +899,11 @@ impl Render for ZedisMetrics {
         let columns = if window_width > px(1200.) { 2 } else { 1 };
         // As many x labels as a chart is wide enough for: a fixed ten ran
         // into each other at the default size and overlapped when zoomed.
-        let dates = &self.metrics_chart_data.dates;
-        let label_chars = dates.iter().map(|date| date.chars().count()).max().unwrap_or(0);
+        let dates = self.metrics_chart_data.dates.clone();
+        let widest = dates.iter().max_by_key(|date| date.len()).cloned().unwrap_or_default();
+        let label_width = measure_text_width(&widest, px(TEXT_SIZE), window);
         let chart_width = chart_plot_width(content_area_width(window, cx).as_f32(), columns);
-        self.tick_margin = tick_margin_for(dates.len(), label_chars, chart_width, cx.theme().font_size.as_f32());
+        self.tick_margin = tick_margin_for(dates.len(), label_width, chart_width);
         if self.latest_metrics.is_none() {
             return ZedisSkeletonLoading::new()
                 .text(i18n_common(cx, "loading"))
@@ -1101,8 +1106,6 @@ fn net_rate_label(input_kbps: f64, output_kbps: f64) -> String {
 mod tests {
     use super::*;
 
-    /// The x labels are as many as the chart has room for, and fewer when
-    /// the font is larger — a fixed ten ran into each other.
     #[test]
     fn a_rate_the_server_does_not_measure_is_not_shown_as_minus_one() {
         assert_eq!(net_rate_label(1.25, 30.), "1.2 / 30.0 KB/s");
@@ -1111,23 +1114,35 @@ mod tests {
         assert_eq!(net_rate_label(-1., -1.), "--");
     }
 
+    /// The x labels are as many as the chart has room for — a fixed ten ran
+    /// into each other — and the two at the right edge never touch, the
+    /// last one being right-aligned (#200).
     #[test]
     fn x_labels_are_thinned_to_what_the_chart_is_wide_enough_for() {
         // Two columns in a 1280px window with the sidebar open.
         let width = chart_plot_width(1100., 2);
         assert!((440.0..460.0).contains(&width), "{width}");
-        // "22:13:20" — eight characters: six labels fit, so 60 samples are
-        // labelled every tenth.
-        assert_eq!(tick_margin_for(60, 8, width, 14.), 10);
-        // Three zoom steps up the labels are wider: fewer of them.
-        assert!(tick_margin_for(60, 8, width, 17.) > 10);
-        // One column: twice the room, twice the labels.
-        assert!(tick_margin_for(60, 8, chart_plot_width(1100., 1), 14.) < 10);
+        // "22:13:20" at the axis' 10px, about 48px: five labels fit, so 60
+        // samples are labelled every twelfth.
+        assert_eq!(tick_margin_for(60, 48., width), 12);
+        // Wider labels: fewer of them. One column: more.
+        assert!(tick_margin_for(60, 60., width) > 12);
+        assert!(tick_margin_for(60, 48., chart_plot_width(1100., 1)) < 12);
+        // Whatever the room, two labelled samples are far enough apart for
+        // a centred label beside a right-aligned one.
+        for (samples, label, width) in [(60, 48., width), (1800, 48., 900.), (61, 70., 300.)] {
+            let margin = tick_margin_for(samples, label, width);
+            let spacing = margin as f32 * width / samples as f32;
+            assert!(
+                spacing >= label * 1.5,
+                "{samples} samples, {label}px labels in {width}px"
+            );
+        }
         // Never zero — the chart would label nothing — however few samples
         // or little room there is.
-        assert_eq!(tick_margin_for(3, 8, width, 14.), 1);
-        assert_eq!(tick_margin_for(0, 0, 0., 14.), 1);
-        assert_eq!(tick_margin_for(60, 8, 0., 14.), 60);
+        assert_eq!(tick_margin_for(3, 48., width), 1);
+        assert_eq!(tick_margin_for(0, 0., 0.), 1);
+        assert_eq!(tick_margin_for(60, 48., 0.), 60);
     }
 
     #[test]

@@ -532,7 +532,10 @@ impl ZedisSlowlogEditor {
                 // Floor y_max at 0.01: a chart whose y range starts and
                 // ends at the same value draws nothing, and an all-zero
                 // history would be an empty frame.
-                let y_max = values.iter().copied().fold(0.01_f64, f64::max);
+                // And a little room above the peak, which the axis rounds
+                // up to its next tick, so a peak on a tick is not drawn
+                // along the top edge.
+                let y_max = values.iter().copied().fold(0.01_f64, f64::max) * 1.05;
                 // Roughly 4 x-axis labels evenly spaced; clamp at 1 so
                 // a single-sample history still renders a tick.
                 let tick_margin = (h.len() / 4).max(1);
@@ -541,7 +544,7 @@ impl ZedisSlowlogEditor {
                     y_min: 0.0,
                     dates: Arc::new(dates),
                     y_max,
-                    y_format: Box::new(|v| format!("{:.0} ms", v)),
+                    y_label: ValueLabel::decimals(0).unit(" ms"),
                     tick_margin,
                 };
                 div()
