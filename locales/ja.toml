@@ -1236,6 +1236,7 @@ idmp_duplicates = "抑制された重複"
 [config_editor]
 title = "設定管理"
 filter_placeholder = "キーで絞り込み…"
+alias_tooltip = "別名: %{names}"
 edit_tooltip = "この設定を編集"
 save_success = "設定を保存しました"
 save_failed = "保存に失敗しました"

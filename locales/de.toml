@@ -1236,6 +1236,7 @@ idmp_duplicates = "Unterdrückte Duplikate"
 [config_editor]
 title = "Konfigurationsverwaltung"
 filter_placeholder = "Nach Schlüssel filtern…"
+alias_tooltip = "Auch: %{names}"
 edit_tooltip = "Diese Konfiguration bearbeiten"
 save_success = "Konfiguration gespeichert"
 save_failed = "Speichern fehlgeschlagen"

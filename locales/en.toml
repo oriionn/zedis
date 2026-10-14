@@ -1236,6 +1236,7 @@ idmp_duplicates = "Duplicates suppressed"
 [config_editor]
 title = "Config Management"
 filter_placeholder = "Filter by key…"
+alias_tooltip = "Also named %{names}"
 edit_tooltip = "Edit this config"
 save_success = "Config saved"
 save_failed = "Save failed"

@@ -1235,6 +1235,7 @@ idmp_duplicates = "已抑制的重复"
 [config_editor]
 title = "配置管理"
 filter_placeholder = "按键名过滤…"
+alias_tooltip = "别名：%{names}"
 edit_tooltip = "编辑此配置"
 save_success = "配置已保存"
 save_failed = "保存失败"

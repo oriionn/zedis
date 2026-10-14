@@ -1272,6 +1272,42 @@ fn standalone_config_is_read_set_and_compared() {
             loaded.params.len()
         );
         assert!(loaded.params.windows(2).all(|w| w[0].0 <= w[1].0), "sorted by name");
+
+        // Each alias once, under the modern spelling, the others kept beside
+        // it — and nothing the server answered is lost (#202).
+        let raw: HashMap<String, String> = cmd("CONFIG")
+            .arg("GET")
+            .arg("*")
+            .query_async(&mut conn(&id, 0).await)
+            .await
+            .expect("raw CONFIG GET *");
+        let listed: HashSet<&str> = loaded
+            .params
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .chain(loaded.aliases.values().flatten().map(String::as_str))
+            .collect();
+        for name in raw.keys() {
+            assert!(listed.contains(name.as_str()), "{name} is neither listed nor an alias");
+        }
+        let names: HashSet<&str> = loaded.params.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names.len(), loaded.params.len(), "a name listed twice");
+        // Redis 7+ and Valkey answer with both names; older servers with one.
+        if raw.contains_key("slave-read-only") && raw.contains_key("replica-read-only") {
+            assert!(names.contains("replica-read-only") && !names.contains("slave-read-only"));
+            assert_eq!(loaded.aliases["replica-read-only"], ["slave-read-only"]);
+            // The name it is listed under is one the server takes.
+            let value = loaded
+                .params
+                .iter()
+                .find(|(name, _)| name == "replica-read-only")
+                .map(|(_, value)| value.clone())
+                .expect("listed");
+            config_set(&at, "replica-read-only", &value)
+                .await
+                .expect("set by its listed name");
+        }
+
         let map = config_get_all(&at).await.expect("config get all");
         assert_eq!(
             map.len(),
@@ -1279,9 +1315,22 @@ fn standalone_config_is_read_set_and_compared() {
             "the list and the map are the same reply"
         );
 
-        // `slowlog-max-len` is a plain integer no other test reads.
-        let name = "slowlog-max-len";
-        let before = map.get(name).cloned().expect("slowlog-max-len exists");
+        // `slowlog-max-len` is a plain integer no other test reads — listed
+        // under its own name, or on Valkey 9 as an alias of
+        // `commandlog-slow-execution-max-len`.
+        let name = loaded
+            .params
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .find(|name| {
+                *name == "slowlog-max-len"
+                    || loaded
+                        .aliases
+                        .get(*name)
+                        .is_some_and(|aliases| aliases.iter().any(|alias| alias == "slowlog-max-len"))
+            })
+            .expect("slowlog-max-len is listed");
+        let before = map.get(name).cloned().expect("listed in the map too");
         let changed = if before == "137" { "138" } else { "137" };
         config_set(&at, name, changed).await.expect("config set");
         assert_eq!(

@@ -38,6 +38,7 @@ use gpui_kit::component::{
     label::Label,
     notification::Notification,
     spinner::Spinner,
+    tooltip::Tooltip,
     v_flex,
 };
 use rust_i18n::t;
@@ -266,6 +267,13 @@ const CONFIG_GROUPS: &[ConfigGroup] = &[
     },
 ];
 
+/// What a load hands the page: the parameters, their aliases, the config file.
+type LoadedConfigs = (
+    Vec<(SharedString, SharedString)>,
+    HashMap<SharedString, Vec<SharedString>>,
+    String,
+);
+
 /// The config list as the page draws it: narrowed by the filter box, bucketed
 /// into [`CONFIG_GROUPS`] order, the rest in `others`.
 struct GroupedConfigs {
@@ -277,12 +285,20 @@ struct GroupedConfigs {
 }
 
 impl GroupedConfigs {
-    fn build(configs: &[(SharedString, SharedString)], filter: &str, version: u64) -> Self {
+    /// A parameter is kept when the filter is in its name or in one of its
+    /// aliases: the row lists one name, and the other is just as much its own.
+    fn build(
+        configs: &[(SharedString, SharedString)],
+        aliases: &HashMap<SharedString, Vec<SharedString>>,
+        filter: &str,
+        version: u64,
+    ) -> Self {
         let needle = filter.to_lowercase();
+        let named = |name: &SharedString| name.to_lowercase().contains(&needle);
         let mut buckets: Vec<Vec<(SharedString, SharedString)>> = vec![Vec::new(); CONFIG_GROUPS.len()];
         let mut others: Vec<(SharedString, SharedString)> = Vec::new();
         for (k, v) in configs {
-            if !needle.is_empty() && !k.to_lowercase().contains(&needle) {
+            if !needle.is_empty() && !named(k) && !aliases.get(k).is_some_and(|names| names.iter().any(named)) {
                 continue;
             }
             // Anything not matching a known group falls into "others".
@@ -320,6 +336,10 @@ pub struct ZedisConfigEditor {
     /// keystroke bubbles up to the global "back" binding.
     focus_handle: FocusHandle,
     configs: Vec<(SharedString, SharedString)>,
+    /// The other names a parameter answers to, by the name `configs` lists
+    /// it under (`replica-read-only` → `slave-read-only`): the server
+    /// answers with both, and they are one row (#202).
+    aliases: HashMap<SharedString, Vec<SharedString>>,
     /// Bumped whenever `configs` is replaced — half of the key of `grouped`.
     configs_version: u64,
     /// `configs` filtered and bucketed by section: what `render` draws.
@@ -385,13 +405,19 @@ impl ZedisConfigEditor {
         {
             return grouped.clone();
         }
-        let grouped = Rc::new(GroupedConfigs::build(&self.configs, &self.filter, self.configs_version));
+        let grouped = Rc::new(GroupedConfigs::build(
+            &self.configs,
+            &self.aliases,
+            &self.filter,
+            self.configs_version,
+        ));
         self.grouped = Some(grouped.clone());
         grouped
     }
 
     pub fn new(server_state: Entity<ZedisServerState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let filter_state = cx.new(|cx| InputState::new(window, cx).placeholder("Filter by key..."));
+        let filter_state =
+            cx.new(|cx| InputState::new(window, cx).placeholder(i18n_config_editor(cx, "filter_placeholder")));
         let edit_state = cx.new(|cx| InputState::new(window, cx));
         // Shared single-line field for values classified as numeric. Kept as a
         // plain `InputState` (not `NumberInput`) so the edit card can pin a
@@ -417,6 +443,7 @@ impl ZedisConfigEditor {
                 // drawing them, editable, until the new list arrived — and
                 // its load in flight is cancelled rather than waited for.
                 this.configs.clear();
+                this.aliases.clear();
                 this.configs_version += 1;
                 this.config_file = SharedString::default();
                 this.diff = None;
@@ -431,6 +458,7 @@ impl ZedisConfigEditor {
             server_state,
             focus_handle: cx.focus_handle(),
             configs: Vec::new(),
+            aliases: HashMap::new(),
             configs_version: 0,
             grouped: None,
             filter_state,
@@ -525,14 +553,20 @@ impl ZedisConfigEditor {
                 let loaded = config_load(&ServerDb::new(server_id, db)).await?;
                 let configs: Vec<(SharedString, SharedString)> =
                     loaded.params.into_iter().map(|(k, v)| (k.into(), v.into())).collect();
-                Ok((configs, loaded.config_file))
+                let aliases: HashMap<SharedString, Vec<SharedString>> = loaded
+                    .aliases
+                    .into_iter()
+                    .map(|(name, aliases)| (name.into(), aliases.into_iter().map(Into::into).collect()))
+                    .collect();
+                Ok((configs, aliases, loaded.config_file))
             });
-            let result: Result<(Vec<(SharedString, SharedString)>, String)> = task.await;
+            let result: Result<LoadedConfigs> = task.await;
             let _ = handle.update(cx, |this, cx| {
                 this.loading = false;
                 match result {
-                    Ok((configs, config_file)) => {
+                    Ok((configs, aliases, config_file)) => {
                         this.configs = configs;
+                        this.aliases = aliases;
                         this.configs_version += 1;
                         this.config_file = config_file.into();
                         this.error = None;
@@ -966,7 +1000,22 @@ impl ZedisConfigEditor {
             let edit_value = value.clone();
             // Official redis.conf description for the `?` help popover;
             // `None` → no `?` shown. Map is loaded once per paint by the caller.
-            let doc = docs.get(key.as_ref()).cloned();
+            // Under an alias when the docs know the parameter by its other
+            // name (Valkey's `primaryauth` is Redis' `masterauth`).
+            let aliases = self.aliases.get(&key);
+            let doc = docs.get(key.as_ref()).cloned().or_else(|| {
+                aliases
+                    .into_iter()
+                    .flatten()
+                    .find_map(|alias| docs.get(alias.as_ref()).cloned())
+            });
+            let alias_tooltip: Option<SharedString> = aliases.map(|names| {
+                let names = names.iter().map(|name| name.as_ref()).collect::<Vec<_>>().join(", ");
+                let locale = cx.global::<ZedisGlobalStore>().read(cx).locale();
+                t!("config_editor.alias_tooltip", names = names, locale = locale)
+                    .to_string()
+                    .into()
+            });
             let value_el = if matches!(kind, ConfigKind::Bool) {
                 let on = value.as_ref() == "yes";
                 h_flex()
@@ -1002,13 +1051,23 @@ impl ZedisConfigEditor {
                 .rounded(radius)
                 .hover(|this| this.bg(hover_bg))
                 .child(
-                    div().flex_none().w(px(CONFIG_NAME_WIDTH)).overflow_hidden().child(
-                        Label::new(key.clone())
-                            .text_sm()
-                            .text_ellipsis()
-                            .text_color(muted)
-                            .font_family(font_family.clone()),
-                    ),
+                    div()
+                        .id(SharedString::from(format!("config-name-{key}")))
+                        .flex_none()
+                        .w(px(CONFIG_NAME_WIDTH))
+                        .overflow_hidden()
+                        // The other names this parameter answers to — it is
+                        // listed once, under the newest spelling.
+                        .when_some(alias_tooltip, |this, text| {
+                            this.tooltip(move |window, cx| Tooltip::new(text.clone()).build(window, cx))
+                        })
+                        .child(
+                            Label::new(key.clone())
+                                .text_sm()
+                                .text_ellipsis()
+                                .text_color(muted)
+                                .font_family(font_family.clone()),
+                        ),
                 )
                 .child(div().flex_1().min_w_0().overflow_hidden().child(value_el))
                 .child(
@@ -1442,6 +1501,7 @@ impl Render for ZedisConfigEditor {
 mod tests {
     use super::{ConfigKind, GroupedConfigs, config_enum_options, config_group_index, config_kind};
     use gpui::SharedString;
+    use std::collections::HashMap;
 
     #[test]
     fn the_grouping_narrows_by_name_ignoring_case_and_keeps_every_pair() {
@@ -1453,7 +1513,8 @@ mod tests {
         ];
         let count = |g: &GroupedConfigs| g.buckets.iter().map(Vec::len).sum::<usize>() + g.others.len();
 
-        let all = GroupedConfigs::build(&configs, "", 7);
+        let no_aliases = HashMap::new();
+        let all = GroupedConfigs::build(&configs, &no_aliases, "", 7);
         assert_eq!(count(&all), 3, "an empty filter keeps everything");
         assert_eq!(
             (all.version, all.filter.as_str()),
@@ -1472,9 +1533,29 @@ mod tests {
             }
         }
 
-        let narrowed = GroupedConfigs::build(&configs, "MaxMem", 7);
+        let narrowed = GroupedConfigs::build(&configs, &no_aliases, "MaxMem", 7);
         assert_eq!(count(&narrowed), 2, "the filter matches names, whatever their case");
-        assert_eq!(count(&GroupedConfigs::build(&configs, "nothing-matches", 7)), 0);
+        assert_eq!(
+            count(&GroupedConfigs::build(&configs, &no_aliases, "nothing-matches", 7)),
+            0
+        );
+
+        // A parameter listed under one name is found by its other (#202).
+        let configs = vec![pair("replica-read-only", "yes"), pair("maxmemory", "0")];
+        let aliases = HashMap::from([(
+            SharedString::from("replica-read-only"),
+            vec![SharedString::from("slave-read-only")],
+        )]);
+        let by_alias = GroupedConfigs::build(&configs, &aliases, "SLAVE", 7);
+        assert_eq!(count(&by_alias), 1);
+        assert!(
+            by_alias
+                .buckets
+                .iter()
+                .flatten()
+                .chain(&by_alias.others)
+                .any(|(k, _)| k.as_ref() == "replica-read-only")
+        );
     }
 
     #[test]
