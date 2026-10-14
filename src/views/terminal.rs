@@ -59,11 +59,16 @@ const CMD_LABEL: &str = "$";
 const CMD_CLEAR: &str = "clear";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The banner a cleared terminal starts with: the logo, and the name under
+/// it rather than beside it. Beside the logo's middle row it made a line of
+/// sixty-odd columns, which at the smallest window — some forty-five
+/// columns of terminal — wrapped through the drawing (#203).
 const ZEDIS_LOGO: &str = r#" __________ ____ ___ ____
 |__  / ____|  _ \_ _/ ___|
-  / /|  _| | | | | |\___ \    ZEDIS Native Redis GUI v{VERSION}
+  / /|  _| | | | | |\___ \
  / /_| |___| |_| | | ___) |
 /____|_____|____/___|____/
+ZEDIS Native Redis GUI v{VERSION}
 "#;
 
 /// Shown when a blocking command is typed in the terminal (see
@@ -1631,9 +1636,20 @@ impl Render for ZedisTerminal {
 #[cfg(test)]
 mod tests {
     use super::{
-        BLOCKING_REJECT_MSG, Block, LineReply, ReplyFormat, TerminalReply, TranscriptEntry, first_write_line, refusal,
-        strip_redis_cli_prefix, transcript_entries_for,
+        BLOCKING_REJECT_MSG, Block, LineReply, ReplyFormat, TerminalReply, TranscriptEntry, VERSION, ZEDIS_LOGO,
+        first_write_line, refusal, strip_redis_cli_prefix, transcript_entries_for,
     };
+
+    /// The banner fits the terminal of the smallest window, about forty-five
+    /// columns: a wider line wraps through the logo (#203).
+    #[test]
+    fn the_banner_fits_the_narrowest_terminal() {
+        let banner = ZEDIS_LOGO.replace("{VERSION}", VERSION);
+        for line in banner.lines() {
+            assert!(line.chars().count() <= 40, "{} columns: {line:?}", line.chars().count());
+        }
+        assert!(banner.contains(VERSION), "the banner names the version");
+    }
 
     /// The line a read-only or locked connection holds the input back for.
     #[test]
