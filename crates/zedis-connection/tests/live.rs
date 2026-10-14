@@ -66,8 +66,9 @@ use zedis_connection::{
     zset_range_by_score, zset_remove, zset_scan,
 };
 use zedis_connection::{
-    MonitorFeed, SlotMigrationDialect, SlotMove, bgsave_cancel, client_name, copy_key, copy_key_logically,
-    function_delete, function_load, function_stats, is_foreign_payload, migrate_slot, restore_or_recreate_chunk,
+    MonitorFeed, SlotMigrationDialect, SlotMove, bgsave_cancel, client_name, command_stats, copy_key,
+    copy_key_logically, function_delete, function_load, function_stats, is_foreign_payload, migrate_slot,
+    restore_or_recreate_chunk,
 };
 use zedis_core::json::JsonPathOp;
 use zedis_core::keysizes::KeysizesUnit;
@@ -1340,6 +1341,26 @@ fn standalone_admin_panels_read_and_reset_through_their_operations() {
         assert!(info[0].1.contains("# Commandstats"), "the full listing was not reached");
 
         config_resetstat(&at).await.expect("config resetstat");
+
+        // The Server Load page's sample: a row per command, in name order.
+        // It came out of a hash map, in a new order on every call, and rows
+        // the page's sort tied reshuffled with each refresh (#199).
+        let mut probe = conn(&id, 0).await;
+        let _: Option<String> = cmd("GET")
+            .arg("it:command-stats")
+            .query_async(&mut probe)
+            .await
+            .expect("get");
+        let stats = command_stats(&at).await.expect("command stats");
+        let names: Vec<&str> = stats.iter().map(|stat| stat.name.as_str()).collect();
+        assert!(
+            names.windows(2).all(|pair| pair[0] < pair[1]),
+            "in name order: {names:?}"
+        );
+        assert!(
+            stats.iter().any(|stat| stat.name == "get" && stat.calls >= 1),
+            "the GET just sent is counted: {names:?}"
+        );
 
         // LATENCY: the listing parses whether or not monitoring is on, a
         // reset answers how many events it cleared, and the threshold is what

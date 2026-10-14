@@ -78,6 +78,25 @@ enum SortBy {
     UsecShare,
 }
 
+/// Order the rows by `col`, and rows the column ties by command name, A to Z
+/// whichever way the column runs. On an idle server every rate is 0.0/s,
+/// and with nothing to break the tie the rows kept the order the sample
+/// came in — a different one on every refresh (#199).
+fn sort_cmd_rows(rows: &mut [CmdRow], col: SortBy, desc: bool) {
+    let by_column = |a: &CmdRow, b: &CmdRow| match col {
+        SortBy::Command => a.name.cmp(&b.name),
+        SortBy::Rate => a.rate.total_cmp(&b.rate),
+        SortBy::AvgUs => a.avg_us.total_cmp(&b.avg_us),
+        SortBy::Calls => a.calls.cmp(&b.calls),
+        SortBy::UsecShare => a.usec_share.total_cmp(&b.usec_share),
+    };
+    rows.sort_by(|a, b| {
+        let order = by_column(a, b);
+        let order = if desc { order.reverse() } else { order };
+        order.then_with(|| a.name.cmp(&b.name))
+    });
+}
+
 struct CmdRow {
     name: SharedString,
     rate: f64,
@@ -238,21 +257,7 @@ impl ZedisServerLoad {
     }
 
     fn sort_rows(&mut self) {
-        let desc = self.sort_desc;
-        let dir = |o: Ordering| if desc { o.reverse() } else { o };
-        match self.sort_by {
-            SortBy::Command => self.cmd_rows.sort_by(|a, b| dir(a.name.cmp(&b.name))),
-            SortBy::Rate => self
-                .cmd_rows
-                .sort_by(|a, b| dir(a.rate.partial_cmp(&b.rate).unwrap_or(Ordering::Equal))),
-            SortBy::AvgUs => self
-                .cmd_rows
-                .sort_by(|a, b| dir(a.avg_us.partial_cmp(&b.avg_us).unwrap_or(Ordering::Equal))),
-            SortBy::Calls => self.cmd_rows.sort_by(|a, b| dir(a.calls.cmp(&b.calls))),
-            SortBy::UsecShare => self
-                .cmd_rows
-                .sort_by(|a, b| dir(a.usec_share.partial_cmp(&b.usec_share).unwrap_or(Ordering::Equal))),
-        }
+        sort_cmd_rows(&mut self.cmd_rows, self.sort_by, self.sort_desc);
     }
 
     fn set_sort(&mut self, col: SortBy, cx: &mut Context<Self>) {
@@ -859,4 +864,43 @@ impl Render for ZedisServerLoad {
 
 async fn fetch_command_stats(server_id: String, db: usize) -> Result<Vec<CommandStat>> {
     Ok(command_stats(&ServerDb::new(server_id, db)).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CmdRow, SortBy, sort_cmd_rows};
+
+    fn row(name: &'static str, rate: f64) -> CmdRow {
+        CmdRow {
+            name: name.into(),
+            rate,
+            avg_us: 0.0,
+            calls: 0,
+            usec_share: 0.0,
+            dcalls: 0,
+        }
+    }
+
+    fn names(rows: &[CmdRow]) -> Vec<&str> {
+        rows.iter().map(|row| row.name.as_ref()).collect()
+    }
+
+    /// Tied rows come out in name order whatever order they went in, so a
+    /// refresh of an idle server does not reshuffle them (#199); the column
+    /// still decides first, either way it runs.
+    #[test]
+    fn tied_rows_are_ordered_by_name() {
+        let sample = || vec![row("set", 0.0), row("get", 0.0), row("ping", 2.0), row("del", 0.0)];
+        let mut once = sample();
+        let mut again = sample();
+        again.reverse();
+
+        sort_cmd_rows(&mut once, SortBy::Rate, true);
+        sort_cmd_rows(&mut again, SortBy::Rate, true);
+        assert_eq!(names(&once), ["ping", "del", "get", "set"]);
+        assert_eq!(names(&once), names(&again));
+
+        sort_cmd_rows(&mut once, SortBy::Rate, false);
+        assert_eq!(names(&once), ["del", "get", "set", "ping"]);
+    }
 }

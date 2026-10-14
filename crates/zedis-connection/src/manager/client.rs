@@ -1234,10 +1234,14 @@ impl RedisClient {
                 }
             }
         }
-        Ok(agg
+        let mut stats: Vec<CommandStat> = agg
             .into_iter()
             .map(|(name, (calls, usec))| CommandStat { name, calls, usec })
-            .collect())
+            .collect();
+        // In name order: a hash map's order is new with every map, so the
+        // same server answered in a different order on every call (#199).
+        stats.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        Ok(stats)
     }
 
     /// `HOTKEYS START` (Redis 8.6) on every master — tracking is per node,
