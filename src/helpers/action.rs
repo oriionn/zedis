@@ -80,6 +80,8 @@ pub enum SidebarServerAction {
         id: SharedString,
         group: SharedString,
     },
+    /// Into a group named in a dialog that opens for it (#219).
+    MoveToNewGroup(SharedString),
     /// Every workspace tab on the connection.
     Disconnect(SharedString),
     Reconnect(SharedString),

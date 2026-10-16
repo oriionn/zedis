@@ -182,6 +182,7 @@ pub use setting_editor::open_settings;
 pub use setting_editor::open_settings_window;
 pub use shortcuts_overlay::ZedisShortcutsOverlay;
 pub use sidebar::ZedisSidebar;
+pub(crate) use sidebar::open_new_group_dialog;
 pub use slowlog_editor::ZedisSlowlogEditor;
 pub use status_bar::ZedisStatusBar;
 pub use stream_editor::ZedisStreamEditor;

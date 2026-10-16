@@ -21,9 +21,11 @@ use crate::connection::get_servers;
 use crate::db::get_favorites_manager;
 use crate::helpers::{ShortcutsAction, fuzzy_score_prepared, has_pubsub, prepare_fuzzy_query};
 use crate::states::{
-    Route, ServerView, SettingsAction, ZedisGlobalStore, ZedisServerState, command_status_label, i18n_command_palette,
-    i18n_shortcuts,
+    Route, ServerToolsAction, ServerView, SettingsAction, ZedisGlobalStore, ZedisServerState, command_status_label,
+    i18n_command_palette, i18n_features, i18n_shortcuts,
 };
+#[cfg(not(target_family = "wasm"))]
+use crate::states::{i18n_status_bar, i18n_trash};
 use gpui::{Context, FocusHandle, Focusable, KeyDownEvent, ScrollHandle, Window, div, prelude::*, px};
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::{ActiveTheme, label::Label, v_flex};
@@ -74,6 +76,11 @@ enum PaletteCommand {
     /// own, and `Route::Settings` draws the connections page — going
     /// there is what "Open Settings" used to do instead.
     OpenSettings,
+    /// A Tools-menu entry that opens a dialog or a window rather than a
+    /// page — the recycle bin, import, export, compare, the capability
+    /// matrix. Handed to the root's `ServerToolsAction` handler, the same
+    /// one the status bar's menu dispatches to (#221).
+    Tool(ServerToolsAction),
 }
 
 struct PaletteItem {
@@ -478,6 +485,58 @@ impl ZedisCommandPalette {
                 command: PaletteCommand::PubsubMode,
             });
         }
+        // The Tools menu's dialogs and windows, on the menu's terms (#221):
+        // the recycle bin, import, export and compare are desktop features,
+        // and import writes, so a read-only connection does not list it — a
+        // palette row cannot carry the menu's "disabled, and why".
+        if conn.is_some() {
+            let mut tools: Vec<(gpui::SharedString, Option<gpui::SharedString>, ServerToolsAction)> = Vec::new();
+            #[cfg(not(target_family = "wasm"))]
+            {
+                tools.push((
+                    i18n_trash(cx, "menu"),
+                    Some(i18n_command_palette(cx, "recycle_bin_keywords")),
+                    ServerToolsAction::Trash,
+                ));
+                if !self.server_state.read(cx).readonly() {
+                    tools.push((
+                        i18n_status_bar(cx, "import_keys_menu"),
+                        None,
+                        ServerToolsAction::ImportKeys,
+                    ));
+                }
+                tools.push((
+                    i18n_status_bar(cx, "export_keys_menu"),
+                    None,
+                    ServerToolsAction::ExportKeys,
+                ));
+                tools.push((
+                    i18n_status_bar(cx, "compare_keys_menu"),
+                    None,
+                    ServerToolsAction::CompareKeys,
+                ));
+            }
+            tools.push((
+                format!("{}…", i18n_features(cx, "dialog_title")).into(),
+                None,
+                ServerToolsAction::Capabilities,
+            ));
+            for (label, keywords, action) in tools {
+                // Other names people look for it by, as the issue did: the
+                // label alone answered "recycle" and not "trash".
+                let search = match keywords {
+                    Some(keywords) => format!("{label} {keywords}"),
+                    None => label.to_string(),
+                };
+                items.push(PaletteItem {
+                    label,
+                    hint: gpui::SharedString::default(),
+                    search,
+                    prescore: None,
+                    command: PaletteCommand::Tool(action),
+                });
+            }
+        }
         let shortcuts_label = i18n_shortcuts(cx, "title");
         items.push(PaletteItem {
             label: shortcuts_label.clone(),
@@ -523,6 +582,12 @@ impl ZedisCommandPalette {
             window.dispatch_action(Box::new(SettingsAction::Editor), cx);
             return;
         }
+        // So are the Tools menu's dialogs and windows.
+        if let PaletteCommand::Tool(action) = command {
+            self.close(cx);
+            window.dispatch_action(Box::new(action), cx);
+            return;
+        }
         // Selecting a key needs the per-connection ServerState entity (not the
         // global store), so handle it here rather than in the update_global
         // block below: select the key, then jump to the editor.
@@ -564,6 +629,7 @@ impl ZedisCommandPalette {
                 // Handled above (early return); arms kept for exhaustiveness.
                 PaletteCommand::ShowShortcuts => {}
                 PaletteCommand::OpenSettings => {}
+                PaletteCommand::Tool(_) => {}
                 PaletteCommand::Key(_) => {}
                 PaletteCommand::PubsubMode => {}
             });
@@ -847,5 +913,70 @@ impl Render for ZedisCommandPalette {
                     }),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::init_ui;
+    use gpui::{AppContext, TestAppContext, size};
+    use gpui_kit::component::Root;
+
+    /// The Tools menu's dialogs are commands too, and the recycle bin is
+    /// found by the names the issue looked for it by — "trash" and
+    /// "deleted" as well as its own (#221).
+    #[gpui::test]
+    fn the_recycle_bin_is_a_command_found_as_trash(cx: &mut TestAppContext) {
+        init_ui(cx);
+        cx.update(|cx| {
+            let store = cx.global::<ZedisGlobalStore>().clone();
+            store.update(cx, |state, cx| {
+                state.go_to(
+                    Route::Server {
+                        id: "server-1".into(),
+                        db: 0,
+                        view: ServerView::Editor,
+                    },
+                    cx,
+                )
+            });
+        });
+        let server_state = cx.new(|_| ZedisServerState::default());
+        let mut palette = None;
+        cx.open_window(size(px(600.), px(400.)), |window, cx| {
+            let page_focus = cx.focus_handle();
+            let view = cx.new(|cx| ZedisCommandPalette::new(server_state.clone(), page_focus, window, cx));
+            palette = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let palette = palette.expect("the window built the palette");
+
+        palette.update(cx, |palette, cx| {
+            let finds_the_bin = |query: &str| {
+                let items = palette.build_items(Scope::General, query, cx);
+                ZedisCommandPalette::ranked(&items, query)
+                    .first()
+                    .is_some_and(|&ix| matches!(items[ix].command, PaletteCommand::Tool(ServerToolsAction::Trash)))
+            };
+            for query in ["recycle", "trash", "deleted"] {
+                assert!(finds_the_bin(query), "{query}");
+            }
+            // The other dialogs are listed with it.
+            let items = palette.build_items(Scope::Commands, "", cx);
+            for action in [
+                ServerToolsAction::ImportKeys,
+                ServerToolsAction::ExportKeys,
+                ServerToolsAction::CompareKeys,
+                ServerToolsAction::Capabilities,
+            ] {
+                assert!(
+                    items
+                        .iter()
+                        .any(|item| matches!(item.command, PaletteCommand::Tool(listed) if listed == action)),
+                    "{action:?}"
+                );
+            }
+        });
     }
 }

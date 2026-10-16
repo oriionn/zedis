@@ -18,7 +18,8 @@ use crate::helpers::{bytes_to_hex_text, clearing_an_applied_filter, get_mono_fon
 use crate::{
     assets::CustomIconName,
     components::{
-        KvTableColumn, KvTableColumnType, KvTableMode, ZedisKvDelegate, ZedisKvFetcher, with_leading_columns,
+        KvRowAction, KvRowMenu, KvTableColumn, KvTableColumnType, KvTableMode, ZedisKvDelegate, ZedisKvFetcher,
+        with_leading_columns,
     },
     helpers::{EditorAction, KeyOpAction, build_csv, hot_key_label},
     states::{
@@ -575,6 +576,13 @@ impl<T: ZedisKvFetcher> ZedisKvTable<T> {
         );
 
         let table_state = cx.new(|cx| TableState::new(delegate, window, cx));
+        // The row menu's Open and Delete come back here (#217).
+        let table = cx.entity().downgrade();
+        table_state.update(cx, |state, _| {
+            state.delegate_mut().on_row_action(Rc::new(move |action, window, cx| {
+                let _ = table.update(cx, |table, cx| table.run_row_action(action, window, cx));
+            }));
+        });
 
         // Subscribe to row selection events (mode check will be done in handler)
         subscriptions.push(cx.subscribe(&table_state, |this, _, event, cx| match event {
@@ -1212,14 +1220,47 @@ impl<T: ZedisKvFetcher> ZedisKvTable<T> {
     }
 
     fn handle_remove_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(row_ix) = self.edit_row else {
+            return;
+        };
+        self.confirm_remove_row(row_ix, window, cx);
+    }
+
+    /// What a row's right-click menu offers beyond copying: what a click on
+    /// the row would open, and whether the panel then edits it or only shows
+    /// it — the same tests `handle_select_row` and the form make.
+    fn row_menu(&self) -> KvRowMenu {
+        let mutates = self
+            .mode
+            .intersects(KvTableMode::UPDATE | KvTableMode::REMOVE | KvTableMode::ADD);
+        KvRowMenu {
+            openable: Capability::ViewEntry.allowed(self.readonly) || mutates,
+            editable: self.mode.contains(KvTableMode::UPDATE)
+                && Capability::MutateContainer.allowed(self.readonly)
+                && !self.fetcher.readonly_on_edit(),
+            removable: self.mode.contains(KvTableMode::REMOVE),
+        }
+    }
+
+    /// Carry out a row-menu choice.
+    fn run_row_action(&mut self, action: KvRowAction, window: &mut Window, cx: &mut Context<Self>) {
+        match action {
+            // As a click: the table selects the row and says so, and the
+            // subscription to that opens the panel.
+            KvRowAction::Open(row_ix) => self
+                .table_state
+                .update(cx, |state, cx| state.set_selected_row(row_ix, cx)),
+            KvRowAction::Remove(row_ix) => self.confirm_remove_row(row_ix, window, cx),
+        }
+    }
+
+    /// Ask before deleting the row at `row_ix` — the one open in the entry
+    /// panel, or one picked from its right-click menu.
+    fn confirm_remove_row(&mut self, row_ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         // Only allow removing if REMOVE mode is enabled
         if !self.mode.contains(KvTableMode::REMOVE) {
             return;
         }
-
-        let Some(row_ix) = self.edit_row else {
-            return;
-        };
         let fetcher = self.fetcher.clone();
         let value = fetcher.get(row_ix, fetcher.primary_index()).unwrap_or_default();
         let entity = cx.entity().clone();
@@ -1463,8 +1504,12 @@ impl<T: ZedisKvFetcher> Render for ZedisKvTable<T> {
         // The cells draw their hover button on the row's colour, and only
         // the table's state knows which row it paints as selected.
         let open_row = self.table_state.read(cx).selected_row();
-        self.table_state
-            .update(cx, |state, _| state.delegate_mut().set_open_row(open_row));
+        let row_menu = self.row_menu();
+        self.table_state.update(cx, |state, _| {
+            let delegate = state.delegate_mut();
+            delegate.set_open_row(open_row);
+            delegate.set_row_menu(row_menu);
+        });
 
         // The columns are fitted to the table's own width, as it was last
         // laid out: opening the entry panel, dragging its handle or resizing

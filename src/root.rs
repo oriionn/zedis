@@ -17,7 +17,7 @@
 
 #[cfg(not(target_family = "wasm"))]
 use crate::connection::servers_toml_redacted;
-use crate::connection::{DangerKind, clear_expired_cache, get_server};
+use crate::connection::{DangerKind, clear_expired_cache, get_server, get_servers};
 use crate::constants::{SIDEBAR_COLLAPSED_WIDTH, SIDEBAR_WIDTH};
 use crate::db::{TRASH_RETENTION_MS, purge_all_trash};
 use crate::dialogs::*;
@@ -56,7 +56,8 @@ use crate::views::{
 };
 use crate::views::{
     ZedisCommandPalette, ZedisContent, ZedisRecentKeysPalette, ZedisShortcutsOverlay, ZedisSidebar, ZedisTitleBar,
-    confirm_dangerous_command, confirm_remove_server, open_features_dialog, open_settings, open_trash_dialog,
+    confirm_dangerous_command, confirm_remove_server, open_features_dialog, open_new_group_dialog, open_settings,
+    open_trash_dialog,
 };
 use crate::window_setup::*;
 use gpui::{
@@ -349,6 +350,7 @@ impl Zedis {
                         this.pending_new_tab = Some((server_id.to_string(), *db));
                     }
                 }
+                GlobalEvent::ServerListUpdated => this.close_tabs_of_removed_servers(cx),
                 _ => {}
             }
             cx.notify();
@@ -621,6 +623,7 @@ impl Zedis {
             SidebarServerAction::MoveToGroup { id, group } => store.update(cx, |state, cx| {
                 state.set_server_group(id, Some(group.to_string()), cx);
             }),
+            SidebarServerAction::MoveToNewGroup(id) => open_new_group_dialog(id.clone(), window, cx),
             SidebarServerAction::Disconnect(id) | SidebarServerAction::Reconnect(id) => {
                 let disconnect = matches!(action, SidebarServerAction::Disconnect(_));
                 // Every tab on the connection: the sidebar's dot is theirs
@@ -663,6 +666,47 @@ impl Zedis {
                 .content
                 .update(cx, |content, cx| content.set_active(true, cx));
             self.rebind_palettes(cx);
+            self.project_active_tab(cx);
+        }
+        self.persist_tabs(cx);
+        cx.notify();
+    }
+
+    /// Close the tabs of connections that are no longer in the list (#209).
+    /// A deleted entry's tab used to stay, titled with its raw id over an
+    /// empty tree with the status bar still saying "Connected". The strip is
+    /// rebuilt in one step rather than tab by tab: closing them one at a time
+    /// made a removed tab the active one, and connected to it, on the way.
+    fn close_tabs_of_removed_servers(&mut self, cx: &mut Context<Self>) {
+        let Ok(servers) = get_servers() else {
+            return;
+        };
+        let surviving = {
+            let ids: Vec<&str> = self.tabs.iter().map(|tab| tab.server_id.as_str()).collect();
+            tabs_surviving_removal(&ids, self.active_tab, |id| servers.iter().any(|server| server.id == id))
+        };
+        if surviving.keep.len() == self.tabs.len() && !surviving.home {
+            return;
+        }
+        let active_id = self.tabs[self.active_tab].content.entity_id();
+        let mut tabs: Vec<Option<ContentTab>> = std::mem::take(&mut self.tabs).into_iter().map(Some).collect();
+        // Dropping a tab's content tears down its subscriptions, server
+        // state and connections.
+        self.tabs = surviving.keep.iter().filter_map(|&ix| tabs[ix].take()).collect();
+        self.active_tab = surviving.active;
+        if surviving.home {
+            let tab = &mut self.tabs[self.active_tab];
+            tab.server_id.clear();
+            tab.db = 0;
+        }
+        let active_changed = self.tabs[self.active_tab].content.entity_id() != active_id;
+        if active_changed {
+            self.tabs[self.active_tab]
+                .content
+                .update(cx, |content, cx| content.set_active(true, cx));
+            self.rebind_palettes(cx);
+        }
+        if active_changed || surviving.home {
             self.project_active_tab(cx);
         }
         self.persist_tabs(cx);
@@ -1410,9 +1454,73 @@ pub(crate) fn moved_active_index(active: usize, from: usize, to: usize) -> usize
     }
 }
 
+/// The strip once some of the connections its tabs were on are gone: the
+/// tabs that stay (by index, in order) and which of them is active. A tab
+/// on a connection that `exists` no more is dropped; a Home tab (no
+/// connection) always stays. The active tab stays active if it stays, else
+/// the nearest one left of it takes over, else the first. When none stays,
+/// the active one is kept and `home` is set: the strip always has a tab, so
+/// that one goes Home rather than going away.
+struct SurvivingTabs {
+    keep: Vec<usize>,
+    active: usize,
+    home: bool,
+}
+
+fn tabs_surviving_removal(ids: &[&str], active: usize, exists: impl Fn(&str) -> bool) -> SurvivingTabs {
+    let keep: Vec<usize> = ids
+        .iter()
+        .enumerate()
+        .filter(|(_, id)| id.is_empty() || exists(id))
+        .map(|(ix, _)| ix)
+        .collect();
+    if keep.is_empty() {
+        return SurvivingTabs {
+            keep: vec![active],
+            active: 0,
+            home: true,
+        };
+    }
+    let active = keep
+        .iter()
+        .position(|&ix| ix == active)
+        .or_else(|| keep.iter().rposition(|&ix| ix < active))
+        .unwrap_or(0);
+    SurvivingTabs {
+        keep,
+        active,
+        home: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::moved_active_index;
+    use super::{moved_active_index, tabs_surviving_removal};
+
+    /// Deleting a connection takes its tabs with it (#209); the strip keeps
+    /// its active tab where it can, and is never left without one.
+    #[test]
+    fn tabs_on_a_removed_connection_close_and_the_active_one_moves_left() {
+        let exists = |id: &str| id != "b";
+        // Tab 1 (the active one) was on "b": tab 0 takes over.
+        let left = tabs_surviving_removal(&["a", "b", "c"], 1, exists);
+        assert_eq!((left.keep, left.active, left.home), (vec![0, 2], 0, false));
+        // Another tab was: the active one stays active at its new index.
+        let kept = tabs_surviving_removal(&["a", "b", "c"], 2, exists);
+        assert_eq!((kept.keep, kept.active, kept.home), (vec![0, 2], 1, false));
+        // Nothing left of it: the first that stays.
+        let first = tabs_surviving_removal(&["b", "", "c"], 0, exists);
+        assert_eq!((first.keep, first.active, first.home), (vec![1, 2], 0, false));
+        // Home tabs are on no connection and always stay.
+        let home = tabs_surviving_removal(&["", "b"], 1, exists);
+        assert_eq!((home.keep, home.active, home.home), (vec![0], 0, false));
+        // Every tab was on it: the active one stays and goes Home.
+        let last = tabs_surviving_removal(&["b", "b"], 1, exists);
+        assert_eq!((last.keep, last.active, last.home), (vec![1], 0, true));
+        // Nothing was removed: nothing changes.
+        let none = tabs_surviving_removal(&["a", "c"], 1, |_| true);
+        assert_eq!((none.keep, none.active, none.home), (vec![0, 1], 1, false));
+    }
 
     /// Reference model: perform the actual remove+insert on tab ids and
     /// locate where the active id ended up.

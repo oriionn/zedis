@@ -14,7 +14,9 @@
 
 use super::{KvTableColumn, KvTableColumnType, select_offset};
 use crate::helpers::get_mono_font_family;
-use crate::states::{DataFormat, KeyType, KvElement, RedisValue, ZedisServerState, i18n_common};
+use crate::states::{
+    DataFormat, KeyType, KvElement, RedisValue, ZedisGlobalStore, ZedisServerState, i18n_common, i18n_kv_table,
+};
 use gpui::{App, ClipboardItem, Edges, Entity, FontWeight, Pixels, SharedString, Window, div, prelude::*, px};
 use gpui_kit::component::{
     ActiveTheme, IconName, StyledExt, WindowExt,
@@ -22,10 +24,38 @@ use gpui_kit::component::{
     checkbox::Checkbox,
     h_flex,
     label::Label,
+    menu::{PopupMenu, PopupMenuItem},
     notification::Notification,
     table::{Column, ColumnSort, TableDelegate, TableState},
 };
+use rust_i18n::t;
 use std::{cell::Cell, collections::HashSet, rc::Rc, sync::Arc};
+
+/// What a row's right-click menu offers besides copying, mirrored from the
+/// table before each render like the open row: the delegate draws the
+/// menu, the table owns the modes and the capability it depends on.
+#[derive(Clone, Copy, Default)]
+pub struct KvRowMenu {
+    /// A click on the row opens it in the entry panel.
+    pub openable: bool,
+    /// The panel edits the row, rather than only showing it.
+    pub editable: bool,
+    /// The row can be deleted.
+    pub removable: bool,
+}
+
+/// A row-menu choice the table carries out: the delegate knows the row, the
+/// table has the entry panel and the confirm.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum KvRowAction {
+    /// Open the row in the entry panel, as a click on it does.
+    Open(usize),
+    /// Delete the row, once its confirm is answered.
+    Remove(usize),
+}
+
+/// Where the delegate hands a [`KvRowAction`].
+pub type KvRowActionHandler = Rc<dyn Fn(KvRowAction, &mut Window, &mut App)>;
 
 /// Trait defining the data fetching and manipulation interface for Key-Value data.
 /// Implementers allow the `ZedisKvDelegate` to display and edit various Redis data types (Hash, Set, List, ZSet).
@@ -186,6 +216,11 @@ pub struct ZedisKvDelegate<T: ZedisKvFetcher> {
     /// panel. Mirrored from the table's state before each render
     /// (`set_open_row`), which a cell cannot read while it is being drawn.
     open_row: Option<usize>,
+    /// What the row menu offers, mirrored the same way (`set_row_menu`).
+    row_menu: KvRowMenu,
+    /// Where the row menu's Open and Delete go; without one the menu only
+    /// copies.
+    on_row_action: Option<KvRowActionHandler>,
 }
 
 /// A column's own paddings, inside the table's. The two leading columns hold
@@ -250,15 +285,27 @@ impl<T: ZedisKvFetcher> ZedisKvDelegate<T> {
             processing: Rc::new(Cell::new(false)),
             selected_rows: HashSet::new(),
             open_row: None,
+            row_menu: KvRowMenu::default(),
+            on_row_action: None,
         }
     }
 
-    /// The ticked rows, ascending — the order `remove_many` is handed them.
     /// Tell the cells which row the table draws as selected.
     pub fn set_open_row(&mut self, row: Option<usize>) {
         self.open_row = row;
     }
 
+    /// Tell the row menu what the table lets it offer.
+    pub fn set_row_menu(&mut self, menu: KvRowMenu) {
+        self.row_menu = menu;
+    }
+
+    /// Hand the row menu's Open and Delete to `handler`.
+    pub fn on_row_action(&mut self, handler: KvRowActionHandler) {
+        self.on_row_action = Some(handler);
+    }
+
+    /// The ticked rows, ascending — the order `remove_many` is handed them.
     pub fn selected_rows(&self) -> Vec<usize> {
         let mut rows: Vec<usize> = self.selected_rows.iter().copied().collect();
         rows.sort_unstable();
@@ -546,6 +593,69 @@ impl<T: ZedisKvFetcher + 'static> TableDelegate for ZedisKvDelegate<T> {
             )
             .into_any_element()
     }
+    /// A row's right-click menu (#217): copy any of its cells, open it in
+    /// the entry panel, delete it — what the hover button, a click and the
+    /// panel's Delete do, from one place. A field's TTL is set in the panel
+    /// it opens.
+    fn context_menu(
+        &mut self,
+        row_ix: usize,
+        menu: PopupMenu,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> PopupMenu {
+        if row_ix >= self.fetcher.rows_count() {
+            return menu;
+        }
+        let locale = cx.global::<ZedisGlobalStore>().read(cx).locale().to_string();
+        let copied = i18n_common(cx, "copied_to_clipboard");
+        let mut menu = menu;
+        for (col_ix, column) in self.table_columns.iter().enumerate() {
+            if column.column_type != KvTableColumnType::Value {
+                continue;
+            }
+            // An empty cell (a field without a TTL) has nothing to copy.
+            let Some(value) = self
+                .fetcher
+                .get(row_ix, self.fetcher_col(col_ix))
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let label = t!("kv_table.copy_column", column = column.name.as_ref(), locale = &locale).to_string();
+            let copied = copied.clone();
+            menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(value.to_string()));
+                window.push_notification(Notification::info(copied.clone()), cx);
+            }));
+        }
+        let Some(handler) = self.on_row_action.clone() else {
+            return menu;
+        };
+        let KvRowMenu {
+            openable,
+            editable,
+            removable,
+        } = self.row_menu;
+        if openable || removable {
+            menu = menu.separator();
+        }
+        if openable {
+            let label = i18n_kv_table(cx, if editable { "row_edit" } else { "row_view" });
+            let handler = handler.clone();
+            menu = menu.item(
+                PopupMenuItem::new(label).on_click(move |_, window, cx| handler(KvRowAction::Open(row_ix), window, cx)),
+            );
+        }
+        if removable {
+            menu = menu.item(
+                PopupMenuItem::new(i18n_kv_table(cx, "row_delete"))
+                    .on_click(move |_, window, cx| handler(KvRowAction::Remove(row_ix), window, cx)),
+            );
+        }
+        menu
+    }
+
     /// Returns whether all data has been loaded (end of file).
     fn has_more(&self, _: &App) -> bool {
         !self.fetcher.is_eof()

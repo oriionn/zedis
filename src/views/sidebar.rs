@@ -21,11 +21,12 @@ use crate::{
         resolve_tag_color, unique_monograms,
     },
     states::{
-        ConnectionHealth, GlobalEvent, Route, ZedisGlobalStore, i18n_servers, i18n_sidebar, update_app_state_and_save,
+        ConnectionHealth, GlobalEvent, Route, ZedisGlobalStore, i18n_common, i18n_servers, i18n_sidebar,
+        update_app_state_and_save,
     },
 };
 use gpui::{
-    Context, DismissEvent, Hsla, Image, ImageFormat, SharedString, Subscription, WeakEntity, Window, div, img,
+    App, Context, DismissEvent, Hsla, Image, ImageFormat, SharedString, Subscription, WeakEntity, Window, div, img,
     prelude::*, px, rgb,
 };
 use gpui_kit::component::scroll::ScrollableElement;
@@ -43,6 +44,7 @@ use rust_i18n::t;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
+use zedis_ui::{ZedisFormField, ZedisFormOptions};
 
 /// Internal state for sidebar component
 ///
@@ -143,36 +145,40 @@ impl ServerMenu {
                     action(SidebarServerAction::Diagnose),
                 )
             });
-        // Offered while there is somewhere else to go: another group, or
-        // out of the one it is in. A new group is the form's to name.
-        let elsewhere = self.group.is_some() || self.groups.iter().any(|group| Some(group) != self.group.as_ref());
-        let menu = if elsewhere {
-            let (id, current, groups, ungrouped) = (
-                self.id.clone(),
-                self.group.clone(),
-                self.groups.clone(),
-                self.ungrouped.clone(),
-            );
-            menu.submenu(
-                i18n_sidebar(cx, "server_move_to_group"),
-                window,
-                cx,
-                move |submenu, _, _| {
-                    let to = |group: &str| {
-                        Box::new(SidebarServerAction::MoveToGroup {
-                            id: id.clone(),
-                            group: group.to_string().into(),
-                        })
-                    };
-                    let submenu = groups.iter().fold(submenu, |submenu, group| {
-                        submenu.menu_with_check(group.clone(), current.as_ref() == Some(group), to(group))
-                    });
-                    submenu.menu_with_check(ungrouped.clone(), current.is_none(), to(""))
-                },
-            )
-        } else {
-            menu
-        };
+        // Every group the list shows, out of the one it is in, and a new one
+        // named in a dialog (#219) — which is why the submenu is there even
+        // before any group exists: creating the first one used to mean
+        // opening the connection's form.
+        let (id, current, groups, ungrouped, new_group) = (
+            self.id.clone(),
+            self.group.clone(),
+            self.groups.clone(),
+            self.ungrouped.clone(),
+            i18n_sidebar(cx, "server_new_group"),
+        );
+        let menu = menu.submenu(
+            i18n_sidebar(cx, "server_move_to_group"),
+            window,
+            cx,
+            move |submenu, _, _| {
+                let to = |group: &str| {
+                    Box::new(SidebarServerAction::MoveToGroup {
+                        id: id.clone(),
+                        group: group.to_string().into(),
+                    })
+                };
+                let submenu = groups.iter().fold(submenu, |submenu, group| {
+                    submenu.menu_with_check(group.clone(), current.as_ref() == Some(group), to(group))
+                });
+                submenu
+                    .menu_with_check(ungrouped.clone(), current.is_none(), to(""))
+                    .separator()
+                    .menu(
+                        new_group.clone(),
+                        Box::new(SidebarServerAction::MoveToNewGroup(id.clone())),
+                    )
+            },
+        );
         let menu = menu.separator();
         let menu = match self.link {
             Some(true) => menu.menu(
@@ -955,3 +961,37 @@ impl Render for ZedisSidebar {
             })
     }
 }
+
+/// Name a group and move `server_id` into it — the sidebar menu's
+/// Move to Group › New Group… (#219). One field, the connection form's own
+/// wording for it; a name that is already a group simply moves there, and
+/// surrounding spaces are not part of a name (`set_server_group` trims).
+pub(crate) fn open_new_group_dialog(server_id: SharedString, window: &mut Window, cx: &mut App) {
+    ZedisFormOptions::new(vec![
+        ZedisFormField::new(NEW_GROUP_FIELD, i18n_servers(cx, "group"))
+            .placeholder(i18n_servers(cx, "group_placeholder"))
+            .required()
+            .focus(),
+    ])
+    .title(i18n_sidebar(cx, "new_group_title"))
+    .confirm_label(i18n_sidebar(cx, "new_group_confirm"))
+    .cancel_label(i18n_common(cx, "cancel"))
+    .on_dialog_submit(move |values, _window, cx| {
+        let name = values
+            .get(NEW_GROUP_FIELD)
+            .map(|name| name.trim().to_string())
+            .unwrap_or_default();
+        if name.is_empty() {
+            return false;
+        }
+        cx.global::<ZedisGlobalStore>()
+            .clone()
+            .update(cx, |state, cx| state.set_server_group(&server_id, Some(name), cx));
+        true
+    })
+    .dialog_width(px(420.))
+    .open_dialog(window, cx);
+}
+
+/// The new group dialog's one field.
+const NEW_GROUP_FIELD: &str = "group";

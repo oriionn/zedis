@@ -32,6 +32,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(target_family = "wasm"))]
 use tracing::{debug, error, info, warn};
 use url::Url;
@@ -1176,6 +1177,20 @@ fn get_or_create_server_config() -> Result<PathBuf> {
 static SERVER_CONFIG_MAP: LazyLock<ArcSwap<HashMap<String, RedisServer>>> =
     LazyLock::new(|| ArcSwap::from_pointee(HashMap::new()));
 
+/// Whether `SERVER_CONFIG_MAP` holds the list — read, saved or handed over —
+/// rather than the empty map it starts as. An empty map is also the list
+/// once the last connection is deleted, and taking it for "not read yet"
+/// read the file again: a read in the moment between the save replacing the
+/// map and its write landing put the deleted entry back, for the rest of
+/// the session, in every list and lookup (#209).
+static SERVER_CONFIG_LOADED: AtomicBool = AtomicBool::new(false);
+
+/// Make `configs` the list, as read or as saved.
+fn store_server_configs(configs: HashMap<String, RedisServer>) {
+    SERVER_CONFIG_MAP.store(Arc::new(configs));
+    SERVER_CONFIG_LOADED.store(true, Ordering::Release);
+}
+
 /// Returns the canonical sort order: group label A→Z (case-insensitive,
 /// empty/None group sorts last under the "Ungrouped" header), then
 /// within each group by `sort_order` ascending, then by `name`
@@ -1198,7 +1213,7 @@ fn server_sort_key(server: &RedisServer) -> (u8, String, i64, String) {
 /// through [`set_servers_cache`] because it is the only process that may hold
 /// the credentials (ADR 9).
 pub fn get_servers() -> Result<Vec<RedisServer>> {
-    if !SERVER_CONFIG_MAP.load().is_empty() {
+    if SERVER_CONFIG_LOADED.load(Ordering::Acquire) || !SERVER_CONFIG_MAP.load().is_empty() {
         let mut servers: Vec<RedisServer> = SERVER_CONFIG_MAP.load().values().cloned().collect();
         servers.sort_by_key(server_sort_key);
         return Ok(servers);
@@ -1237,7 +1252,7 @@ pub fn get_servers() -> Result<Vec<RedisServer>> {
             let _ = map_secrets(server, |value| Ok(decrypt(value).unwrap_or_else(|_| value.to_string())));
             configs.insert(server.id.clone(), server.clone());
         }
-        SERVER_CONFIG_MAP.store(Arc::new(configs));
+        store_server_configs(configs);
         servers.sort_by_key(server_sort_key);
         Ok(servers)
     }
@@ -1254,7 +1269,7 @@ pub fn set_servers_cache(servers: Vec<RedisServer>) {
         .into_iter()
         .map(|server| (server.id.clone(), server))
         .collect::<HashMap<_, _>>();
-    SERVER_CONFIG_MAP.store(Arc::new(configs));
+    store_server_configs(configs);
 }
 
 /// Returns the distinct, trimmed, non-empty group labels currently in
@@ -1348,7 +1363,7 @@ pub async fn save_servers(mut servers: Vec<RedisServer>) -> Result<()> {
         }
     }
 
-    SERVER_CONFIG_MAP.store(Arc::new(configs));
+    store_server_configs(configs);
     let path = get_or_create_server_config()?;
     let value = toml::to_string(&RedisServers { servers }).map_err(|e| Error::Invalid { message: e.to_string() })?;
     // Atomic replace plus a rolling `.bak` — the server list carries the
