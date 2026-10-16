@@ -26,7 +26,7 @@
 //! operation to its local document instead of sending it.
 
 use crate::connection::{FromEnd, KeyOp};
-use crate::helpers::KeyOpAction;
+use crate::helpers::{KeyOpAction, ttl_secs};
 use crate::states::{ZedisServerState, dialog_button_props, i18n_common, i18n_key_ops};
 use gpui::{App, Entity, SharedString, Window, prelude::*, px};
 use gpui_kit::component::{
@@ -198,17 +198,9 @@ impl ZedisKeyOpDialog {
                 let text = self.raw(0, cx);
                 (!text.is_empty()).then_some(KeyOp::StringAppend { text })
             }
-            // Blank means PERSIST: "no expiry" is a real answer here, so an
-            // empty field is valid rather than missing.
-            KeyOpAction::StringGetEx => {
-                if first.is_empty() {
-                    Some(KeyOp::StringGetEx { ttl: None })
-                } else {
-                    Some(KeyOp::StringGetEx {
-                        ttl: Some(first.parse().ok()?),
-                    })
-                }
-            }
+            KeyOpAction::StringGetEx => Some(KeyOp::StringGetEx {
+                ttl: getex_ttl(&first)?,
+            }),
             KeyOpAction::JsonSet => json(first, JsonPathOp::Set(parse_json(&second)?)),
             KeyOpAction::JsonDel => json(first, JsonPathOp::Del),
             KeyOpAction::JsonNumIncrBy => json(first, JsonPathOp::NumIncrBy(second.parse().ok()?)),
@@ -224,6 +216,17 @@ impl ZedisKeyOpDialog {
             KeyOpAction::JsonClear => json(first, JsonPathOp::Clear),
         }
     }
+}
+
+/// What GETEX's field asks for: blank is PERSIST — "no expiry" is a real
+/// answer here, so `Some(None)` — and anything else a TTL as every other TTL
+/// field reads one, `90` or `1h30m` (#214). `None` keeps the dialog open,
+/// as for `0`, which GETEX refuses.
+fn getex_ttl(text: &str) -> Option<Option<u64>> {
+    if text.is_empty() {
+        return Some(None);
+    }
+    ttl_secs(text).map(Some)
 }
 
 /// A count that is worth sending: `0` would pop nothing and read as a bug.
@@ -320,7 +323,9 @@ pub fn run_key_op_confirmed(
     let confirm = i18n_key_ops(cx, &format!("{title_key}_confirm"));
     let confirm_title = i18n_common(cx, "remove_title");
     ZedisDialog::new_alert(confirm_title, confirm.to_string())
-        .button_props(dialog_button_props(cx))
+        .danger()
+        .ok_text(i18n_common(cx, "delete"))
+        .cancel_text(i18n_common(cx, "cancel"))
         .on_ok(move |_, window, cx| {
             run(cx);
             window.close_dialog(cx);
@@ -359,4 +364,22 @@ pub fn open_key_op_dialog_prefilled(
         window,
         cx,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::getex_ttl;
+
+    /// GETEX reads a TTL the way the key bar and the hash field TTL do,
+    /// where it used to take whole seconds only (#214).
+    #[test]
+    fn getex_takes_a_duration_or_blank_for_persist() {
+        assert_eq!(getex_ttl(""), Some(None));
+        assert_eq!(getex_ttl("90"), Some(Some(90)));
+        assert_eq!(getex_ttl("1h"), Some(Some(3600)));
+        assert_eq!(getex_ttl("1h30m"), Some(Some(5400)));
+        for text in ["0", "500ms", "1,5h", "soon"] {
+            assert_eq!(getex_ttl(text), None, "{text}");
+        }
+    }
 }

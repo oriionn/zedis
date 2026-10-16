@@ -100,6 +100,9 @@ const INLINE_DELETE_WIDTH: f32 = 28.0;
 /// type codes (`STR` / `STRM` / `ZSET`, max 4 chars at 10px) so the key names
 /// line up in a column regardless of their type (matches the design).
 const TYPE_BADGE_COL_WIDTH: f32 = 36.0;
+/// The Add Key dialog's value field, in lines: how tall it opens, and how
+/// tall it grows before it scrolls.
+const ADD_KEY_VALUE_ROWS: (usize, usize) = (3, 10);
 
 #[derive(Default)]
 struct KeyTreeState {
@@ -1013,9 +1016,12 @@ impl ZedisKeyTree {
                         Some(ttl_invalid.clone())
                     }
                 }),
-            // Value field for String, List, Set
+            // Value field for String, List, Set. Several lines tall and
+            // growing, since a value is as often JSON or text over lines as
+            // a word (#216); Return there is a new line, not Confirm.
             ZedisFormField::new("value", i18n_common(cx, "value"))
                 .placeholder(i18n_common(cx, "value_placeholder"))
+                .field_type(ZedisFormFieldType::AutoGrow(ADD_KEY_VALUE_ROWS.0, ADD_KEY_VALUE_ROWS.1))
                 .required()
                 .visible_on("category", &[0, 1, 2]),
             // Score + Member fields for Zset
@@ -1033,6 +1039,7 @@ impl ZedisKeyTree {
                 .visible_on("category", &[4]),
             ZedisFormField::new("hash_value", i18n_common(cx, "value"))
                 .placeholder(i18n_common(cx, "value_placeholder"))
+                .field_type(ZedisFormFieldType::AutoGrow(ADD_KEY_VALUE_ROWS.0, ADD_KEY_VALUE_ROWS.1))
                 .required()
                 .visible_on("category", &[4]),
             // Stream ID field for Stream only

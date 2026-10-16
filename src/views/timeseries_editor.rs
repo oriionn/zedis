@@ -532,7 +532,9 @@ impl ZedisTimeSeriesEditor {
         )
         .to_string();
         ZedisDialog::new_alert(i18n_timeseries(cx, "rule_delete_title"), message)
-            .button_props(dialog_button_props(cx))
+            .danger()
+            .ok_text(i18n_common(cx, "delete"))
+            .cancel_text(i18n_common(cx, "cancel"))
             .on_ok(move |_, window, cx| {
                 let destination = destination.clone();
                 if let Some(editor) = editor.upgrade() {

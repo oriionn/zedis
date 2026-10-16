@@ -83,7 +83,8 @@ impl ZedisKvFetcher for ZedisHashValues {
     /// Column layout:
     /// - Column 1: Field name
     /// - Column 2: Field value
-    /// - Column 3: TTL in seconds (Redis 7.4+, empty string = no expiry)
+    /// - Column 3: the field's time left as a duration (Redis 7.4+, empty
+    ///   string = no expiry)
     fn get(&self, row_ix: usize, col_ix: usize) -> Option<SharedString> {
         let hash = self.value.hash_value()?;
         let (field, value) = hash.values.get(row_ix)?;
@@ -290,9 +291,15 @@ impl ZedisHashEditor {
                 .verbatim(),
         ];
         if supports_field_ttl {
-            // TTL column: shows seconds remaining (empty = no expiry). Optional
-            // so the add/edit form never forces a TTL.
-            columns.push(KvTableColumn::new(i18n_kv_table(cx, "ttl_seconds").as_ref(), Some(TTL_WIDTH)).optional());
+            // TTL column: the time left as a duration (empty = no expiry).
+            // Optional so the add/edit form never forces a TTL; the field
+            // takes `90` as well as `1h30m`, which the placeholder shows
+            // because a header that said "TTL(s)" read as seconds only (#214).
+            columns.push(
+                KvTableColumn::new(i18n_kv_table(cx, "field_ttl").as_ref(), Some(TTL_WIDTH))
+                    .optional()
+                    .placeholder(i18n_kv_table(cx, "field_ttl_placeholder")),
+            );
         }
 
         let table_state = cx.new(|cx| ZedisKvTable::<ZedisHashValues>::new(columns, server_state, window, cx));

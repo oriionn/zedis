@@ -31,8 +31,8 @@ use crate::{
     error::Error,
     helpers::{djb2_hash, get_mono_font_family, parse_lines},
     states::{
-        ServerEvent, ServerView, ZedisGlobalStore, ZedisServerState, back_to_editor_tooltip, dialog_button_props,
-        escalate_dangerous_body, i18n_common, i18n_functions,
+        ServerEvent, ServerView, ZedisGlobalStore, ZedisServerState, back_to_editor_tooltip, escalate_dangerous_body,
+        i18n_common, i18n_functions,
     },
 };
 use ahash::{AHashMap, AHashSet};
@@ -489,11 +489,9 @@ impl ZedisFunctionEditor {
         let db = self.server_state.read(cx).db();
         let library_for_task = library.clone();
         ZedisDialog::new_alert(title, escalate_dangerous_body(cx, &server_id, message))
-            .button_props(
-                dialog_button_props(cx)
-                    .ok_text(i18n_functions(cx, "delete_confirm"))
-                    .cancel_text(i18n_common(cx, "cancel")),
-            )
+            .danger()
+            .ok_text(i18n_functions(cx, "delete_confirm"))
+            .cancel_text(i18n_common(cx, "cancel"))
             .on_ok(move |_, _w, cx| {
                 let Some(this) = entity.upgrade() else { return true };
                 let lib = library_for_task.clone();
@@ -538,11 +536,9 @@ impl ZedisFunctionEditor {
         let server_id = self.server_state.read(cx).server_id().to_string();
         let db = self.server_state.read(cx).db();
         ZedisDialog::new_alert(title, escalate_dangerous_body(cx, &server_id, message))
-            .button_props(
-                dialog_button_props(cx)
-                    .ok_text(i18n_functions(cx, "flush_confirm"))
-                    .cancel_text(i18n_common(cx, "cancel")),
-            )
+            .danger()
+            .ok_text(i18n_functions(cx, "flush_confirm"))
+            .cancel_text(i18n_common(cx, "cancel"))
             .on_ok(move |_, _w, cx| {
                 let Some(this) = entity.upgrade() else { return true };
                 let server_id_inner = server_id.clone();
@@ -629,11 +625,9 @@ impl ZedisFunctionEditor {
         let server_id = self.server_state.read(cx).server_id().to_string();
         let db = self.server_state.read(cx).db();
         ZedisDialog::new_alert(title, escalate_dangerous_body(cx, &server_id, message))
-            .button_props(
-                dialog_button_props(cx)
-                    .ok_text(i18n_functions(cx, "restore_confirm"))
-                    .cancel_text(i18n_common(cx, "cancel")),
-            )
+            .danger()
+            .ok_text(i18n_functions(cx, "restore_confirm"))
+            .cancel_text(i18n_common(cx, "cancel"))
             .on_ok(move |_, _w, cx| {
                 let Some(this) = entity.upgrade() else { return true };
                 let server_id_inner = server_id.clone();

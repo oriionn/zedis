@@ -26,8 +26,8 @@ use crate::connection::{Capability, CommandStat, ServerDb, command_stats, config
 use crate::error::Error;
 use crate::helpers::{get_mono_font_family, pacing};
 use crate::states::{
-    ServerEvent, ServerView, ZedisGlobalStore, ZedisServerState, back_to_editor_tooltip, dialog_button_props,
-    escalate_dangerous_body, i18n_common, i18n_server_load,
+    ServerEvent, ServerView, ZedisGlobalStore, ZedisServerState, back_to_editor_tooltip, escalate_dangerous_body,
+    i18n_common, i18n_server_load,
 };
 use crate::views::panel_poll::{PanelPoll, summary_chip};
 use crate::views::unavailable_chip;
@@ -346,11 +346,9 @@ impl ZedisServerLoad {
         let db = self.server_state.read(cx).db();
         let entity = cx.entity().downgrade();
         ZedisDialog::new_alert(title, escalate_dangerous_body(cx, &server_id, body.to_string()))
-            .button_props(
-                dialog_button_props(cx)
-                    .ok_text(i18n_server_load(cx, "reset_confirm"))
-                    .cancel_text(i18n_common(cx, "cancel")),
-            )
+            .danger()
+            .ok_text(i18n_server_load(cx, "reset_confirm"))
+            .cancel_text(i18n_common(cx, "cancel"))
             .on_ok(move |_, window, cx| {
                 if let Some(this) = entity.upgrade() {
                     this.update(cx, |this, cx| {

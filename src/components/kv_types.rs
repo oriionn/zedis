@@ -74,6 +74,8 @@ pub struct KvTableColumn {
     /// The column holds data (a value, a member, a field name), so its form
     /// field submits the text as typed instead of trimmed.
     pub verbatim: bool,
+    /// What the column's form field shows while empty.
+    pub placeholder: Option<SharedString>,
 }
 
 impl KvTableColumn {
@@ -119,6 +121,12 @@ impl KvTableColumn {
     /// whitespace, which a Redis value, member or field name may carry.
     pub fn verbatim(mut self) -> Self {
         self.verbatim = true;
+        self
+    }
+    /// Show `text` in the column's form field while it is empty — an example
+    /// of what it takes, where the header is too narrow to say.
+    pub fn placeholder(mut self, text: impl Into<SharedString>) -> Self {
+        self.placeholder = Some(text.into());
         self
     }
 }

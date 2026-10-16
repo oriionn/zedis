@@ -19,7 +19,7 @@ use crate::error::Error;
 use crate::helpers::get_mono_font_family;
 use crate::states::ZedisGlobalStore;
 use crate::states::i18n_proto_editor;
-use crate::states::{ZedisServerState, dialog_button_props};
+use crate::states::{ZedisServerState, i18n_common};
 use gpui::{App, Entity, SharedString, Subscription, Window, div, prelude::*, px};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::label::Label;
@@ -542,7 +542,9 @@ impl ZedisProtoEditor {
         .to_string();
 
         ZedisDialog::new_alert(i18n_proto_editor(cx, "remove_proto_title"), text)
-            .button_props(dialog_button_props(cx))
+            .danger()
+            .ok_text(i18n_common(cx, "delete"))
+            .cancel_text(i18n_common(cx, "cancel"))
             .on_ok(move |_, _window, cx| {
                 let id = id.clone();
                 let view_handle = view_handle.clone();

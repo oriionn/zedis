@@ -403,11 +403,9 @@ impl ZedisLuaScriptLibrary {
         .into();
         let id_for_task = id.clone();
         ZedisDialog::new_alert(title, message)
-            .button_props(
-                dialog_button_props(cx)
-                    .ok_text(i18n_lua_scripts(cx, "delete_confirm"))
-                    .cancel_text(i18n_common(cx, "cancel")),
-            )
+            .danger()
+            .ok_text(i18n_lua_scripts(cx, "delete_confirm"))
+            .cancel_text(i18n_common(cx, "cancel"))
             .on_ok(move |_, _w, cx| {
                 let Some(this) = entity.upgrade() else { return true };
                 let id_clone = id_for_task.clone();
@@ -658,11 +656,9 @@ impl ZedisLuaScriptLibrary {
         let server_id = self.server_state.read(cx).server_id().to_string();
         let db = self.server_state.read(cx).db();
         ZedisDialog::new_alert(title, escalate_dangerous_body(cx, &server_id, message))
-            .button_props(
-                dialog_button_props(cx)
-                    .ok_text(i18n_lua_scripts(cx, "flush_confirm"))
-                    .cancel_text(i18n_common(cx, "cancel")),
-            )
+            .danger()
+            .ok_text(i18n_lua_scripts(cx, "flush_confirm"))
+            .cancel_text(i18n_common(cx, "cancel"))
             .on_ok(move |_, _w, cx| {
                 let Some(this) = entity.upgrade() else { return true };
                 let server_id_inner = server_id.clone();

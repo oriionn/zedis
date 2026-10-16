@@ -417,7 +417,7 @@ pub fn open_trash_dialog(server_state: Entity<ZedisServerState>, window: &mut Wi
     let view_child = view.clone();
     ZedisDialog::new(i18n_trash(cx, "title"))
         .w(px(560.))
-        .ok_text(i18n_common(cx, "confirm"))
+        .ok_text(i18n_common(cx, "close"))
         .child(move || view_child.clone())
         .open(window, cx);
 }

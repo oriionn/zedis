@@ -1725,6 +1725,13 @@ impl ZedisServerState {
         self.value.as_ref()
     }
 
+    /// Put `value` on screen as if it had been loaded: a view test has no
+    /// server to load one from.
+    #[cfg(test)]
+    pub(crate) fn show_value_for_test(&mut self, value: RedisValue) {
+        self.value = Some(value);
+    }
+
     /// Get the in-memory value history for `key` (newest first), if any.
     /// Returns `None` rather than an empty slice so callers can easily
     /// distinguish "never written" from "written and rolled back to 0".

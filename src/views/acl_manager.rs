@@ -414,7 +414,9 @@ impl ZedisAclManager {
         let message = escalate_dangerous_body(cx, &server_id, message);
         let username_for_run = username.clone();
         ZedisDialog::new_alert(title, message)
-            .button_props(dialog_button_props(cx))
+            .danger()
+            .ok_text(i18n_common(cx, "delete"))
+            .cancel_text(i18n_common(cx, "cancel"))
             .on_ok(move |_, _, cx| {
                 let Some(this) = entity.upgrade() else { return true };
                 let user = username_for_run.clone();
@@ -498,7 +500,8 @@ impl ZedisAclManager {
     }
 
     /// `ACL LOAD` throws away every runtime change, and `ACL LOG RESET`
-    /// every recorded event — both ask first, escalated on a tagged server.
+    /// every recorded event — both ask first, escalated on a tagged server,
+    /// with Return answering Cancel and the button named after the command.
     fn confirm_acl_op(&mut self, op: AclOp, window: &mut Window, cx: &mut gpui::Context<Self>) {
         let (Some(title_key), Some(body_key)) = (op.confirm_title_key(), op.confirm_body_key()) else {
             self.run_acl_op(op, cx);
@@ -511,7 +514,9 @@ impl ZedisAclManager {
         let body = escalate_dangerous_body(cx, &server_id, body);
         let entity = cx.entity().downgrade();
         ZedisDialog::new_alert(title, body)
-            .button_props(dialog_button_props(cx).ok_text(i18n_common(cx, "confirm")))
+            .danger()
+            .ok_text(i18n_acl(cx, op.label_key()))
+            .cancel_text(i18n_common(cx, "cancel"))
             .on_ok(move |_, _window, cx| {
                 if let Some(this) = entity.upgrade() {
                     this.update(cx, |this, cx| this.run_acl_op(op, cx));
@@ -545,6 +550,15 @@ enum AclOp {
 }
 
 impl AclOp {
+    /// The header button's label, which is also its confirm's OK.
+    fn label_key(self) -> &'static str {
+        match self {
+            AclOp::Save => "save",
+            AclOp::Load => "load",
+            AclOp::LogReset => "log_reset",
+        }
+    }
+
     fn done_key(self) -> &'static str {
         match self {
             AclOp::Save => "acl.save_done",
@@ -673,7 +687,7 @@ impl gpui::Render for ZedisAclManager {
                                 .outline()
                                 .small()
                                 .icon(Icon::new(CustomIconName::Save))
-                                .label(i18n_acl(cx, "save"))
+                                .label(i18n_acl(cx, AclOp::Save.label_key()))
                                 .tooltip(i18n_acl(cx, "save_tooltip"))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.confirm_acl_op(AclOp::Save, window, cx);
@@ -684,7 +698,7 @@ impl gpui::Render for ZedisAclManager {
                                 .outline()
                                 .small()
                                 .icon(Icon::new(CustomIconName::Undo2))
-                                .label(i18n_acl(cx, "load"))
+                                .label(i18n_acl(cx, AclOp::Load.label_key()))
                                 .tooltip(i18n_acl(cx, "load_tooltip"))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.confirm_acl_op(AclOp::Load, window, cx);
@@ -703,7 +717,7 @@ impl gpui::Render for ZedisAclManager {
                                 .outline()
                                 .small()
                                 .icon(IconName::CircleX)
-                                .label(i18n_acl(cx, "log_reset"))
+                                .label(i18n_acl(cx, AclOp::LogReset.label_key()))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.confirm_acl_op(AclOp::LogReset, window, cx);
                                 })),

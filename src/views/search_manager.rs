@@ -37,8 +37,8 @@ use crate::{
     error::Error,
     helpers::get_mono_font_family,
     states::{
-        ServerEvent, ServerView, ZedisGlobalStore, ZedisServerState, back_to_editor_tooltip, dialog_button_props,
-        escalate_dangerous_body, i18n_common, i18n_search,
+        ServerEvent, ServerView, ZedisGlobalStore, ZedisServerState, back_to_editor_tooltip, escalate_dangerous_body,
+        i18n_common, i18n_search,
     },
     views::open_key_in_editor,
 };
@@ -528,11 +528,9 @@ impl ZedisSearchManager {
         // an ACL user does.
         let body_message = escalate_dangerous_body(cx, &server_id, body_message);
         ZedisDialog::new_alert(title, body_message)
-            .button_props(
-                dialog_button_props(cx)
-                    .ok_text(i18n_search(cx, "drop_confirm"))
-                    .cancel_text(i18n_common(cx, "cancel")),
-            )
+            .danger()
+            .ok_text(i18n_search(cx, "drop_confirm"))
+            .cancel_text(i18n_common(cx, "cancel"))
             .on_ok(move |_, _window, cx| {
                 let Some(this) = entity.upgrade() else { return true };
                 // `on_ok` is `Fn` (callable multiple times), so we

@@ -1018,6 +1018,7 @@ impl Render for ZedisEditor {
         });
 
         v_flex()
+            .track_focus(&self.focus_handle)
             .w_full()
             .h_full()
             .when(!is_channel_mode, |this| this.child(self.render_select_key(cx)))

@@ -23,7 +23,7 @@ use crate::{
     helpers::{EditorAction, KeyOpAction, build_csv, hot_key_label},
     states::{
         DataFormat, KeyType, KvElement, ServerEvent, ZedisGlobalStore, ZedisServerState, detect_and_decode,
-        dialog_button_props, i18n_common, i18n_editor, i18n_key_ops, i18n_kv_table, i18n_list_editor, i18n_zset_editor,
+        i18n_common, i18n_editor, i18n_key_ops, i18n_kv_table, i18n_list_editor, i18n_zset_editor,
         update_app_state_and_save_quiet_debounced,
     },
     views::{
@@ -1196,7 +1196,9 @@ impl<T: ZedisKvFetcher> ZedisKvTable<T> {
         let title = i18n_common(cx, "remove_title");
 
         ZedisDialog::new_alert(title, message.to_string())
-            .button_props(dialog_button_props(cx))
+            .danger()
+            .ok_text(i18n_common(cx, "delete"))
+            .cancel_text(i18n_common(cx, "cancel"))
             .on_ok(move |_, window, cx| {
                 fetcher.remove_many(&rows, cx);
                 table_state.update(cx, |state, _| state.delegate_mut().clear_selection());
@@ -1232,7 +1234,9 @@ impl<T: ZedisKvFetcher> ZedisKvTable<T> {
         let title = i18n_common(cx, "remove_title");
 
         ZedisDialog::new_alert(title, message.to_string())
-            .button_props(dialog_button_props(cx))
+            .danger()
+            .ok_text(i18n_common(cx, "delete"))
+            .cancel_text(i18n_common(cx, "cancel"))
             .on_ok(move |_, window, cx| {
                 fetcher.remove(row_ix, cx);
                 entity.update(cx, |this, _cx| {
@@ -1354,6 +1358,9 @@ impl<T: ZedisKvFetcher> ZedisKvTable<T> {
             }
             if column.verbatim {
                 field = field.verbatim();
+            }
+            if let Some(placeholder) = column.placeholder.clone() {
+                field = field.placeholder(placeholder);
             }
             if let Some(field_type) = column.field_type.clone() {
                 if field_type == ZedisFormFieldType::Editor && !column.flex {

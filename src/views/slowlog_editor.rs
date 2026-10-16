@@ -1115,7 +1115,9 @@ impl ZedisSlowlogEditor {
         let body = escalate_dangerous_body(cx, &server_id, body);
         let editor = cx.entity().downgrade();
         ZedisDialog::new_alert(title, body)
-            .button_props(dialog_button_props(cx).ok_text(i18n_common(cx, "confirm")))
+            .danger()
+            .ok_text(i18n_slowlog_editor(cx, "slowlog_reset"))
+            .cancel_text(i18n_common(cx, "cancel"))
             .on_ok(move |_, window, cx| {
                 if let Some(editor) = editor.upgrade() {
                     editor.update(cx, |this, cx| this.run_reset_slowlog(cx));

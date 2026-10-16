@@ -299,7 +299,7 @@ pub fn open_connection_diagnostics(server: RedisServer, window: &mut Window, cx:
     let view_child = view.clone();
     ZedisDialog::new(i18n_servers(cx, "diag_title"))
         .w(px(520.))
-        .ok_text(i18n_common(cx, "confirm"))
+        .ok_text(i18n_common(cx, "close"))
         .child(move || view_child.clone())
         .open(window, cx);
 }

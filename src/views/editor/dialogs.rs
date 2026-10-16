@@ -123,11 +123,9 @@ impl ZedisEditor {
         let locale = cx.global::<ZedisGlobalStore>().read(cx).locale();
         let message = t!("editor.save_conflict_body", key = key.as_ref(), locale = locale).to_string();
         ZedisDialog::new_alert(i18n_editor(cx, "save_conflict_title"), message)
-            .button_props(
-                dialog_button_props(cx)
-                    .ok_text(i18n_editor(cx, "save_conflict_overwrite"))
-                    .cancel_text(i18n_common(cx, "cancel")),
-            )
+            .danger()
+            .ok_text(i18n_editor(cx, "save_conflict_overwrite"))
+            .cancel_text(i18n_common(cx, "cancel"))
             .on_ok(move |_, window, cx| {
                 let (key, draft) = (key.clone(), draft.clone());
                 server_state.update(cx, move |state, cx| {

@@ -46,7 +46,10 @@ use crate::{
 #[cfg(not(target_family = "wasm"))]
 use crate::{states::i18n_servers, views::open_connection_diagnostics};
 use bytes::Bytes;
-use gpui::{ClipboardItem, Entity, PathPromptOptions, SharedString, Subscription, Task, Window, div, prelude::*, px};
+use gpui::{
+    ClipboardItem, Entity, FocusHandle, Focusable, PathPromptOptions, SharedString, Subscription, Task, Window, div,
+    prelude::*, px,
+};
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt, WindowExt,
     alert::Alert,
@@ -164,6 +167,9 @@ pub struct ZedisEditor {
     should_enter_ttl_edit_mode: Option<bool>,
     ttl_edit_mode: bool,
     ttl_input_state: Entity<InputState>,
+    /// The editor's own focus, which stays in the tree on every key: what
+    /// the TTL field hands the focus to when it closes with it.
+    focus_handle: FocusHandle,
 
     /// Rename dialog input — holds the proposed new key name.
     rename_input_state: Entity<InputState>,
@@ -494,6 +500,7 @@ impl ZedisEditor {
             pending_save_conflict: None,
             ttl_edit_mode: false,
             ttl_input_state,
+            focus_handle: cx.focus_handle(),
             rename_input_state,
             placeholders,
             pending_overwrite_confirm: None,
@@ -623,7 +630,7 @@ impl ZedisEditor {
         }));
     }
     /// Handle TTL update when user submits new value
-    fn handle_update_ttl(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_update_ttl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let key = self.server_state.clone().read(cx).key().unwrap_or_default();
         if key.is_empty() {
             return;
@@ -638,12 +645,29 @@ impl ZedisEditor {
             });
             return;
         }
-        self.ttl_edit_mode = false;
+        self.close_ttl_field(window, cx);
 
         self.server_state.update(cx, move |state, cx| {
             state.update_key_ttl(key, ttl.into(), cx);
         });
         cx.notify();
+    }
+
+    /// Leave TTL edit mode after a TTL was set. The field leaves the tree,
+    /// and with it the focus if it held it — after which no shortcut reached
+    /// its handler until something was clicked: ⌘N did nothing after a TTL
+    /// set with Return. The editor takes the focus then; when the field
+    /// closes because the focus went elsewhere (`Blur`), it stays there.
+    fn close_ttl_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .ttl_input_state
+            .read(cx)
+            .focus_handle(cx)
+            .contains_focused(window, cx)
+        {
+            self.focus_handle.focus(window, cx);
+        }
+        self.ttl_edit_mode = false;
     }
 
     /// Drop the selected key's expiry (`PERSIST`) from the TTL dropdown.

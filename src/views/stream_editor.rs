@@ -954,7 +954,9 @@ impl ZedisStreamEditor {
             i18n_stream_editor(cx, "destroy_group_title"),
             escalate_dangerous_body(cx, &server_id, message),
         )
-        .button_props(dialog_button_props(cx))
+        .danger()
+        .ok_text(i18n_common(cx, "delete"))
+        .cancel_text(i18n_common(cx, "cancel"))
         .on_ok(move |_, window, cx| {
             let group = group_for_ok.clone();
             server_state.update(cx, |state, cx| {
@@ -1135,7 +1137,9 @@ impl ZedisStreamEditor {
                     i18n_stream_editor(cx, "trim_title"),
                     escalate_dangerous_body(cx, &server_id, message),
                 )
-                .button_props(dialog_button_props(cx).ok_text(i18n_common(cx, "confirm")))
+                .danger()
+                .ok_text(i18n_stream_editor(cx, "trim"))
+                .cancel_text(i18n_common(cx, "cancel"))
                 .on_ok(move |_, window, cx| {
                     let trim = trim.clone();
                     server_state.update(cx, |state, cx| state.trim_stream(trim, policy, cx));

@@ -43,6 +43,7 @@ use crate::states::{
     i18n_value_search,
 };
 use crate::views::export_to_file;
+use crate::views::placeholders::Placeholders;
 use gpui::{
     ClipboardItem, Context, Entity, ScrollHandle, SharedString, Subscription, Task, Window, div, prelude::*, px,
     uniform_list,
@@ -150,6 +151,8 @@ pub struct ZedisValueSearch {
     preview: Option<Preview>,
     preview_task: Option<Task<()>>,
     preview_scroll: ScrollHandle,
+    /// Re-words the three fields' placeholders after a language change.
+    placeholders: Placeholders,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -164,12 +167,30 @@ impl ZedisValueSearch {
     }
 
     pub fn new(server_state: Entity<ZedisServerState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let prefix_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder(i18n_value_search(cx, "prefix_placeholder")));
-        let query_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder(i18n_value_search(cx, "query_placeholder")));
-        let filter_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder(i18n_value_search(cx, "filter_placeholder")));
+        let prefix_input = cx.new(|cx| InputState::new(window, cx));
+        let query_input = cx.new(|cx| InputState::new(window, cx));
+        let filter_input = cx.new(|cx| InputState::new(window, cx));
+        // The panel is kept across routes, so a language picked while it was
+        // away has to reach its fields too (#210).
+        let mut placeholders = Placeholders::new(cx);
+        placeholders.add(
+            &prefix_input,
+            |cx| i18n_value_search(cx, "prefix_placeholder"),
+            window,
+            cx,
+        );
+        placeholders.add(
+            &query_input,
+            |cx| i18n_value_search(cx, "query_placeholder"),
+            window,
+            cx,
+        );
+        placeholders.add(
+            &filter_input,
+            |cx| i18n_value_search(cx, "filter_placeholder"),
+            window,
+            cx,
+        );
 
         // Enter in either field starts the search (when not already running).
         let mut subscriptions = vec![cx.subscribe_in(&query_input, window, |this, _s, event, _w, cx| {
@@ -233,6 +254,7 @@ impl ZedisValueSearch {
             preview: None,
             preview_task: None,
             preview_scroll: ScrollHandle::new(),
+            placeholders,
             _subscriptions: subscriptions,
         }
     }
@@ -953,6 +975,7 @@ fn truncate_preview(mut text: String) -> SharedString {
 
 impl Render for ZedisValueSearch {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.placeholders.follow(window, cx);
         if take(&mut self.should_focus) {
             self.prefix_input.update(cx, |state, cx| state.focus(window, cx));
         }

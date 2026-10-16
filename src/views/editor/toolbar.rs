@@ -28,6 +28,9 @@ const REPLACE_KEYSTROKE: &str = "ctrl-h";
 use crate::connection::{Capability, ServerCommand};
 use gpui::{AnyElement, App};
 
+/// The inline TTL field, while the key bar shows it instead of the TTL button.
+const TTL_INPUT_ID: &str = "zedis-editor-ttl-input";
+
 /// How much of a key's name the bar shows before the facts beside it (size,
 /// encoding, heat) are given any room, in characters. A key is known by its
 /// name, and the name used to be what a narrow bar took from first: at the
@@ -212,7 +215,7 @@ impl ZedisEditor {
                     .w(px(TTL_INPUT_MAX_WIDTH))
                     .tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx))
                     .child(
-                        Input::new(&self.ttl_input_state).suffix(
+                        Input::new(&self.ttl_input_state).id(TTL_INPUT_ID).suffix(
                             Button::new("zedis-editor-ttl-update-btn")
                                 .icon(Icon::new(IconName::Check))
                                 .on_click(cx.listener(move |this, _event, window, cx| {
@@ -802,5 +805,69 @@ mod tests {
         // A wide character takes two columns of the mono face.
         assert_eq!(key_name_priority_width("用户", font_size), 24.);
         assert_eq!(key_name_priority_width("", font_size), 0.);
+    }
+
+    /// Return in the TTL field closes it, and the focus stays in the window:
+    /// it used to leave with the field, after which no shortcut (⌘N, ⌘J)
+    /// reached its handler until something was clicked.
+    #[gpui::test]
+    fn return_in_the_ttl_field_leaves_the_focus_in_the_editor(cx: &mut gpui::TestAppContext) {
+        use crate::states::{KeyType, RedisValue, ZedisServerState};
+        use crate::test_support::init_ui;
+        use gpui::{AppContext, size};
+        use gpui_kit::component::Root;
+        use gpui_kit::test::TestWindowExt;
+
+        init_ui(cx);
+        let server_state = cx.new(|_| ZedisServerState::default());
+        server_state.update(cx, |state, cx| state.select_key("list:1".into(), cx));
+        // The load that selecting starts finds no server and gives up; the
+        // value goes on screen once it has.
+        cx.run_until_parked();
+        server_state.update(cx, |state, _| {
+            state.show_value_for_test(RedisValue {
+                key_type: KeyType::List,
+                expire_at: Some(-1),
+                ..Default::default()
+            })
+        });
+
+        let mut editor = None;
+        let handle = cx.open_window(size(px(900.), px(600.)), |window, cx| {
+            let view = cx.new(|cx| ZedisEditor::new(server_state.clone(), window, cx));
+            editor = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let editor = editor.expect("the window built the editor");
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            editor.update(cx, |editor, cx| editor.enter_ttl_edit_mode(window, cx));
+        })
+        .expect("the window is open");
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find(TTL_INPUT_ID).focused(),
+                Some(true),
+                "the field opens focused"
+            );
+            window.input("1h", cx);
+            window.press("enter", cx);
+        })
+        .expect("the window is open");
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find(TTL_INPUT_ID).is_none(), "Return closed the field");
+            assert!(
+                editor.read(cx).focus_handle.contains_focused(window, cx),
+                "the focus is somewhere a shortcut can be dispatched from"
+            );
+        })
+        .expect("the window is open");
     }
 }
