@@ -27,10 +27,10 @@ use super::{
     zset::first_load_zset_value,
 };
 use crate::connection::{
-    ExpireCondition, KeyOp, KeyOpOutcome, ServerCommand, create_key, delete_key, delete_keys, delete_keys_matching,
-    dump_key, expire_key, expire_key_at, floors, flush_all, flush_db, get_server_features, get_server_heat_probe,
-    key_memory_usage, key_object_meta, key_type_and_ttl, key_types, persist_key, publish, rename_key, run_key_op,
-    scan_page, server_supports, set_keys_ttl, set_ttl_matching, snapshot_key,
+    ExpireCondition, HeatMetric, KeyOp, KeyOpOutcome, ServerCommand, create_key, delete_key, delete_keys,
+    delete_keys_matching, dump_key, expire_key, expire_key_at, floors, flush_all, flush_db, get_server_features,
+    get_server_heat_probe, key_memory_usage, key_object_meta, key_type_and_ttl, key_types, persist_key, publish,
+    rename_key, run_key_op, scan_page, server_supports, set_keys_ttl, set_ttl_matching, snapshot_key,
 };
 use crate::db::{
     TRASH_MAX_BULK_KEYS, TRASH_MAX_PAYLOAD, TRASH_MAX_VALUE_MEMORY, TRASH_RETENTION_MS, TrashEntry,
@@ -1237,11 +1237,15 @@ impl ZedisServerState {
         );
     }
 
-    /// Re-read `MEMORY USAGE` for the selected key after a collection write.
-    /// The key-bar size chip is that number, taken once at load; member
+    /// Re-read what the key bar says about the selected key after a write
+    /// to it: the size, and the `OBJECT` decorations beside it — the
+    /// encoding, which a write can change (`int` to `embstr`, `listpack` to
+    /// `quicklist`), and the heat, which the write itself resets. All three
+    /// are taken at load, and after a save they went on describing the value
+    /// as it was: a string set from `12` to `ABC` still said `int`. Member
     /// counts already move locally. Does not flip `Updating` — the write
     /// already finished.
-    pub(crate) fn refresh_value_size(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn refresh_value_header(&mut self, cx: &mut Context<Self>) {
         let Some(key) = self.key.clone() else {
             return;
         };
@@ -1255,26 +1259,55 @@ impl ZedisServerState {
             .unwrap_or_default();
         let epoch = self.value_epoch;
         let at = self.at();
+        // The same two questions the load asks, answered the same way.
+        let with_encoding = self.features.is_usable(ServerCommand::ObjectEncoding);
+        let heat_probe = get_server_heat_probe(self.server_id.as_str());
         self.spawn(
-            ServerTask::RefreshValueSize,
-            move || async move { Ok(key_memory_usage(&at, key.as_str(), &key_type).await?) },
+            ServerTask::RefreshValueHeader,
+            move || async move {
+                let (size, (encoding, heat)) = join(
+                    key_memory_usage(&at, key.as_str(), &key_type),
+                    key_object_meta(&at, key.as_str(), with_encoding, heat_probe),
+                )
+                .await;
+                Ok((size.ok(), encoding, heat))
+            },
             move |this, result, cx| {
                 if this.value_epoch != epoch {
                     return;
                 }
-                let Ok(size) = result else {
+                let Ok((size, encoding, heat)) = result else {
                     return;
                 };
                 let Some(value) = this.value.as_mut() else {
                     return;
                 };
-                if !Self::apply_refreshed_memory_size(value, size) {
-                    return;
+                if Self::apply_refreshed_header(value, size, encoding.into(), heat) {
+                    cx.notify();
                 }
-                cx.notify();
             },
             cx,
         );
+    }
+
+    /// Put a re-read header on `value`; true when the key bar would change.
+    /// A size the server would not give leaves the one shown.
+    fn apply_refreshed_header(
+        value: &mut RedisValue,
+        size: Option<u64>,
+        encoding: SharedString,
+        heat: HeatMetric,
+    ) -> bool {
+        let mut changed = size.is_some_and(|size| Self::apply_refreshed_memory_size(value, size));
+        if value.encoding != encoding {
+            value.encoding = encoding;
+            changed = true;
+        }
+        if value.heat != heat {
+            value.heat = heat;
+            changed = true;
+        }
+        changed
     }
 
     /// True when the header size chip would change.
@@ -2509,5 +2542,31 @@ mod memory_size_tests {
         assert_eq!(value.size, 128);
         assert!(ZedisServerState::apply_refreshed_memory_size(&mut value, 160));
         assert_eq!(value.size, 160);
+    }
+
+    /// After a save the key bar takes the encoding and heat asked again, not
+    /// only the size: `12` saved as `ABC` went on saying `int`, idle 2m.
+    #[test]
+    fn a_refreshed_header_replaces_encoding_and_heat() {
+        let mut value = RedisValue {
+            size: 48,
+            encoding: "int".into(),
+            heat: HeatMetric::IdleTime(120),
+            ..Default::default()
+        };
+        let unchanged =
+            ZedisServerState::apply_refreshed_header(&mut value, Some(48), "int".into(), HeatMetric::IdleTime(120));
+        assert!(!unchanged);
+        assert!(ZedisServerState::apply_refreshed_header(
+            &mut value,
+            Some(48),
+            "embstr".into(),
+            HeatMetric::IdleTime(0)
+        ));
+        assert_eq!(value.encoding.as_ref(), "embstr");
+        assert_eq!(value.heat, HeatMetric::IdleTime(0));
+        // A size the server would not give leaves the one shown.
+        ZedisServerState::apply_refreshed_header(&mut value, None, "embstr".into(), HeatMetric::IdleTime(0));
+        assert_eq!(value.size, 48);
     }
 }

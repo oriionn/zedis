@@ -581,7 +581,7 @@ impl TaskRun {
     fn log_completed(&self) {
         if !matches!(
             self.name,
-            ServerTask::RefreshRedisInfo | ServerTask::RefreshDbsize | ServerTask::RefreshValueSize
+            ServerTask::RefreshRedisInfo | ServerTask::RefreshDbsize | ServerTask::RefreshValueHeader
         ) {
             info!(
                 task = self.name.as_str(),
@@ -986,7 +986,7 @@ impl ZedisServerState {
                     run.name,
                     ServerTask::RefreshRedisInfo
                         | ServerTask::RefreshDbsize
-                        | ServerTask::RefreshValueSize
+                        | ServerTask::RefreshValueHeader
                         | ServerTask::ProbeFeatures
                 )
                 && !self.note_command_error(e, cx)

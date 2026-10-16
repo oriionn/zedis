@@ -1291,6 +1291,7 @@ impl ZedisServerState {
             return;
         }
         let conflict = matches!(result, Ok(StringWrite::Conflict));
+        let mut saved = false;
         if let Some(value) = self.value.as_mut() {
             value.status = RedisValueStatus::Idle;
             match result {
@@ -1298,6 +1299,7 @@ impl ZedisServerState {
                     if let Some(size) = result_size {
                         value.size = size;
                     }
+                    saved = true;
                 }
                 // Refused or failed: the optimistic display is wrong either
                 // way — recover what was loaded.
@@ -1307,6 +1309,11 @@ impl ZedisServerState {
                 }
             }
             cx.emit(ServerEvent::ValueUpdated);
+        }
+        // The encoding and heat in the key bar are the old value's until
+        // asked again: `12` saved as `ABC` still said `int`.
+        if saved {
+            self.refresh_value_header(cx);
         }
         if conflict {
             // Truth first: pull the winner's value onto the screen, then

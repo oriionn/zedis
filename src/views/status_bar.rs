@@ -47,7 +47,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants},
     h_flex,
     label::Label,
-    menu::{DropdownMenu, PopupMenu},
+    menu::{DropdownMenu, PopupMenu, PopupMenuItem},
     tooltip::Tooltip,
 };
 use rust_i18n::t;
@@ -303,6 +303,53 @@ struct MetricChip {
 /// editor's own controls (Soft Wrap, the format, the Viewer) share the bar.
 const UNITS_MIN_WIDTH: f32 = 1020.;
 const UNITS_MIN_WIDTH_WITH_EDITOR: f32 = 1260.;
+/// The content width from which the editor's three controls are drawn as
+/// they are; below it they fold into one menu button. The default window
+/// (1200, so 1020 of content) cut "Viewer: Auto" at the window's edge.
+const EDITOR_CONTROLS_MIN_WIDTH: f32 = 1120.;
+/// The content width from which the link chip says "Connected" beside its
+/// icon, with the editor's controls (folded) on the bar and without them.
+const LINK_LABEL_MIN_WIDTH_WITH_EDITOR: f32 = 860.;
+const LINK_LABEL_MIN_WIDTH: f32 = 810.;
+/// The Viewer menu's width: its longest choice, the tick and the paddings.
+const VIEWER_MENU_WIDTH: f32 = 96.;
+/// The viewers a string can be shown in, in the Viewer picker's order.
+const VIEWER_MODES: [ViewMode; 3] = [ViewMode::Auto, ViewMode::Plain, ViewMode::Hex];
+
+/// What the bar has room for, from the most to the least. A bar that has to
+/// stay one line gives things up in this order, and whole: first the words
+/// beside its counts, then the editor's controls fold into one button, then
+/// the link chip lets its word go and keeps its icon — never half of
+/// something cut by the window's edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum BarFit {
+    Full,
+    NoUnits,
+    FoldedEditorControls,
+    LinkIconOnly,
+}
+
+impl BarFit {
+    fn for_width(width: f32, editor_controls: bool) -> Self {
+        if editor_controls {
+            if width >= UNITS_MIN_WIDTH_WITH_EDITOR {
+                BarFit::Full
+            } else if width >= EDITOR_CONTROLS_MIN_WIDTH {
+                BarFit::NoUnits
+            } else if width >= LINK_LABEL_MIN_WIDTH_WITH_EDITOR {
+                BarFit::FoldedEditorControls
+            } else {
+                BarFit::LinkIconOnly
+            }
+        } else if width >= UNITS_MIN_WIDTH {
+            BarFit::Full
+        } else if width >= LINK_LABEL_MIN_WIDTH {
+            BarFit::NoUnits
+        } else {
+            BarFit::LinkIconOnly
+        }
+    }
+}
 
 #[derive(Default)]
 struct StatusBarServerState {
@@ -498,7 +545,7 @@ impl ZedisStatusBar {
                     // error chip.
                     if matches!(
                         *task,
-                        ServerTask::RefreshRedisInfo | ServerTask::RefreshDbsize | ServerTask::RefreshValueSize
+                        ServerTask::RefreshRedisInfo | ServerTask::RefreshDbsize | ServerTask::RefreshValueHeader
                     ) {
                         return;
                     }
@@ -525,11 +572,7 @@ impl ZedisStatusBar {
         }));
         let viewer_mode_state = cx.new(|cx| {
             SelectState::new(
-                SearchableVec::new(vec![
-                    ViewMode::Auto.as_str().into(),
-                    ViewMode::Plain.as_str().into(),
-                    ViewMode::Hex.as_str().into(),
-                ]),
+                SearchableVec::new(VIEWER_MODES.iter().map(|mode| mode.as_str().into()).collect::<Vec<_>>()),
                 Some(IndexPath::new(0)),
                 window,
                 cx,
@@ -1496,6 +1539,7 @@ impl ZedisStatusBar {
         let latency_text: SharedString =
             format!("{:<width$}", latency_text.as_ref(), width = LATENCY_LABEL_CHARS).into();
         let status_text = status_text_color(cx.theme().is_dark());
+        let link_label = self.bar_fit(window, cx) < BarFit::LinkIconOnly;
         ZedisDivider::new()
             .child(
                 // One native ghost button covering icon + label, so the whole
@@ -1512,8 +1556,14 @@ impl ZedisStatusBar {
                     // air between adjacent chips; compact → px_1p5.
                     .compact()
                     .disabled(!icon_clickable)
-                    .icon(Icon::new(health_icon).mr_1().text_color(health_color))
-                    .label(health_label)
+                    // Where the bar is short of room the icon says it alone,
+                    // and the tooltip still in words.
+                    .icon(
+                        Icon::new(health_icon)
+                            .when(link_label, |icon| icon.mr_1())
+                            .text_color(health_color),
+                    )
+                    .when(link_label, |button| button.label(health_label))
                     .text_color(status_text)
                     .tooltip(health_tooltip)
                     .on_click(cx.listener(move |this, _, _window, cx| {
@@ -1670,12 +1720,12 @@ impl ZedisStatusBar {
     /// who already knew them; the words go away again where they would push
     /// the rest of the bar out of the window.
     fn shows_units(&self, window: &Window, cx: &App) -> bool {
-        let needed = if self.show_editor_controls(cx) {
-            UNITS_MIN_WIDTH_WITH_EDITOR
-        } else {
-            UNITS_MIN_WIDTH
-        };
-        content_area_width(window, cx).as_f32() >= needed
+        self.bar_fit(window, cx) == BarFit::Full
+    }
+
+    /// What the bar has room for at the content's current width.
+    fn bar_fit(&self, window: &Window, cx: &App) -> BarFit {
+        BarFit::for_width(content_area_width(window, cx).as_f32(), self.show_editor_controls(cx))
     }
     fn render_editor_settings(&self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let server_state = &self.state.server_state;
@@ -1711,20 +1761,23 @@ impl ZedisStatusBar {
                 .into()
             })
             .label(i18n_status_bar(cx, "soft_wrap"))
-            .on_click(cx.listener(|this, _, _window, cx| {
-                let soft_wrap = !this.state.server_state.soft_wrap;
-                this.state.server_state.soft_wrap = soft_wrap;
-                this.server_state.update(cx, |state, cx| {
-                    state.set_soft_wrap(soft_wrap, cx);
-                });
-                cx.notify();
+            .on_click(cx.listener(|this, _, _window, cx| this.toggle_soft_wrap(cx)))
+    }
 
-                let server_id = this.state.server_state.server_id.clone();
-                if let Ok(mut option) = get_session_option(server_id.as_str()) {
-                    option.soft_wrap = Some(soft_wrap);
-                    save_session_option(server_id.as_str(), option, cx);
-                }
-            }))
+    /// Soft Wrap on or off, for this server's sessions from now on.
+    fn toggle_soft_wrap(&mut self, cx: &mut Context<Self>) {
+        let soft_wrap = !self.state.server_state.soft_wrap;
+        self.state.server_state.soft_wrap = soft_wrap;
+        self.server_state.update(cx, |state, cx| {
+            state.set_soft_wrap(soft_wrap, cx);
+        });
+        cx.notify();
+
+        let server_id = self.state.server_state.server_id.clone();
+        if let Ok(mut option) = get_session_option(server_id.as_str()) {
+            option.soft_wrap = Some(soft_wrap);
+            save_session_option(server_id.as_str(), option, cx);
+        }
     }
     fn render_data_format(&self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(data_format) = self.state.data_format.clone() else {
@@ -1744,9 +1797,81 @@ impl ZedisStatusBar {
             return h_flex();
         };
         let label = i18n_status_bar(cx, "viewer");
-        h_flex()
-            .child(Label::new(label).mr_1())
-            .child(Select::new(&self.viewer_mode_state).appearance(false))
+        h_flex().child(Label::new(label).mr_1()).child(
+            Select::new(&self.viewer_mode_state)
+                .appearance(false)
+                // Its own width, not the trigger's: the trigger is as wide
+                // as "Auto", and the menu cut "Plain" to "Pla…".
+                .menu_width(px(VIEWER_MENU_WIDTH)),
+        )
+    }
+
+    /// The editor's controls folded into one button, where the bar is short
+    /// of room for Soft Wrap, the format and the Viewer side by side: the
+    /// format's icon and the viewer the value is shown in, with the format
+    /// named in its tooltip and at the top of its menu, the viewers and Soft
+    /// Wrap below.
+    fn render_folded_editor_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let format = self.state.data_format.clone().unwrap_or_default();
+        let (mode, wrap_fits) = self
+            .server_state
+            .read(cx)
+            .value()
+            .and_then(|value| value.bytes_value())
+            .map(|bytes| (bytes.view_mode.clone(), bytes.soft_wrap_fits()))
+            .unwrap_or((ViewMode::Auto, true));
+        let soft_wrap = self.state.server_state.soft_wrap && wrap_fits;
+        let format_line: SharedString = format!("{}: {format}", i18n_status_bar(cx, "data_format_tooltip")).into();
+        let status_bar = cx.entity().downgrade();
+        Button::new("zedis-status-bar-view")
+            .ghost()
+            .xsmall()
+            .compact()
+            .text_color(status_text_color(cx.theme().is_dark()))
+            .icon(Icon::new(CustomIconName::Binary))
+            .label(mode.as_str())
+            // A menu, not a switch: the caret says so.
+            .dropdown_caret(true)
+            .tooltip(format_line.clone())
+            .dropdown_menu(move |menu, _window, cx| {
+                let mut menu = menu
+                    .min_w(px(VIEWER_MENU_WIDTH * 2.))
+                    .label(format_line.clone())
+                    .separator()
+                    .label(i18n_status_bar(cx, "viewer"));
+                for (ix, choice) in VIEWER_MODES.iter().enumerate() {
+                    let status_bar = status_bar.clone();
+                    menu = menu.item(PopupMenuItem::new(choice.as_str()).checked(*choice == mode).on_click(
+                        move |_, window, cx| {
+                            let _ = status_bar.update(cx, |this, cx| this.choose_viewer(ix, window, cx));
+                        },
+                    ));
+                }
+                let status_bar = status_bar.clone();
+                menu.separator().item(
+                    PopupMenuItem::new(i18n_status_bar(cx, "soft_wrap"))
+                        .checked(soft_wrap)
+                        .disabled(!wrap_fits)
+                        .on_click(move |_, _window, cx| {
+                            let _ = status_bar.update(cx, |this, cx| this.toggle_soft_wrap(cx));
+                        }),
+                )
+            })
+    }
+
+    /// Show the value in the viewer at `ix` of the Viewer picker — from the
+    /// folded menu, keeping the picker in step for when the bar widens.
+    fn choose_viewer(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(choice) = VIEWER_MODES.get(ix) else {
+            return;
+        };
+        self.viewer_mode_state.update(cx, |state, cx| {
+            state.set_selected_index(Some(IndexPath::new(ix)), window, cx);
+        });
+        let name: SharedString = choice.as_str().into();
+        self.server_state.update(cx, |state, cx| {
+            state.update_bytes_value_view_mode(name, cx);
+        });
     }
 
     /// Render the error message
@@ -1837,6 +1962,8 @@ impl Render for ZedisStatusBar {
             });
         }
         let status_text = status_text_color(cx.theme().is_dark());
+        let editor_controls = self.show_editor_controls(cx);
+        let folded = self.bar_fit(window, cx) >= BarFit::FoldedEditorControls;
         h_flex()
             .items_center()
             .w_full()
@@ -1860,16 +1987,19 @@ impl Render for ZedisStatusBar {
             .child(
                 ZedisDivider::new()
                     .child(self.render_telemetry(window, cx))
-                    .when(self.show_editor_controls(cx), |this| {
+                    .when(editor_controls && !folded, |this| {
                         this.child(self.render_editor_settings(window, cx))
                     })
-                    .when(self.show_editor_controls(cx), |this| {
+                    .when(editor_controls && !folded, |this| {
                         this.child(
                             h_flex()
                                 .items_center()
                                 .child(self.render_data_format(window, cx))
                                 .child(self.render_viewer_mode(window, cx)),
                         )
+                    })
+                    .when(editor_controls && folded, |this| {
+                        this.child(self.render_folded_editor_controls(cx))
                     }),
             )
     }
@@ -1973,5 +2103,29 @@ mod tests {
         assert!(counts[1..15].iter().all(|&c| c == 0));
 
         assert!(keyspace_key_counts(&keyspace, 0).is_empty());
+    }
+
+    /// The bar gives things up one at a time as the content narrows, in one
+    /// order, and later with the editor's controls on it than without. The
+    /// default window (1020 of content) used to cut "Viewer: Auto" at its
+    /// edge; there the editor's controls are folded into one button.
+    #[test]
+    fn the_bar_gives_things_up_in_order_as_it_narrows() {
+        let editor = |width: f32| BarFit::for_width(width, true);
+        let page = |width: f32| BarFit::for_width(width, false);
+        assert_eq!(editor(1400.), BarFit::Full);
+        assert_eq!(editor(1200.), BarFit::NoUnits);
+        assert_eq!(editor(1020.), BarFit::FoldedEditorControls);
+        assert_eq!(editor(780.), BarFit::LinkIconOnly);
+        assert_eq!(page(1020.), BarFit::Full);
+        assert_eq!(page(900.), BarFit::NoUnits);
+        assert_eq!(page(780.), BarFit::LinkIconOnly);
+        // Narrower never shows more.
+        let mut last = BarFit::Full;
+        for width in (600..1500).rev().step_by(10) {
+            let fit = editor(width as f32);
+            assert!(fit >= last, "{width}");
+            last = fit;
+        }
     }
 }

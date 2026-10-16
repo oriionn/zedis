@@ -239,7 +239,7 @@ impl ZedisServerState {
                 match result {
                     Ok(data) => {
                         on_success(this, data, cx);
-                        this.refresh_value_size(cx);
+                        this.refresh_value_header(cx);
                     }
                     Err(e) => {
                         this.emit_error_notification(e.to_string().into(), cx);
