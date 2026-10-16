@@ -499,8 +499,19 @@ impl ZedisTopology {
         };
         let server_state = self.server_state.clone();
         let server_id = self.server_state.read(cx).server_id().to_string();
-        ZedisDialog::new_alert(title, escalate_dangerous_body(cx, &server_id, body))
-            .button_props(dialog_button_props(cx).ok_text(i18n_common(cx, "confirm")))
+        let dialog = ZedisDialog::new_alert(title, escalate_dangerous_body(cx, &server_id, body));
+        // FORCE skips the handshake with the master, and writes the old
+        // master takes before the cluster reconciles are lost — the danger
+        // shape, as its button on the page is.
+        let dialog = if force {
+            dialog
+                .danger()
+                .ok_text(i18n_topology(cx, "force_failover_button"))
+                .cancel_text(i18n_common(cx, "cancel"))
+        } else {
+            dialog.button_props(dialog_button_props(cx).ok_text(i18n_common(cx, "confirm")))
+        };
+        dialog
             .on_ok(move |_, window, cx| {
                 let addr = target_addr.clone();
                 server_state.update(cx, |state, cx| state.cluster_failover(addr, force, cx));

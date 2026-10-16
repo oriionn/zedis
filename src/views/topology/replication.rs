@@ -405,7 +405,9 @@ impl ZedisTopology {
     }
 
     /// `REPLICAOF host port` behind the alert dialog: the body says the
-    /// dataset goes, production tags escalate it.
+    /// dataset goes, production tags escalate it. It is the one topology
+    /// confirm that deletes data, so it is the danger shape — Return answers
+    /// Cancel — with the page's own verb on the button.
     pub(super) fn open_replicaof_dialog(
         &mut self,
         host: SharedString,
@@ -424,7 +426,9 @@ impl ZedisTopology {
         let server_state = self.server_state.clone();
         let server_id = self.server_state.read(cx).server_id().to_string();
         ZedisDialog::new_alert(title, escalate_dangerous_body(cx, &server_id, body))
-            .button_props(dialog_button_props(cx).ok_text(i18n_common(cx, "confirm")))
+            .danger()
+            .ok_text(i18n_topology(cx, "repl_make_replica_button"))
+            .cancel_text(i18n_common(cx, "cancel"))
             .on_ok(move |_, window, cx| {
                 let host = host.clone();
                 server_state.update(cx, |state, cx| state.replicaof(host, port, cx));
@@ -493,8 +497,18 @@ impl ZedisTopology {
         let server_state = self.server_state.clone();
         let server_id = self.server_state.read(cx).server_id().to_string();
         let host: SharedString = host.into();
-        ZedisDialog::new_alert(title, escalate_dangerous_body(cx, &server_id, body))
-            .button_props(dialog_button_props(cx).ok_text(i18n_common(cx, "confirm")))
+        let dialog = ZedisDialog::new_alert(title, escalate_dangerous_body(cx, &server_id, body));
+        // FORCE loses the writes the replica never received, so it is the
+        // danger shape; a plain FAILOVER waits for them and loses nothing.
+        let dialog = if force {
+            dialog
+                .danger()
+                .ok_text(i18n_topology(cx, "force_failover_button"))
+                .cancel_text(i18n_common(cx, "cancel"))
+        } else {
+            dialog.button_props(dialog_button_props(cx).ok_text(i18n_common(cx, "confirm")))
+        };
+        dialog
             .on_ok(move |_, window, cx| {
                 let host = host.clone();
                 server_state.update(cx, |state, cx| state.failover(host, port, force, cx));

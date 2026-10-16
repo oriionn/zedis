@@ -22,7 +22,7 @@ use crate::states::{
 };
 use crate::views::placeholders::Placeholders;
 use bytes::Bytes;
-use gpui::{App, Entity, Image, ObjectFit, SharedString, Subscription, Window, img, px, relative};
+use gpui::{AnyElement, App, Entity, Image, ObjectFit, SharedString, Subscription, Window, img, px, relative};
 use gpui::{div, hsla, prelude::*};
 use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants};
 use gpui_kit::component::highlighter::Language;
@@ -31,7 +31,7 @@ use gpui_kit::component::input::{
 };
 use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListItem, ListState};
-use gpui_kit::component::{ActiveTheme, IconName, IndexPath, Selectable, Sizable, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Disableable, IconName, IndexPath, Selectable, Sizable, h_flex, v_flex};
 use pretty_hex::HexConfig;
 use pretty_hex::config_hex;
 use std::cell::RefCell;
@@ -141,6 +141,16 @@ pub struct ZedisBytesEditor {
     /// `value_bytes_for_save`).
     is_hex_text: bool,
 
+    /// The Hex format is asked for. It opens on the read-only dump —
+    /// offset, bytes, ASCII — and the bytes are edited as hex text only
+    /// after asking to (`hex_editing`, #215).
+    hex_mode: bool,
+    /// The Hex format is being edited as text rather than shown as a dump.
+    hex_editing: bool,
+    /// Whether the value may be edited as hex at all: not on a read-only
+    /// connection, a module type's DUMP or a preview of a large string.
+    hex_editable: bool,
+
     /// The tree that stands in for the text of a JSON value in
     /// `json_tree_mode`.
     json_tree: Entity<ZedisJsonTree>,
@@ -215,22 +225,24 @@ fn small_image_scale(width: i32, height: i32) -> Option<i32> {
     Some(SMALL_IMAGE_TARGET / longest).filter(|scale| *scale > 1)
 }
 
+/// The read-only hex dump: offset, bytes and their ASCII on each row, as
+/// many bytes a row as the pane is wide enough for.
+fn hex_dump_data(bytes: &[u8], cx: &App) -> ByteEditorData {
+    let cfg = HexConfig {
+        title: false,
+        width: hex_bytes_per_row(cx),
+        group: 0,
+        ..Default::default()
+    };
+    ByteEditorData::Hex(HexViewerListDelegate::new(&config_hex(&bytes, cfg)))
+}
+
 fn format_byte_editor_data(value: &Arc<RedisBytesValue>, cx: &App) -> ByteEditorData {
     if value.bytes.is_empty() {
         return ByteEditorData::Text(value.text.clone().unwrap_or_default());
     }
 
-    let create_hex_view = || {
-        let cfg = HexConfig {
-            title: false,
-            width: hex_bytes_per_row(cx),
-            group: 0,
-            ..Default::default()
-        };
-
-        let hex_data = config_hex(&value.bytes, cfg);
-        ByteEditorData::Hex(HexViewerListDelegate::new(&hex_data))
-    };
+    let create_hex_view = || hex_dump_data(&value.bytes, cx);
 
     match value.view_mode {
         ViewMode::Hex => ByteEditorData::Text(bytes_to_hex_text(&value.bytes, hex_bytes_per_row(cx)).into()),
@@ -343,10 +355,13 @@ impl ZedisBytesEditor {
             window,
             |this, _server_state, event, window, cx| match event {
                 ServerEvent::ValueLoaded | ServerEvent::ValueModeViewUpdated => {
+                    // Another value, or another format: Hex opens on its dump.
+                    this.hex_editing = false;
                     this.update_editor_data(cx);
                     this.should_update_editor = true;
                 }
                 ServerEvent::ValueUpdated => {
+                    this.leave_hex_editing_once_saved(cx);
                     this.update_editor_data(cx);
                 }
                 ServerEvent::KeySelected(_) => {
@@ -522,6 +537,9 @@ impl ZedisBytesEditor {
             json_tree_mode: false,
             json_tree_stale: true,
             is_hex_text: false,
+            hex_mode: false,
+            hex_editing: false,
+            hex_editable: false,
             _subscriptions: subscriptions,
         };
         this.update_editor_data(cx);
@@ -591,8 +609,16 @@ impl ZedisBytesEditor {
             // Nor is a preview's: saved, the first bytes would replace the
             // whole value.
             let preview = value.is_some_and(|v| v.preview_of().is_some());
-            self.readonly = readonly || module_dump || preview || (!hex_mode && !redis_bytes_value.is_utf8_text());
-            self.data = format_byte_editor_data(redis_bytes_value, cx);
+            self.hex_editable = !(readonly || module_dump || preview);
+            // The Hex format shows its dump, read-only, until asked to edit.
+            let hex_dump = hex_mode && !self.hex_editing && !redis_bytes_value.bytes.is_empty();
+            self.readonly =
+                readonly || module_dump || preview || hex_dump || (!hex_mode && !redis_bytes_value.is_utf8_text());
+            self.data = if hex_dump {
+                hex_dump_data(&redis_bytes_value.bytes, cx)
+            } else {
+                format_byte_editor_data(redis_bytes_value, cx)
+            };
         } else {
             self.data = ByteEditorData::Text(SharedString::default());
         }
@@ -610,7 +636,8 @@ impl ZedisBytesEditor {
         // another binary key included — needs a new list.
         self.hex_viewer_state = None;
 
-        self.is_hex_text = hex_mode;
+        self.hex_mode = hex_mode;
+        self.is_hex_text = hex_mode && (self.hex_editing || matches!(self.data, ByteEditorData::Text(_)));
 
         // JSON detection is meaningless on hex-encoded text — skip it.
         self.is_json_value = if hex_mode {
@@ -656,6 +683,42 @@ impl ZedisBytesEditor {
         Some(parse_hex_text(text.as_ref()))
     }
 
+    /// Switch the Hex format between its dump and editing the bytes as hex
+    /// text. Leaving the text is offered only with nothing unsaved in it.
+    fn set_hex_editing(&mut self, editing: bool, cx: &mut Context<Self>) {
+        if self.hex_editing == editing || (editing && !self.hex_editable) || (!editing && self.value_modified) {
+            return;
+        }
+        self.hex_editing = editing;
+        self.update_editor_data(cx);
+        // The text is the bytes as they are now, not as editing last left it.
+        self.should_update_editor = true;
+        cx.notify();
+    }
+
+    /// Back to the dump once the bytes being edited are the stored ones: a
+    /// save that landed, or a change elsewhere (the TTL) with nothing edited.
+    /// A save that failed, or one still on its way, keeps the edits on
+    /// screen.
+    fn leave_hex_editing_once_saved(&mut self, cx: &mut Context<Self>) {
+        if !self.hex_editing {
+            return;
+        }
+        let stored = self
+            .server_state
+            .read(cx)
+            .value()
+            .and_then(|value| value.bytes_value())
+            .map(|value| value.bytes.clone());
+        let edited = parse_hex_text(self.editor.read(cx).value().as_ref());
+        if let (Some(stored), Ok(edited)) = (stored, edited)
+            && stored.as_ref() == edited.as_slice()
+        {
+            self.hex_editing = false;
+            self.should_update_editor = true;
+        }
+    }
+
     /// Check if the current editor value differs from the original Redis value
     pub fn is_value_modified(&self) -> bool {
         self.value_modified
@@ -666,6 +729,10 @@ impl ZedisBytesEditor {
     /// something anyone discovers. Does nothing on a read-only value: the
     /// component refuses replace mode there anyway.
     pub fn open_find_replace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Replacing is editing: the Hex format leaves its dump for its text.
+        if self.hex_dump_editable() {
+            self.set_hex_editing(true, cx);
+        }
         if self.readonly {
             return;
         }
@@ -681,9 +748,23 @@ impl ZedisBytesEditor {
         self.is_json_value
     }
 
-    /// Check if the editor is readonly
+    /// Whether the value cannot be edited here. The Hex format's dump is
+    /// read-only on screen, but its bytes are a click from editable, so it
+    /// does not count: a lock beside the size, or history and replace
+    /// withheld, would say they are not.
     pub fn is_readonly(&self) -> bool {
-        self.readonly
+        self.readonly && !self.hex_dump_editable()
+    }
+
+    /// The Hex format's dump is on screen. It has nothing to save: the
+    /// bytes are edited in its text.
+    pub fn shows_hex_dump(&self) -> bool {
+        self.hex_mode && matches!(self.data, ByteEditorData::Hex(_))
+    }
+
+    /// The dump is on screen and the text behind it may be edited.
+    fn hex_dump_editable(&self) -> bool {
+        self.shows_hex_dump() && self.hex_editable
     }
 
     /// Get the current editor value
@@ -704,6 +785,10 @@ impl ZedisBytesEditor {
     ///
     /// Marks the editor as modified so the Save button enables itself.
     pub fn load_bytes_into_editor(&mut self, bytes: Bytes, window: &mut Window, cx: &mut Context<Self>) {
+        // The Hex format takes an old version in its text, not its dump.
+        if self.hex_dump_editable() {
+            self.set_hex_editing(true, cx);
+        }
         if self.readonly {
             return;
         }
@@ -715,6 +800,9 @@ impl ZedisBytesEditor {
         self.editor.update(cx, |state, cx| {
             state.set_value(text, window, cx);
         });
+        // The text is the old version now; the next frame must not put the
+        // current bytes back over it (leaving the dump asked for that).
+        self.should_update_editor = false;
         self.value_modified = true;
         self.json_tree_stale = true;
         cx.notify();
@@ -784,6 +872,45 @@ impl ZedisBytesEditor {
     /// Text / Tree, in the JSONPath row so it exists only for a JSON value.
     /// The segmented control the terminal's reply format uses: an outline
     /// group whose chosen button is painted pressed.
+    /// The Hex format's switch between its dump and editing the bytes as
+    /// hex text (#215), in a strip like the one a JSON value has its text /
+    /// tree switch in. Back to the dump is offered with nothing unsaved.
+    fn render_hex_switch(&self, cx: &Context<Self>) -> impl IntoElement {
+        let editing = self.hex_editing;
+        let unsaved = editing && self.value_modified;
+        h_flex()
+            .w_full()
+            .px_2()
+            .py_0p5()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .justify_end()
+            .child(
+                ButtonGroup::new("hex-view-switch")
+                    .compact()
+                    .small()
+                    .outline()
+                    .child(
+                        Button::new("hex-view-dump")
+                            .label(i18n_editor(cx, "hex_view_dump"))
+                            .selected(!editing)
+                            .disabled(unsaved)
+                            .when(unsaved, |button| button.tooltip(i18n_editor(cx, "hex_view_unsaved"))),
+                    )
+                    .child(
+                        Button::new("hex-view-edit")
+                            .label(i18n_editor(cx, "hex_view_edit"))
+                            .selected(editing)
+                            .disabled(!self.hex_editable),
+                    )
+                    .on_click(cx.listener(|this, clicks: &Vec<usize>, _window, cx| {
+                        if let Some(ix) = clicks.first() {
+                            this.set_hex_editing(*ix == 1, cx);
+                        }
+                    })),
+            )
+    }
+
     fn render_json_view_switch(&self, cx: &Context<Self>) -> impl IntoElement {
         let tree_mode = self.json_tree_mode;
         ButtonGroup::new("json-view-switch")
@@ -838,6 +965,21 @@ impl Render for ZedisBytesEditor {
             });
             self.soft_wrap_changed = false;
         }
+        let value = self.render_value(window, cx);
+        if !self.hex_mode {
+            return value;
+        }
+        v_flex()
+            .size_full()
+            .child(self.render_hex_switch(cx))
+            .child(v_flex().flex_1().min_h_0().w_full().child(value))
+            .into_any_element()
+    }
+}
+
+impl ZedisBytesEditor {
+    /// The value itself: an image, the hex dump, or the text in the editor.
+    fn render_value(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match &self.data {
             ByteEditorData::Image(value) => {
                 // Known once the image has decoded; the frame before that it
@@ -1150,7 +1292,88 @@ impl ZedisBytesEditor {
 
 #[cfg(test)]
 mod tests {
-    use super::small_image_scale;
+    use super::*;
+    use crate::states::{KeyType, RedisValue, RedisValueData};
+    use crate::test_support::init_ui;
+    use gpui::{TestAppContext, size};
+    use gpui_kit::component::Root;
+    use gpui_kit::test::TestWindowExt;
+
+    fn hex_value(bytes: &'static [u8]) -> RedisValue {
+        RedisValue {
+            key_type: KeyType::String,
+            data: Some(RedisValueData::Bytes(Arc::new(RedisBytesValue {
+                format: DataFormat::Bytes,
+                bytes: bytes::Bytes::from_static(bytes),
+                view_mode: ViewMode::Hex,
+                ..Default::default()
+            }))),
+            ..Default::default()
+        }
+    }
+
+    /// The Hex format opens on the read-only dump — offset, bytes, ASCII —
+    /// and edits the bytes as hex text only once asked to (#215). Once the
+    /// stored bytes are the edited ones — the save landed — it is back on
+    /// the dump; edits not saved stay on screen.
+    #[gpui::test]
+    fn hex_opens_on_its_dump_and_edits_on_request(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let server_state = cx.new(|_| ZedisServerState::default());
+        server_state.update(cx, |state, cx| state.select_key("blob".into(), cx));
+        // The load that selecting starts finds no server and gives up; the
+        // value goes on screen once it has.
+        cx.run_until_parked();
+        server_state.update(cx, |state, _| state.show_value_for_test(hex_value(b"\x00\x01zedis")));
+
+        let mut view = None;
+        let handle = cx.open_window(size(px(900.), px(600.)), |window, cx| {
+            let editor = cx.new(|cx| ZedisBytesEditor::new(server_state.clone(), window, cx));
+            view = Some(editor.clone());
+            Root::new(editor, window, cx)
+        });
+        let editor = view.expect("the window built the editor");
+        let frame = |cx: &mut TestAppContext| {
+            cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+                .expect("the window is open");
+        };
+        editor.read_with(cx, |editor, _| {
+            assert!(editor.shows_hex_dump(), "opens on the dump");
+            assert!(editor.readonly && !editor.is_hex_text);
+            // Read-only on screen, but not a value that cannot be edited: no
+            // lock beside its size, history and replace still offered.
+            assert!(!editor.is_readonly());
+        });
+
+        editor.update(cx, |editor, cx| editor.set_hex_editing(true, cx));
+        frame(cx);
+        editor.read_with(cx, |editor, cx| {
+            assert!(!editor.readonly && editor.is_hex_text);
+            assert_eq!(editor.editor.read(cx).value().as_ref(), "00 01 7a 65 64 69 73");
+        });
+
+        // Something else about the value changed, and the text holds edits
+        // that are not saved: they stay.
+        cx.update_window(handle.into(), |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.editor.update(cx, |state, cx| state.set_value("ff", window, cx))
+            })
+        })
+        .expect("the window is open");
+        server_state.update(cx, |_, cx| cx.emit(ServerEvent::ValueUpdated));
+        editor.read_with(cx, |editor, _| assert!(editor.hex_editing, "unsaved edits stay"));
+
+        // Saved: the stored bytes are the edited ones.
+        server_state.update(cx, |state, cx| {
+            state.show_value_for_test(hex_value(b"\xff"));
+            cx.emit(ServerEvent::ValueUpdated);
+        });
+        frame(cx);
+        editor.read_with(cx, |editor, _| {
+            assert!(!editor.hex_editing, "back on the dump");
+            assert!(matches!(editor.data, ByteEditorData::Hex(_)));
+        });
+    }
 
     #[test]
     fn only_a_small_image_is_enlarged_and_by_a_whole_step() {

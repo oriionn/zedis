@@ -1350,6 +1350,9 @@ impl ZedisServerState {
                 .ok()
                 .map(|s| SharedString::from(s.to_string())),
             format,
+            // Saved, the value stays in the viewer it was edited in: a Hex
+            // value went back to Auto, and its text, on every save (#215).
+            view_mode: original_bytes_value.view_mode.clone(),
             ..Default::default()
         })));
 
@@ -1420,6 +1423,31 @@ fn merge_patch_is_faithful(patch: &JsonValue, new: &JsonValue) -> bool {
 mod tests {
     use super::*;
     use crate::helpers::contrast_ratio;
+    use crate::test_support::init_ui;
+    use gpui::{AppContext, TestAppContext};
+
+    /// A string saved in the Hex viewer is still in it: the value the save
+    /// puts on screen used to start over in Auto (#215).
+    #[gpui::test]
+    fn saving_a_string_keeps_its_viewer(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let state = cx.new(|_| ZedisServerState::default());
+        state.update(cx, |state, cx| {
+            state.show_value_for_test(RedisValue {
+                key_type: KeyType::String,
+                data: Some(RedisValueData::Bytes(Arc::new(RedisBytesValue {
+                    bytes: Bytes::from_static(b"a"),
+                    view_mode: ViewMode::Hex,
+                    ..Default::default()
+                }))),
+                ..Default::default()
+            });
+            state.update_value_bytes("blob".into(), b"b".to_vec(), false, cx);
+            let saved = state.value().and_then(|value| value.bytes_value()).expect("a string");
+            assert_eq!(saved.bytes.as_ref(), b"b");
+            assert_eq!(saved.view_mode, ViewMode::Hex);
+        });
+    }
 
     /// The cap is on what the editor shows: the decoded text where the
     /// value has one, its bytes otherwise.

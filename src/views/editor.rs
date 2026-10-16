@@ -764,6 +764,11 @@ impl ZedisEditor {
             return;
         };
         editor.clone().update(cx, move |state, cx| {
+            // The Hex format's dump is not text to save — ⌘S there would
+            // write whatever the hidden editor last held.
+            if state.shows_hex_dump() {
+                return;
+            }
             // We only reach here when the server isn't read-only (that's caught
             // above), so `is_readonly()` here means the *value* can't be saved
             // as-is: a binary / truncated / decompressed preview whose editor
