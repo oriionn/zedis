@@ -66,11 +66,83 @@ fn flag(name: &str) -> Option<String> {
     None
 }
 
+const TOKEN_USAGE: &str = "zedis-bridge token new --user <account> --name <label> [--expires YYYY-MM-DD]";
+
+/// `zedis-bridge token new …`: a fresh MCP token (ADR 15), printed once with
+/// the line its account lists it by in the users file. Nothing is written:
+/// the users file is the operator's, and the token is the client's — the
+/// bridge keeps neither, only the hash the operator pastes.
+fn token_command() -> Result<(), Box<dyn std::error::Error>> {
+    let verb = std::env::args().nth(2);
+    if std::env::args().any(|a| a == "--help" || a == "-h") {
+        println!("{TOKEN_USAGE}");
+        println!();
+        println!("Prints a token for an AI assistant at POST /v1/mcp and the line to add to that");
+        println!("account's tokens in the users file. The account must be read_only = true.");
+        println!("The client sends it as `Authorization: Bearer <token>`; it signs in there and");
+        println!("nowhere else. --expires 2027-01-01 refuses it from the start of that day (UTC).");
+        return Ok(());
+    }
+    if verb.as_deref() != Some("new") {
+        return Err(format!("usage: {TOKEN_USAGE}").into());
+    }
+    let user = flag("--user").filter(|user| !user.trim().is_empty());
+    let label = flag("--name").filter(|label| !label.trim().is_empty());
+    let (Some(user), Some(label)) = (user, label) else {
+        return Err(format!("usage: {TOKEN_USAGE}").into());
+    };
+    let (user, label) = (user.trim().to_string(), label.trim().to_string());
+    if user.contains(':') {
+        return Err("--user: an account name cannot contain ':'".into());
+    }
+    let expires = flag("--expires");
+    if let Some(expires) = &expires {
+        let at = auth::parse_expiry(expires).map_err(|e| format!("--expires: {e}"))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if at <= now {
+            return Err(format!("--expires {expires} is already past").into());
+        }
+    }
+    let (token, sha256) = auth::new_mcp_token();
+    let expires = expires
+        .map(|date| format!(", expires = \"{}\"", date.trim()))
+        .unwrap_or_default();
+    let quoted = |text: &str| serde_json::to_string(text).unwrap_or_else(|_| format!("\"{text}\""));
+    println!(
+        "Token for account {} ({label}) — shown once, put it in the MCP client's config:",
+        quoted(&user)
+    );
+    println!();
+    println!("  {token}");
+    println!();
+    println!("Add this to that account in the users file, then restart the bridge:");
+    println!();
+    println!("  [[users]]");
+    println!("  name = {}", quoted(&user));
+    println!("  read_only = true");
+    println!("  tokens = [");
+    println!("    {{ name = {}, sha256 = \"{sha256}\"{expires} }},", quoted(&label));
+    println!("  ]");
+    println!();
+    println!("The client sends it as a header, for example:");
+    println!();
+    println!("  claude mcp add --transport http zedis https://<bridge>/v1/mcp \\");
+    println!("    --header \"Authorization: Bearer {token}\"");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
+
+    if std::env::args().nth(1).as_deref() == Some("token") {
+        return token_command();
+    }
 
     if std::env::args().any(|a| a == "--help" || a == "-h") {
         println!(
@@ -80,7 +152,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         println!();
         println!("POST /v1/mcp is a Model Context Protocol server for an AI assistant (Claude");
-        println!("Code, Cursor, …): HTTP Basic with a read-only account, and tools that list the");
+        println!("Code, Cursor, …): a read-only account's token (`{TOKEN_USAGE}`,");
+        println!("sent as `Authorization: Bearer …`) or HTTP Basic, and tools that list the");
         println!("servers, scan keys, describe one key, read INFO and SLOWLOG and run any other");
         println!("read-only command. A full account is refused there, every call is one audit");
         println!(
@@ -152,6 +225,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         accounts = accounts.len(),
         read_only = accounts.read_only_count(),
         with_server_rules = accounts.with_server_rules(),
+        mcp_tokens = accounts.mcp_token_count(),
         source = users_file.as_ref().map_or(USERS_ENV, |_| USERS_FILE_ENV),
         "accounts loaded"
     );

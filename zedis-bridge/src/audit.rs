@@ -121,6 +121,7 @@ impl Audit {
             peer: origin.peer.as_deref(),
             forwarded_for: origin.forwarded_for.as_deref(),
             auth: origin.auth,
+            token: origin.token.as_deref(),
             via: origin.via,
             event,
         };
@@ -166,9 +167,13 @@ pub struct Origin {
     /// The peer's address as an address, for the trusted-proxy check.
     pub peer_ip: Option<IpAddr>,
     /// How the caller was identified when it was not by a password of its
-    /// own: `proxy` for an identity the reverse proxy asserted. Set by
-    /// `authorize`, written into every line of that request.
+    /// own: `proxy` for an identity the reverse proxy asserted, `token` for
+    /// an MCP token (ADR 15). Set by `authorize` / `authorize_mcp`, written
+    /// into every line of that request.
     pub auth: Option<&'static str>,
+    /// Which of the account's MCP tokens signed it in: the name the users
+    /// file gives it, so the log tells one machine from another.
+    pub token: Option<String>,
     /// Which door the request came through when it was not the page or a
     /// script at the API: `mcp` for a tool call by an AI assistant (ADR 15).
     /// Set by that handler, written into every line of that request.
@@ -181,6 +186,7 @@ impl Origin {
             peer: Some(peer.to_string()),
             peer_ip: Some(peer.ip()),
             auth: None,
+            token: None,
             via: None,
             forwarded_for: headers
                 .get("x-forwarded-for")
@@ -202,6 +208,8 @@ struct Line<'a> {
     forwarded_for: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     auth: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     via: Option<&'static str>,
     #[serde(flatten)]

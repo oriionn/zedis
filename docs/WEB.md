@@ -142,7 +142,33 @@ It is the log of the bridge only: what reaches Redis from `redis-cli` or an appl
 
 ## Read-only access for AI assistants (MCP)
 
-`POST /v1/mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server, so Claude Code, Cursor or any other MCP client can read your Redis through the bridge — and only read. The assistant signs in like a script (HTTP Basic) as an account that **must be read-only** (`ai:ro@secret`, or `read_only = true`); a full account is refused there whatever it asks. Its tools are shaped for a model rather than a terminal: `list_servers`, `scan_keys` (paged, across every master of a cluster), `inspect_key` (type, TTL, memory, encoding, length and a short preview), `server_info` and `slowlog` (parsed, per master), and `read_command` for any other read-only command. Every command a tool sends goes through the same read-only allowlist as the page, plus a refusal of the commands that would change the state of the shared connection (`SELECT`, `AUTH`, `CLIENT SETNAME`, `SUBSCRIBE`, …); writes, scripts other than the `_RO` forms, administration and reads that return credentials (`CONFIG GET` of a password, `ACL LIST`) are refused with a reason the model can read. Large values are cut to a size that fits a model's context, an account may make 120 calls a minute, and **every call is one line of the audit log** — reads included, because the caller is a program acting for someone.
+`POST /v1/mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server, so Claude Code, Cursor or any other MCP client can read your Redis through the bridge — and only read. The assistant signs in as an account that **must be read-only** (`ai:ro@secret`, or `read_only = true`) — with a token of that account's (below), or like a script with HTTP Basic; a full account is refused there whatever it asks. Its tools are shaped for a model rather than a terminal: `list_servers`, `scan_keys` (paged, across every master of a cluster), `inspect_key` (type, TTL, memory, encoding, length and a short preview), `server_info` and `slowlog` (parsed, per master), and `read_command` for any other read-only command. Every command a tool sends goes through the same read-only allowlist as the page, plus a refusal of the commands that would change the state of the shared connection (`SELECT`, `AUTH`, `CLIENT SETNAME`, `SUBSCRIBE`, …); writes, scripts other than the `_RO` forms, administration and reads that return credentials (`CONFIG GET` of a password, `ACL LIST`) are refused with a reason the model can read. Large values are cut to a size that fits a model's context, an account may make 120 calls a minute, and **every call is one line of the audit log** — reads included, because the caller is a program acting for someone.
+
+Give the assistant a **token** rather than the account's password. On the bridge's host (or `docker run --rm vicanso/zedis-web token new …`):
+
+```sh
+zedis-bridge token new --user ai --name claude-laptop --expires 2027-01-01
+```
+
+It prints the token once, and the line to add to that account in the users file — the token's SHA-256, never the token itself. Add it and restart the bridge:
+
+```toml
+[[users]]
+name = "ai"
+read_only = true
+tokens = [
+  { name = "claude-laptop", sha256 = "5e1f2416…", expires = "2027-01-01" },
+]
+```
+
+The client sends it as a header:
+
+```sh
+claude mcp add --transport http zedis https://bridge.example.com/v1/mcp \
+  --header "Authorization: Bearer ${ZEDIS_MCP_TOKEN}"
+```
+
+A token signs in at `/v1/mcp` and nowhere else — not the page, not the API — so what an MCP client keeps in plain text in its config file is not a password that opens the page. One machine is cut off by deleting its line and restarting the bridge; `expires` (optional) refuses it from the first second of that day, UTC; and every audit line of a call says which token made it (`"auth":"token","token":"claude-laptop"`). Tokens are listed only in a users file (the `ZEDIS_BRIDGE_USERS` short form has none), and only on a read-only account — the bridge does not start otherwise. HTTP Basic still works at `/v1/mcp`, for a client set up before tokens:
 
 ```sh
 claude mcp add --transport http zedis https://bridge.example.com/v1/mcp \

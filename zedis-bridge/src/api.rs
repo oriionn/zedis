@@ -291,6 +291,21 @@ pub(crate) fn authorize(state: &AppState, headers: &HeaderMap, origin: &mut Orig
         .ok_or(ApiError::Unauthorized)
 }
 
+/// Who is calling at the MCP entry point (ADR 15): an account's token first
+/// — `Authorization: Bearer zdt_…`, which signs in here and nowhere else —
+/// then whatever [`authorize`] accepts, so a client set up with HTTP Basic
+/// before tokens existed goes on working. The token's name goes into every
+/// audit line of the request.
+pub(crate) fn authorize_mcp(state: &AppState, headers: &HeaderMap, origin: &mut Origin) -> ApiResult<String> {
+    let authorization = headers.get("authorization").and_then(|v| v.to_str().ok());
+    if let Some((account, token)) = state.accounts.account_for_token(authorization) {
+        origin.auth = Some("token");
+        origin.token = Some(token);
+        return Ok(account);
+    }
+    authorize(state, headers, origin)
+}
+
 /// What a read-only account is told, wherever it is refused. One wording,
 /// because the page shows it verbatim and the CLI prints it.
 pub(crate) const READ_ONLY_REFUSAL: &str = "this account is read-only";
@@ -1782,5 +1797,74 @@ mod exec_request_tests {
         assert_eq!(request.server, "srv");
         assert_eq!(request.db, 2);
         assert_eq!(request.commands.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod mcp_auth_tests {
+    use super::*;
+
+    fn state(accounts: &str) -> AppState {
+        AppState {
+            accounts: auth::Accounts::from_toml(accounts).expect("accounts"),
+            sessions: Sessions::new(),
+            logins: auth::Logins::new(),
+            audit: Audit::off(),
+            trusted: None,
+            unlocks: policy::Unlocks::new(),
+            cookie: auth::CookiePolicy::new(false, ""),
+            base_path: String::new(),
+            web_root: None,
+            mcp_calls: mcp::Limiter::new(),
+        }
+    }
+
+    fn headers(authorization: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", authorization.parse().expect("header"));
+        headers
+    }
+
+    /// The MCP entry point takes an account's token and says which one in
+    /// its audit lines; HTTP Basic still works there; and the token opens no
+    /// other route (ADR 15).
+    #[test]
+    fn a_token_signs_in_at_the_mcp_entry_point_and_nowhere_else() {
+        let (token, sha256) = auth::new_mcp_token();
+        let state = state(&format!(
+            "[[users]]\nname = \"ai\"\npassword = \"secret\"\nread_only = true\n\
+             tokens = [{{ name = \"claude-laptop\", sha256 = \"{sha256}\" }}]"
+        ));
+        let bearer = headers(&format!("Bearer {token}"));
+
+        let mut origin = Origin::default();
+        let Ok(account) = authorize_mcp(&state, &bearer, &mut origin) else {
+            panic!("the token did not sign in");
+        };
+        assert_eq!(account, "ai");
+        assert_eq!(origin.auth, Some("token"));
+        assert_eq!(origin.token.as_deref(), Some("claude-laptop"));
+
+        let basic = headers(&format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("ai:secret")
+        ));
+        let mut origin = Origin::default();
+        let Ok(account) = authorize_mcp(&state, &basic, &mut origin) else {
+            panic!("Basic did not sign in");
+        };
+        assert_eq!(account, "ai");
+        assert_eq!((origin.auth, origin.token), (None, None));
+
+        let mut origin = Origin::default();
+        assert!(matches!(
+            authorize(&state, &bearer, &mut origin),
+            Err(ApiError::Unauthorized)
+        ));
+        let mut origin = Origin::default();
+        assert!(matches!(
+            authorize_mcp(&state, &headers("Bearer zdt_nobody"), &mut origin),
+            Err(ApiError::Unauthorized)
+        ));
     }
 }

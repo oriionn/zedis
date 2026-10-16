@@ -142,7 +142,33 @@ read_only = true
 
 ## 让 AI 助手只读访问（MCP）
 
-`POST /v1/mcp` 是一个 [Model Context Protocol](https://modelcontextprotocol.io) 服务端，Claude Code、Cursor 或任何 MCP 客户端都可以经由 bridge 读取你的 Redis —— 只能读。助手像脚本一样用 HTTP Basic 登录，账号**必须是只读的**（`ai:ro@secret`，或 `read_only = true`），完整权限的账号在这里无论请求什么都会被拒绝。工具是按模型而不是按终端的习惯设计的：`list_servers`、`scan_keys`（分页，集群的每个 master 都会扫到）、`inspect_key`（类型、TTL、内存、编码、长度和一小段预览）、`server_info` 与 `slowlog`（按 master 解析好），以及兜底的 `read_command`，跑任意其它只读命令。工具发出的每条命令都要过页面用的那份只读白名单，此外还会拒绝会改动共享连接状态的命令（`SELECT`、`AUTH`、`CLIENT SETNAME`、`SUBSCRIBE` 等）；写入、`_RO` 形式以外的脚本、管理命令以及会返回凭据的读（读密码的 `CONFIG GET`、`ACL LIST`）都会被拒绝，并附上模型读得懂的原因。大值会截断到能放进模型上下文的大小，每个账号每分钟最多 120 次调用，而且**每次调用都是审计日志里的一行** —— 读也记，因为调用者是替人做事的程序。
+`POST /v1/mcp` 是一个 [Model Context Protocol](https://modelcontextprotocol.io) 服务端，Claude Code、Cursor 或任何 MCP 客户端都可以经由 bridge 读取你的 Redis —— 只能读。助手登录的账号**必须是只读的**（`ai:ro@secret`，或 `read_only = true`）—— 用这个账号的 token（见下文），或像脚本一样用 HTTP Basic；完整权限的账号在这里无论请求什么都会被拒绝。工具是按模型而不是按终端的习惯设计的：`list_servers`、`scan_keys`（分页，集群的每个 master 都会扫到）、`inspect_key`（类型、TTL、内存、编码、长度和一小段预览）、`server_info` 与 `slowlog`（按 master 解析好），以及兜底的 `read_command`，跑任意其它只读命令。工具发出的每条命令都要过页面用的那份只读白名单，此外还会拒绝会改动共享连接状态的命令（`SELECT`、`AUTH`、`CLIENT SETNAME`、`SUBSCRIBE` 等）；写入、`_RO` 形式以外的脚本、管理命令以及会返回凭据的读（读密码的 `CONFIG GET`、`ACL LIST`）都会被拒绝，并附上模型读得懂的原因。大值会截断到能放进模型上下文的大小，每个账号每分钟最多 120 次调用，而且**每次调用都是审计日志里的一行** —— 读也记，因为调用者是替人做事的程序。
+
+给助手一个 **token**，而不是账号的密码。在 bridge 所在的机器上执行（或 `docker run --rm vicanso/zedis-web token new …`）：
+
+```sh
+zedis-bridge token new --user ai --name claude-laptop --expires 2027-01-01
+```
+
+它只显示一次 token，并给出要加到 users 文件里那个账号下的一行 —— 记的是 token 的 SHA-256，而不是 token 本身。加上之后重启 bridge：
+
+```toml
+[[users]]
+name = "ai"
+read_only = true
+tokens = [
+  { name = "claude-laptop", sha256 = "5e1f2416…", expires = "2027-01-01" },
+]
+```
+
+客户端把它放在请求头里：
+
+```sh
+claude mcp add --transport http zedis https://bridge.example.com/v1/mcp \
+  --header "Authorization: Bearer ${ZEDIS_MCP_TOKEN}"
+```
+
+token 只能在 `/v1/mcp` 登录，别处都不行 —— 页面不行，API 也不行 —— 所以 MCP 客户端明文存在配置文件里的，不是一个能打开页面的密码。要停掉某一台机器，删掉它那一行再重启 bridge 即可；`expires`（可选）从那一天的第一秒（UTC）起拒绝它；每次调用的审计日志都会写明是哪个 token（`"auth":"token","token":"claude-laptop"`）。token 只能写在 users 文件里（`ZEDIS_BRIDGE_USERS` 简写形式没有 token），而且只能写在只读账号下 —— 否则 bridge 不会启动。为了兼容在有 token 之前配置的客户端，`/v1/mcp` 仍然接受 HTTP Basic：
 
 ```sh
 claude mcp add --transport http zedis https://bridge.example.com/v1/mcp \

@@ -38,6 +38,15 @@
 //! Every check here answers *who*, not merely *whether*: the routes need the
 //! name to decide which entries a caller sees.
 //!
+//! An AI assistant at the MCP entry point (ADR 15) may present a **token**
+//! instead of the password: `Authorization: Bearer zdt_…`, one of the
+//! `tokens` its read-only account lists in the users file by SHA-256 and a
+//! name. It signs in there and nowhere else — not the page, not `/v1/exec` —
+//! so the password a client config file keeps in plain text is not the
+//! account's, one machine's token is revoked by deleting its line, and the
+//! audit log says which one called. It is not the shared bearer token above
+//! come back: each belongs to an account, as every caller here must.
+//!
 //! Browsers do not hold the password. They post it once to `/v1/login` and
 //! get back a cookie carrying a [`Logins`] id instead: `HttpOnly`, so no
 //! script on the page can read it, `SameSite=Strict`, so it does not ride
@@ -86,6 +95,122 @@ pub struct Account {
     /// inline form can give), `Some` is the entries a rule names. Its own
     /// entries it always sees, whatever the rules say.
     pub servers: Option<Vec<ServerRule>>,
+    /// The tokens an AI assistant may present for this account at the MCP
+    /// entry point, and nowhere else. Only a read-only account has any — the
+    /// users file is refused otherwise — and the inline form has none.
+    pub mcp_tokens: Vec<McpToken>,
+}
+
+/// What `zedis-bridge token new` puts in front of a token, so a scanner (or
+/// a person) can tell one in a config file or a paste at a glance.
+pub const MCP_TOKEN_PREFIX: &str = "zdt_";
+
+/// One token an account lists: what it is called and the SHA-256 of it.
+/// The token itself is never stored — it is 244 random bits, so a plain
+/// hash keeps it as safe as a slow one would, and a users file that leaks
+/// does not leak it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpToken {
+    /// What the audit log calls it: the machine or the client it was made
+    /// for (`claude-laptop`).
+    name: String,
+    sha256: [u8; 32],
+    /// Unix seconds from which it is refused; `None` never expires.
+    expires_at: Option<u64>,
+}
+
+/// A fresh token, and the SHA-256 (lowercase hex) the users file keeps of
+/// it. The same randomness as a login id: two v4 UUIDs.
+pub fn new_mcp_token() -> (String, String) {
+    let token = format!(
+        "{MCP_TOKEN_PREFIX}{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    );
+    let digest = hex(&Sha256::digest(token.as_bytes()));
+    (token, digest)
+}
+
+/// `"2027-01-01"` → the first second of that day, UTC: a token listed with
+/// `expires = "2027-01-01"` works through the last day of 2026.
+pub fn parse_expiry(text: &str) -> Result<u64, String> {
+    let wrong = || format!("expires {text:?} is not a date like \"2027-01-01\"");
+    let mut parts = text.trim().splitn(3, '-');
+    let (Some(year), Some(month), Some(day)) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(wrong());
+    };
+    let (Ok(year), Ok(month), Ok(day)) = (year.parse::<i64>(), month.parse::<u32>(), day.parse::<u32>()) else {
+        return Err(wrong());
+    };
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return Err(wrong()),
+    };
+    if !(1970..=9999).contains(&year) || day == 0 || day > days_in_month {
+        return Err(wrong());
+    }
+    u64::try_from(days_from_civil(year, month, day) * 86_400).map_err(|_| wrong())
+}
+
+/// Days since 1970-01-01 of a date — the inverse of the audit log's
+/// civil-from-days (Howard Hinnant's algorithms), without a date crate.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year.rem_euclid(400);
+    let month = i64::from(month);
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// One item of an account's `tokens` list in the users file.
+#[derive(Deserialize)]
+struct TokenEntry {
+    name: String,
+    sha256: String,
+    #[serde(default)]
+    expires: Option<String>,
+}
+
+impl TokenEntry {
+    fn parse(self) -> Result<McpToken, String> {
+        let name = self.name.trim().to_string();
+        if name.is_empty() {
+            return Err("a token has an empty name".to_string());
+        }
+        let digest = self.sha256.trim();
+        let mut sha256 = [0u8; 32];
+        // ASCII first: the digits are sliced by byte, and a stray non-ASCII
+        // character would put a slice inside it.
+        let parsed = digest.len() == 64
+            && digest.is_ascii()
+            && sha256.iter_mut().enumerate().all(|(index, byte)| {
+                u8::from_str_radix(&digest[index * 2..index * 2 + 2], 16)
+                    .map(|value| *byte = value)
+                    .is_ok()
+            });
+        if !parsed {
+            return Err(format!(
+                "token \"{name}\": sha256 is not the 64 hex digits `zedis-bridge token new` prints"
+            ));
+        }
+        let expires_at = self
+            .expires
+            .as_deref()
+            .map(parse_expiry)
+            .transpose()
+            .map_err(|e| format!("token \"{name}\": {e}"))?;
+        Ok(McpToken {
+            name,
+            sha256,
+            expires_at,
+        })
+    }
 }
 
 /// One item of an account's `servers` list: `"prod-*"`, `"prod-*:ro"`,
@@ -184,6 +309,9 @@ struct UserEntry {
     read_only: bool,
     #[serde(default)]
     servers: Option<Vec<String>>,
+    /// Tokens for the MCP entry point; a read-only account's only.
+    #[serde(default)]
+    tokens: Vec<TokenEntry>,
 }
 
 /// The accounts that may sign in, name → account.
@@ -246,14 +374,50 @@ impl Accounts {
                 })
                 .transpose()
                 .map_err(|e| format!("user \"{name}\" (entry {position}): {e}"))?;
+            // A token is for the MCP entry point, which takes read-only
+            // accounts alone (ADR 15): on a full account it would be a
+            // credential for nothing — or, were the door ever widened, one
+            // that may write.
+            if !entry.tokens.is_empty() && !entry.read_only {
+                return Err(format!(
+                    "user \"{name}\" (entry {position}) lists tokens but is not read_only: tokens are \
+                     for the MCP entry point, which takes read-only accounts only"
+                ));
+            }
+            let mut mcp_tokens: Vec<McpToken> = Vec::new();
+            for token in entry.tokens {
+                let token = token
+                    .parse()
+                    .map_err(|e| format!("user \"{name}\" (entry {position}): {e}"))?;
+                if mcp_tokens.iter().any(|other| other.name == token.name) {
+                    return Err(format!(
+                        "user \"{name}\" (entry {position}): two tokens are called \"{}\"",
+                        token.name
+                    ));
+                }
+                mcp_tokens.push(token);
+            }
             let account = Account {
                 password: entry.password,
                 read_only: entry.read_only,
                 servers,
+                mcp_tokens,
             };
             if users.insert(name.clone(), account).is_some() {
                 return Err(format!("user \"{name}\" is listed twice"));
             }
+        }
+        // One token, one account: the same hash twice would sign in
+        // whichever came first, and say nothing about the other.
+        let mut digests: Vec<&[u8; 32]> = users
+            .values()
+            .flat_map(|account| account.mcp_tokens.iter().map(|token| &token.sha256))
+            .collect();
+        let listed = digests.len();
+        digests.sort_unstable();
+        digests.dedup();
+        if digests.len() != listed {
+            return Err("the same token (sha256) is listed twice".to_string());
         }
         if users.is_empty() {
             return Err("no [[users]] entries".to_string());
@@ -328,6 +492,32 @@ impl Accounts {
     /// as a button that does nothing and no error anybody reads.
     pub fn read_only_count(&self) -> usize {
         self.0.values().filter(|a| a.read_only).count()
+    }
+
+    /// How many MCP tokens the accounts list — a line in the startup log.
+    pub fn mcp_token_count(&self) -> usize {
+        self.0.values().map(|account| account.mcp_tokens.len()).sum()
+    }
+
+    /// The account, and the name of the token, an `Authorization: Bearer …`
+    /// header signs in as — at the MCP entry point, the one place that asks.
+    /// A token past its `expires` date, or one no account lists, signs in
+    /// nobody. Each listed hash is compared in constant time.
+    pub fn account_for_token(&self, header: Option<&str>) -> Option<(String, String)> {
+        self.account_for_token_at(header, now_secs())
+    }
+
+    fn account_for_token_at(&self, header: Option<&str>, now: u64) -> Option<(String, String)> {
+        let token = bearer_token(header)?;
+        let digest = Sha256::digest(token.as_bytes());
+        self.0.iter().find_map(|(name, account)| {
+            account
+                .mcp_tokens
+                .iter()
+                .find(|listed| same(&digest, &listed.sha256))
+                .filter(|listed| listed.expires_at.is_none_or(|at| now < at))
+                .map(|listed| (name.clone(), listed.name.clone()))
+        })
     }
 
     /// The account an `Authorization: Basic …` header signs in as, if its
@@ -439,6 +629,7 @@ pub fn parse_users(spec: &str) -> Result<HashMap<String, Account>, String> {
             password: Some(password.to_string()),
             read_only,
             servers: None,
+            mcp_tokens: Vec::new(),
         };
         if users.insert(name.to_string(), account).is_some() {
             return Err(format!("user \"{name}\" is listed twice"));
@@ -561,6 +752,15 @@ impl Network {
             _ => false,
         }
     }
+}
+
+/// The token behind an `Authorization: Bearer …` header.
+fn bearer_token(header: Option<&str>) -> Option<&str> {
+    let value = header?.trim();
+    let token = value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))?;
+    Some(token.trim()).filter(|token| !token.is_empty())
 }
 
 /// The `name:password` behind an `Authorization: Basic …` header.
@@ -1457,5 +1657,101 @@ servers = []
         );
         assert!(!accounts.accepts_password("carol", "secret"));
         assert_eq!(accounts.len(), 2);
+    }
+
+    /// A token signs its read-only account in by its hash, until the first
+    /// second of its `expires` day, and names itself for the audit log. It
+    /// is no password: Basic with it, or the page, signs in nobody (ADR 15).
+    #[test]
+    fn a_token_signs_in_its_account_until_it_expires() {
+        let (token, sha256) = new_mcp_token();
+        assert!(token.starts_with(MCP_TOKEN_PREFIX));
+        assert_eq!(token.len(), MCP_TOKEN_PREFIX.len() + 64);
+        let (expiring, expiring_sha256) = new_mcp_token();
+        let accounts = Accounts::from_toml(&format!(
+            r#"
+            [[users]]
+            name = "ai"
+            read_only = true
+            tokens = [
+              {{ name = "claude-laptop", sha256 = "{sha256}" }},
+              {{ name = "ci", sha256 = "{expiring_sha256}", expires = "2027-01-01" }},
+            ]
+            "#
+        ))
+        .expect("accounts");
+        let bearer = |token: &str| format!("Bearer {token}");
+        let signed_in = |account: &str, token: &str| Some((account.to_string(), token.to_string()));
+        assert_eq!(accounts.mcp_token_count(), 2);
+        assert_eq!(
+            accounts.account_for_token(Some(&bearer(&token))),
+            signed_in("ai", "claude-laptop")
+        );
+        let expires_at = parse_expiry("2027-01-01").expect("a date");
+        assert_eq!(
+            accounts.account_for_token_at(Some(&bearer(&expiring)), expires_at - 1),
+            signed_in("ai", "ci")
+        );
+        assert_eq!(
+            accounts.account_for_token_at(Some(&bearer(&expiring)), expires_at),
+            None,
+            "refused from its expires day"
+        );
+        assert_eq!(accounts.account_for_token(Some("Bearer zdt_not-a-listed-token")), None);
+        assert_eq!(accounts.account_for_token(Some(&format!("Basic {token}"))), None);
+        assert_eq!(accounts.account_for_token(None), None);
+        assert_eq!(accounts.account_for_header(Some(&bearer(&token))), None);
+        let basic = format!("Basic {}", B64.encode(format!("ai:{token}")));
+        assert_eq!(accounts.account_for_header(Some(&basic)), None);
+    }
+
+    /// A users file whose tokens cannot mean what they say stops the bridge,
+    /// and the error never quotes what was pasted where the hash goes — that
+    /// may be the token itself.
+    #[test]
+    fn a_users_file_with_a_token_that_cannot_work_is_refused() {
+        let sha256 = "a".repeat(64);
+        let refused = |toml: &str| Accounts::from_toml(toml).err().expect("refused");
+        let on_full = refused(&format!(
+            "[[users]]\nname = \"bob\"\npassword = \"x\"\ntokens = [{{ name = \"t\", sha256 = \"{sha256}\" }}]"
+        ));
+        assert!(on_full.contains("not read_only"), "{on_full}");
+        let pasted = refused(
+            "[[users]]\nname = \"ai\"\nread_only = true\n\
+             tokens = [{ name = \"t\", sha256 = \"zdt_0123456789abcdef\" }]",
+        );
+        assert!(pasted.contains("64 hex"), "{pasted}");
+        assert!(!pasted.contains("zdt_0123456789abcdef"), "{pasted}");
+        let twice = refused(&format!(
+            "[[users]]\nname = \"ai\"\nread_only = true\n\
+             tokens = [{{ name = \"t\", sha256 = \"{sha256}\" }}, {{ name = \"t\", sha256 = \"{}\" }}]",
+            "b".repeat(64)
+        ));
+        assert!(twice.contains("two tokens"), "{twice}");
+        let shared = refused(&format!(
+            "[[users]]\nname = \"ai\"\nread_only = true\ntokens = [{{ name = \"a\", sha256 = \"{sha256}\" }}]\n\
+             [[users]]\nname = \"ci\"\nread_only = true\ntokens = [{{ name = \"b\", sha256 = \"{sha256}\" }}]"
+        ));
+        assert!(shared.contains("listed twice"), "{shared}");
+        let date = refused(&format!(
+            "[[users]]\nname = \"ai\"\nread_only = true\n\
+             tokens = [{{ name = \"t\", sha256 = \"{sha256}\", expires = \"next year\" }}]"
+        ));
+        assert!(date.contains("not a date"), "{date}");
+        let non_ascii = refused(&format!(
+            "[[users]]\nname = \"ai\"\nread_only = true\ntokens = [{{ name = \"t\", sha256 = \"{}é\" }}]",
+            "a".repeat(62)
+        ));
+        assert!(non_ascii.contains("64 hex"), "{non_ascii}");
+    }
+
+    #[test]
+    fn an_expiry_is_the_first_second_of_that_day_utc() {
+        assert_eq!(parse_expiry("1970-01-01"), Ok(0));
+        assert_eq!(parse_expiry("2027-01-01"), Ok(1_798_761_600));
+        assert_eq!(parse_expiry("2028-02-29"), Ok(1_835_395_200));
+        for wrong in ["2027-02-29", "2027-13-01", "2027-04-31", "2027-1", "tomorrow", ""] {
+            assert!(parse_expiry(wrong).is_err(), "{wrong}");
+        }
     }
 }

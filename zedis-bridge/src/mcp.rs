@@ -20,8 +20,10 @@
 //! subset a tools-only server needs. Hand-rolled: it is five methods, and
 //! the bridge's policy layer, not the protocol surface, is the point.
 //!
-//! Nothing here is a second door. The caller signs in the way a script does
-//! (HTTP Basic), is refused unless the account is read-only, and each tool
+//! Nothing here is a second door. The caller signs in with one of its
+//! account's MCP tokens (`Authorization: Bearer zdt_…`, `api::authorize_mcp`)
+//! or the way a script does (HTTP Basic), is refused unless the account is
+//! read-only, and each tool
 //! turns into commands that go through `policy::check` with the read-only
 //! role fixed and out through `forward_values`, the page's own path. What
 //! the tools add is shape: a key described with a short preview instead of
@@ -30,7 +32,7 @@
 //! (`Event::Tool`), whatever it read — a program acting for someone is not a
 //! person looking, and reads are the whole of what it does.
 
-use crate::api::{ApiError, AppState, ExecRequest, authorize, forward_values, visible_to};
+use crate::api::{ApiError, AppState, ExecRequest, authorize_mcp, forward_values, visible_to};
 use crate::audit::{self, Event, Origin, ServerRef};
 use crate::policy;
 use axum::{
@@ -148,7 +150,7 @@ pub async fn post(
 ) -> Response {
     let mut origin = Origin::new(peer, &headers);
     origin.via = Some("mcp");
-    let account = match authorize(&state, &headers, &mut origin) {
+    let account = match authorize_mcp(&state, &headers, &mut origin) {
         Ok(account) => account,
         Err(refusal) => return refusal.into_response(),
     };

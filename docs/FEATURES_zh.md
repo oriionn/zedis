@@ -244,7 +244,7 @@ Valkey 从 Redis 7.2.4 分叉，版本号走自己的节奏，所以为 Redis �
 ### 让 AI 助手只读访问（MCP）
 **Claude Code、Cursor 或任何 MCP 客户端都能经由 bridge 读取你的 Redis —— 以只读账号，只能读。**
 
-`POST /v1/mcp` 是一个 Model Context Protocol 服务端，与页面共用同一套登录。助手像脚本一样用 HTTP Basic 登录，账号必须是只读的；完整权限的账号无论问什么都会被拒绝，能看到哪些条目由 users 文件的 `servers` 规则决定。六个工具按模型而不是终端的习惯设计——`list_servers`、`scan_keys`（分页，集群的每个 master 都会扫到）、`inspect_key`（类型、TTL、内存、编码、长度和一段预览）、`server_info` 与 `slowlog`（按 master 解析好），以及兜底的 `read_command`。每条命令都过页面同一份只读白名单，工具还会额外拒绝会返回凭据的读（读密码的 `CONFIG GET`、`ACL LIST`），以及会改动或占住共享连接的命令（`SELECT`——工具直接接收 `db` 参数——`MULTI`、阻塞读、`SUBSCRIBE` 等）；脚本只能以 `_RO` 形式运行。回复会截断到能放进上下文的大小，每个账号每分钟最多 120 次调用，每次调用（包括读）都是审计日志里的一行。一行 `claude mcp add` 的接入方式见自托管指南的 [MCP 一节](./WEB_zh.md#让-ai-助手只读访问mcp)。
+`POST /v1/mcp` 是一个 Model Context Protocol 服务端，与页面共用同一套登录。助手登录的账号必须是只读的 —— 用这个账号的 token（`zedis-bridge token new` 生成；只能打开 `/v1/mcp`，删掉一行即可吊销，审计日志里写明是哪个 token），或像脚本一样用 HTTP Basic；完整权限的账号无论问什么都会被拒绝，能看到哪些条目由 users 文件的 `servers` 规则决定。六个工具按模型而不是终端的习惯设计——`list_servers`、`scan_keys`（分页，集群的每个 master 都会扫到）、`inspect_key`（类型、TTL、内存、编码、长度和一段预览）、`server_info` 与 `slowlog`（按 master 解析好），以及兜底的 `read_command`。每条命令都过页面同一份只读白名单，工具还会额外拒绝会返回凭据的读（读密码的 `CONFIG GET`、`ACL LIST`），以及会改动或占住共享连接的命令（`SELECT`——工具直接接收 `db` 参数——`MULTI`、阻塞读、`SUBSCRIBE` 等）；脚本只能以 `_RO` 形式运行。回复会截断到能放进上下文的大小，每个账号每分钟最多 120 次调用，每次调用（包括读）都是审计日志里的一行。一行 `claude mcp add` 的接入方式见自托管指南的 [MCP 一节](./WEB_zh.md#让-ai-助手只读访问mcp)。
 
 ### 浏览器里没有什么
 **凡是"一问一答"的都能用；流式面板和需要落盘的功能留在桌面端。**

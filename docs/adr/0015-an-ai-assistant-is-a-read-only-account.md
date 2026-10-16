@@ -78,3 +78,38 @@ model in a loop scans faster than a person clicks.
   to every request without a session and to every fan-out, whose per-node
   connections are shared too, and checks a pipeline's `offset` / `count`
   against `PipelineSpec::for_pipeline` instead of trusting them.
+
+## Amendment — 2026-10-16: tokens
+
+Signing in with the account's password put that password in plain text in
+every MCP client's config file (`~/.claude.json`, `.cursor/mcp.json`), where
+it also opens the page; one machine could not be cut off without changing it
+for every client; and the audit log could say which account called but not
+which client.
+
+An account may now list **tokens** for this entry point in the users file —
+`tokens = [{ name = "claude-laptop", sha256 = "…", expires = "2027-01-01" }]`
+— and a client sends one as `Authorization: Bearer zdt_…`.
+`zedis-bridge token new --user ai --name claude-laptop` prints a fresh token
+(`zdt_` and 64 hex digits, two v4 UUIDs) once, with that line; the file keeps
+the SHA-256, never the token, which is random enough that a plain hash keeps
+it as safe as a slow one would. A token:
+
+- signs in at `/v1/mcp` and nowhere else (`api::authorize_mcp`; every other
+  route still answers a Bearer header with `401`), so it is not a password
+  for the page;
+- is allowed only on a read-only account: the users file is refused, and the
+  bridge does not start, if a full account lists one — a credential for this
+  door must not become one that writes were the door ever widened;
+- is refused from the first second (UTC) of its `expires` day;
+- is named in every audit line of the request (`"auth":"token"`,
+  `"token":"claude-laptop"`);
+- is revoked by deleting its line and restarting the bridge — the users file
+  is read once, at startup.
+
+HTTP Basic keeps working here for clients set up before tokens. This is not
+the shared bearer token ADR 9 removed: that one had no owner, and a caller
+who is "whoever holds the token" could not own a private entry. Each of
+these belongs to an account, and everything the account's `servers` rules
+say applies to it unchanged. Not done: OAuth, which a client that cannot set
+a header (Claude Desktop's remote connectors) would need.
