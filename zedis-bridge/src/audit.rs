@@ -495,7 +495,7 @@ fn rfc3339_now() -> String {
 /// `secs` since the epoch as `YYYY-MM-DDTHH:MM:SS.mmmZ`, without a date
 /// crate: the bridge's dependency list is short on purpose, and this is the
 /// one place it needs a calendar (Howard Hinnant's civil-from-days).
-fn rfc3339(secs: u64, millis: u32) -> String {
+pub(crate) fn rfc3339(secs: u64, millis: u32) -> String {
     let days = (secs / 86_400) as i64;
     let second_of_day = secs % 86_400;
     let z = days + 719_468;

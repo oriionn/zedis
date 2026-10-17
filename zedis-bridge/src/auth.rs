@@ -575,6 +575,12 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// What a browser login is known by on this side: the SHA-256 of its cookie
+/// id, never the id — the logins file and the online list both keep this.
+pub fn login_key(id: &str) -> String {
+    hex(&Sha256::digest(id))
+}
+
 /// `alice@secret,bob:ro@hunter2` → the accounts.
 ///
 /// An entry splits at its *first* `@`, so a password may contain one and a
@@ -910,7 +916,7 @@ impl Logins {
                 last_used: now_secs(),
                 remember,
             };
-            state.file.logins.insert(hex(&Sha256::digest(&id)), login);
+            state.file.logins.insert(login_key(&id), login);
             state.dirty = true;
         }
         self.flush();
@@ -920,7 +926,7 @@ impl Logins {
     /// How long a live login `id` may now sit idle — what its cookie's
     /// `Max-Age` is renewed to — or `None` for no live login.
     pub fn idle_timeout_of(&self, id: &str) -> Option<Duration> {
-        let key = hex(&Sha256::digest(id));
+        let key = login_key(id);
         let state = self.0.lock().expect("logins");
         state
             .file
@@ -932,7 +938,7 @@ impl Logins {
 
     /// Whose live login `id` is, refreshing its idle clock.
     pub fn account(&self, id: &str) -> Option<String> {
-        let key = hex(&Sha256::digest(id));
+        let key = login_key(id);
         let mut state = self.0.lock().expect("logins");
         let now = now_secs();
         match state.file.logins.get_mut(&key) {
@@ -959,7 +965,7 @@ impl Logins {
     pub fn close(&self, id: &str) -> Option<String> {
         let account = {
             let mut state = self.0.lock().expect("logins");
-            let removed = state.file.logins.remove(&hex(&Sha256::digest(id)));
+            let removed = state.file.logins.remove(&login_key(id));
             state.dirty |= removed.is_some();
             removed.map(|login| login.account)
         };

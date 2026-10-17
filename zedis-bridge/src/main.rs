@@ -34,6 +34,7 @@ mod audit;
 mod auth;
 mod mcp;
 mod policy;
+mod presence;
 mod resp;
 mod session;
 mod static_files;
@@ -316,6 +317,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sweeper = sessions.clone();
     let login_sweeper = logins.clone();
     let unlock_sweeper = unlocks.clone();
+    let presence = presence::Presence::new();
+    let presence_sweeper = presence.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         loop {
@@ -328,6 +331,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if expired > 0 {
                 tracing::info!(expired, "swept idle logins");
+            }
+            // Five quiet minutes: each client that went is a line, with how
+            // many are left.
+            let (gone, online) = presence_sweeper.sweep();
+            for (account, kind) in gone {
+                tracing::info!(account, kind, online, "client offline");
             }
             let ended = unlock_sweeper.sweep();
             if ended > 0 {
@@ -384,6 +393,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         base_path,
         web_root,
         mcp_calls: mcp::Limiter::new(),
+        presence,
     });
     // With the peer's address, which the audit log records beside whatever
     // a proxy wrote in `X-Forwarded-For`.

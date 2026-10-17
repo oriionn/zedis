@@ -140,6 +140,28 @@ A **Prod**-tagged entry starts with its writes locked, on the desktop and in the
 
 It is the log of the bridge only: what reaches Redis from `redis-cli` or an application is not in it, and it cannot tell you who changed a key — it can tell you whether anyone did so by hand. The bridge appends and never reopens the file, so rotate it with `copytruncate`.
 
+## Who is online
+
+The bridge counts who is using it. A client is online from its first request until it has made none for five minutes: each browser sign-in is one client (every tab of that browser shares its cookie), a script signing in with HTTP Basic is one per account and address, an MCP token is one per name, and an account behind the trusted proxy is one per account. A page with a server open sends a heartbeat every 10 seconds (60 in a background tab), so it stays online while it is open; a page left on the home screen sends nothing and goes offline after the five minutes. Signing out takes that browser off at once.
+
+The process log says when one comes and goes, with the count:
+
+```text
+INFO zedis_bridge::api: client online account="alice" kind="browser" online=3
+INFO zedis_bridge: client offline account="ops" kind="basic" online=2
+```
+
+`GET /v1/clients` lists who is online now, the most recently seen first. It names other accounts and where they call from, so a read-only account is refused (`403`, and an audit line when the audit log is on):
+
+```console
+$ curl -s -u alice:secret https://zedis.example.com/v1/clients
+{"online":2,"window_secs":300,"clients":[
+  {"account":"alice","kind":"browser","peer":"10.0.0.7","last_seen":"2026-10-17T04:21:57.000Z","idle_secs":4},
+  {"account":"ai","kind":"token","token":"claude-laptop","peer":"10.0.0.9","last_seen":"2026-10-17T04:20:41.000Z","idle_secs":80}]}
+```
+
+`peer` is the socket peer, which behind a reverse proxy is the proxy; `forwarded_for` is added when the proxy wrote `X-Forwarded-For`. The count is kept in memory: after a restart each client is back with its next request.
+
 ## Read-only access for AI assistants (MCP)
 
 `POST /v1/mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server, so Claude Code, Cursor or any other MCP client can read your Redis through the bridge — and only read. The assistant signs in as an account that **must be read-only** (`ai:ro@secret`, or `read_only = true`) — with a token of that account's (below), or like a script with HTTP Basic; a full account is refused there whatever it asks. Its tools are shaped for a model rather than a terminal: `list_servers`, `scan_keys` (paged, across every master of a cluster), `inspect_key` (type, TTL, memory, encoding, length and a short preview), `server_info` and `slowlog` (parsed, per master), and `read_command` for any other read-only command. Every command a tool sends goes through the same read-only allowlist as the page, plus a refusal of the commands that would change the state of the shared connection (`SELECT`, `AUTH`, `CLIENT SETNAME`, `SUBSCRIBE`, …); writes, scripts other than the `_RO` forms, administration and reads that return credentials (`CONFIG GET` of a password, `ACL LIST`) are refused with a reason the model can read. Large values are cut to a size that fits a model's context, an account may make 120 calls a minute, and **every call is one line of the audit log** — reads included, because the caller is a program acting for someone.

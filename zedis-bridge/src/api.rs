@@ -19,6 +19,7 @@
 //! never sees a host, a password or a key (ADR 9).
 
 use crate::audit::{self, Audit, Event, Origin, ServerRef};
+use crate::presence::{Client, ClientKey, ONLINE_WINDOW, Presence};
 use crate::static_files::{Representation, WebBuild};
 use crate::{auth, mcp, policy, resp, session::Sessions, static_files};
 use axum::{
@@ -64,6 +65,8 @@ pub struct AppState {
     pub web_root: Option<std::path::PathBuf>,
     /// How often each account may call an MCP tool (ADR 15).
     pub mcp_calls: mcp::Limiter,
+    /// Who has made a request in the last five minutes (`GET /v1/clients`).
+    pub presence: Presence,
 }
 
 /// The page and the API, under `state.base_path` when there is one.
@@ -90,6 +93,7 @@ pub fn router(state: AppState) -> Router {
         .route(&at("/v1/exec"), post(exec))
         .route(&at("/v1/session"), post(open_session))
         .route(&at("/v1/session/{token}"), delete(close_session))
+        .route(&at("/v1/clients"), get(clients))
         // The MCP entry point (ADR 15): JSON-RPC over POST alone. GET is
         // the server-initiated stream this bridge does not offer, DELETE a
         // session it does not keep; both answer 405 as the protocol allows.
@@ -279,16 +283,32 @@ pub(crate) fn authorize(state: &AppState, headers: &HeaderMap, origin: &mut Orig
             )));
         }
         origin.auth = Some("proxy");
+        note_client(state, ClientKey::Proxy(name.clone()), &name, origin);
         return Ok(name);
     }
     let authorization = headers.get("authorization").and_then(|v| v.to_str().ok());
     if let Some(account) = state.accounts.account_for_header(authorization) {
+        let key = ClientKey::Basic {
+            account: account.clone(),
+            peer: origin.peer_ip,
+        };
+        note_client(state, key, &account, origin);
         return Ok(account);
     }
     let cookie = headers.get("cookie").and_then(|v| v.to_str().ok());
-    auth::cookie_value(cookie)
-        .and_then(|id| state.logins.account(id))
-        .ok_or(ApiError::Unauthorized)
+    let id = auth::cookie_value(cookie).ok_or(ApiError::Unauthorized)?;
+    let account = state.logins.account(id).ok_or(ApiError::Unauthorized)?;
+    note_client(state, ClientKey::Browser(auth::login_key(id)), &account, origin);
+    Ok(account)
+}
+
+/// Count the caller in for `GET /v1/clients`, and say so in the process log
+/// when it has just come online.
+fn note_client(state: &AppState, key: ClientKey, account: &str, origin: &Origin) {
+    let kind = key.kind();
+    if let Some(online) = state.presence.seen(key, account, origin) {
+        tracing::info!(account, kind, online, "client online");
+    }
 }
 
 /// Who is calling at the MCP entry point (ADR 15): an account's token first
@@ -300,6 +320,11 @@ pub(crate) fn authorize_mcp(state: &AppState, headers: &HeaderMap, origin: &mut 
     let authorization = headers.get("authorization").and_then(|v| v.to_str().ok());
     if let Some((account, token)) = state.accounts.account_for_token(authorization) {
         origin.auth = Some("token");
+        let key = ClientKey::Token {
+            account: account.clone(),
+            token: token.clone(),
+        };
+        note_client(state, key, &account, origin);
         origin.token = Some(token);
         return Ok(account);
     }
@@ -444,7 +469,12 @@ async fn logout(
     headers: HeaderMap,
 ) -> Response {
     let cookie = headers.get("cookie").and_then(|v| v.to_str().ok());
-    if let Some(account) = auth::cookie_value(cookie).and_then(|id| state.logins.close(id)) {
+    let id = auth::cookie_value(cookie);
+    // Off the online list now, not five minutes on.
+    if let Some((account, online)) = id.and_then(|id| state.presence.forget(&ClientKey::Browser(auth::login_key(id)))) {
+        tracing::info!(account, kind = "browser", online, "client offline");
+    }
+    if let Some(account) = id.and_then(|id| state.logins.close(id)) {
         tracing::info!(account, "logout");
         state
             .audit
@@ -657,6 +687,40 @@ impl ServerEntry {
 /// nothing. Passwords, keys and passphrases still never leave this process —
 /// a caller learns that one is stored, not what it is (ADR 9).
 ///
+/// What `GET /v1/clients` answers.
+#[derive(Serialize)]
+struct ClientsReply {
+    /// How many clients made a request within the window.
+    online: usize,
+    window_secs: u64,
+    clients: Vec<Client>,
+}
+
+/// Who is using the bridge now: every client that made a request within
+/// `presence::ONLINE_WINDOW`, the most recently seen first. A full account's
+/// question — the answer names other accounts and where they call from —
+/// so a read-only one is refused, and the refusal is audited like a write.
+async fn clients(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ClientsReply>> {
+    let mut origin = Origin::new(peer, &headers);
+    let account = authorize(&state, &headers, &mut origin)?;
+    if state.accounts.is_read_only(&account) {
+        state
+            .audit
+            .record(&account, &origin, Event::Refused { action: "list clients" });
+        return Err(ApiError::Forbidden(READ_ONLY_REFUSAL.to_string()));
+    }
+    let clients = state.presence.online();
+    Ok(Json(ClientsReply {
+        online: clients.len(),
+        window_secs: ONLINE_WINDOW.as_secs(),
+        clients,
+    }))
+}
+
 /// Only the entries the caller may see: its own, and the shared ones its
 /// rules admit. `owner` comes back as stored — the caller's own name or
 /// nothing — which is how the page knows whether its form's *shared* box
@@ -1816,6 +1880,7 @@ mod mcp_auth_tests {
             base_path: String::new(),
             web_root: None,
             mcp_calls: mcp::Limiter::new(),
+            presence: Presence::new(),
         }
     }
 
@@ -1866,5 +1931,45 @@ mod mcp_auth_tests {
             authorize_mcp(&state, &headers("Bearer zdt_nobody"), &mut origin),
             Err(ApiError::Unauthorized)
         ));
+    }
+
+    /// Whoever signs in is online — a browser by its login, a script by its
+    /// account and address — and the list of who is online is a full
+    /// account's to read.
+    #[test]
+    fn whoever_signs_in_is_online_and_only_a_full_account_reads_the_list() {
+        let state = state(
+            "[[users]]\nname = \"ops\"\npassword = \"secret\"\n\n\
+             [[users]]\nname = \"viewer\"\npassword = \"look\"\nread_only = true",
+        );
+        let peer: SocketAddr = "10.0.0.7:5000".parse().expect("address");
+        let id = state.logins.open("ops", &state.accounts, false).expect("login");
+        let mut browser = HeaderMap::new();
+        let cookie = format!("{}={id}", auth::COOKIE_NAME);
+        browser.insert("cookie", cookie.parse().expect("cookie"));
+        let script = headers(&format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("viewer:look")
+        ));
+        for headers in [&browser, &script] {
+            let mut origin = Origin::new(peer, headers);
+            assert!(authorize(&state, headers, &mut origin).is_ok());
+        }
+
+        let list = |headers: HeaderMap| {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime")
+                .block_on(clients(State(state.clone()), ConnectInfo(peer), headers))
+        };
+        assert!(matches!(list(script.clone()), Err(ApiError::Forbidden(_))));
+        let Ok(Json(reply)) = list(browser.clone()) else {
+            panic!("a full account reads the list");
+        };
+        assert_eq!(reply.online, 2);
+        let mut seen: Vec<(&str, &str)> = reply.clients.iter().map(|c| (c.account.as_str(), c.kind)).collect();
+        seen.sort();
+        assert_eq!(seen, [("ops", "browser"), ("viewer", "basic")]);
+        assert!(reply.clients.iter().all(|c| c.peer.as_deref() == Some("10.0.0.7")));
     }
 }

@@ -140,6 +140,28 @@ read_only = true
 
 这只是 bridge 这一扇门的日志：`redis-cli` 和应用程序直连 Redis 的操作不在里面；它回答不了"谁改了这个 key"，能回答的是"有没有人手动改过"。bridge 只追加、从不重新打开文件，轮转请用 `copytruncate`。
 
+## 在线客户端
+
+bridge 会统计谁在使用它。一个客户端从第一次请求起算在线，连续 5 分钟没有请求就算下线：每次浏览器登录算一个（同一浏览器的多个标签页共用登录 cookie，只算一个），用 HTTP Basic 认证的脚本按"账号 + 地址"各算一个，MCP token 按名字各算一个，经可信代理登录的按账号各算一个。打开了连接的页面每 10 秒发一次心跳（后台标签页 60 秒），只要开着就一直在线；停在首页、没打开任何连接的页面不发请求，5 分钟后算下线。退出登录会立即下线。
+
+进程日志会在客户端上线和下线时各记一行，并带上当前在线数：
+
+```text
+INFO zedis_bridge::api: client online account="alice" kind="browser" online=3
+INFO zedis_bridge: client offline account="ops" kind="basic" online=2
+```
+
+`GET /v1/clients` 返回当前在线的客户端，最近有请求的排在前面。结果里有其他账号的名字和来源地址，所以只读账号会被拒绝（`403`；开了审计日志时会记一行）：
+
+```console
+$ curl -s -u alice:secret https://zedis.example.com/v1/clients
+{"online":2,"window_secs":300,"clients":[
+  {"account":"alice","kind":"browser","peer":"10.0.0.7","last_seen":"2026-10-17T04:21:57.000Z","idle_secs":4},
+  {"account":"ai","kind":"token","token":"claude-laptop","peer":"10.0.0.9","last_seen":"2026-10-17T04:20:41.000Z","idle_secs":80}]}
+```
+
+`peer` 是 TCP 连接的对端，经反向代理时是代理的地址；代理写了 `X-Forwarded-For` 时会多一个 `forwarded_for`。在线数只保存在内存里：bridge 重启后，每个客户端在下一次请求时重新计入。
+
 ## 让 AI 助手只读访问（MCP）
 
 `POST /v1/mcp` 是一个 [Model Context Protocol](https://modelcontextprotocol.io) 服务端，Claude Code、Cursor 或任何 MCP 客户端都可以经由 bridge 读取你的 Redis —— 只能读。助手登录的账号**必须是只读的**（`ai:ro@secret`，或 `read_only = true`）—— 用这个账号的 token（见下文），或像脚本一样用 HTTP Basic；完整权限的账号在这里无论请求什么都会被拒绝。工具是按模型而不是按终端的习惯设计的：`list_servers`、`scan_keys`（分页，集群的每个 master 都会扫到）、`inspect_key`（类型、TTL、内存、编码、长度和一小段预览）、`server_info` 与 `slowlog`（按 master 解析好），以及兜底的 `read_command`，跑任意其它只读命令。工具发出的每条命令都要过页面用的那份只读白名单，此外还会拒绝会改动共享连接状态的命令（`SELECT`、`AUTH`、`CLIENT SETNAME`、`SUBSCRIBE` 等）；写入、`_RO` 形式以外的脚本、管理命令以及会返回凭据的读（读密码的 `CONFIG GET`、`ACL LIST`）都会被拒绝，并附上模型读得懂的原因。大值会截断到能放进模型上下文的大小，每个账号每分钟最多 120 次调用，而且**每次调用都是审计日志里的一行** —— 读也记，因为调用者是替人做事的程序。
