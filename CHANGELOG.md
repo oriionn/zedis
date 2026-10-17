@@ -1,5 +1,54 @@
 # Changelog
 
+## [0.14.0](https://github.com/vicanso/zedis/compare/v0.13.0..v0.14.0) - 2026-10-17
+
+### ⛰️  Features
+
+- *(bridge)* Count who is online — a client goes offline after five minutes without a request, logged as it comes and goes, listed for full accounts by GET /v1/clients - ([7c1a582](https://github.com/vicanso/zedis/commit/7c1a58252435cedabe52f4c0fa1c62304556cb03))
+- *(bridge, mcp)* Per-account MCP tokens — zedis-bridge token new, Bearer accepted at /v1/mcp only, hashed in the users file, named in the audit log - ([649fa05](https://github.com/vicanso/zedis/commit/649fa05e6025955e6197e77d51963c3b179c1aa4))
+- *(build)* Bump gpui-kit to 0.7.3 and ship a GPUI Fast image on macOS - ([f5c9cf4](https://github.com/vicanso/zedis/commit/f5c9cf477f9d7e7ed668c0573299d0f96e7c4e65))
+- *(bytes-editor, topology)* Open Hex on a read-only dump with offset and ASCII and edit it on request, keep the viewer across a save, red confirms for REPLICAOF and forced failovers ([#215](https://github.com/orhun/git-cliff/issues/215)) - ([49d283b](https://github.com/vicanso/zedis/commit/49d283b68055ecffb99042ae854959fea18fef67))
+- *(key-tree, kv-table, hash, connection)* Set and remove a hash field's TTL from its row menu, Set TTL / Remove TTL on one key, no name tooltip over an open key menu, one shared TTL dialog (#225 #226) - ([15fe385](https://github.com/vicanso/zedis/commit/15fe385513796221d4fc4c03bd6bf9db6f89f79e))
+- *(sidebar)* Right-click menu on a connection — open, new tab, edit, clone, diagnose, move to group, disconnect / reconnect, delete ([#204](https://github.com/orhun/git-cliff/issues/204)) - ([904534c](https://github.com/vicanso/zedis/commit/904534c04d760c4669eed538e4d6d7dac77eefcb))
+- *(value-diff)* Draw the diff with gpui-kit's Diff component, side by side or unified - ([5085f51](https://github.com/vicanso/zedis/commit/5085f51ccd0ca339be08dede152b6fb6c9542aa0))
+
+### 🐛 Bug Fixes
+
+- *(charts, metrics)* Tick line charts at round values their labels can tell apart and keep the x labels' last pair from touching ([#200](https://github.com/orhun/git-cliff/issues/200)) - ([39bb667](https://github.com/vicanso/zedis/commit/39bb667fded787ab26c57435de89fd24319bbc08))
+- *(config-editor, connection)* List each config alias once under the server's own name, the alias beside it ([#202](https://github.com/orhun/git-cliff/issues/202)) - ([fcfbbba](https://github.com/vicanso/zedis/commit/fcfbbba0ae9493e1683349dff1d3513321575d7c))
+- *(dialogs, editor, key-tree, i18n)* Red destructive confirms with Return as Cancel, one recycle-bin name, Close on info dialogs, duration TTLs for hash fields and GETEX, multi-line Add Key value, keep focus after setting a TTL (#210 #213 #214 #216 #218 #220) - ([0705788](https://github.com/vicanso/zedis/commit/0705788e49f5bab7b5a1031ac95227e679f53472))
+- *(i18n, terminal)* Re-word kept views' placeholders on a language change and translate the terminal's own labels ([#198](https://github.com/orhun/git-cliff/issues/198)) - ([b32ea82](https://github.com/vicanso/zedis/commit/b32ea82ddd0baff5b2eae85efd581ddbbffa29a2))
+- *(key-tree)* One cleanup for every key delete, so a folder delete also closes the open key and leaves recent keys ([#197](https://github.com/orhun/git-cliff/issues/197)) - ([3003099](https://github.com/vicanso/zedis/commit/30030994a7ed37fd31c54caaadd8dd8b5873a9b9))
+- *(key-tree)* Make the multi-select checkbox a real checkbox and keep the inline delete off its rows ([#196](https://github.com/orhun/git-cliff/issues/196)) - ([849272c](https://github.com/vicanso/zedis/commit/849272c2c354226853c44bfc6007faf92c31709e))
+- *(key-tree, trash)* Keep a multi-selection deleted together in the recycle bin, up to 100 keys ([#195](https://github.com/orhun/git-cliff/issues/195)) - ([7b45e3c](https://github.com/vicanso/zedis/commit/7b45e3c6b49e14168cf476e794b7d071084d3fdd))
+- *(kv-table, clients)* Show every row again when a filter box is cleared with × or Escape ([#194](https://github.com/orhun/git-cliff/issues/194)) - ([34a621a](https://github.com/vicanso/zedis/commit/34a621a33bfda116dc927e5649b6087930c076a7))
+- *(palette, recent-keys, multi-search, key-tree, editor)* Placeholders follow a language change, folder tag tooltip in the chosen language, a viewer picked on the status bar leaves the bitmap grid (#222 #224) - ([d967f26](https://github.com/vicanso/zedis/commit/d967f262aa406ea106a123e8d73139d3e9e886ff))
+- *(root, palette, sidebar, kv-table, connection)* Close a deleted connection's tabs and keep an emptied server list empty, recycle bin and tool dialogs in ⌘K, New Group… in Move to Group, row menu on collection tables (#209 #217 #219 #221) - ([3384981](https://github.com/vicanso/zedis/commit/33849810a57fb35a41728634b1cecdaa35a1746f))
+- *(server-load, connection)* Order Command Stats rows by name within ties so a refresh no longer reshuffles them ([#199](https://github.com/orhun/git-cliff/issues/199)) - ([90329c6](https://github.com/vicanso/zedis/commit/90329c679d147312c6a3393d9ef069a2addce4c8))
+- *(settings)* Follow a language change in the Settings window's title and its lists - ([d272e39](https://github.com/vicanso/zedis/commit/d272e394b1ca724586b4113d81d51e9e3ea71c7b))
+- *(status-bar, key-bar)* Fold the editor controls and drop the link label in order as the bar narrows, widen the Viewer menu, re-read encoding and heat after a write - ([df1e452](https://github.com/vicanso/zedis/commit/df1e45227657f7cbc9cef03ef506a90ec0354f82))
+- *(status-bar, metrics)* Show clients as connected / blocked in both places, under one label ([#201](https://github.com/orhun/git-cliff/issues/201)) - ([f5136c5](https://github.com/vicanso/zedis/commit/f5136c5dc0d10275148a9e0b0820cf88b172088b))
+- *(terminal)* Put the banner's name under the logo so the smallest window does not wrap through it ([#203](https://github.com/orhun/git-cliff/issues/203)) - ([c8dc963](https://github.com/vicanso/zedis/commit/c8dc96386d6bdd0f620a75da8049b036adba5231))
+- *(terminal, pubsub)* Refuse SUBSCRIBE / MONITOR in the terminal and close it when Pubsub Mode opens ([#191](https://github.com/orhun/git-cliff/issues/191)) - ([805d69f](https://github.com/vicanso/zedis/commit/805d69f6482ef4c4ada70de273699487e673ee4b))
+
+### 📚 Documentation
+
+- *(readme)* Describe the GPUI Fast build as a macOS-only trial - ([c171ba7](https://github.com/vicanso/zedis/commit/c171ba71da4b8c23787e5931ebbd9d41c744b703))
+- *(signpath)* GitHub.com linked to the project and the test-signing dry run signed both architectures - ([49aa0fd](https://github.com/vicanso/zedis/commit/49aa0fd6eca6b42b2e788b78cb6c6022795cefc5))
+
+### 🧪 Testing
+
+- *(editor)* Cover the rename dialog's focus in a headless window, and keep test runs off the real config and keychain - ([b94f0d5](https://github.com/vicanso/zedis/commit/b94f0d590a617a872ef42d137494f8595b321878))
+
+### ⚙️ Miscellaneous Tasks
+
+- Update rustls - ([5e1c801](https://github.com/vicanso/zedis/commit/5e1c80162b66d2e024f3471e1b6fbe07ff69edd5))
+
+### Build
+
+- *(deps)* Bump protox from 0.9.1 to 0.10.0 ([#193](https://github.com/orhun/git-cliff/issues/193)) - ([91bd70d](https://github.com/vicanso/zedis/commit/91bd70dab6ec75409cb8d0fc8ef411dad1543ee8))
+- *(deps)* Bump russh from 0.63.3 to 0.64.1 ([#192](https://github.com/orhun/git-cliff/issues/192)) - ([ea8c708](https://github.com/vicanso/zedis/commit/ea8c708480b09ec4a834d2d537df2686cecee0f1))
+
 ## [0.13.0](https://github.com/vicanso/zedis/compare/v0.12.4..v0.13.0) - 2026-10-11
 
 ### ⛰️  Features
