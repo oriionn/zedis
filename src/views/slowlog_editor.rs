@@ -58,6 +58,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use zedis_core::tally::totals_by_command;
 use zedis_ui::{
     CellAction, CellActionProvider, CellRenderer, TextColumn, ZedisDialog, ZedisDivider, ZedisTextTable, fitted_table,
 };
@@ -224,30 +225,16 @@ struct CommandAggRow {
 /// native unit) for the slow log, bytes for a COMMANDLOG size log, where
 /// the same ranking reads "which command moves the most bytes".
 fn aggregate_commands(rows: &[SlowLogRow]) -> Vec<CommandAggRow> {
-    let mut map: AHashMap<SharedString, (usize, u64, u64)> = AHashMap::new();
-    for row in rows {
-        let entry = map.entry(row.command.clone()).or_insert((0, 0, 0));
-        entry.0 += 1;
-        entry.1 += row.amount_fine;
-        entry.2 = entry.2.max(row.amount_fine);
-    }
-    let grand_total: u64 = map.values().map(|(_, total, _)| *total).sum();
-    let mut out: Vec<CommandAggRow> = map
+    totals_by_command(rows.iter().map(|row| (row.command.as_ref(), row.amount_fine)))
         .into_iter()
-        .map(|(command, (count, total, max))| CommandAggRow {
-            command,
-            count,
-            total,
-            max,
-            share_pct: if grand_total == 0 {
-                0.0
-            } else {
-                total as f64 * 100.0 / grand_total as f64
-            },
+        .map(|total| CommandAggRow {
+            command: total.command.into(),
+            count: total.count,
+            total: total.total,
+            max: total.max,
+            share_pct: total.share_pct,
         })
-        .collect();
-    out.sort_by(|a, b| b.total.cmp(&a.total).then(a.command.cmp(&b.command)));
-    out
+        .collect()
 }
 
 /// Format an aggregated microsecond figure as milliseconds with one

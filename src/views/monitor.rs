@@ -16,7 +16,7 @@ use crate::assets::CustomIconName;
 use crate::connection::{Capability, MonitorFeeds, ServerDb, get_server, open_monitor_feeds};
 use crate::error::Error;
 use crate::helpers::channel;
-use crate::helpers::{MonitorAction, build_csv, format_clock, get_mono_font_family};
+use crate::helpers::{MonitorAction, build_csv, format_clock, get_mono_font_family, group_thousands};
 use crate::states::{
     ConnectionErrorKind, GlobalEvent, NotificationAction, ServerEvent, ServerView, ZedisGlobalStore, ZedisServerState,
     back_to_editor_tooltip, content_area_width, escalate_dangerous_body, i18n_common, i18n_monitor, i18n_status_bar,
@@ -28,23 +28,25 @@ use crate::states::{
 /// scrollable table.  Supports keyword and command-type filtering.
 /// The buffer is capped at `MAX_RECORDS` entries.
 use crate::views::{export_to_file, open_key_in_editor};
-use gpui::{App, Entity, Render, SharedString, Subscription, Task, Window, div, prelude::*, px};
+use gpui::{AnyElement, App, Div, Entity, Hsla, Render, SharedString, Subscription, Task, Window, div, prelude::*, px};
 use gpui_kit::component::button::ButtonVariants;
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Icon, IconName, Sizable, WindowExt,
-    button::Button,
+    ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable, StyledExt, WindowExt,
+    button::{Button, ButtonGroup},
     dialog::DialogButtonProps,
     h_flex,
     input::{Input, InputEvent, InputState},
     label::Label,
     menu::DropdownMenu,
     table::{DataTable, TableState},
+    tooltip::Tooltip,
     v_flex,
 };
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::error;
+use zedis_core::tally::{MonitorTally, Tally};
 use zedis_ui::{CellAction, CellActionProvider, TextColumn, ZedisDialog, ZedisTextTable, fitted_table};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -59,6 +61,10 @@ const RATE_WINDOW_SECS: f64 = 5.0;
 /// thread, so a runaway stream is disconnected outright — pausing the UI
 /// alone would keep the server formatting every command for us.
 const AUTO_STOP_EVENTS_PER_SEC: f64 = 5000.0;
+/// How long a sample may run, in seconds: what the Sample menu offers.
+const SAMPLE_SECONDS: [u64; 3] = [5, 10, 30];
+/// Rows each list of a sample's summary shows.
+const SUMMARY_ROWS: usize = 15;
 
 // ── Parsed MONITOR line ──────────────────────────────────────────────
 
@@ -74,6 +80,9 @@ struct MonitorEntry {
     client: SharedString,
     command: SharedString,
     args: SharedString,
+    /// The first argument as the server printed it: the key, for most
+    /// commands — what a sample groups by prefix.
+    key: Option<SharedString>,
 }
 
 /// Parse a raw MONITOR output line into a `MonitorEntry`.
@@ -144,6 +153,7 @@ fn parse_monitor_line(line: &str, node_label: &str) -> Option<MonitorEntry> {
         let args = parts[1..].join(" ");
         (cmd, args)
     };
+    let key = parts.get(1).map(|key| SharedString::from(key.to_string()));
 
     Some(MonitorEntry {
         timestamp,
@@ -152,6 +162,7 @@ fn parse_monitor_line(line: &str, node_label: &str) -> Option<MonitorEntry> {
         client: client.to_string().into(),
         command: command.into(),
         args: args.into(),
+        key,
     })
 }
 
@@ -263,7 +274,49 @@ pub struct ZedisMonitor {
     rate_ticks: VecDeque<Instant>,
     row_count: usize,
     monitor_tasks: Vec<Task<()>>,
+    /// A timed sample in progress (the Sample menu): it counts every line it
+    /// sees, by client, command and key prefix — all of them, where the
+    /// table keeps the last `MAX_RECORDS`.
+    sampling: Option<Sampling>,
+    /// The last finished sample, until another starts or the server changes.
+    sample: Option<SampleResult>,
+    /// Show the sample's summary rather than the lines.
+    show_summary: bool,
     _subscriptions: Vec<Subscription>,
+}
+
+/// A sample being taken: its counts, how long it was asked to run, and the
+/// timer that ends it (dropped, and so cancelled, when it ends early).
+struct Sampling {
+    tally: MonitorTally,
+    seconds: u64,
+    started: Instant,
+    _timer: Task<()>,
+}
+
+/// What a finished sample counted, and over how long.
+struct SampleResult {
+    tally: MonitorTally,
+    elapsed: Duration,
+    /// Ended before its time — Stop, the rate guard, a dropped link.
+    cut_short: bool,
+}
+
+/// A share of the sample, in percent.
+fn share_of(count: u64, total: u64) -> String {
+    if total == 0 {
+        return "0%".to_string();
+    }
+    format!("{:.1}%", count as f64 * 100.0 / total as f64)
+}
+
+/// One row of a summary list: the count and its share, the name after them.
+fn summary_row(count: String, share: String, muted: Hsla) -> Div {
+    h_flex()
+        .w_full()
+        .gap_3()
+        .child(div().w(px(72.)).flex_none().text_right().child(count))
+        .child(div().w(px(56.)).flex_none().text_right().text_color(muted).child(share))
 }
 
 impl ZedisMonitor {
@@ -275,6 +328,9 @@ impl ZedisMonitor {
         subscriptions.push(cx.subscribe(&server_state, |this, _, event, cx| {
             if matches!(event, ServerEvent::ServerSelected(_)) {
                 this.handle_stop(cx);
+                // Another server's sample says nothing about this one.
+                this.sample = None;
+                this.show_summary = false;
                 this.table_state.update(cx, |state, _| state.delegate_mut().clear());
                 this.row_count = 0;
                 this.auto_stopped = false;
@@ -305,6 +361,9 @@ impl ZedisMonitor {
             rate_ticks: VecDeque::new(),
             row_count: 0,
             monitor_tasks: Vec::new(),
+            sampling: None,
+            sample: None,
+            show_summary: false,
             _subscriptions: subscriptions,
         }
     }
@@ -352,14 +411,14 @@ impl ZedisMonitor {
     /// drop from one attached client. On a cluster we attach to every master, so
     /// each node pays it. Cheap servers start straight away; production gets one
     /// sentence explaining the cost before anything is attached.
-    fn confirm_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn confirm_start(&mut self, sample_seconds: Option<u64>, window: &mut Window, cx: &mut Context<Self>) {
         if self.monitoring || !self.server_state.read(cx).can(Capability::Observe) {
             return;
         }
         let server_id = self.server_state.read(cx).server_id().to_string();
         let high_risk = get_server(&server_id).map(|s| s.is_high_risk_tag()).unwrap_or(false);
         if !high_risk {
-            self.handle_start(cx);
+            self.handle_start(sample_seconds, cx);
             return;
         }
 
@@ -371,14 +430,17 @@ impl ZedisMonitor {
         ZedisDialog::new_alert(i18n_monitor(cx, "start_confirm_title"), body)
             .button_props(button_props)
             .on_ok(move |_, window, cx| {
-                entity.update(cx, |this, cx| this.handle_start(cx));
+                entity.update(cx, |this, cx| this.handle_start(sample_seconds, cx));
                 window.close_dialog(cx);
                 true
             })
             .open(window, cx);
     }
 
-    fn handle_start(&mut self, cx: &mut Context<Self>) {
+    /// Attach MONITOR. With `sample_seconds`, it is a sample: the table starts
+    /// empty, every line is counted, and the stream ends by itself when the
+    /// time is up — then the summary is shown.
+    fn handle_start(&mut self, sample_seconds: Option<u64>, cx: &mut Context<Self>) {
         // Observe is a read-class capability (allowed on read-only
         // connections); routed through the matrix so a stricter future mode
         // can turn observation off in one place.
@@ -395,6 +457,21 @@ impl ZedisMonitor {
         self.paused = false;
         self.auto_stopped = false;
         self.rate_ticks.clear();
+        if let Some(seconds) = sample_seconds {
+            self.handle_clear(cx);
+            self.sample = None;
+            self.show_summary = false;
+            let timer = cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Duration::from_secs(seconds)).await;
+                let _ = this.update(cx, |this, cx| this.handle_stop(cx));
+            });
+            self.sampling = Some(Sampling {
+                tally: MonitorTally::default(),
+                seconds,
+                started: Instant::now(),
+                _timer: timer,
+            });
+        }
         cx.notify();
 
         let table_state = self.table_state.clone();
@@ -498,6 +575,14 @@ impl ZedisMonitor {
                         return false;
                     }
                     let n = batch.len();
+                    if let Some(sampling) = this.sampling.as_mut() {
+                        let separator = this.server_state.read(cx).key_separator().to_string();
+                        for entry in &batch {
+                            sampling
+                                .tally
+                                .add(&entry.client, &entry.command, entry.key.as_deref(), &separator);
+                        }
+                    }
                     // Through the keyword the table already holds (the input
                     // sets it on every change), rather than setting it again
                     // per batch, which re-filtered the whole buffer each time.
@@ -528,6 +613,7 @@ impl ZedisMonitor {
             let _ = entity.update(cx, |this: &mut ZedisMonitor, cx| {
                 this.monitoring = false;
                 this.paused = false;
+                this.end_sampling();
                 cx.notify();
             });
 
@@ -541,7 +627,23 @@ impl ZedisMonitor {
         self.monitor_tasks.clear();
         self.monitoring = false;
         self.paused = false;
+        self.end_sampling();
         cx.notify();
+    }
+
+    /// Close a sample in progress into its result, and show the summary.
+    fn end_sampling(&mut self) {
+        let Some(sampling) = self.sampling.take() else {
+            return;
+        };
+        let elapsed = sampling.started.elapsed();
+        self.sample = Some(SampleResult {
+            tally: sampling.tally,
+            elapsed,
+            // A little short of the time is the timer's own scheduling.
+            cut_short: elapsed + Duration::from_millis(500) < Duration::from_secs(sampling.seconds),
+        });
+        self.show_summary = true;
     }
 
     /// Keep the MONITOR connections attached but drop inbound batches.
@@ -646,6 +748,136 @@ impl ZedisMonitor {
         export_to_file(cx, server_state, bytes, suggested, success, error);
     }
 
+    /// Show the lines a summary row stands for: its name in the keyword
+    /// box — a prefix without its `*`, which the filter would take literally.
+    fn show_lines_for(&mut self, name: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        let term = name.strip_suffix('*').unwrap_or(&name).to_string();
+        self.keyword_state
+            .update(cx, |state, cx| state.set_value(term, window, cx));
+        self.handle_filter(cx);
+        self.show_summary = false;
+        cx.notify();
+    }
+
+    /// The finished sample: how many commands over how long, then who sent
+    /// them, what they were and which keys they touched, the most first.
+    fn render_summary(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(sample) = &self.sample else {
+            return div().into_any_element();
+        };
+        let muted = cx.theme().muted_foreground;
+        let total = sample.tally.total();
+        let seconds = sample.elapsed.as_secs_f64().max(0.001);
+        let locale = cx.global::<ZedisGlobalStore>().read(cx).locale().to_string();
+        let header = rust_i18n::t!(
+            "monitor.summary_header",
+            total = group_thousands(total),
+            secs = format!("{seconds:.1}"),
+            rate = group_thousands((total as f64 / seconds).round() as u64),
+            locale = locale
+        )
+        .to_string();
+        let filter_tooltip = i18n_monitor(cx, "summary_show_lines");
+        let others = i18n_monitor(cx, "summary_others");
+        let column = |id: &'static str, title: SharedString, tally: &Tally| -> AnyElement {
+            let mut rows: Vec<AnyElement> = tally
+                .top(SUMMARY_ROWS)
+                .into_iter()
+                .enumerate()
+                .map(|(ix, (name, count))| {
+                    let name = SharedString::from(name);
+                    let target = name.clone();
+                    summary_row(group_thousands(count), share_of(count, total), muted)
+                        .child(
+                            div()
+                                .id((id, ix))
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .cursor_pointer()
+                                .hover(|style| style.underline())
+                                .tooltip({
+                                    let tip = filter_tooltip.clone();
+                                    move |window, cx| Tooltip::new(tip.clone()).build(window, cx)
+                                })
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.show_lines_for(target.clone(), window, cx)
+                                }))
+                                .child(name),
+                        )
+                        .into_any_element()
+                })
+                .collect();
+            if tally.other() > 0 {
+                rows.push(
+                    summary_row(group_thousands(tally.other()), share_of(tally.other(), total), muted)
+                        .child(Label::new(others.clone()).text_color(muted))
+                        .into_any_element(),
+                );
+            }
+            v_flex()
+                .flex_1()
+                .min_w(px(260.))
+                .gap_1()
+                .child(Label::new(title).font_semibold().pb_1())
+                .children(rows)
+                .into_any_element()
+        };
+        let lists = h_flex()
+            .w_full()
+            .items_start()
+            .flex_wrap()
+            .gap_6()
+            .child(column(
+                "summary-client",
+                i18n_monitor(cx, "summary_clients"),
+                &sample.tally.clients,
+            ))
+            .child(column(
+                "summary-command",
+                i18n_monitor(cx, "summary_commands"),
+                &sample.tally.commands,
+            ))
+            .child(column(
+                "summary-prefix",
+                i18n_monitor(cx, "summary_prefixes"),
+                &sample.tally.prefixes,
+            ));
+        div()
+            .id("monitor-summary")
+            .size_full()
+            .overflow_y_scroll()
+            .child(
+                v_flex()
+                    .p_4()
+                    .gap_3()
+                    .text_sm()
+                    .child(Label::new(header).font_semibold())
+                    .when(sample.cut_short, |this| {
+                        this.child(
+                            Label::new(i18n_monitor(cx, "summary_cut_short"))
+                                .text_xs()
+                                .text_color(cx.theme().warning),
+                        )
+                    })
+                    .child(
+                        Label::new(i18n_monitor(cx, "summary_no_duration"))
+                            .text_xs()
+                            .text_color(muted),
+                    )
+                    .map(|this| {
+                        if total == 0 {
+                            this.child(Label::new(i18n_monitor(cx, "summary_empty")).text_color(muted))
+                        } else {
+                            this.child(lists)
+                        }
+                    }),
+            )
+            .into_any_element()
+    }
+
     fn handle_clear(&mut self, cx: &mut Context<Self>) {
         self.table_state.update(cx, |state, _| state.delegate_mut().clear());
         self.row_count = 0;
@@ -663,6 +895,14 @@ impl Render for ZedisMonitor {
             format!("({}/{})", self.row_count, total)
         };
         let paused = self.paused;
+        let sampling = self.sampling.is_some();
+        let sampling_label = self.sampling.as_ref().map(|sampling| {
+            let locale = cx.global::<ZedisGlobalStore>().read(cx).locale().to_string();
+            SharedString::from(
+                rust_i18n::t!("monitor.sampling_badge", secs = sampling.seconds, locale = locale).to_string(),
+            )
+        });
+        let show_summary = self.show_summary && self.sample.is_some();
         let rate = self.events_per_sec();
         let rate_label: Option<SharedString> = if self.monitoring && !paused && rate > 0.05 {
             Some(format!("{rate:.1}/s").into())
@@ -706,11 +946,38 @@ impl Render for ZedisMonitor {
                                     .text_color(cx.theme().muted_foreground)
                                     .text_sm(),
                             )
-                            .when(self.monitoring && !paused, |this| {
+                            .when(self.monitoring && !paused && !sampling, |this| {
                                 this.child(
                                     Label::new(i18n_monitor(cx, "monitoring"))
                                         .text_color(cx.theme().green)
                                         .text_sm(),
+                                )
+                            })
+                            .when_some(sampling_label, |this, label| {
+                                this.child(Label::new(label).text_color(cx.theme().green).text_sm())
+                            })
+                            .when(self.sample.is_some() && !sampling, |this| {
+                                this.child(
+                                    ButtonGroup::new("monitor-view-switch")
+                                        .compact()
+                                        .small()
+                                        .outline()
+                                        .child(
+                                            Button::new("monitor-view-summary")
+                                                .label(i18n_monitor(cx, "view_summary"))
+                                                .selected(show_summary),
+                                        )
+                                        .child(
+                                            Button::new("monitor-view-lines")
+                                                .label(i18n_monitor(cx, "view_lines"))
+                                                .selected(!show_summary),
+                                        )
+                                        .on_click(cx.listener(|this, clicks: &Vec<usize>, _window, cx| {
+                                            if let Some(ix) = clicks.first() {
+                                                this.show_summary = *ix == 0;
+                                                cx.notify();
+                                            }
+                                        })),
                                 )
                             })
                             .when_some(rate_label, |this, r| {
@@ -757,11 +1024,31 @@ impl Render for ZedisMonitor {
                                         .icon(Icon::new(CustomIconName::Zap))
                                         .label(i18n_monitor(cx, "start"))
                                         .on_click(cx.listener(|this, _, window, cx| {
-                                            this.confirm_start(window, cx);
+                                            this.confirm_start(None, window, cx);
                                         })),
                                 )
+                                .child(
+                                    Button::new("sample-monitor")
+                                        .outline()
+                                        .small()
+                                        .icon(Icon::new(CustomIconName::Clock3))
+                                        .label(i18n_monitor(cx, "sample"))
+                                        .tooltip(i18n_monitor(cx, "sample_tooltip"))
+                                        .dropdown_menu(move |menu, _window, cx| {
+                                            let locale = cx.global::<ZedisGlobalStore>().read(cx).locale().to_string();
+                                            SAMPLE_SECONDS.iter().fold(menu, |menu, seconds| {
+                                                let label = rust_i18n::t!(
+                                                    "monitor.sample_secs",
+                                                    secs = seconds,
+                                                    locale = locale
+                                                )
+                                                .to_string();
+                                                menu.menu(label, Box::new(MonitorAction::Sample(*seconds)))
+                                            })
+                                        }),
+                                )
                             })
-                            .when(self.monitoring, |this| {
+                            .when(self.monitoring && !sampling, |this| {
                                 this.child(
                                     Button::new("pause-monitor")
                                         .outline()
@@ -776,7 +1063,9 @@ impl Render for ZedisMonitor {
                                             this.toggle_pause(cx);
                                         })),
                                 )
-                                .child(
+                            })
+                            .when(self.monitoring, |this| {
+                                this.child(
                                     Button::new("stop-monitor")
                                         .outline()
                                         .small()
@@ -822,7 +1111,8 @@ impl Render for ZedisMonitor {
                     .flex_1()
                     .w_full()
                     .min_h_0()
-                    .when(is_empty, |this| {
+                    .when(show_summary, |this| this.child(self.render_summary(cx)))
+                    .when(is_empty && !show_summary, |this| {
                         this.child(
                             div()
                                 .size_full()
@@ -832,7 +1122,7 @@ impl Render for ZedisMonitor {
                                 .child(Label::new(i18n_monitor(cx, "no_data")).text_color(cx.theme().muted_foreground)),
                         )
                     })
-                    .when(!is_empty, |this| {
+                    .when(!is_empty && !show_summary, |this| {
                         this.child(fitted_table(
                             &self.table_state,
                             DataTable::new(&self.table_state)
@@ -844,9 +1134,10 @@ impl Render for ZedisMonitor {
             )
             // The toolbar Export dropdown dispatches these; handle them
             // here on the panel root (same pattern as the slow-log panel).
-            .on_action(cx.listener(|this, event: &MonitorAction, _window, cx| match event {
+            .on_action(cx.listener(|this, event: &MonitorAction, window, cx| match event {
                 MonitorAction::ExportCsv => this.export_csv(cx),
                 MonitorAction::ExportJson => this.export_json(cx),
+                MonitorAction::Sample(seconds) => this.confirm_start(Some(*seconds), window, cx),
             }))
             .into_any_element()
     }
@@ -861,6 +1152,16 @@ mod tests {
         let entry = parse_monitor_line(r#"1339518083.107412 [0 127.0.0.1:60866] "keys" "*""#, "n").expect("a line");
         assert_eq!((entry.db.as_ref(), entry.client.as_ref()), ("0", "127.0.0.1:60866"));
         assert_eq!((entry.command.as_ref(), entry.args.as_ref()), ("KEYS", "*"));
+    }
+
+    /// A sample groups by the first argument, as the server printed it; a
+    /// command without one has none.
+    #[test]
+    fn the_first_argument_is_kept_for_a_sample() {
+        let entry = parse_monitor_line(r#"1.0 [0 10.0.0.1:5000] "hgetall" "user:profile:7""#, "n").expect("a line");
+        assert_eq!(entry.key.as_deref(), Some("user:profile:7"));
+        let entry = parse_monitor_line(r#"1.0 [0 10.0.0.1:5000] "ping""#, "n").expect("a line");
+        assert_eq!(entry.key, None);
     }
 
     /// An IPv6 client brings brackets of its own, and a quote inside a word

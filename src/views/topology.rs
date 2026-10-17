@@ -49,7 +49,7 @@ use crate::connection::{
     cluster_slot_stats, floors, get_server, group_slot_ranges, slots_in_ranges, unassigned_slot_ranges,
 };
 use crate::error::Error;
-use crate::helpers::{format_lag_bytes, get_mono_font_family, pacing};
+use crate::helpers::{format_lag_bytes, get_mono_font_family, group_thousands, pacing};
 use crate::states::{
     ClusterMasterRanges, ClusterNodeLoad, HINT_TOPOLOGY, RebalanceLeg, ReplicaInfo, ServerEvent, ServerView,
     ZedisGlobalStore, ZedisServerState, back_to_editor_tooltip, dialog_button_props, escalate_dangerous_body,
@@ -221,6 +221,7 @@ enum LoadMetric {
     Memory,
     Ops,
     Clients,
+    Keys,
 }
 
 impl ZedisTopology {

@@ -60,6 +60,7 @@ pub struct ClusterNodeLoad {
     pub used_memory: u64,
     pub ops_per_sec: u64,
     pub connected_clients: u64,
+    pub keys: u64,
     pub slot_count: u32,
     pub color_index: usize,
 }
@@ -693,6 +694,7 @@ pub async fn fetch_cluster_node_loads(
                 used_memory: load.used_memory,
                 ops_per_sec: load.ops_per_sec,
                 connected_clients: load.connected_clients,
+                keys: load.keys,
                 slot_count: *slot_count,
                 color_index: *color_index,
             })

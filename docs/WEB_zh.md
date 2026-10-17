@@ -164,7 +164,7 @@ $ curl -s -u alice:secret https://zedis.example.com/v1/clients
 
 ## 让 AI 助手只读访问（MCP）
 
-`POST /v1/mcp` 是一个 [Model Context Protocol](https://modelcontextprotocol.io) 服务端，Claude Code、Cursor 或任何 MCP 客户端都可以经由 bridge 读取你的 Redis —— 只能读。助手登录的账号**必须是只读的**（`ai:ro@secret`，或 `read_only = true`）—— 用这个账号的 token（见下文），或像脚本一样用 HTTP Basic；完整权限的账号在这里无论请求什么都会被拒绝。工具是按模型而不是按终端的习惯设计的：`list_servers`、`scan_keys`（分页，集群的每个 master 都会扫到）、`inspect_key`（类型、TTL、内存、编码、长度和一小段预览）、`server_info` 与 `slowlog`（按 master 解析好），以及兜底的 `read_command`，跑任意其它只读命令。工具发出的每条命令都要过页面用的那份只读白名单，此外还会拒绝会改动共享连接状态的命令（`SELECT`、`AUTH`、`CLIENT SETNAME`、`SUBSCRIBE` 等）；写入、`_RO` 形式以外的脚本、管理命令以及会返回凭据的读（读密码的 `CONFIG GET`、`ACL LIST`）都会被拒绝，并附上模型读得懂的原因。大值会截断到能放进模型上下文的大小，每个账号每分钟最多 120 次调用，而且**每次调用都是审计日志里的一行** —— 读也记，因为调用者是替人做事的程序。
+`POST /v1/mcp` 是一个 [Model Context Protocol](https://modelcontextprotocol.io) 服务端，Claude Code、Cursor 或任何 MCP 客户端都可以经由 bridge 读取你的 Redis —— 只能读。助手登录的账号**必须是只读的**（`ai:ro@secret`，或 `read_only = true`）—— 用这个账号的 token（见下文），或像脚本一样用 HTTP Basic；完整权限的账号在这里无论请求什么都会被拒绝。工具是按模型而不是按终端的习惯设计的：`list_servers`、`scan_keys`（分页，集群的每个 master 都会扫到）、`inspect_key`（类型、TTL、内存、编码、长度和一小段预览）、`server_info` 与 `slowlog`（按 master 解析好）；三个做汇总而不是罗列的工具——`slowlog_summary`（慢日志按命令汇总，最重的在前，并列出最慢的几条）、`hotkeys`（读取已在运行的 `HOTKEYS` 采集报告，Redis 8.6+；启动采集会改变服务器状态，所以留给人来做）和 `memory_summary`（最多抽 5000 个 key，用 `MEMORY USAGE` 测量后按前缀汇总，并列出最大的 key）；以及兜底的 `read_command`，跑任意其它只读命令。工具发出的每条命令都要过页面用的那份只读白名单，此外还会拒绝会改动共享连接状态的命令（`SELECT`、`AUTH`、`CLIENT SETNAME`、`SUBSCRIBE` 等）；写入、`_RO` 形式以外的脚本、管理命令以及会返回凭据的读（读密码的 `CONFIG GET`、`ACL LIST`）都会被拒绝，并附上模型读得懂的原因。大值会截断到能放进模型上下文的大小，每个账号每分钟最多 120 次调用，而且**每次调用都是审计日志里的一行** —— 读也记，因为调用者是替人做事的程序。
 
 给助手一个 **token**，而不是账号的密码。在 bridge 所在的机器上执行（或 `docker run --rm vicanso/zedis-web token new …`）：
 

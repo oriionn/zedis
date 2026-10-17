@@ -27,18 +27,19 @@
 //! / `BITPOS`, and a thin `BITFIELD` box runs raw sub-commands. The grid
 //! is capped at [`CAP_BITS`]; `BITCOUNT` / `BITPOS` stay whole-key.
 
+use crate::assets::CustomIconName;
 use crate::helpers::get_mono_font_family;
 use crate::{
     connection::{BitOpKind, BitmapInfo, Capability, ServerDb, bit_field, bit_op, bitmap_info, set_bit},
     states::{ZedisServerState, dialog_button_props, i18n_bitmap, i18n_common},
 };
 use gpui::{
-    BorderStyle, Bounds, Context, Entity, EventEmitter, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels,
+    App, BorderStyle, Bounds, Context, Entity, EventEmitter, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels,
     Point, SharedString, Subscription, Task, Window, bounds, canvas, div, fill, point, prelude::*, px, quad, rgb, size,
     transparent_black,
 };
 use gpui_kit::component::{
-    ActiveTheme, IconName, Sizable, StyledExt,
+    ActiveTheme, IconName, Selectable, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
@@ -138,6 +139,10 @@ pub struct ZedisBitmapEditor {
     loading: bool,
     /// Bit currently under the cursor (grid index), for hover + click.
     hovered: Option<usize>,
+    /// A click flips the bit under it only while this is on. It used to
+    /// `SETBIT` on any click, so a click meant to look at a bit — or a test
+    /// tool's click aimed somewhere else — wrote the value.
+    editing: bool,
     /// Painted canvas bounds, handed from the paint phase to the mouse
     /// handlers so window coordinates can be made canvas-local.
     viewport: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -189,6 +194,7 @@ impl ZedisBitmapEditor {
             error: None,
             loading: false,
             hovered: None,
+            editing: false,
             viewport: Rc::new(Cell::new(None)),
             bitfield_input,
             bitfield_result: None,
@@ -267,9 +273,16 @@ impl ZedisBitmapEditor {
         }
     }
 
-    /// Click a cell to flip its bit with `SETBIT`. No-op in read-only mode.
+    /// Whether the bits may be written here: not a read-only view, and a
+    /// connection that may write now (a lock or read-only mode says no).
+    fn can_write(&self, cx: &App) -> bool {
+        !self.readonly && self.server_state.read(cx).can(Capability::MutateContainer)
+    }
+
+    /// Click a cell to flip its bit with `SETBIT` — while editing, and only
+    /// where the bits may be written.
     fn on_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
-        if self.readonly {
+        if !self.editing || !self.can_write(cx) {
             return;
         }
         let Some(local) = self.local(event.position) else {
@@ -562,6 +575,8 @@ impl ZedisBitmapEditor {
 impl Render for ZedisBitmapEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
+        let can_write = self.can_write(cx);
+        let editing = self.editing && can_write;
 
         let mut header = h_flex()
             .w_full()
@@ -585,6 +600,23 @@ impl Render for ZedisBitmapEditor {
                         .tooltip(i18n_bitmap(cx, "bitop_tooltip"))
                         .on_click(cx.listener(|this, _, window, cx| this.bitop_dialog(window, cx))),
                 )
+            })
+            .when(can_write, |this| {
+                this.child(
+                    Button::new("bitmap-edit")
+                        .small()
+                        .ghost()
+                        .icon(CustomIconName::FilePenLine)
+                        .selected(editing)
+                        .tooltip(i18n_bitmap(cx, "edit_bits"))
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.editing = !this.editing;
+                            cx.notify();
+                        })),
+                )
+            })
+            .when(editing, |this| {
+                this.child(Label::new(i18n_bitmap(cx, "edit_hint")).text_xs().text_color(muted))
             });
         if let Some(data) = self.data.as_ref() {
             header = header
@@ -630,7 +662,7 @@ impl Render for ZedisBitmapEditor {
                 .child(self.render_canvas(cx))
                 .when_some(self.render_tooltip(cx), |this, tip| this.child(tip))
                 .on_mouse_move(cx.listener(|this, event, _window, cx| this.on_move(event, cx)));
-            if !self.readonly {
+            if editing {
                 grid = grid.cursor_pointer().on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, event, _window, cx| this.on_down(event, cx)),

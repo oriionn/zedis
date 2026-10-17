@@ -48,7 +48,10 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use zedis_connection::{RedisServer, get_connection_manager, get_servers, redact_secrets};
+use zedis_connection::{
+    HotkeyEntry, HotkeysReport, RedisServer, floors, get_connection_manager, get_servers, redact_secrets,
+};
+use zedis_core::tally::{memory_by_prefix, totals_by_command};
 
 /// The protocol revisions this server answers. A client that asks for one
 /// of them is answered in kind; any other request gets the newest.
@@ -78,6 +81,21 @@ const MAX_ITEMS: usize = 1000;
 const MAX_TEXT_BYTES: usize = 200 * 1024;
 const DEFAULT_SLOWLOG: u64 = 25;
 const MAX_SLOWLOG: u64 = 128;
+/// Commands `slowlog_summary` ranks, and the slowest entries it quotes.
+const SUMMARY_COMMANDS: usize = 30;
+const SUMMARY_SLOWEST: usize = 5;
+/// Keys `hotkeys` lists per metric, when not told, and at most.
+const DEFAULT_HOTKEYS: usize = 20;
+const MAX_HOTKEYS: usize = 100;
+/// Keys `memory_summary` measures, when not told, and at most: a sample,
+/// so the cost of one call on a production server stays bounded.
+const DEFAULT_MEMORY_SAMPLE: u64 = 1000;
+const MAX_MEMORY_SAMPLE: u64 = 5000;
+/// Keys measured per pipeline to one master.
+const MEMORY_BATCH: usize = 250;
+/// Prefixes and keys `memory_summary` lists.
+const MEMORY_TOP_PREFIXES: usize = 30;
+const MEMORY_TOP_KEYS: usize = 10;
 
 /// What a full account is told at this door.
 const WRITE_ACCOUNT_REFUSAL: &str =
@@ -86,17 +104,22 @@ const WRITE_ACCOUNT_REFUSAL: &str =
 const INSTRUCTIONS: &str = "Read-only access to the Redis and Valkey servers this zedis-bridge holds, as the \
 signed-in account sees them. Start with list_servers; the other tools take a server by its name or id. \
 scan_keys pages through keys (pass next_cursor back to continue), inspect_key describes one key with a \
-short preview, server_info and slowlog read INFO and SLOWLOG GET on every master, and read_command runs \
-any other read-only command. Writes and administration are refused, results are cut to a size that fits \
+short preview, server_info and slowlog read INFO and SLOWLOG GET on every master, slowlog_summary ranks the \
+slow log by command, hotkeys reads the report of a HOTKEYS collection already running (Redis 8.6+), \
+memory_summary measures a sample of keys and groups their memory by prefix, and read_command runs any other \
+read-only command. Writes and administration are refused, results are cut to a size that fits \
 a context, and every call is written to the bridge's audit log.";
 
 /// The tools, in the order `tools/list` names them.
-const TOOLS: [&str; 6] = [
+const TOOLS: [&str; 9] = [
     "list_servers",
     "scan_keys",
     "inspect_key",
     "server_info",
     "slowlog",
+    "slowlog_summary",
+    "hotkeys",
+    "memory_summary",
     "read_command",
 ];
 
@@ -347,6 +370,54 @@ fn tool_list() -> Vec<Json> {
             "annotations": read_only,
         }),
         json!({
+            "name": "slowlog_summary",
+            "title": "Slow log by command",
+            "description": format!("The slow log of every master grouped by command: for each, how many entries, the total, longest and average duration in microseconds and its share of the total — the heaviest first, at most {SUMMARY_COMMANDS} — plus the {SUMMARY_SLOWEST} slowest entries themselves."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "server": server,
+                    "count": { "type": "integer", "minimum": 1, "maximum": MAX_SLOWLOG, "default": MAX_SLOWLOG, "description": "How many entries to read from each master." }
+                },
+                "required": ["server"],
+                "additionalProperties": false
+            },
+            "annotations": read_only,
+        }),
+        json!({
+            "name": "hotkeys",
+            "title": "Hot keys",
+            "description": "The report of the HOTKEYS collection on the server (Redis 8.6+), merged over every master: the keys using the most CPU time and the most network bytes, each with its share. It reads a collection someone started — from Zedis's Hot Keys panel, or with HOTKEYS START — and does not start one, since that changes the server; with none it says so.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "server": server,
+                    "limit": { "type": "integer", "minimum": 1, "maximum": MAX_HOTKEYS, "default": DEFAULT_HOTKEYS, "description": "How many keys to list for each metric." }
+                },
+                "required": ["server"],
+                "additionalProperties": false
+            },
+            "annotations": read_only,
+        }),
+        json!({
+            "name": "memory_summary",
+            "title": "Memory by key prefix",
+            "description": format!("Measure a sample of keys (SCAN, then TYPE and MEMORY USAGE on each, on every master) and group their memory by key prefix — everything up to the last separator, user:profile:42 counting under user:profile:* — the heaviest {MEMORY_TOP_PREFIXES} prefixes with their key count, bytes, average and types, and the {MEMORY_TOP_KEYS} largest keys. complete says whether every matching key was measured; otherwise it is the first keys SCAN returned, and shares are of the sample."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "server": server,
+                    "db": db,
+                    "pattern": { "type": "string", "default": "*", "description": "Only keys matching this glob pattern." },
+                    "sample": { "type": "integer", "minimum": 1, "maximum": MAX_MEMORY_SAMPLE, "default": DEFAULT_MEMORY_SAMPLE, "description": "How many keys to measure at most." },
+                    "separator": { "type": "string", "default": ":", "description": "What separates the parts of a key name." }
+                },
+                "required": ["server"],
+                "additionalProperties": false
+            },
+            "annotations": read_only,
+        }),
+        json!({
             "name": "read_command",
             "title": "Run a read-only command",
             "description": format!("Run one read-only Redis command, given as its words (for example [\"HGETALL\", \"user:42\"]). Refused: writes, scripts other than EVAL_RO / EVALSHA_RO / FCALL_RO, administration, reads that return credentials (CONFIG GET of a password, ACL GETUSER / LIST), and commands that change or hold the connection the tools share (SELECT — pass db instead — AUTH, HELLO, MULTI / EXEC / WATCH, blocking reads such as BLPOP and XREAD BLOCK, SUBSCRIBE, MONITOR, WAIT). On a cluster a command with a key is routed to its node; set every_master to run it on each master instead. Strings over {MAX_STRING_CHARS} characters and arrays or maps over {MAX_ITEMS} items are cut, with what was dropped counted in place."),
@@ -509,6 +580,9 @@ async fn run_tool(
         "inspect_key" => inspect_key(state, server, parse(arguments)?).await,
         "server_info" => server_info(state, server, parse(arguments)?).await,
         "slowlog" => slowlog(state, server, parse(arguments)?).await,
+        "slowlog_summary" => slowlog_summary(state, server, parse(arguments)?).await,
+        "hotkeys" => hotkeys(state, server, parse(arguments)?).await,
+        "memory_summary" => memory_summary(state, server, parse(arguments)?).await,
         "read_command" => read_command(state, server, parse(arguments)?).await,
         other => Err(format!("unknown tool {other:?}")),
     }
@@ -610,49 +684,22 @@ fn star() -> String {
 /// would be a different keyspace.
 async fn scan_keys(state: &AppState, server: &RedisServer, args: ScanArgs) -> Result<Json, String> {
     let limit = args.limit.unwrap_or(DEFAULT_SCAN_LIMIT).clamp(1, MAX_SCAN_LIMIT);
-    let client = get_connection_manager()
-        .get_client(&server.id, args.db)
-        .await
-        .map_err(|e| e.to_string())?;
-    let labels: Vec<String> = client
-        .master_servers()
-        .iter()
-        .map(|s| format!("{}:{}", s.host, s.port))
-        .collect();
-    let mut cursors: Vec<(String, u64)> = match &args.cursor {
+    let labels = master_labels(server, args.db).await?;
+    let cursors: Vec<(String, u64)> = match &args.cursor {
         None => labels.iter().map(|label| (label.clone(), 0)).collect(),
         Some(cursor) => parse_cursor(cursor, &labels)?,
     };
-    let mut keys: Vec<String> = Vec::new();
-    let mut rounds = 0;
-    while !cursors.is_empty() && (keys.len() as u64) < limit && rounds < MAX_SCAN_ROUNDS {
-        rounds += 1;
-        // Shared out over the masters still scanning, so a round brings
-        // about `limit` keys in all rather than `limit` from each.
-        let remaining = limit - keys.len() as u64;
-        let count = (remaining / cursors.len() as u64).clamp(10, SCAN_COUNT).to_string();
-        let (nodes, commands): (Vec<String>, Vec<Vec<Vec<u8>>>) = cursors
-            .iter()
-            .map(|(label, cursor)| {
-                let cursor = cursor.to_string();
-                let mut parts = vec!["SCAN", cursor.as_str(), "MATCH", args.pattern.as_str(), "COUNT", &count];
-                if let Some(key_type) = &args.key_type {
-                    parts.extend(["TYPE", key_type.as_str()]);
-                }
-                (label.clone(), words(&parts))
-            })
-            .unzip();
-        let (values, answered) = run(state, server, args.db, commands, nodes, true).await?;
-        let mut next = Vec::new();
-        for (label, value) in answered.into_iter().zip(values) {
-            let (cursor, page) = scan_reply(&value)?;
-            keys.extend(page);
-            if cursor != 0 {
-                next.push((label, cursor));
-            }
-        }
-        cursors = next;
-    }
+    let (found, cursors) = scan_masters(
+        state,
+        server,
+        args.db,
+        &args.pattern,
+        args.key_type.as_deref(),
+        limit,
+        cursors,
+    )
+    .await?;
+    let keys: Vec<String> = found.into_iter().map(|(_, key)| key).collect();
     let next_cursor = (!cursors.is_empty()).then(|| encode_cursor(&cursors));
     Ok(json!({
         "keys": keys,
@@ -660,6 +707,65 @@ async fn scan_keys(state: &AppState, server: &RedisServer, args: ScanArgs) -> Re
         "next_cursor": next_cursor,
         "complete": cursors.is_empty(),
     }))
+}
+
+/// Every master of `server`, as `host:port` — the labels the scan cursors
+/// and the per-node commands carry.
+async fn master_labels(server: &RedisServer, db: usize) -> Result<Vec<String>, String> {
+    let client = get_connection_manager()
+        .get_client(&server.id, db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(client
+        .master_servers()
+        .iter()
+        .map(|s| format!("{}:{}", s.host, s.port))
+        .collect())
+}
+
+/// `SCAN` on every master from `cursors` until about `limit` keys or
+/// [`MAX_SCAN_ROUNDS`] rounds: each key with the master it came from, and
+/// the cursors of the masters not yet done.
+async fn scan_masters(
+    state: &AppState,
+    server: &RedisServer,
+    db: usize,
+    pattern: &str,
+    key_type: Option<&str>,
+    limit: u64,
+    mut cursors: Vec<(String, u64)>,
+) -> Result<(Vec<(String, String)>, Vec<(String, u64)>), String> {
+    let mut found: Vec<(String, String)> = Vec::new();
+    let mut rounds = 0;
+    while !cursors.is_empty() && (found.len() as u64) < limit && rounds < MAX_SCAN_ROUNDS {
+        rounds += 1;
+        // Shared out over the masters still scanning, so a round brings
+        // about `limit` keys in all rather than `limit` from each.
+        let remaining = limit - found.len() as u64;
+        let count = (remaining / cursors.len() as u64).clamp(10, SCAN_COUNT).to_string();
+        let (nodes, commands): (Vec<String>, Vec<Vec<Vec<u8>>>) = cursors
+            .iter()
+            .map(|(label, cursor)| {
+                let cursor = cursor.to_string();
+                let mut parts = vec!["SCAN", cursor.as_str(), "MATCH", pattern, "COUNT", &count];
+                if let Some(key_type) = key_type {
+                    parts.extend(["TYPE", key_type]);
+                }
+                (label.clone(), words(&parts))
+            })
+            .unzip();
+        let (values, answered) = run(state, server, db, commands, nodes, true).await?;
+        let mut next = Vec::new();
+        for (label, value) in answered.into_iter().zip(values) {
+            let (cursor, page) = scan_reply(&value)?;
+            found.extend(page.into_iter().map(|key| (label.clone(), key)));
+            if cursor != 0 {
+                next.push((label, cursor));
+            }
+        }
+        cursors = next;
+    }
+    Ok((found, cursors))
 }
 
 fn encode_cursor(cursors: &[(String, u64)]) -> String {
@@ -902,6 +1008,254 @@ fn slowlog_entry(entry: &Value) -> Json {
     })
 }
 
+/// A share in percent, to one decimal.
+fn percent(part: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        (part as f64 * 1000.0 / total as f64).round() / 10.0
+    }
+}
+
+/// The slow log of every master, grouped by command (`zedis_core::tally`,
+/// the desktop's Top Commands), with the slowest entries quoted.
+async fn slowlog_summary(state: &AppState, server: &RedisServer, args: SlowlogArgs) -> Result<Json, String> {
+    let count = args.count.unwrap_or(MAX_SLOWLOG).clamp(1, MAX_SLOWLOG).to_string();
+    let (values, nodes) = run(
+        state,
+        server,
+        0,
+        vec![words(&["SLOWLOG", "GET", &count])],
+        Vec::new(),
+        true,
+    )
+    .await?;
+    // (node, command name, microseconds, the entry as `slowlog` shows it)
+    let mut entries: Vec<(String, String, u64, Json)> = Vec::new();
+    for (node, value) in nodes.iter().zip(&values) {
+        let Value::Array(list) = value else { continue };
+        for entry in list {
+            let shown = slowlog_entry(entry);
+            let command = shown["command"]
+                .get(0)
+                .and_then(Json::as_str)
+                .unwrap_or_default()
+                .to_ascii_uppercase();
+            let micros = shown["duration_us"].as_u64().unwrap_or(0);
+            entries.push((node.clone(), command, micros, shown));
+        }
+    }
+    let totals = totals_by_command(
+        entries
+            .iter()
+            .map(|(_, command, micros, _)| (command.as_str(), *micros)),
+    );
+    let by_command: Vec<Json> = totals
+        .iter()
+        .take(SUMMARY_COMMANDS)
+        .map(|total| {
+            json!({
+                "command": total.command,
+                "count": total.count,
+                "total_us": total.total,
+                "max_us": total.max,
+                "avg_us": total.total / total.count.max(1) as u64,
+                "share_pct": (total.share_pct * 10.0).round() / 10.0,
+            })
+        })
+        .collect();
+    entries.sort_by_key(|(_, _, micros, _)| std::cmp::Reverse(*micros));
+    let slowest: Vec<Json> = entries
+        .iter()
+        .take(SUMMARY_SLOWEST)
+        .map(|(node, _, _, shown)| {
+            let mut shown = shown.clone();
+            shown["node"] = json!(node);
+            shown
+        })
+        .collect();
+    Ok(json!({
+        "entries": entries.len(),
+        "masters": nodes.len(),
+        "by_command": by_command,
+        "commands_in_all": totals.len(),
+        "slowest": slowest,
+    }))
+}
+
+#[derive(Deserialize)]
+struct HotkeysArgs {
+    limit: Option<usize>,
+}
+
+/// The report of the server's `HOTKEYS` collection, merged over every master
+/// (`HotkeysReport`, as the Hot Keys panel reads it). It only reads: starting
+/// a collection changes the server, so that is left to a person.
+async fn hotkeys(state: &AppState, server: &RedisServer, args: HotkeysArgs) -> Result<Json, String> {
+    let client = get_connection_manager()
+        .get_client(&server.id, 0)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !client.supports(floors::HOTKEYS) {
+        return Err("HOTKEYS is a Redis 8.6 command, and this server does not have it".to_string());
+    }
+    let (values, _) = run(state, server, 0, vec![words(&["HOTKEYS", "GET"])], Vec::new(), true).await?;
+    let mut report = HotkeysReport::default();
+    for value in &values {
+        report.merge_node_reply(value);
+    }
+    report.sort();
+    if report.is_empty() {
+        return Ok(json!({
+            "collected": false,
+            "message": "No HOTKEYS collection has run on this server. Start one from Zedis's Hot Keys panel (or HOTKEYS START), let it run, then ask again.",
+        }));
+    }
+    let limit = args.limit.unwrap_or(DEFAULT_HOTKEYS).clamp(1, MAX_HOTKEYS);
+    let listed = |list: &[HotkeyEntry], total: u64| -> Vec<Json> {
+        list.iter()
+            .take(limit)
+            .map(|entry| json!({ "key": cut_text(&entry.key), "value": entry.value, "share_pct": percent(entry.value, total) }))
+            .collect()
+    };
+    Ok(json!({
+        "collected": true,
+        "tracking_active": report.tracking_active,
+        "sample_ratio": report.sample_ratio,
+        "duration_ms": report.collection_duration_ms,
+        "total_cpu_us": report.total_cpu_us,
+        "total_net_bytes": report.total_net_bytes,
+        "by_cpu_us": listed(&report.by_cpu, report.total_cpu_us),
+        "by_net_bytes": listed(&report.by_net, report.total_net_bytes),
+    }))
+}
+
+#[derive(Deserialize)]
+struct MemoryArgs {
+    #[serde(default)]
+    db: usize,
+    #[serde(default = "star")]
+    pattern: String,
+    sample: Option<u64>,
+    separator: Option<String>,
+}
+
+/// A sample of keys measured and grouped by prefix (`zedis_core::tally`).
+/// Bounded twice: by `sample` keys, and by the scan's own rounds, so one
+/// call costs a production server a few thousand cheap commands at most.
+async fn memory_summary(state: &AppState, server: &RedisServer, args: MemoryArgs) -> Result<Json, String> {
+    let sample = args.sample.unwrap_or(DEFAULT_MEMORY_SAMPLE).clamp(1, MAX_MEMORY_SAMPLE);
+    let separator = args.separator.unwrap_or_else(|| ":".to_string());
+    let start = master_labels(server, args.db)
+        .await?
+        .into_iter()
+        .map(|label| (label, 0))
+        .collect();
+    let (found, unscanned) = scan_masters(state, server, args.db, &args.pattern, None, sample, start).await?;
+    // Complete when the scan ran out before the sample did: SCAN's COUNT is
+    // a hint, so a page can bring more than asked, and those are cut.
+    let complete = unscanned.is_empty() && (found.len() as u64) <= sample;
+    let found: Vec<(String, String)> = found.into_iter().take(sample as usize).collect();
+
+    // (key, type, bytes)
+    let mut measured: Vec<(String, String, u64)> = Vec::new();
+    for batch in found.chunks(MEMORY_BATCH) {
+        let mut nodes = Vec::with_capacity(batch.len() * 2);
+        let mut commands = Vec::with_capacity(batch.len() * 2);
+        for (label, key) in batch {
+            nodes.push(label.clone());
+            commands.push(words(&["TYPE", key]));
+            nodes.push(label.clone());
+            commands.push(words(&["MEMORY", "USAGE", key]));
+        }
+        let (values, answered) = run(state, server, args.db, commands, nodes, true).await?;
+        measured.extend(pair_measurements(batch, answered, values));
+    }
+    if measured.is_empty() && !found.is_empty() {
+        return Err("MEMORY USAGE answered nothing for the keys found; the server may not allow it".to_string());
+    }
+
+    let total: u64 = measured.iter().map(|(_, _, bytes)| bytes).sum();
+    let groups = memory_by_prefix(
+        measured
+            .iter()
+            .map(|(key, key_type, bytes)| (key.as_str(), key_type.as_str(), *bytes)),
+        &separator,
+    );
+    let prefixes: Vec<Json> = groups
+        .iter()
+        .take(MEMORY_TOP_PREFIXES)
+        .map(|group| {
+            json!({
+                "prefix": cut_text(&group.prefix),
+                "keys": group.keys,
+                "bytes": group.bytes,
+                "avg_bytes": group.bytes / group.keys.max(1),
+                "share_pct": percent(group.bytes, total),
+                "types": group.types,
+            })
+        })
+        .collect();
+    let mut largest: Vec<&(String, String, u64)> = measured.iter().collect();
+    largest.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    let largest: Vec<Json> = largest
+        .into_iter()
+        .take(MEMORY_TOP_KEYS)
+        .map(|(key, key_type, bytes)| json!({ "key": cut_text(key), "type": key_type, "bytes": bytes }))
+        .collect();
+    Ok(json!({
+        "measured_keys": measured.len(),
+        "measured_bytes": total,
+        "complete": complete,
+        "note": if complete {
+            "Every key matching the pattern was measured."
+        } else {
+            "A sample: the first keys SCAN returned, not the whole keyspace. Shares are of the sample."
+        },
+        "separator": separator,
+        "prefix_count": groups.len(),
+        "prefixes": prefixes,
+        "largest_keys": largest,
+    }))
+}
+
+/// Each key of `batch` with its type and size, from the replies to its
+/// `TYPE` and `MEMORY USAGE`. Each master answers its own commands in the
+/// order it got them — a key's `TYPE`, then its `MEMORY USAGE` — and the
+/// masters one after another, so the pairs are put back together per
+/// master. A key gone since the scan (`none`, nil), or one `MEMORY` was
+/// refused for, is left out.
+fn pair_measurements(
+    batch: &[(String, String)],
+    answered: Vec<String>,
+    values: Vec<Value>,
+) -> Vec<(String, String, u64)> {
+    let mut queues: HashMap<&str, VecDeque<&str>> = HashMap::new();
+    for (label, key) in batch {
+        queues.entry(label).or_default().push_back(key);
+    }
+    let mut types: HashMap<String, String> = HashMap::new();
+    let mut measured = Vec::new();
+    for (label, value) in answered.into_iter().zip(values) {
+        match types.remove(&label) {
+            None => {
+                types.insert(label, text(&value).unwrap_or_default());
+            }
+            Some(key_type) => {
+                let Some(key) = queues.get_mut(label.as_str()).and_then(VecDeque::pop_front) else {
+                    continue;
+                };
+                if let Some(bytes) = int(&value).filter(|bytes| *bytes >= 0)
+                    && key_type != "none"
+                {
+                    measured.push((key.to_string(), key_type, bytes as u64));
+                }
+            }
+        }
+    }
+    measured
+}
+
 #[derive(Deserialize)]
 struct CommandArgs {
     #[serde(default)]
@@ -1027,6 +1381,45 @@ fn cap_text(text: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Replies come back master by master, not in the order the keys were
+    /// sent; each key still gets its own type and size, and a key gone
+    /// since the scan or refused by MEMORY is left out.
+    #[test]
+    fn measurements_are_paired_back_per_master() {
+        let batch: Vec<(String, String)> = [
+            ("a:1", "user:1"),
+            ("b:2", "cache:x"),
+            ("a:1", "user:2"),
+            ("b:2", "gone"),
+        ]
+        .iter()
+        .map(|(label, key)| (label.to_string(), key.to_string()))
+        .collect();
+        // Master a:1 answers first, then b:2 — each in the order it was sent.
+        let answered: Vec<String> = ["a:1", "a:1", "a:1", "a:1", "b:2", "b:2", "b:2", "b:2"]
+            .iter()
+            .map(|label| label.to_string())
+            .collect();
+        let values = vec![
+            Value::SimpleString("hash".into()),
+            Value::Int(300),
+            Value::SimpleString("string".into()),
+            Value::Int(80),
+            Value::SimpleString("string".into()),
+            Value::Int(900),
+            Value::SimpleString("none".into()),
+            Value::Nil,
+        ];
+        assert_eq!(
+            pair_measurements(&batch, answered, values),
+            [
+                ("user:1".to_string(), "hash".to_string(), 300),
+                ("user:2".to_string(), "string".to_string(), 80),
+                ("cache:x".to_string(), "string".to_string(), 900),
+            ]
+        );
+    }
 
     #[test]
     fn a_request_is_taken_apart_and_a_notification_has_no_id() {

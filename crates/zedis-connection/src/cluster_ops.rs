@@ -222,33 +222,50 @@ pub async fn node_slot_migrations(node: &ClusterNode) -> Result<Vec<AtomicSlotMi
     cluster_get_slot_migrations(&mut node.cached_connection().await?, dialect).await
 }
 
-/// What the load heatmap samples from each master.
+/// What the Load tab samples from each master.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NodeLoad {
     pub used_memory: u64,
     pub ops_per_sec: u64,
     pub connected_clients: u64,
+    /// Keys in every database of the node, from its keyspace lines.
+    pub keys: u64,
 }
 
-/// Default `INFO` on this node, read down to the three numbers the heatmap
+/// Default `INFO` on this node, read down to the numbers the Load tab
 /// draws. On the pooled connection, and default `INFO` rather than `INFO
 /// all`: this runs on a poll interval, and `all` additionally streams the
-/// command-scaled stats just to be thrown away.
+/// command-scaled stats just to be thrown away. The default set already
+/// carries the keyspace section, so the key count costs nothing more.
 pub async fn node_load(node: &ClusterNode) -> Result<NodeLoad> {
     let info: String = cmd("INFO").query_async(&mut node.cached_connection().await?).await?;
+    Ok(parse_node_load(&info))
+}
+
+/// The Load tab's numbers out of an `INFO` reply. A database's line reads
+/// `db0:keys=12,expires=3,avg_ttl=0`; a Valkey 9 cluster can hold several.
+fn parse_node_load(info: &str) -> NodeLoad {
     let mut load = NodeLoad::default();
     for line in info.lines() {
-        let Some((field, value)) = line.split_once(':') else {
+        let Some((field, value)) = line.trim_end().split_once(':') else {
             continue;
         };
         match field {
             "used_memory" => load.used_memory = value.parse().unwrap_or(0),
             "instantaneous_ops_per_sec" => load.ops_per_sec = value.parse().unwrap_or(0),
             "connected_clients" => load.connected_clients = value.parse().unwrap_or(0),
+            db if db.strip_prefix("db").is_some_and(|n| n.parse::<u32>().is_ok()) => {
+                let keys = value
+                    .split(',')
+                    .find_map(|part| part.strip_prefix("keys="))
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .unwrap_or(0);
+                load.keys += keys;
+            }
             _ => {}
         }
     }
-    Ok(load)
+    load
 }
 
 /// `CLUSTER MEET host port` on every master, so the new node is introduced
@@ -423,7 +440,26 @@ fn split_addr(addr: &str) -> Result<(&str, u16)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{migrate_auth, split_addr};
+    use super::{NodeLoad, migrate_auth, parse_node_load, split_addr};
+
+    /// The Load tab's numbers, the key count summed over every database
+    /// line of the keyspace section (a Valkey 9 cluster can have several).
+    #[test]
+    fn a_node_load_reads_memory_ops_clients_and_every_databases_keys() {
+        let info = "# Clients\r\nconnected_clients:7\r\n\r\n# Memory\r\nused_memory:2048\r\n\
+                    used_memory_human:2.00K\r\n\r\n# Stats\r\ninstantaneous_ops_per_sec:42\r\n\r\n\
+                    # Keyspace\r\ndb0:keys=12,expires=3,avg_ttl=0\r\ndb3:keys=5,expires=0,avg_ttl=0\r\n";
+        assert_eq!(
+            parse_node_load(info),
+            NodeLoad {
+                used_memory: 2048,
+                ops_per_sec: 42,
+                connected_clients: 7,
+                keys: 17,
+            }
+        );
+        assert_eq!(parse_node_load("# Keyspace\r\n").keys, 0, "an empty node");
+    }
 
     #[test]
     fn migrate_signs_in_as_the_entry_does() {

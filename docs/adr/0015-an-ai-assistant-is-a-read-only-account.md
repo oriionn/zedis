@@ -113,3 +113,24 @@ who is "whoever holds the token" could not own a private entry. Each of
 these belongs to an account, and everything the account's `servers` rules
 say applies to it unchanged. Not done: OAuth, which a client that cannot set
 a header (Claude Desktop's remote connectors) would need.
+
+## Amendment — 2026-10-17: diagnostic summaries
+
+Three tools summarise rather than list, because a model asked "why is this
+server slow" otherwise reads a hundred slow-log entries or thousands of keys
+to answer it. `slowlog_summary` groups the slow log of every master by
+command, heaviest first, and quotes the slowest entries. `memory_summary`
+scans a bounded sample (1,000 keys by default, 5,000 at most), sends `TYPE`
+and `MEMORY USAGE` for each to the master it came from, and groups the bytes
+by key prefix; it says whether the sample was the whole match, so a share of
+a sample is never read as a share of the keyspace. `hotkeys` reads the report
+of a `HOTKEYS` collection (Redis 8.6+) and does not start one: `HOTKEYS
+START` changes what the server tracks for every client, which is not a read,
+so the allowlist keeps `GET` alone and a person starts the collection from
+the Hot Keys panel.
+
+The counting is `zedis_core::tally`, which the desktop's Top Commands and the
+`MONITOR` sample count with too, so the panel and the tool give the same
+answer about the same log. All three go through `run` like the other tools —
+the same allowlist, the same audit line per call — and add nothing to what
+an account may send.

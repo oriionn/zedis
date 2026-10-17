@@ -329,6 +329,8 @@ pub enum MonitorAction {
     ExportCsv,
     /// Export the visible monitor rows to a JSON file.
     ExportJson,
+    /// Run MONITOR for this many seconds and count what it saw.
+    Sample(u64),
 }
 
 /// Memory-analysis panel export actions, dispatched by the toolbar

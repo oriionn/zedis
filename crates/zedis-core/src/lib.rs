@@ -46,6 +46,7 @@ pub mod replication;
 pub mod search_params;
 pub mod ssh_config;
 pub mod string;
+pub mod tally;
 pub mod ttl;
 pub mod ttl_cache;
 pub mod validate;
