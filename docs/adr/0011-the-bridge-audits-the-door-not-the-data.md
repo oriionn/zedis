@@ -81,3 +81,32 @@ is worse than none.
 - A new mutating route calls `authorize_write` with an action name, and a new
   route that forwards commands goes through `audit::command_lines` — there is
   no third way to change something through this process.
+
+## Amended 2026-10-17 — a copy of the lines can be pushed to a chat
+
+A log someone reads after an incident tells nobody while it happens.
+`--audit-webhook <url>` (`webhook.rs`) pushes lines to a Feishu / Lark,
+DingTalk, WeCom or Slack bot — the format told by the URL's host — or, as the
+lines themselves in JSON, to any other URL. It is a **notice, not the
+record**: the file stays the record, and the two choices below follow from
+that.
+
+- **A subset.** By default every event but sign-ins, sign-outs and MCP tool
+  calls (`--audit-webhook-events` changes the list), and of the commands only
+  the administrative ones and those that were confirmed, stopped for a
+  confirmation or denied. A plain data write is never pushed, even with
+  `--audit-writes`: a chat that carries every `SET` is a chat nobody reads,
+  which is the same reason the file leaves reads out.
+- **It never holds up a request, and its failure is not an outage.** Lines go
+  into a bounded queue (dropped and counted past it) and out three seconds
+  after the first, up to twenty to a message — which also keeps under the
+  bots' rate limits; a failed send is retried once, then a warning in the
+  process log. The URL and the event list are checked at startup, as the
+  file's path is; the bot is not dialed then, because a chat that is down
+  for a minute is no reason for the bridge to be.
+
+The bot's URL carries its key, so only the host is logged; the signing
+secret has a variable of its own, so it need not sit in the process list as
+a flag would. HMAC-SHA256 is done
+over the `sha2` the bridge already has and the POSTs go through the `ureq`
+the desktop already builds — the feature adds no crate to the lock file.

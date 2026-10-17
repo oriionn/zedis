@@ -38,6 +38,7 @@ mod presence;
 mod resp;
 mod session;
 mod static_files;
+mod webhook;
 
 use auth::{Accounts, USERS_ENV, USERS_FILE_ENV};
 use session::Sessions;
@@ -149,6 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "zedis-bridge [--listen {DEFAULT_LISTEN}] [--base-path /prefix] [--static <dir>] \
              [--users-file <file>] [--insecure-cookie] [--audit-log <file>] [--audit-writes] \
+             [--audit-webhook <url> [--audit-webhook-format <name>] [--audit-webhook-events <list>]] \
              [--trusted-header <name> --trusted-proxy <cidr,…>]"
         );
         println!();
@@ -187,6 +189,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             audit::WRITES_ENV
         );
         println!("are never logged. Passwords in arguments are blanked.");
+        println!(
+            "--audit-webhook <url> ({}) pushes those lines to a chat as they happen:",
+            webhook::URL_ENV
+        );
+        println!("a Feishu / Lark, DingTalk, WeCom or Slack bot (told apart by its host, or named");
+        println!(
+            "with --audit-webhook-format json|feishu|dingtalk|wecom|slack, {}), or any",
+            webhook::FORMAT_ENV
+        );
+        println!("other URL, which gets them as JSON. Every few seconds, one message; a signing");
+        println!(
+            "secret goes in {} (Feishu, DingTalk). By default all but sign-ins,",
+            webhook::SECRET_ENV
+        );
+        println!(
+            "sign-outs and MCP calls; --audit-webhook-events ({}) takes a list of",
+            webhook::EVENTS_ENV
+        );
+        println!(
+            "{}, or all. Plain data writes are never pushed.",
+            webhook::EVENTS.join(", ")
+        );
         println!(
             "--trusted-header Remote-User ({}) believes the identity a reverse proxy",
             auth::TRUSTED_HEADER_ENV
@@ -304,6 +328,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None if audit_writes => return Err("--audit-writes needs --audit-log".into()),
         None => audit::Audit::off(),
+    };
+    // The webhook, when asked for, checked here too: a URL or a list that
+    // is wrong stops the bridge rather than pushing nothing all day.
+    let webhook_url = flag("--audit-webhook")
+        .or_else(|| std::env::var(webhook::URL_ENV).ok())
+        .filter(|url| !url.trim().is_empty());
+    let audit = match webhook_url {
+        Some(url) => {
+            let config = webhook::WebhookConfig::new(
+                &url,
+                flag("--audit-webhook-format")
+                    .or_else(|| std::env::var(webhook::FORMAT_ENV).ok())
+                    .as_deref(),
+                flag("--audit-webhook-secret").or_else(|| std::env::var(webhook::SECRET_ENV).ok()),
+                flag("--audit-webhook-events")
+                    .or_else(|| std::env::var(webhook::EVENTS_ENV).ok())
+                    .as_deref(),
+            )
+            .map_err(|e| format!("--audit-webhook: {e}"))?;
+            // The host, never the URL: the bot's key is in it.
+            tracing::info!(
+                host = config.host(),
+                format = config.format().name(),
+                events = %config.events().join(","),
+                signed = config.signed(),
+                "audit webhook on"
+            );
+            audit.with_webhook(webhook::Webhook::start(config))
+        }
+        None => audit,
     };
 
     // Saved, so that restarting the bridge does not sign everybody out —

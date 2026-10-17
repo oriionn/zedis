@@ -51,6 +51,7 @@
 //! an outage, and a bridge that stops is a bridge someone goes around.
 
 use crate::policy::{Verdict, words};
+use crate::webhook::Webhook;
 use axum::http::HeaderMap;
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -76,10 +77,14 @@ const MAX_ARG_CHARS: usize = 128;
 /// count: a `DEL` of a folder names hundreds of keys.
 const MAX_ARGS: usize = 24;
 
-/// The log, or nothing. Cloned into the router state; `off()` is a
-/// deployment without `--audit-log`, where every `record` is a no-op.
+/// Where the lines go: the file, the webhook (`crate::webhook`), both or
+/// neither. Cloned into the router state; `off()` is a deployment with
+/// neither, where every `record` is a no-op.
 #[derive(Clone, Default)]
-pub struct Audit(Option<Arc<Sink>>);
+pub struct Audit {
+    file: Option<Arc<Sink>>,
+    webhook: Option<Webhook>,
+}
 
 struct Sink {
     path: PathBuf,
@@ -89,7 +94,7 @@ struct Sink {
 
 impl Audit {
     pub fn off() -> Self {
-        Self(None)
+        Self::default()
     }
 
     /// Open `path` for appending — created owner-only if it is new — and
@@ -97,24 +102,34 @@ impl Audit {
     pub fn open(path: &Path, writes: bool) -> std::io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         restrict(path);
-        Ok(Self(Some(Arc::new(Sink {
-            path: path.to_path_buf(),
-            file: Mutex::new(file),
-            writes,
-        }))))
+        Ok(Self {
+            file: Some(Arc::new(Sink {
+                path: path.to_path_buf(),
+                file: Mutex::new(file),
+                writes,
+            })),
+            webhook: None,
+        })
+    }
+
+    /// Push the lines the webhook wants to it as well.
+    pub fn with_webhook(mut self, webhook: Webhook) -> Self {
+        self.webhook = Some(webhook);
+        self
     }
 
     /// Whether plain data writes get a line too.
     pub fn logs_writes(&self) -> bool {
-        self.0.as_ref().is_some_and(|sink| sink.writes)
+        self.file.as_ref().is_some_and(|sink| sink.writes)
     }
 
-    /// Append one line. Never fails the caller: a line that could not be
-    /// written is an error in the process log instead.
+    /// Append one line, and push it where the webhook wants it. Never fails
+    /// the caller: a line that could not be written is an error in the
+    /// process log instead.
     pub fn record(&self, account: &str, origin: &Origin, event: Event) {
-        let Some(sink) = &self.0 else {
+        if self.file.is_none() && self.webhook.is_none() {
             return;
-        };
+        }
         let line = Line {
             ts: rfc3339_now(),
             account,
@@ -124,6 +139,18 @@ impl Audit {
             token: origin.token.as_deref(),
             via: origin.via,
             event,
+        };
+        if let Some(webhook) = &self.webhook
+            && webhook.wants(line.event.name())
+            && line.event.worth_pushing()
+        {
+            match serde_json::to_value(&line) {
+                Ok(value) => webhook.push(value),
+                Err(e) => tracing::error!(error = %e, "audit line could not be serialised for the webhook"),
+            }
+        }
+        let Some(sink) = &self.file else {
+            return;
         };
         let mut bytes = match serde_json::to_vec(&line) {
             Ok(bytes) => bytes,
@@ -283,6 +310,39 @@ pub enum Event {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+}
+
+impl Event {
+    /// The line's `event` field, as `--audit-webhook-events` names it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Event::Login { .. } => "login",
+            Event::LoginFailed => "login_failed",
+            Event::NoAccount => "no_account",
+            Event::Logout => "logout",
+            Event::Refused { .. } => "refused",
+            Event::Command(_) => "command",
+            Event::ServerAdded { .. } => "server_added",
+            Event::ServerUpdated { .. } => "server_updated",
+            Event::ServerDeleted { .. } => "server_deleted",
+            Event::Unlocked { .. } => "unlocked",
+            Event::Locked { .. } => "locked",
+            Event::Tool { .. } => "tool",
+        }
+    }
+
+    /// Whether a line of a pushed event goes to the webhook: all of them
+    /// but a plain data write (`--audit-writes`), which a chat cannot keep
+    /// up with — a command goes when it administers the server or someone
+    /// had to confirm it, or was refused.
+    fn worth_pushing(&self) -> bool {
+        match self {
+            Event::Command(line) => {
+                line.outcome != Outcome::Allowed || is_administration_command(&line.command, &line.args)
+            }
+            _ => true,
+        }
+    }
 }
 
 /// The entry a line is about — enough to find it, and the name a reader
@@ -522,6 +582,7 @@ pub(crate) fn rfc3339(secs: u64, millis: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::webhook::{EVENTS, WebhookConfig};
     use zedis_connection::DangerKind;
 
     fn args(parts: &[&str]) -> Vec<Vec<u8>> {
@@ -537,6 +598,98 @@ mod tests {
             password: Some("hunter2".to_string()),
             ..Default::default()
         }
+    }
+
+    fn command(name: &str, args: &[&str], outcome: Outcome) -> Event {
+        Event::Command(CommandLine {
+            server: ServerRef::from(&server()),
+            db: 0,
+            command: name.to_string(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            count: 1,
+            outcome,
+            kind: None,
+            confirm: None,
+            error: None,
+        })
+    }
+
+    /// The webhook gets what a team wants to hear of at once — a failed
+    /// sign-in, a command that administers the server, a confirmed write —
+    /// and not what happens all day: a sign-in, a plain write.
+    #[test]
+    fn the_webhook_gets_what_matters_and_never_a_plain_write() {
+        let config = WebhookConfig::new("https://hooks.example/x", None, None, None).expect("config");
+        let (webhook, mut queue) = Webhook::queued(config);
+        let audit = Audit::off().with_webhook(webhook);
+        let origin = Origin::default();
+        audit.record("alice", &origin, Event::Login { remember: false });
+        audit.record("alice", &origin, command("SET", &["k", "v"], Outcome::Allowed));
+        audit.record(
+            "alice",
+            &origin,
+            command("CONFIG", &["SET", "maxmemory", "1gb"], Outcome::Allowed),
+        );
+        audit.record("alice", &origin, command("SET", &["k", "v"], Outcome::Confirmed));
+        audit.record("mallory", &origin, Event::LoginFailed);
+        let mut pushed = Vec::new();
+        while let Ok(line) = queue.try_recv() {
+            pushed.push(format!(
+                "{} {}",
+                line["event"].as_str().unwrap_or_default(),
+                line["command"].as_str().unwrap_or_default()
+            ));
+        }
+        assert_eq!(pushed, ["command CONFIG", "command SET", "login_failed "]);
+    }
+
+    /// `--audit-webhook-events` filters by `name()` and the list it accepts
+    /// is `webhook::EVENTS`, while the line spells its `event` through
+    /// serde: one of each event has to agree on all three, or a new event
+    /// is neither pushed by default nor nameable.
+    #[test]
+    fn every_event_is_named_as_its_line_spells_it_and_the_webhook_knows_it() {
+        let at = || ServerRef::from(&server());
+        let every = [
+            Event::Login { remember: false },
+            Event::LoginFailed,
+            Event::NoAccount,
+            Event::Logout,
+            Event::Refused { action: "server_add" },
+            command("CONFIG", &["SET", "maxmemory", "1gb"], Outcome::Allowed),
+            Event::ServerAdded {
+                server: at(),
+                shared: false,
+                settings: Map::new(),
+                error: None,
+            },
+            Event::ServerUpdated {
+                server: at(),
+                changed: BTreeMap::new(),
+                secrets_changed: Vec::new(),
+                shared: None,
+                error: None,
+            },
+            Event::ServerDeleted { server: at() },
+            Event::Unlocked {
+                server: at(),
+                seconds: 900,
+            },
+            Event::Locked { server: at() },
+            Event::Tool {
+                tool: "scan_keys".to_string(),
+                server: None,
+                db: None,
+                arguments: Value::Null,
+                error: None,
+            },
+        ];
+        let names: Vec<&str> = every.iter().map(Event::name).collect();
+        for event in &every {
+            let line = serde_json::to_value(event).expect("serialize");
+            assert_eq!(line["event"].as_str(), Some(event.name()));
+        }
+        assert_eq!(names, EVENTS);
     }
 
     fn lines(judged: &[(Vec<Vec<u8>>, Verdict)], writes: bool) -> Vec<CommandLine> {

@@ -11888,6 +11888,7 @@ dependencies = [
  "toml 1.1.8+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
+ "ureq",
  "uuid",
  "zedis-connection",
  "zedis-core",

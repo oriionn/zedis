@@ -140,6 +140,32 @@ A **Prod**-tagged entry starts with its writes locked, on the desktop and in the
 
 It is the log of the bridge only: what reaches Redis from `redis-cli` or an application is not in it, and it cannot tell you who changed a key — it can tell you whether anyone did so by hand. The bridge appends and never reopens the file, so rotate it with `copytruncate`.
 
+### Pushed to a chat
+
+`--audit-webhook <url>` (`ZEDIS_BRIDGE_AUDIT_WEBHOOK`) sends the lines that need a person's attention to a group chat as they happen, with or without `--audit-log`. Give it a bot's webhook address and its host picks the message — Feishu / Lark (`open.feishu.cn`, `open.larksuite.com`), DingTalk (`oapi.dingtalk.com`), WeCom (`qyapi.weixin.qq.com`), Slack (`hooks.slack.com`) — and any other URL is sent the lines themselves as JSON, `{"source":"zedis-bridge","events":[…]}`, for a receiver of your own. Behind a relay whose host says nothing, name the format: `--audit-webhook-format json|feishu|dingtalk|wecom|slack` (`ZEDIS_BRIDGE_AUDIT_WEBHOOK_FORMAT`). A Feishu or DingTalk bot with signature verification switched on needs its secret in `ZEDIS_BRIDGE_AUDIT_WEBHOOK_SECRET` (there is a `--audit-webhook-secret` flag too, but a flag is visible to every user of the machine in the process list).
+
+```bash
+docker run -d --name zedis-web -p 127.0.0.1:7379:7379 \
+  -e ZEDIS_BRIDGE_USERS="alice@…,bob@…" \
+  -e ZEDIS_BRIDGE_AUDIT_LOG=/data/audit.log \
+  -e ZEDIS_BRIDGE_AUDIT_WEBHOOK="https://open.feishu.cn/open-apis/bot/v2/hook/…" \
+  -e ZEDIS_BRIDGE_AUDIT_WEBHOOK_SECRET="…" \
+  -v zedis-data:/data \
+  vicanso/zedis-web:latest
+```
+
+The chat gets one sentence per line:
+
+```text
+[zedis-bridge audit, times in UTC]
+08:12:03 alice ran, confirmed, CONFIG SET maxmemory 2gb on prod db0 from 10.0.0.7
+08:13:00 mallory failed to sign in from 203.0.113.9
+```
+
+What is pushed is a subset of what the log records. By default it is every event except sign-ins, sign-outs and MCP tool calls, which happen all day; `--audit-webhook-events` (`ZEDIS_BRIDGE_AUDIT_WEBHOOK_EVENTS`) takes a list instead — `login`, `login_failed`, `no_account`, `logout`, `refused`, `command`, `server_added`, `server_updated`, `server_deleted`, `unlocked`, `locked`, `tool` — or `all`. Of the commands, only those that administer the server and those someone had to confirm or was refused are pushed: a plain data write never is, even with `--audit-writes`, or a busy morning would bury the chat.
+
+Sending never holds up a request: lines are queued and go out three seconds after the first of them, up to twenty in one message, which also keeps under a bot's rate limit (WeCom allows twenty messages a minute). A send that fails is tried once more five seconds later and is then a warning in the process log; a bot that answers with an error code (a wrong signature, a disabled bot) counts as a failure. The URL carries the bot's key, so the process log names only its host — at startup the `audit webhook on` line gives the host, the format, the events and whether it signs. A bad URL, format or event name stops the bridge at startup instead, and so does a secret for a bot that is not signed (WeCom, Slack, JSON), rather than leaving you to believe its messages are.
+
 ## Who is online
 
 The bridge counts who is using it. A client is online from its first request until it has made none for five minutes: each browser sign-in is one client (every tab of that browser shares its cookie), a script signing in with HTTP Basic is one per account and address, an MCP token is one per name, and an account behind the trusted proxy is one per account. A page with a server open sends a heartbeat every 10 seconds (60 in a background tab), so it stays online while it is open; a page left on the home screen sends nothing and goes offline after the five minutes. Signing out takes that browser off at once.

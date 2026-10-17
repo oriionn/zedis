@@ -140,6 +140,32 @@ read_only = true
 
 这只是 bridge 这一扇门的日志：`redis-cli` 和应用程序直连 Redis 的操作不在里面；它回答不了"谁改了这个 key"，能回答的是"有没有人手动改过"。bridge 只追加、从不重新打开文件，轮转请用 `copytruncate`。
 
+### 推送到群聊
+
+`--audit-webhook <url>`（`ZEDIS_BRIDGE_AUDIT_WEBHOOK`）把需要人留意的审计行实时推送到群聊，开不开 `--audit-log` 都可以。填机器人的 webhook 地址，消息格式按域名自动识别——飞书 / Lark（`open.feishu.cn`、`open.larksuite.com`）、钉钉（`oapi.dingtalk.com`）、企业微信（`qyapi.weixin.qq.com`）、Slack（`hooks.slack.com`）；其它地址收到的是审计行本身的 JSON，`{"source":"zedis-bridge","events":[…]}`，方便接自己的程序。经过中转、从域名看不出来时，用 `--audit-webhook-format json|feishu|dingtalk|wecom|slack`（`ZEDIS_BRIDGE_AUDIT_WEBHOOK_FORMAT`）指定。飞书或钉钉机器人开了签名校验的，把密钥放进 `ZEDIS_BRIDGE_AUDIT_WEBHOOK_SECRET`（也有 `--audit-webhook-secret` 参数，但命令行参数在进程列表里本机所有用户都看得到）。
+
+```bash
+docker run -d --name zedis-web -p 127.0.0.1:7379:7379 \
+  -e ZEDIS_BRIDGE_USERS="alice@…,bob@…" \
+  -e ZEDIS_BRIDGE_AUDIT_LOG=/data/audit.log \
+  -e ZEDIS_BRIDGE_AUDIT_WEBHOOK="https://open.feishu.cn/open-apis/bot/v2/hook/…" \
+  -e ZEDIS_BRIDGE_AUDIT_WEBHOOK_SECRET="…" \
+  -v zedis-data:/data \
+  vicanso/zedis-web:latest
+```
+
+群里每条审计行是一句话：
+
+```text
+[zedis-bridge audit, times in UTC]
+08:12:03 alice ran, confirmed, CONFIG SET maxmemory 2gb on prod db0 from 10.0.0.7
+08:13:00 mallory failed to sign in from 203.0.113.9
+```
+
+推送的是审计日志所记内容的一个子集。默认推送除登录、退出登录和 MCP 工具调用之外的所有事件——这三种整天都在发生；`--audit-webhook-events`（`ZEDIS_BRIDGE_AUDIT_WEBHOOK_EVENTS`）可以改成一个列表——`login`、`login_failed`、`no_account`、`logout`、`refused`、`command`、`server_added`、`server_updated`、`server_deleted`、`unlocked`、`locked`、`tool`——或 `all`。命令里只推送管理服务器的命令，以及需要人确认或被拒绝的命令：普通的数据写永远不推，开了 `--audit-writes` 也一样，否则忙一个上午群就被刷屏了。
+
+推送从不拖慢请求：审计行先进队列，第一行到达 3 秒后发出，一条消息最多 20 行，这样也不会超过机器人的频率限制（企业微信每分钟 20 条）。发送失败会在 5 秒后重试一次，仍失败就在进程日志里记一条警告；机器人返回错误码（签名不对、机器人已停用）也算失败。URL 里带着机器人的密钥，所以进程日志只记它的域名——启动时的 `audit webhook on` 一行列出域名、格式、推送的事件以及是否签名。URL、格式或事件名写错时，bridge 在启动时就会报错退出；给不签名的机器人（企业微信、Slack、JSON）配了密钥也一样，免得你以为消息是签过名的。
+
 ## 在线客户端
 
 bridge 会统计谁在使用它。一个客户端从第一次请求起算在线，连续 5 分钟没有请求就算下线：每次浏览器登录算一个（同一浏览器的多个标签页共用登录 cookie，只算一个），用 HTTP Basic 认证的脚本按"账号 + 地址"各算一个，MCP token 按名字各算一个，经可信代理登录的按账号各算一个。打开了连接的页面每 10 秒发一次心跳（后台标签页 60 秒），只要开着就一直在线；停在首页、没打开任何连接的页面不发请求，5 分钟后算下线。退出登录会立即下线。
