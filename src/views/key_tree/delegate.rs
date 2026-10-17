@@ -17,6 +17,7 @@
 
 use super::render::tag_color_label_key;
 use super::*;
+use gpui::DismissEvent;
 
 /// The selection checkbox of a key row, with the row's index.
 const ROW_CHECKBOX_ID: &str = "ktree-check";
@@ -86,6 +87,12 @@ pub(super) struct KeyTreeDelegate {
     /// of the list's transient selected index (reset on every tree rebuild —
     /// which made the highlight vanish a moment after selecting).
     pub(super) server_state: Entity<ZedisServerState>,
+    /// The key or folder whose right-click menu is open, if one is. Its row
+    /// offers no name tooltip meanwhile: the tooltip waits half a second
+    /// after the pointer arrives, a right-click does not cancel it, and it
+    /// opened over the menu's first item — Delete key…, which a report then
+    /// said was not there (#226).
+    pub(super) menu_row: Rc<RefCell<Option<SharedString>>>,
 }
 
 impl KeyTreeDelegate {
@@ -310,6 +317,13 @@ impl ListDelegate for KeyTreeDelegate {
         let selected_items_count = self.selected_items.len();
         let id = entry.id.clone();
         let readonly = self.readonly;
+        let menu_row = self.menu_row.clone();
+        let menu_open_here = menu_row.borrow().as_ref() == Some(&entry.id);
+        let tree = cx.entity().downgrade();
+        // Remove TTL is offered unless the key is known not to expire
+        // (`-1`), or known to be gone (`-2`); with the TTL column off it is
+        // not known, and offered.
+        let may_expire = entry.ttl_secs.is_none_or(|secs| secs >= 0);
         // Pre-resolve client-side annotation visuals before the
         // ListItem builder chain — we need both the colour (for the
         // left-edge bar) and the note (for hover tooltip) below, and
@@ -414,6 +428,17 @@ impl ListDelegate for KeyTreeDelegate {
                         .children(guides)
                         .context_menu(move |mut menu, _window, cx| {
                             let id = id.clone();
+                            // This row's tooltip is withheld until the menu
+                            // is dismissed (`menu_row`).
+                            menu_row.replace(Some(id.clone()));
+                            let _ = tree.update(cx, |_, cx| cx.notify());
+                            let open = menu_row.clone();
+                            let tree = tree.clone();
+                            cx.subscribe_self(move |_, _: &DismissEvent, cx| {
+                                open.borrow_mut().take();
+                                let _ = tree.update(cx, |_, cx| cx.notify());
+                            })
+                            .detach();
                             let multi_selection_count = if selected { selected_items_count } else { 0 };
                             // Capability matrix (`connection::Capability`) is the
                             // source of truth for what survives read-only mode.
@@ -474,12 +499,30 @@ impl ListDelegate for KeyTreeDelegate {
                                         move |_, cx| Label::new(i18n_key_tree(cx, "persist_tooltip")),
                                     );
                                 }
-                            } else if Capability::DeleteKey.allowed(readonly) {
-                                menu = menu.menu_element_with_icon(
-                                    CustomIconName::X,
-                                    Box::new(KeyTreeAction::DeleteKey(id.clone())),
-                                    move |_, cx| Label::new(i18n_key_tree(cx, "delete_key_tooltip")),
-                                );
+                            } else {
+                                if Capability::DeleteKey.allowed(readonly) {
+                                    menu = menu.menu_element_with_icon(
+                                        CustomIconName::X,
+                                        Box::new(KeyTreeAction::DeleteKey(id.clone())),
+                                        move |_, cx| Label::new(i18n_key_tree(cx, "delete_key_tooltip")),
+                                    );
+                                }
+                                // What a folder and a selection offer, for one
+                                // key (#226).
+                                if Capability::SetTtl.allowed(readonly) {
+                                    menu = menu.menu_element_with_icon(
+                                        CustomIconName::Clock3,
+                                        Box::new(KeyTreeAction::SetTtlKey(id.clone())),
+                                        move |_, cx| Label::new(i18n_key_tree(cx, "set_ttl_tooltip")),
+                                    );
+                                }
+                                if may_expire && Capability::PersistTtl.allowed(readonly) {
+                                    menu = menu.menu_element_with_icon(
+                                        CustomIconName::Clock3,
+                                        Box::new(KeyTreeAction::PersistKey(id.clone())),
+                                        move |_, cx| Label::new(i18n_key_tree(cx, "persist_title")),
+                                    );
+                                }
                             }
                             // Export is a Redis read + local write — always OK
                             // where there is a local file to write.
@@ -615,19 +658,22 @@ impl ListDelegate for KeyTreeDelegate {
                                         .min_w_0()
                                         // Hover tooltip: full key / prefix path
                                         // (visible label is last segment only),
-                                        // plus leaf note or folder tag aggregate.
-                                        .tooltip({
-                                            let text: SharedString = if has_note {
-                                                format!("{}\n{}", entry.id, note).into()
-                                            } else if let Some(tags) = &folder_tags {
-                                                format!("{}\n{tags}", entry.id).into()
-                                            } else {
-                                                entry.id.clone()
-                                            };
-                                            move |window, cx| {
-                                                gpui_kit::component::tooltip::Tooltip::new(text.clone())
-                                                    .build(window, cx)
-                                            }
+                                        // plus leaf note or folder tag aggregate —
+                                        // none while the row's menu is open.
+                                        .when(!menu_open_here, |this| {
+                                            this.tooltip({
+                                                let text: SharedString = if has_note {
+                                                    format!("{}\n{}", entry.id, note).into()
+                                                } else if let Some(tags) = &folder_tags {
+                                                    format!("{}\n{tags}", entry.id).into()
+                                                } else {
+                                                    entry.id.clone()
+                                                };
+                                                move |window, cx| {
+                                                    gpui_kit::component::tooltip::Tooltip::new(text.clone())
+                                                        .build(window, cx)
+                                                }
+                                            })
                                         })
                                         .child(row_label),
                                 )
@@ -957,6 +1003,7 @@ mod tests {
                 range_base: AHashSet::new(),
                 readonly: false,
                 server_state: server_state.clone(),
+                menu_row: Default::default(),
             };
             let state = cx.new(|cx| ListState::new(delegate, window, cx));
             list = Some(state.clone());

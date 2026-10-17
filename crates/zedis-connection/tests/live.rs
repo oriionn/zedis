@@ -57,8 +57,8 @@ use zedis_connection::{
     remove_list_indexes, rename_hash_field, rename_key, restore_key, restore_keys_chunk, run_key_op, run_script,
     save_servers, scan_page, script_exists, script_load, script_sha1, sentinel_ckquorum, sentinel_flushconfig,
     sentinel_master_names, sentinel_masters, sentinel_monitor, sentinel_remove, sentinel_set, server_summary,
-    server_supports, set_add, set_bit, set_card, set_keys_ttl, set_remove, set_replace_member, set_scan,
-    set_ttl_matching, slow_logs, snapshot_key, sniff_import_format, split_acl_rules, stream_ack, stream_add,
+    server_supports, set_add, set_bit, set_card, set_hash_field_ttl, set_keys_ttl, set_remove, set_replace_member,
+    set_scan, set_ttl_matching, slow_logs, snapshot_key, sniff_import_format, split_acl_rules, stream_ack, stream_add,
     stream_autoclaim, stream_claim, stream_delete, stream_info, stream_len, stream_page, stream_set_id, stream_trim,
     string_get, string_prefix, string_set, test_connection, ts_add, ts_alter, ts_create_rule, ts_delete_rule,
     ts_mrange, ts_window, unassigned_slot_ranges, value_preview, vset_info, vset_remove, vset_set_attr, vset_sim,
@@ -6352,6 +6352,55 @@ fn standalone_hash_field_writes_carry_their_ttl() {
         }
 
         cmd("DEL").arg(&key).exec_async(&mut c).await.expect("del");
+    });
+}
+
+/// One field's TTL set and taken away on its own — the hash row menu's Set
+/// field TTL… / Remove field TTL (#225): the value is left alone, a field
+/// without a TTL is still there, and one deleted since it was listed is
+/// answered as gone. Standalone only: the shared collection body runs on
+/// Dragonfly and Garnet, where `HPERSIST` has not been checked.
+#[test]
+#[ignore]
+fn standalone_a_hash_field_ttl_is_set_and_taken_away_alone() {
+    smol::block_on(async {
+        let id = register(server("it-hash-field-ttl", standalone())).await;
+        if !supports(&id, floors::HASH_FIELD_TTL).await {
+            eprintln!("skipped: server has no hash field TTL");
+            return;
+        }
+        let at = ServerDb::new(&id, 0);
+        let hash = unique("hfttl");
+        write_hash_field(&at, &hash, b"f1", b"v1", FieldTtl::Persist, false)
+            .await
+            .expect("hset");
+
+        assert!(set_hash_field_ttl(&at, &hash, b"f1", Some(300)).await.expect("hexpire"));
+        let ttl = hash_field_ttls(&at, &hash, &[b"f1"]).await.expect("httl")[0];
+        assert!((1..=300).contains(&ttl), "{ttl}");
+        let (_, pairs) = hash_scan(&at, &hash, Some("f1"), 0, 100).await.expect("hscan");
+        assert_eq!(pairs, [(b"f1".to_vec(), b"v1".to_vec())], "the value is left alone");
+
+        assert!(set_hash_field_ttl(&at, &hash, b"f1", None).await.expect("hpersist"));
+        assert_eq!(hash_field_ttls(&at, &hash, &[b"f1"]).await.expect("httl")[0], -1);
+        assert!(
+            set_hash_field_ttl(&at, &hash, b"f1", None)
+                .await
+                .expect("hpersist again"),
+            "a field without a TTL is still there"
+        );
+        assert!(
+            !set_hash_field_ttl(&at, &hash, b"gone", Some(60))
+                .await
+                .expect("hexpire gone")
+        );
+        assert!(
+            !set_hash_field_ttl(&at, &hash, b"gone", None)
+                .await
+                .expect("hpersist gone")
+        );
+
+        assert_eq!(hash_delete_fields(&at, &hash, &[b"f1"]).await.expect("hdel"), 1);
     });
 }
 

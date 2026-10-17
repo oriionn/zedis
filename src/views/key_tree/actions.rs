@@ -33,6 +33,10 @@ pub(super) enum KeyTreeAction {
     PersistMultipleKeys,
     SetTtlFolder(SharedString),
     PersistFolder(SharedString),
+    /// One key's TTL, from its row menu (#226): `SetTtlKey` asks for it,
+    /// `PersistKey` takes it away at once.
+    SetTtlKey(SharedString),
+    PersistKey(SharedString),
     RefreshFolder(SharedString),
     CollapseAllKeys,
     ToggleMultiSelectMode,
@@ -463,7 +467,8 @@ impl Render for ZedisKeyTree {
                     }
                     let server_state = this.server_state.clone();
                     let show_condition = server_state.read(cx).supports_expire_conditions();
-                    open_batch_ttl_dialog(
+                    open_ttl_dialog(
+                        i18n_key_tree(cx, "batch_ttl_prompt"),
                         show_condition,
                         move |secs, condition, cx| {
                             server_state.update(cx, |state, cx| {
@@ -478,7 +483,8 @@ impl Render for ZedisKeyTree {
                     let id = id.clone();
                     let server_state = this.server_state.clone();
                     let show_condition = server_state.read(cx).supports_expire_conditions();
-                    open_batch_ttl_dialog(
+                    open_ttl_dialog(
+                        i18n_key_tree(cx, "batch_ttl_prompt"),
                         show_condition,
                         move |secs, condition, cx| {
                             server_state.update(cx, |state, cx| {
@@ -488,6 +494,30 @@ impl Render for ZedisKeyTree {
                         window,
                         cx,
                     );
+                }
+                KeyTreeAction::SetTtlKey(id) => {
+                    let keys = vec![id.clone()];
+                    let server_state = this.server_state.clone();
+                    let locale = cx.global::<ZedisGlobalStore>().read(cx).locale();
+                    let prompt = t!("key_tree.key_ttl_prompt", key = id, locale = locale).to_string();
+                    open_ttl_dialog(
+                        prompt.into(),
+                        false,
+                        move |secs, _, cx| {
+                            server_state.update(cx, |state, cx| {
+                                state.batch_set_ttl_keys(keys.clone(), Some(secs), None, cx)
+                            });
+                        },
+                        window,
+                        cx,
+                    );
+                }
+                // At once, as the editor's own Remove TTL is: it destroys
+                // nothing, and the row says what it did.
+                KeyTreeAction::PersistKey(id) => {
+                    let keys = vec![id.clone()];
+                    this.server_state
+                        .update(cx, |state, cx| state.batch_set_ttl_keys(keys, None, None, cx));
                 }
                 KeyTreeAction::ExportSelectedKeys => {
                     #[cfg(not(target_family = "wasm"))]
@@ -578,112 +608,4 @@ impl Render for ZedisKeyTree {
                 }
             }))
     }
-}
-
-/// Radio order in the batch-TTL dialog: unconditional first, then the four
-/// `EXPIRE` option words; the second field is the label's i18n key.
-const TTL_CONDITION_CHOICES: [(Option<ExpireCondition>, &str); 5] = [
-    (None, "batch_ttl_cond_none"),
-    (Some(ExpireCondition::Nx), "batch_ttl_cond_nx"),
-    (Some(ExpireCondition::Xx), "batch_ttl_cond_xx"),
-    (Some(ExpireCondition::Gt), "batch_ttl_cond_gt"),
-    (Some(ExpireCondition::Lt), "batch_ttl_cond_lt"),
-];
-
-/// The batch-TTL dialog body as a **view entity** (a dialog body holding an
-/// `InputState` must be one — see the CLAUDE.md dialog gotcha — and the
-/// condition radios need `cx.notify` to repaint): the TTL input plus, on
-/// Redis 7.0+ / Valkey, the `EXPIRE` condition (NX / XX / GT / LT).
-struct BatchTtlForm {
-    ttl: Entity<InputState>,
-    /// Offer the condition radios (`EXPIRE` option words, Redis 7.0+).
-    show_condition: bool,
-    condition: Option<ExpireCondition>,
-}
-
-impl BatchTtlForm {
-    fn new(show_condition: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let ttl = cx.new(|cx| InputState::new(window, cx).placeholder(i18n_key_tree(cx, "batch_ttl_placeholder")));
-        Self {
-            ttl,
-            show_condition,
-            condition: None,
-        }
-    }
-
-    /// What the dialog submits: the parsed TTL (`None` keeps the dialog
-    /// open) and the condition — never one on a server that predates the
-    /// option words, so nothing extra goes on the wire there.
-    fn submission(&self, cx: &App) -> Option<(u64, Option<ExpireCondition>)> {
-        // `ttl_secs`, not a bare duration parse: it takes the `3600` the
-        // placeholder suggests, and refuses the `0` that EXPIRE would turn
-        // into deleting every key in scope.
-        let secs = ttl_secs(self.ttl.read(cx).value().as_ref())?;
-        Some((secs, self.show_condition.then_some(self.condition).flatten()))
-    }
-}
-
-impl Render for BatchTtlForm {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let muted = cx.theme().muted_foreground;
-        let selected = TTL_CONDITION_CHOICES.iter().position(|(c, _)| *c == self.condition);
-        v_flex()
-            .gap_2()
-            .w_full()
-            .child(Label::new(i18n_key_tree(cx, "batch_ttl_prompt")).text_sm())
-            .child(Input::new(&self.ttl).small())
-            .when(self.show_condition, |this| {
-                this.child(
-                    Label::new(i18n_key_tree(cx, "batch_ttl_condition"))
-                        .text_xs()
-                        .text_color(muted),
-                )
-                .child(
-                    RadioGroup::vertical("batch-ttl-condition")
-                        .selected_index(selected)
-                        .children(
-                            TTL_CONDITION_CHOICES
-                                .iter()
-                                .map(|(_, key)| Radio::new(*key).label(i18n_key_tree(cx, key))),
-                        )
-                        .on_click(cx.listener(|this, index: &usize, _window, cx| {
-                            this.condition = TTL_CONDITION_CHOICES.get(*index).and_then(|(c, _)| *c);
-                            cx.notify();
-                        })),
-                )
-            })
-    }
-}
-
-/// Open the batch-TTL dialog; `apply` gets the parsed seconds and the chosen
-/// `EXPIRE` condition once the user confirms with a valid duration.
-fn open_batch_ttl_dialog(
-    show_condition: bool,
-    apply: impl Fn(u64, Option<ExpireCondition>, &mut App) + 'static,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let form = cx.new(|cx| BatchTtlForm::new(show_condition, window, cx));
-    let body = form.clone();
-    ZedisDialog::new(i18n_key_tree(cx, "batch_ttl_title"))
-        .w(px(360.))
-        .ok_text(i18n_key_tree(cx, "set_ttl_confirm"))
-        .cancel_text(i18n_common(cx, "cancel"))
-        .button_props(
-            dialog_button_props(cx)
-                .ok_text(i18n_key_tree(cx, "set_ttl_confirm"))
-                .cancel_text(i18n_common(cx, "cancel")),
-        )
-        .child(move || body.clone())
-        .on_ok(move |_, window, cx| match form.read(cx).submission(cx) {
-            Some((secs, condition)) => {
-                apply(secs, condition, cx);
-                true
-            }
-            None => {
-                window.push_notification(Notification::error(i18n_common(cx, "ttl_invalid")), cx);
-                false
-            }
-        })
-        .open(window, cx);
 }

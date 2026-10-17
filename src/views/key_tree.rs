@@ -20,7 +20,7 @@ use crate::views::{ExportSource, open_migration_export_window};
 use crate::{
     assets::CustomIconName,
     components::KeyTypeBadge,
-    connection::{Capability, ExpireCondition, ServerCommand},
+    connection::{Capability, ServerCommand},
     constants::EDITOR_KEY_BAR_HEIGHT,
     db::{
         KeyMetadata, TagColor, get_favorites_manager, get_key_metadata_manager, get_recent_keys_manager,
@@ -37,7 +37,7 @@ use crate::{
         i18n_common, i18n_editor, i18n_features, i18n_key_tag, i18n_key_tree, i18n_timeseries, i18n_vector_set,
         key_tree_no_scan_body, save_session_option,
     },
-    views::{OnTagDialogDone, confirm_delete_key, open_batch_key_tag_dialog, open_key_tag_dialog},
+    views::{OnTagDialogDone, confirm_delete_key, open_batch_key_tag_dialog, open_key_tag_dialog, open_ttl_dialog},
 };
 use ahash::{AHashMap, AHashSet};
 use gpui::{
@@ -53,7 +53,6 @@ use gpui_kit::component::{
     label::Label,
     menu::ContextMenuExt,
     notification::Notification,
-    radio::{Radio, RadioGroup},
     spinner::Spinner,
     v_flex,
 };
@@ -65,7 +64,7 @@ use regex::Regex;
 use rust_i18n::t;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::{str::FromStr, time::Duration};
+use std::{cell::RefCell, rc::Rc, str::FromStr, time::Duration};
 use tracing::{info, warn};
 use web_time::Instant;
 use zedis_ui::{ZedisDialog, ZedisFormField, ZedisFormFieldType, ZedisFormOptions, ZedisSkeletonLoading};
@@ -472,6 +471,7 @@ impl ZedisKeyTree {
             range_base: AHashSet::new(),
             readonly,
             server_state: server_state.clone(),
+            menu_row: Default::default(),
         };
         let key_tree_list_state = cx.new(|cx| ListState::new(delegate, window, cx));
         subscriptions.push(cx.subscribe(&key_tree_list_state, |view, _, event, cx| match event {

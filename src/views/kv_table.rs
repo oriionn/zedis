@@ -29,7 +29,7 @@ use crate::{
     },
     views::{
         JsonTreeEvent, JsonTreeTarget, ZedisJsonTree, export_to_file, key_op_title_key, open_key_op_dialog,
-        open_score_filter_dialog, placeholders::Placeholders,
+        open_score_filter_dialog, open_ttl_dialog, placeholders::Placeholders,
     },
 };
 use gpui::{
@@ -1229,16 +1229,18 @@ impl<T: ZedisKvFetcher> ZedisKvTable<T> {
     /// What a row's right-click menu offers beyond copying: what a click on
     /// the row would open, and whether the panel then edits it or only shows
     /// it — the same tests `handle_select_row` and the form make.
-    fn row_menu(&self) -> KvRowMenu {
+    fn row_menu(&self, cx: &App) -> KvRowMenu {
         let mutates = self
             .mode
             .intersects(KvTableMode::UPDATE | KvTableMode::REMOVE | KvTableMode::ADD);
+        let editable = self.mode.contains(KvTableMode::UPDATE)
+            && Capability::MutateContainer.allowed(self.readonly)
+            && !self.fetcher.readonly_on_edit();
         KvRowMenu {
             openable: Capability::ViewEntry.allowed(self.readonly) || mutates,
-            editable: self.mode.contains(KvTableMode::UPDATE)
-                && Capability::MutateContainer.allowed(self.readonly)
-                && !self.fetcher.readonly_on_edit(),
+            editable,
             removable: self.mode.contains(KvTableMode::REMOVE),
+            ttl: editable && self.fetcher.supports_row_ttl(cx),
         }
     }
 
@@ -1251,6 +1253,25 @@ impl<T: ZedisKvFetcher> ZedisKvTable<T> {
                 .table_state
                 .update(cx, |state, cx| state.set_selected_row(row_ix, cx)),
             KvRowAction::Remove(row_ix) => self.confirm_remove_row(row_ix, window, cx),
+            KvRowAction::SetTtl(row_ix) => {
+                let name = self
+                    .fetcher
+                    .get(row_ix, self.fetcher.primary_index())
+                    .unwrap_or_default();
+                let locale = cx.global::<ZedisGlobalStore>().read(cx).locale();
+                let prompt = t!("kv_table.field_ttl_prompt", field = name, locale = locale).to_string();
+                let fetcher = self.fetcher.clone();
+                open_ttl_dialog(
+                    prompt.into(),
+                    false,
+                    move |secs, _, cx| fetcher.set_row_ttl(row_ix, Some(secs), cx),
+                    window,
+                    cx,
+                );
+            }
+            // At once, as the editor's Remove TTL is: nothing is destroyed,
+            // and the row's TTL cell says what happened.
+            KvRowAction::RemoveTtl(row_ix) => self.fetcher.set_row_ttl(row_ix, None, cx),
         }
     }
 
@@ -1504,7 +1525,7 @@ impl<T: ZedisKvFetcher> Render for ZedisKvTable<T> {
         // The cells draw their hover button on the row's colour, and only
         // the table's state knows which row it paints as selected.
         let open_row = self.table_state.read(cx).selected_row();
-        let row_menu = self.row_menu();
+        let row_menu = self.row_menu(cx);
         self.table_state.update(cx, |state, _| {
             let delegate = state.delegate_mut();
             delegate.set_open_row(open_row);

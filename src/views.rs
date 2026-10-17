@@ -93,6 +93,7 @@ mod title_bar;
 #[cfg(not(target_family = "wasm"))]
 mod topology;
 mod trash_dialog;
+mod ttl_dialog;
 mod unsupported_panel;
 mod update_dialog;
 mod value_diff;
@@ -192,6 +193,7 @@ pub use title_bar::ZedisTitleBar;
 #[cfg(not(target_family = "wasm"))]
 pub use topology::ZedisTopology;
 pub use trash_dialog::open_trash_dialog;
+pub(crate) use ttl_dialog::open_ttl_dialog;
 pub use unsupported_panel::ZedisUnsupportedPanel;
 pub use update_dialog::{DialogCallback, ZedisUpdateDialog};
 pub use value_diff::{DiffCloseCallback, ZedisValueDiff};

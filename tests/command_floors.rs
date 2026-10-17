@@ -76,6 +76,10 @@ const GATED: &[(&str, &str)] = &[
         "floors::HASH_FIELD_TTL — the editor has no TTL column below it",
     ),
     ("HTTL", "floors::HASH_FIELD_TTL"),
+    (
+        "HPERSIST",
+        "floors::HASH_FIELD_TTL — Remove field TTL is offered only where the TTL column is",
+    ),
     ("HOTKEYS", "floors::HOTKEYS + ServerCommand::HotkeysStart"),
     ("HOTKEYS GET", "floors::HOTKEYS + ServerCommand::HotkeysGet"),
     ("HOTKEYS RESET", "floors::HOTKEYS"),

@@ -55,6 +55,7 @@ const WRITES: &[&str] = &[
     "HDEL",
     "HEXPIRE",
     "HINCRBY",
+    "HPERSIST",
     "HSET",
     "HSETEX",
     "INCRBY",

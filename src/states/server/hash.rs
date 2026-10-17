@@ -30,7 +30,7 @@ use crate::helpers::unix_ts;
 use crate::{
     connection::{
         CommandStatus, FieldTtl, ServerCommand, ServerDb, hash_delete_fields, hash_field_ttls, hash_len, hash_scan,
-        rename_hash_field, write_hash_field,
+        rename_hash_field, set_hash_field_ttl, write_hash_field,
     },
     error::Error,
     states::{SUCCESS_NOTIFY_THRESHOLD, ServerEvent, i18n_hash_editor},
@@ -409,6 +409,33 @@ impl ZedisServerState {
             },
         );
     }
+    /// Sets one field's TTL, or takes it away (`None`), its value left
+    /// alone — the hash row menu's Set field TTL… / Remove field TTL
+    /// (#225). A field deleted since it was listed is said so, and the
+    /// value read again.
+    pub fn set_hash_field_ttl(&mut self, field: KvElement, ttl: Option<u64>, cx: &mut Context<Self>) {
+        let name = field.text().clone();
+        self.exec_hash_op(
+            ServerTask::UpdateHashField,
+            cx,
+            move |hash| match ttl {
+                Some(secs) => {
+                    hash.field_ttls.insert(name, i64::try_from(secs).unwrap_or(i64::MAX));
+                }
+                None => {
+                    hash.field_ttls.remove(&name);
+                }
+            },
+            move |key, at| async move { Ok(set_hash_field_ttl(&at, &key, field.raw(), ttl).await?) },
+            move |this, present, cx| {
+                if !present {
+                    this.emit_error_notification(i18n_hash_editor(cx, "field_ttl_gone"), cx);
+                    this.reload_after_failed_write(cx);
+                }
+            },
+        );
+    }
+
     /// Applies a filter to HASH fields by resetting the scan state with a keyword.
     ///
     /// Creates a new HASH value state with the filter keyword and triggers a load.

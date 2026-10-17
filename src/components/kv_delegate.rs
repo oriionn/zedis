@@ -42,6 +42,9 @@ pub struct KvRowMenu {
     pub editable: bool,
     /// The row can be deleted.
     pub removable: bool,
+    /// The row's own TTL can be set and taken away — a hash field's, on a
+    /// server that has them (#225).
+    pub ttl: bool,
 }
 
 /// A row-menu choice the table carries out: the delegate knows the row, the
@@ -52,6 +55,10 @@ pub enum KvRowAction {
     Open(usize),
     /// Delete the row, once its confirm is answered.
     Remove(usize),
+    /// Ask for a TTL for the row's entry and set it.
+    SetTtl(usize),
+    /// Take the row's TTL away.
+    RemoveTtl(usize),
 }
 
 /// Where the delegate hands a [`KvRowAction`].
@@ -121,6 +128,22 @@ pub trait ZedisKvFetcher: 'static {
     /// Removes every row in `rows` (indices into the *visible* rows) in one
     /// operation. Only called when [`Self::supports_batch_remove`] is true.
     fn remove_many(&self, _rows: &[usize], _cx: &mut App) {}
+
+    /// Whether a row's entry can carry a TTL of its own here — a hash
+    /// field's, where the server has them (`floors::HASH_FIELD_TTL`). The
+    /// row menu offers Set / Remove field TTL on it (#225).
+    fn supports_row_ttl(&self, _cx: &App) -> bool {
+        false
+    }
+
+    /// Whether the row's entry has a TTL (asked only where
+    /// [`Self::supports_row_ttl`]).
+    fn row_expires(&self, _row_ix: usize) -> bool {
+        false
+    }
+
+    /// Set the row's TTL in seconds, or take it away (`None`).
+    fn set_row_ttl(&self, _row_ix: usize, _ttl: Option<u64>, _cx: &mut App) {}
 
     /// Whether form fields are required when adding/editing.
     fn fields_required(&self) -> bool {
@@ -636,8 +659,9 @@ impl<T: ZedisKvFetcher + 'static> TableDelegate for ZedisKvDelegate<T> {
             openable,
             editable,
             removable,
+            ttl,
         } = self.row_menu;
-        if openable || removable {
+        if openable || removable || ttl {
             menu = menu.separator();
         }
         if openable {
@@ -646,6 +670,20 @@ impl<T: ZedisKvFetcher + 'static> TableDelegate for ZedisKvDelegate<T> {
             menu = menu.item(
                 PopupMenuItem::new(label).on_click(move |_, window, cx| handler(KvRowAction::Open(row_ix), window, cx)),
             );
+        }
+        if ttl {
+            let set = handler.clone();
+            menu = menu.item(
+                PopupMenuItem::new(i18n_kv_table(cx, "row_set_ttl"))
+                    .on_click(move |_, window, cx| set(KvRowAction::SetTtl(row_ix), window, cx)),
+            );
+            if self.fetcher.row_expires(row_ix) {
+                let remove = handler.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(i18n_kv_table(cx, "row_remove_ttl"))
+                        .on_click(move |_, window, cx| remove(KvRowAction::RemoveTtl(row_ix), window, cx)),
+                );
+            }
         }
         if removable {
             menu = menu.item(

@@ -179,6 +179,29 @@ pub async fn hash_field_ttls(at: &ServerDb, key: &str, fields: &[&[u8]]) -> Resu
     Ok(c.query_async(&mut at.connection().await?).await?)
 }
 
+/// One field's TTL, its value left alone (`floors::HASH_FIELD_TTL`):
+/// `HEXPIRE key secs FIELDS 1 field` to set it, `HPERSIST key FIELDS 1
+/// field` to take it away. Answers whether the field was there — `false`
+/// (`-2`) for one deleted since it was listed; a field that had no TTL to
+/// take away (`-1`) was there. `secs` is at least 1: `0` would delete it.
+pub async fn set_hash_field_ttl(at: &ServerDb, key: &str, field: &[u8], ttl: Option<u64>) -> Result<bool> {
+    let mut c = match ttl {
+        Some(secs) => {
+            let mut c = cmd("HEXPIRE");
+            c.arg(key).arg(secs);
+            c
+        }
+        None => {
+            let mut c = cmd("HPERSIST");
+            c.arg(key);
+            c
+        }
+    };
+    c.arg("FIELDS").arg(1).arg(field);
+    let codes: Vec<i64> = c.query_async(&mut at.connection().await?).await?;
+    Ok(codes.first().is_some_and(|code| *code != -2))
+}
+
 /// `HDEL key field…`; answers how many were there to delete.
 pub async fn hash_delete_fields(at: &ServerDb, key: &str, fields: &[&[u8]]) -> Result<usize> {
     if fields.is_empty() {

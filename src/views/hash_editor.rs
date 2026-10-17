@@ -155,6 +155,34 @@ impl ZedisKvFetcher for ZedisHashValues {
         });
     }
 
+    /// A field's TTL, where the server has them — the same test that adds
+    /// the TTL column.
+    fn supports_row_ttl(&self, cx: &App) -> bool {
+        self.server_state.read(cx).supports_hash_field_ttl()
+    }
+
+    fn row_expires(&self, row_ix: usize) -> bool {
+        self.value
+            .hash_value()
+            .and_then(|hash| {
+                let (field, _) = hash.values.get(row_ix)?;
+                Some(hash.field_ttls.contains_key(field.text()))
+            })
+            .unwrap_or(false)
+    }
+
+    fn set_row_ttl(&self, row_ix: usize, ttl: Option<u64>, cx: &mut App) {
+        let Some((field, _)) = self
+            .value
+            .hash_value()
+            .and_then(|hash| hash.values.get(row_ix).cloned())
+        else {
+            return;
+        };
+        self.server_state
+            .update(cx, |this, cx| this.set_hash_field_ttl(field, ttl, cx));
+    }
+
     /// Removes a field-value pair from the HASH at the given index.
     ///
     /// Executes Redis HDEL command to delete the field.
