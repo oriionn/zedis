@@ -24,7 +24,9 @@
 
 use crate::error::Error;
 use crate::hotkeys::HotkeysReport;
-use crate::manager::{CommandStat, HeatProbe, KeyMemoryUsage, PubsubChannelsSnapshot, ValueSearchRound};
+use crate::manager::{
+    CommandStat, HeatProbe, KeyMemoryUsage, PubsubChannelsSnapshot, ValueSearchRound, ValueSearchSpec,
+};
 use crate::server_db::ServerDb;
 use crate::slot_stats::{SlotStatMetric, SlotStatRow};
 use zedis_core::keysizes::KeysizesDist;
@@ -104,22 +106,8 @@ pub async fn cluster_slot_stats(at: &ServerDb, metric: SlotStatMetric, limit: u6
 /// One round of a value search; `cursors` from the previous round continue it.
 pub async fn scan_values_round(
     at: &ServerDb,
-    pattern: &str,
-    needle_lower: &str,
-    max_value_bytes: u64,
-    max_container_elems: u64,
+    spec: &ValueSearchSpec,
     cursors: Option<Vec<u64>>,
-    page_count: u64,
 ) -> Result<ValueSearchRound> {
-    at.client()
-        .await?
-        .scan_values_round(
-            pattern,
-            needle_lower,
-            max_value_bytes,
-            max_container_elems,
-            cursors,
-            page_count,
-        )
-        .await
+    at.client().await?.scan_values_round(spec, cursors).await
 }

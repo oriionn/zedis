@@ -343,6 +343,18 @@ pub enum MemoryAnalysisAction {
     ExportKeysCsv,
 }
 
+/// The value-search panel's type choice, dispatched by its type dropdown
+/// and handled by the panel's own `.on_action`.
+#[derive(Clone, Copy, PartialEq, Debug, Deserialize, JsonSchema, Action)]
+pub enum ValueSearchTypeFilter {
+    All,
+    String,
+    Hash,
+    List,
+    Set,
+    Zset,
+}
+
 /// Whether the command key here is ⌘ (and the other modifiers are drawn as
 /// ⌃ ⌥ ⇧) rather than Ctrl.
 ///

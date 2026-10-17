@@ -222,6 +222,53 @@ pub struct ValueSearchRound {
     pub done: bool,
 }
 
+/// The types a value search reads, as `TYPE` and `SCAN … TYPE` spell them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchableType {
+    String,
+    Hash,
+    List,
+    Set,
+    Zset,
+}
+
+impl SearchableType {
+    pub const ALL: [Self; 5] = [Self::String, Self::Hash, Self::List, Self::Set, Self::Zset];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::Hash => "hash",
+            Self::List => "list",
+            Self::Set => "set",
+            Self::Zset => "zset",
+        }
+    }
+
+    /// The type a `TYPE` reply names, when a value search can read it.
+    fn from_type(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|t| t.as_str() == name)
+    }
+}
+
+/// What a value search looks for. One spec drives every round of a search,
+/// so a search that stopped goes on from its cursors with the same one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValueSearchSpec {
+    /// The `SCAN MATCH` pattern.
+    pub pattern: String,
+    /// The text to find, already lowercased.
+    pub needle_lower: String,
+    /// Only keys of this type; `None` reads every [`SearchableType`].
+    pub only: Option<SearchableType>,
+    /// Strings longer than this are skipped, not read.
+    pub max_value_bytes: u64,
+    /// Containers with more elements than this are skipped, not read.
+    pub max_container_elems: u64,
+    /// `SCAN COUNT` per master per round.
+    pub page_count: u64,
+}
+
 /// Case-insensitive substring match on a lossy-UTF8 view of raw bytes.
 fn contains_needle(bytes: &[u8], needle_lower: &str) -> bool {
     String::from_utf8_lossy(bytes).to_lowercase().contains(needle_lower)

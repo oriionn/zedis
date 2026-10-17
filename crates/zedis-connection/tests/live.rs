@@ -70,6 +70,7 @@ use zedis_connection::{
     copy_key_logically, function_delete, function_load, function_stats, is_foreign_payload, migrate_slot,
     restore_or_recreate_chunk,
 };
+use zedis_connection::{SearchableType, ValueSearchSpec, scan_values_round};
 use zedis_core::json::JsonPathOp;
 use zedis_core::keysizes::KeysizesUnit;
 use zedis_core::search_params::{ParamKind, encode_param};
@@ -346,6 +347,93 @@ fn standalone_scan_sees_every_type_it_wrote() {
     smol::block_on(async {
         let id = register(server("it-standalone", standalone())).await;
         scan_sees_every_type_it_wrote(id).await;
+    });
+}
+
+/// A value search finds the text in every type it reads and in none it
+/// does not, goes on from the cursors a round answers until the keyspace is
+/// covered, and with one type asked for reads only keys of that type.
+#[test]
+#[ignore]
+fn standalone_value_search_reads_by_type_and_goes_on_from_its_cursors() {
+    smol::block_on(async {
+        let id = register(server("it-value-search", standalone())).await;
+        let at = ServerDb::new(&id, 0);
+        let mut c = conn(&id, 0).await;
+        let prefix = unique("value-search");
+        let key = |name: &str| format!("{prefix}:{name}");
+        let writes = [
+            cmd("SET").arg(key("s1")).arg("hello NEEDLE world").clone(),
+            cmd("SET").arg(key("s2")).arg("nothing here").clone(),
+            cmd("HSET").arg(key("h1")).arg("f").arg("a needle inside").clone(),
+            cmd("RPUSH").arg(key("l1")).arg("x").arg("the needle").clone(),
+            cmd("SADD").arg(key("set1")).arg("needle").clone(),
+            cmd("ZADD").arg(key("z1")).arg(1).arg("needle-member").clone(),
+            // Streams are not read, whatever they hold.
+            cmd("XADD").arg(key("x1")).arg("*").arg("f").arg("needle").clone(),
+        ];
+        for write in &writes {
+            write.exec_async(&mut c).await.expect("write");
+        }
+
+        // Every round goes on from the last one's cursors, as a search that
+        // stopped and is continued does; a COUNT of 2 makes that many rounds.
+        let search = |only| {
+            let at = at.clone();
+            let spec = ValueSearchSpec {
+                pattern: format!("{prefix}:*"),
+                needle_lower: "needle".to_string(),
+                only,
+                max_value_bytes: 1024 * 1024,
+                max_container_elems: 10_000,
+                page_count: 2,
+            };
+            async move {
+                let (mut cursors, mut found, mut scanned, mut rounds) = (None, Vec::new(), 0, 0);
+                loop {
+                    let round = scan_values_round(&at, &spec, cursors).await.expect("round");
+                    rounds += 1;
+                    scanned += round.scanned;
+                    found.extend(round.matches.into_iter().map(|m| (m.key, m.key_type)));
+                    if round.done {
+                        break;
+                    }
+                    cursors = Some(round.cursors);
+                }
+                found.sort();
+                found.dedup();
+                (found, scanned, rounds)
+            }
+        };
+
+        let (found, _, rounds) = search(None).await;
+        let expected: Vec<(String, String)> = [
+            ("h1", "hash"),
+            ("l1", "list"),
+            ("s1", "string"),
+            ("set1", "set"),
+            ("z1", "zset"),
+        ]
+        .into_iter()
+        .map(|(name, t)| (key(name), t.to_string()))
+        .collect();
+        assert_eq!(
+            found, expected,
+            "case-insensitive, every readable type, never the stream"
+        );
+        assert!(rounds > 1, "the search went on from its cursors: {rounds} round(s)");
+
+        let (found, scanned, _) = search(Some(SearchableType::Hash)).await;
+        assert_eq!(found, [(key("h1"), "hash".to_string())]);
+        if supports(&id, floors::SCAN_TYPE).await {
+            assert_eq!(scanned, 1, "the server narrowed the scan to the one hash");
+        }
+
+        let (found, _, _) = search(Some(SearchableType::Zset)).await;
+        assert_eq!(found, [(key("z1"), "zset".to_string())]);
+
+        let names: Vec<String> = ["s1", "s2", "h1", "l1", "set1", "z1", "x1"].map(key).to_vec();
+        cmd("DEL").arg(&names).exec_async(&mut c).await.expect("cleanup");
     });
 }
 

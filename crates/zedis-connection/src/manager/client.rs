@@ -23,6 +23,7 @@ use crate::bridge::{BridgePipeline as _, BridgeQuery as _};
 use crate::floors::{self, Floor};
 use crate::hotkeys::HotkeysReport;
 use crate::keyspace::expire_seconds;
+use crate::reply;
 use crate::slot_stats::{SlotStatMetric, SlotStatRow, parse_slot_stats};
 use redis::Pipeline;
 use zedis_core::keysizes::{KeysizesDist, merge_keysizes, parse_keysizes};
@@ -1338,32 +1339,41 @@ impl RedisClient {
 
     /// One bounded round of **search-by-value**: SCAN a single page across all
     /// masters, then for each key read its value (size-gated) and
-    /// case-insensitively substring-match it against `needle_lower` (which must
-    /// already be lowercased). Unsupported types are ignored; values/containers
-    /// larger than the caps are skipped (counted in `skipped_oversized`).
+    /// case-insensitively substring-match it against `spec.needle_lower`.
+    /// Unsupported types are ignored, and so is every type but `spec.only`
+    /// when it is set; values/containers larger than the caps are skipped
+    /// (counted in `skipped_oversized`).
     ///
     /// The caller drives this in a cancellable loop, accumulating across pages
     /// until the keyspace is exhausted (`done`) or a scan/time budget trips —
-    /// results are an explicit **sample**, never guaranteed exhaustive.
+    /// results are an explicit **sample**, never guaranteed exhaustive. The
+    /// cursors a round answers continue the search, now or after it stopped.
     ///
     /// Reads are batched into three pipelines per master (TYPE → length gate →
     /// value fetch), so a page costs ~3 round trips per master instead of 2–3
     /// per *key* — the per-key serial version burned the whole time budget on
-    /// network latency before touching most of the page. A key that vanishes
-    /// mid-round types as "none" (dropped) or reads as empty (no match); a
-    /// mid-round *type change* can fail the round's pipeline, which surfaces
-    /// as this round's error — same contract as the key-tree `scan`.
+    /// network latency before touching most of the page. A search for one
+    /// type asks the server to narrow the page (`SCAN … TYPE`, 6.0+), which
+    /// names every key's type and saves the TYPE pipeline. A key that
+    /// vanishes mid-round types as "none" (dropped) or reads as empty (no
+    /// match); a mid-round *type change* can fail the round's pipeline,
+    /// which surfaces as this round's error — same contract as the key-tree
+    /// `scan`.
     ///
     pub async fn scan_values_round(
         &self,
-        pattern: &str,
-        needle_lower: &str,
-        max_value_bytes: u64,
-        max_container_elems: u64,
+        spec: &ValueSearchSpec,
         cursors: Option<Vec<u64>>,
-        page_count: u64,
     ) -> Result<ValueSearchRound> {
-        let (cursors, keys_per_node) = self.scan_nodes(cursors, pattern, page_count, None).await?;
+        let narrowed = spec.only.filter(|_| self.supports(floors::SCAN_TYPE));
+        let (cursors, keys_per_node) = self
+            .scan_nodes(
+                cursors,
+                &spec.pattern,
+                spec.page_count,
+                narrowed.map(SearchableType::as_str),
+            )
+            .await?;
         let master_addrs: Vec<_> = self.master_nodes.iter().map(|item| item.server.clone()).collect();
         // Every per-node collection below is indexed/zipped against the
         // master list; `scan_nodes` output is aligned with it by
@@ -1375,29 +1385,8 @@ impl RedisClient {
             });
         }
 
-        let mut scanned = 0usize;
+        let scanned = keys_per_node.iter().map(Vec::len).sum();
         let mut skipped_oversized = 0usize;
-
-        // Phase 1 — resolve every key's type, one pipeline per master.
-        let mut pipes: Vec<Option<redis::Pipeline>> = vec![None; master_addrs.len()];
-        for (idx, keys) in keys_per_node.iter().enumerate() {
-            scanned += keys.len();
-            if keys.is_empty() {
-                continue;
-            }
-            let mut pipe = redis::pipe();
-            for key in keys {
-                pipe.cmd("TYPE").arg(key.as_str());
-            }
-            pipes[idx] = Some(pipe);
-        }
-        let type_results = self.query_async_masters_pipelines(pipes).await?;
-
-        let redis_string = |val: &Value| match val {
-            Value::SimpleString(s) => s.clone(),
-            Value::BulkString(d) => String::from_utf8_lossy(d).into_owned(),
-            _ => String::new(),
-        };
 
         // Keep the per-node grouping throughout so follow-up pipelines stay
         // routed to the master that owns the keys. Streams and module types
@@ -1410,20 +1399,41 @@ impl RedisClient {
         // `query_async_masters_pipeline` call instead of yielding `None`,
         // so an `if let Some` here never silently drops real keys. The
         // debug_asserts pin that contract against future changes.
-        let mut candidates_per_node: Vec<Vec<(String, String)>> = Vec::with_capacity(keys_per_node.len());
-        for (keys, types) in keys_per_node.into_iter().zip(type_results) {
-            debug_assert_eq!(types.is_some(), !keys.is_empty());
-            let mut node_candidates = Vec::with_capacity(keys.len());
-            if let Some(types) = types {
-                for (key, type_val) in keys.into_iter().zip(types) {
-                    let key_type = redis_string(&type_val);
-                    if matches!(key_type.as_str(), "string" | "hash" | "list" | "set" | "zset") {
-                        node_candidates.push((key, key_type));
+        let candidates_per_node: Vec<Vec<(String, SearchableType)>> = if let Some(only) = narrowed {
+            keys_per_node
+                .into_iter()
+                .map(|keys| keys.into_iter().map(|key| (key, only)).collect())
+                .collect()
+        } else {
+            // Phase 1 — resolve every key's type, one pipeline per master.
+            let mut pipes: Vec<Option<redis::Pipeline>> = vec![None; master_addrs.len()];
+            for (idx, keys) in keys_per_node.iter().enumerate() {
+                if keys.is_empty() {
+                    continue;
+                }
+                let mut pipe = redis::pipe();
+                for key in keys {
+                    pipe.cmd("TYPE").arg(key.as_str());
+                }
+                pipes[idx] = Some(pipe);
+            }
+            let type_results = self.query_async_masters_pipelines(pipes).await?;
+            let mut candidates_per_node = Vec::with_capacity(keys_per_node.len());
+            for (keys, types) in keys_per_node.into_iter().zip(type_results) {
+                debug_assert_eq!(types.is_some(), !keys.is_empty());
+                let mut node_candidates = Vec::with_capacity(keys.len());
+                if let Some(types) = types {
+                    for (key, type_val) in keys.into_iter().zip(types) {
+                        let key_type = reply::text_lossy(&type_val).and_then(|t| SearchableType::from_type(&t));
+                        if let Some(key_type) = key_type.filter(|t| spec.only.is_none_or(|only| only == *t)) {
+                            node_candidates.push((key, key_type));
+                        }
                     }
                 }
+                candidates_per_node.push(node_candidates);
             }
-            candidates_per_node.push(node_candidates);
-        }
+            candidates_per_node
+        };
 
         // Phase 2 — size gate: one length-probe pipeline per master.
         // Containers are gated on element count so a giant collection isn't
@@ -1435,12 +1445,12 @@ impl RedisClient {
             }
             let mut pipe = redis::pipe();
             for (key, key_type) in candidates {
-                let len_cmd = match key_type.as_str() {
-                    "string" => "STRLEN",
-                    "hash" => "HLEN",
-                    "list" => "LLEN",
-                    "set" => "SCARD",
-                    _ => "ZCARD",
+                let len_cmd = match key_type {
+                    SearchableType::String => "STRLEN",
+                    SearchableType::Hash => "HLEN",
+                    SearchableType::List => "LLEN",
+                    SearchableType::Set => "SCARD",
+                    SearchableType::Zset => "ZCARD",
                 };
                 pipe.cmd(len_cmd).arg(key.as_str());
             }
@@ -1448,7 +1458,7 @@ impl RedisClient {
         }
         let len_results = self.query_async_masters_pipelines(pipes).await?;
 
-        let mut survivors_per_node: Vec<Vec<(String, String)>> = Vec::with_capacity(candidates_per_node.len());
+        let mut survivors_per_node: Vec<Vec<(String, SearchableType)>> = Vec::with_capacity(candidates_per_node.len());
         for (candidates, lens) in candidates_per_node.into_iter().zip(len_results) {
             debug_assert_eq!(lens.is_some(), !candidates.is_empty());
             let mut node_survivors = Vec::with_capacity(candidates.len());
@@ -1460,10 +1470,10 @@ impl RedisClient {
                         // comes back empty and simply doesn't match.
                         _ => 0,
                     };
-                    let cap = if key_type == "string" {
-                        max_value_bytes
+                    let cap = if key_type == SearchableType::String {
+                        spec.max_value_bytes
                     } else {
-                        max_container_elems
+                        spec.max_container_elems
                     };
                     if len > cap {
                         skipped_oversized += 1;
@@ -1483,12 +1493,12 @@ impl RedisClient {
             }
             let mut pipe = redis::pipe();
             for (key, key_type) in survivors {
-                match key_type.as_str() {
-                    "string" => pipe.cmd("GET").arg(key.as_str()),
-                    "hash" => pipe.cmd("HGETALL").arg(key.as_str()),
-                    "list" => pipe.cmd("LRANGE").arg(key.as_str()).arg(0).arg(-1),
-                    "set" => pipe.cmd("SMEMBERS").arg(key.as_str()),
-                    _ => pipe.cmd("ZRANGE").arg(key.as_str()).arg(0).arg(-1),
+                match key_type {
+                    SearchableType::String => pipe.cmd("GET").arg(key.as_str()),
+                    SearchableType::Hash => pipe.cmd("HGETALL").arg(key.as_str()),
+                    SearchableType::List => pipe.cmd("LRANGE").arg(key.as_str()).arg(0).arg(-1),
+                    SearchableType::Set => pipe.cmd("SMEMBERS").arg(key.as_str()),
+                    SearchableType::Zset => pipe.cmd("ZRANGE").arg(key.as_str()).arg(0).arg(-1),
                 };
             }
             pipes[idx] = Some(pipe);
@@ -1499,6 +1509,7 @@ impl RedisClient {
         // key is recorded (one row per key); the inline preview shows the
         // full value. Conversion failures read as empty — "no match" —
         // mirroring the old per-key `unwrap_or_default` semantics.
+        let needle_lower = spec.needle_lower.as_str();
         let mut matches = Vec::new();
         for (survivors, values) in survivors_per_node.into_iter().zip(value_results) {
             debug_assert_eq!(values.is_some(), !survivors.is_empty());
@@ -1506,27 +1517,26 @@ impl RedisClient {
                 continue;
             };
             for ((key, key_type), value) in survivors.into_iter().zip(values) {
-                let location = match key_type.as_str() {
-                    "string" => {
+                let location = match key_type {
+                    SearchableType::String => {
                         let value: Vec<u8> = Vec::from_redis_value(value).unwrap_or_default();
                         contains_needle(&value, needle_lower).then_some(MatchLocation::Value)
                     }
-                    "hash" => {
+                    SearchableType::Hash => {
                         let fields: Vec<(Vec<u8>, Vec<u8>)> = Vec::from_redis_value(value).unwrap_or_default();
                         fields
                             .into_iter()
                             .find(|(f, v)| contains_needle(f, needle_lower) || contains_needle(v, needle_lower))
                             .map(|(f, _)| MatchLocation::Field(truncate_member(&f)))
                     }
-                    "list" => {
+                    SearchableType::List => {
                         let items: Vec<Vec<u8>> = Vec::from_redis_value(value).unwrap_or_default();
                         items
                             .into_iter()
                             .position(|e| contains_needle(&e, needle_lower))
                             .map(MatchLocation::Index)
                     }
-                    // set / zset
-                    _ => {
+                    SearchableType::Set | SearchableType::Zset => {
                         let members: Vec<Vec<u8>> = Vec::from_redis_value(value).unwrap_or_default();
                         members
                             .into_iter()
@@ -1537,7 +1547,7 @@ impl RedisClient {
                 if let Some(location) = location {
                     matches.push(ValueMatch {
                         key,
-                        key_type,
+                        key_type: key_type.as_str().to_string(),
                         location,
                     });
                 }

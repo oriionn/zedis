@@ -128,7 +128,7 @@ Start a collection (CPU time and/or network bytes, top 10/20/50), watch the two 
 ### Value Search
 **Find which key *contains* some text (a guarded, sampled scan).**
 
-Redis can't index values, so this `O(keyspace)` search runs behind guardrails: a mandatory key prefix, a 10k-key / 10s cap (cancellable), and values over 1 MiB skipped — searching string values, hash fields, and list/set/sorted-set members, with each hit showing where it matched. A guide on the empty page and a key filter over the results keep the flow clear; results are an explicit **sample**, never claimed exhaustive.
+Redis can't index values, so this `O(keyspace)` search runs behind guardrails: a mandatory key prefix, a cap of 10k keys / 10s by default (Settings → Key Behavior, up to 1M keys / 300s; cancellable), and values over 1 MiB skipped — searching string values, hash fields, and list/set/sorted-set members, all of them or one type (narrowed by the server with `SCAN … TYPE`), with each hit showing where it matched. A search the cap, the clock or the Stop button ended can be **continued** from where it stopped with a fresh budget, keeping its hits — hits past the match cap included. A guide on the empty page and a key filter over the results keep the flow clear; results are an explicit **sample**, never claimed exhaustive.
 
 ### Cluster Health & Management
 **Topology tree with replication lag, a slot map, per-node load, and a reshard wizard.**

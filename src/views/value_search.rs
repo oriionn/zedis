@@ -30,14 +30,22 @@
 //! - **Sampling semantics** — the summary states what was scanned / matched /
 //!   skipped and why it stopped; results are never claimed exhaustive.
 //!
+//! - **Continue** — a search the budget or the Stop button ended keeps its
+//!   cursors, and goes on from them with a fresh budget while the form still
+//!   asks what it asked.
+//!
 //! Clicking a hit previews its value **inline** in the right-hand pane (the
 //! "Open" button there still jumps to the editor). Supports string / hash /
-//! list / set / zset with case-insensitive substring matching.
+//! list / set / zset — all of them or one — with case-insensitive substring
+//! matching.
 
 use crate::components::KeyTypeBadge;
-use crate::connection::{MatchLocation, ServerDb, ValueMatch, ValueSearchRound, scan_values_round, value_preview};
-use crate::helpers::has_file_dialogs;
-use crate::helpers::{build_csv, get_mono_font_family};
+use crate::connection::{
+    MatchLocation, SearchableType, ServerDb, ValueMatch, ValueSearchRound, ValueSearchSpec, scan_values_round,
+    value_preview,
+};
+use crate::helpers::{ValueSearchTypeFilter, has_file_dialogs};
+use crate::helpers::{build_csv, get_mono_font_family, group_thousands};
 use crate::states::{
     KeyType, ServerEvent, ServerView, ZedisGlobalStore, ZedisServerState, back_to_editor_tooltip, i18n_common,
     i18n_value_search,
@@ -45,15 +53,16 @@ use crate::states::{
 use crate::views::export_to_file;
 use crate::views::placeholders::Placeholders;
 use gpui::{
-    ClipboardItem, Context, Entity, ScrollHandle, SharedString, Subscription, Task, Window, div, prelude::*, px,
+    App, ClipboardItem, Context, Entity, ScrollHandle, SharedString, Subscription, Task, Window, div, prelude::*, px,
     uniform_list,
 };
 use gpui_kit::component::{
-    ActiveTheme, Icon, IconName, Sizable, StyledExt, WindowExt,
+    ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt, WindowExt,
     button::{Button, ButtonVariants},
     h_flex,
     input::{Input, InputEvent, InputState},
     label::Label,
+    menu::DropdownMenu,
     notification::Notification,
     v_flex,
 };
@@ -76,6 +85,9 @@ const PAGE_COUNT: u64 = 128;
 /// Bytes of a value rendered in the preview pane before truncating.
 const PREVIEW_MAX_BYTES: usize = 64 * 1024;
 
+/// The status row's Continue button, which a test looks for.
+const CONTINUE_BUTTON_ID: &str = "vs-continue";
+
 /// Example prefixes offered on the empty state (fill the prefix field only).
 const EXAMPLE_PREFIXES: &[&str] = &["session:", "user:", "cache:", "job:"];
 
@@ -90,6 +102,26 @@ enum StopReason {
     Timeout,
     /// User pressed Stop.
     Cancelled,
+}
+
+/// Where a stopped search can go on from: what it was asked, as typed, and
+/// the cursors past the last page whose hits are on screen.
+struct Resume {
+    prefix: String,
+    query: String,
+    spec: ValueSearchSpec,
+    /// `None` until a first round has answered.
+    cursors: Option<Vec<u64>>,
+    /// Hits of the round that reached the match cap, past it: the cursors
+    /// are already beyond their page, so a continue starts with them.
+    held: Vec<ValueMatch>,
+}
+
+impl Resume {
+    /// Whether anything is left to read: keys past the cursors, or hits held.
+    fn has_more(&self) -> bool {
+        !self.held.is_empty() || !self.cursors.as_ref().is_some_and(|c| c.iter().all(|&c| c == 0))
+    }
 }
 
 /// State of the inline value preview for the selected match.
@@ -116,6 +148,10 @@ pub struct ZedisValueSearch {
     query_input: Entity<InputState>,
     /// Local filter over already-found matches (key substring).
     filter_input: Entity<InputState>,
+    /// The one type to search, or every searchable type.
+    only: Option<SearchableType>,
+    /// The search on screen, for Continue.
+    resume: Option<Resume>,
     /// One-shot flag: focus the prefix box on the first render only, so a
     /// freshly opened panel is ready to type into.
     should_focus: bool,
@@ -235,6 +271,8 @@ impl ZedisValueSearch {
             prefix_input,
             query_input,
             filter_input,
+            only: None,
+            resume: None,
             should_focus: true,
             running: false,
             matches: Vec::new(),
@@ -259,9 +297,16 @@ impl ZedisValueSearch {
         }
     }
 
+    /// The prefix and the query as the form holds them.
+    fn typed(&self, cx: &App) -> (String, String) {
+        (
+            self.prefix_input.read(cx).value().trim().to_string(),
+            self.query_input.read(cx).value().trim().to_string(),
+        )
+    }
+
     fn start_search(&mut self, cx: &mut Context<Self>) {
-        let prefix = self.prefix_input.read(cx).value().trim().to_string();
-        let query = self.query_input.read(cx).value().trim().to_string();
+        let (prefix, query) = self.typed(cx);
         if prefix.is_empty() {
             self.error = Some(i18n_value_search(cx, "need_prefix"));
             cx.notify();
@@ -274,23 +319,80 @@ impl ZedisValueSearch {
         }
         // Respect an explicit glob; otherwise pin the scan to `prefix*`.
         let pattern = if prefix.contains(['*', '?', '[']) {
-            prefix
+            prefix.clone()
         } else {
             format!("{prefix}*")
         };
-        let needle = query.to_lowercase();
+        let spec = ValueSearchSpec {
+            pattern,
+            needle_lower: query.to_lowercase(),
+            only: self.only,
+            max_value_bytes: MAX_VALUE_BYTES,
+            max_container_elems: MAX_CONTAINER_ELEMS,
+            page_count: PAGE_COUNT,
+        };
 
         self.clear_results();
-        self.running = true;
-        cx.notify();
-
         // Read the connection live at search time, not at construction — a
         // restored `valuesearch` route recreates this view before
         // ServerSelected wires up the server, so a cached id would be empty
         // ("Redis config not found"). By search time the connection is ready.
         let server_id = self.server_state.read(cx).server_id().to_string();
         let db = self.server_state.read(cx).db();
-        self.searched = Some((server_id.clone(), db));
+        self.searched = Some((server_id, db));
+        self.resume = Some(Resume {
+            prefix,
+            query,
+            spec,
+            cursors: None,
+            held: Vec::new(),
+        });
+        self.run_search(cx);
+    }
+
+    /// Whether the search on screen can go on: it was stopped rather than
+    /// finished, something is left to read, and the form still asks what
+    /// it asked — a changed prefix, query or type is a new search.
+    fn resumable(&self, cx: &App) -> bool {
+        if self.running
+            || !matches!(
+                self.stop_reason,
+                Some(StopReason::Capped | StopReason::Timeout | StopReason::Cancelled)
+            )
+        {
+            return false;
+        }
+        let Some(resume) = &self.resume else {
+            return false;
+        };
+        let (prefix, query) = self.typed(cx);
+        resume.has_more() && resume.prefix == prefix && resume.query == query && resume.spec.only == self.only
+    }
+
+    /// Go on with the search on screen from where it stopped, keeping its
+    /// hits and counts, with a fresh budget.
+    fn continue_search(&mut self, cx: &mut Context<Self>) {
+        if !self.resumable(cx) {
+            return;
+        }
+        self.stop_reason = None;
+        self.truncated = false;
+        self.error = None;
+        self.run_search(cx);
+    }
+
+    /// Run the search in `resume` from its cursors until it is done or a
+    /// budget — keys, time or matches, each counted from now — runs out.
+    fn run_search(&mut self, cx: &mut Context<Self>) {
+        let Some(resume) = self.resume.as_mut() else {
+            return;
+        };
+        let spec = resume.spec.clone();
+        let mut cursors = resume.cursors.clone();
+        let held = take(&mut resume.held);
+        let Some((server_id, db)) = self.searched.clone() else {
+            return;
+        };
         // Snapshot the tunable guardrails at search start — a mid-search
         // settings change applies to the next search, not this one.
         let (scan_cap, time_budget_secs, max_matches) = {
@@ -301,28 +403,26 @@ impl ZedisValueSearch {
                 store.value_search_max_matches(),
             )
         };
+        let limit = self.matches.len() + max_matches;
+        self.running = true;
+        self.admit(held, limit);
+        if self.truncated {
+            self.finish(StopReason::Capped, cx);
+            return;
+        }
+        cx.notify();
+
         self.task = Some(cx.spawn(async move |this, cx| {
             let at = ServerDb::new(&*server_id, db);
             let start = Instant::now();
-            let mut cursors = None;
+            let mut scanned_here = 0;
             loop {
                 // Off the UI thread: a round decodes and lower-cases every
                 // value it reads to match it, which is CPU work that grows
                 // with the values, not just a wait on the server.
                 let round = cx.background_spawn({
-                    let (at, pattern, needle, cursors) = (at.clone(), pattern.clone(), needle.clone(), cursors.clone());
-                    async move {
-                        scan_values_round(
-                            &at,
-                            &pattern,
-                            &needle,
-                            MAX_VALUE_BYTES,
-                            MAX_CONTAINER_ELEMS,
-                            cursors,
-                            PAGE_COUNT,
-                        )
-                        .await
-                    }
+                    let (at, spec, cursors) = (at.clone(), spec.clone(), cursors.clone());
+                    async move { scan_values_round(&at, &spec, cursors).await }
                 });
                 let round = match round.await {
                     Ok(r) => r,
@@ -338,21 +438,22 @@ impl ZedisValueSearch {
                     skipped_oversized,
                     done,
                 } = round;
+                scanned_here += scanned;
                 let stop = this.update(cx, |this, cx| {
                     this.scanned += scanned;
                     this.skipped += skipped_oversized;
-                    for m in matches {
-                        if this.matches.len() >= max_matches {
-                            this.truncated = true;
-                            break;
-                        }
-                        this.matches.push(m);
+                    // The cursors move with the hits they were read with, so
+                    // a Stop between rounds leaves no page half counted.
+                    if let Some(resume) = this.resume.as_mut() {
+                        resume.cursors = Some(next.clone());
                     }
-                    this.matches_rev += 1;
+                    this.admit(matches, limit);
                     cx.notify();
-                    if done {
+                    if this.truncated {
+                        Some(StopReason::Capped)
+                    } else if done {
                         Some(StopReason::Done)
-                    } else if this.scanned >= scan_cap || this.truncated {
+                    } else if scanned_here >= scan_cap {
                         Some(StopReason::Capped)
                     } else if start.elapsed().as_secs() >= time_budget_secs {
                         Some(StopReason::Timeout)
@@ -372,8 +473,20 @@ impl ZedisValueSearch {
         }));
     }
 
+    /// Put `found` on the list up to `limit` hits; past it they are held for
+    /// a continue and the list is marked truncated.
+    fn admit(&mut self, found: Vec<ValueMatch>, limit: usize) {
+        let held = admit_up_to(&mut self.matches, found, limit);
+        self.truncated |= !held.is_empty();
+        if let Some(resume) = self.resume.as_mut() {
+            resume.held = held;
+        }
+        self.matches_rev += 1;
+    }
+
     /// Forget the previous search's hits, summary and preview.
     fn clear_results(&mut self) {
+        self.resume = None;
         self.matches.clear();
         self.matches_rev += 1;
         self.scanned = 0;
@@ -547,6 +660,19 @@ impl ZedisValueSearch {
         }
     }
 
+    /// A guardrail sentence with the budget Settings gives a search now.
+    fn with_budget(&self, key: &str, cx: &App) -> SharedString {
+        let store = cx.global::<ZedisGlobalStore>().read(cx);
+        rust_i18n::t!(
+            key,
+            cap = group_thousands(store.value_search_scan_cap() as u64),
+            secs = store.value_search_time_budget_secs(),
+            locale = store.locale()
+        )
+        .to_string()
+        .into()
+    }
+
     fn render_stat_chip(
         label: SharedString,
         value: SharedString,
@@ -585,7 +711,7 @@ impl ZedisValueSearch {
         }
 
         if !self.running && self.stop_reason.is_none() {
-            return Label::new(i18n_value_search(cx, "guardrails_hint"))
+            return Label::new(self.with_budget("value_search.guardrails_hint", cx))
                 .text_xs()
                 .text_color(muted)
                 .into_any_element();
@@ -625,6 +751,17 @@ impl ZedisValueSearch {
                 Label::new(i18n_value_search(cx, "truncated"))
                     .text_xs()
                     .text_color(warning),
+            );
+        }
+        if self.resumable(cx) {
+            row = row.child(
+                Button::new(CONTINUE_BUTTON_ID)
+                    .outline()
+                    .xsmall()
+                    .icon(IconName::Play)
+                    .label(i18n_value_search(cx, "continue"))
+                    .tooltip(i18n_value_search(cx, "continue_tooltip"))
+                    .on_click(cx.listener(|this, _, _w, cx| this.continue_search(cx))),
             );
         }
         // Cap reminder while running.
@@ -689,7 +826,7 @@ impl ZedisValueSearch {
                             .font_semibold(),
                     )
                     .child(
-                        Label::new(i18n_value_search(cx, "empty_guardrails_body"))
+                        Label::new(self.with_budget("value_search.empty_guardrails_body", cx))
                             .text_xs()
                             .text_color(muted),
                     ),
@@ -951,6 +1088,49 @@ impl ZedisValueSearch {
     }
 }
 
+/// Move `found` onto `matches` until it holds `limit`, and answer the rest.
+fn admit_up_to(matches: &mut Vec<ValueMatch>, found: Vec<ValueMatch>, limit: usize) -> Vec<ValueMatch> {
+    let room = limit.saturating_sub(matches.len());
+    let mut found = found.into_iter();
+    matches.extend(found.by_ref().take(room));
+    found.collect()
+}
+
+/// The type filter as the panel's action names it.
+fn type_filter(only: Option<SearchableType>) -> ValueSearchTypeFilter {
+    match only {
+        None => ValueSearchTypeFilter::All,
+        Some(SearchableType::String) => ValueSearchTypeFilter::String,
+        Some(SearchableType::Hash) => ValueSearchTypeFilter::Hash,
+        Some(SearchableType::List) => ValueSearchTypeFilter::List,
+        Some(SearchableType::Set) => ValueSearchTypeFilter::Set,
+        Some(SearchableType::Zset) => ValueSearchTypeFilter::Zset,
+    }
+}
+
+/// …and back.
+fn searchable(filter: ValueSearchTypeFilter) -> Option<SearchableType> {
+    match filter {
+        ValueSearchTypeFilter::All => None,
+        ValueSearchTypeFilter::String => Some(SearchableType::String),
+        ValueSearchTypeFilter::Hash => Some(SearchableType::Hash),
+        ValueSearchTypeFilter::List => Some(SearchableType::List),
+        ValueSearchTypeFilter::Set => Some(SearchableType::Set),
+        ValueSearchTypeFilter::Zset => Some(SearchableType::Zset),
+    }
+}
+
+/// A type's name as the key tree's type filter writes it.
+fn type_label(only: SearchableType) -> &'static str {
+    match only {
+        SearchableType::String => "String",
+        SearchableType::Hash => "Hash",
+        SearchableType::List => "List",
+        SearchableType::Set => "Set",
+        SearchableType::Zset => "Zset",
+    }
+}
+
 /// Format a match location for a CSV cell (machine-readable, no i18n).
 fn location_csv(loc: &MatchLocation) -> String {
     match loc {
@@ -998,11 +1178,30 @@ impl Render for ZedisValueSearch {
                 .on_click(cx.listener(|this, _, _w, cx| this.start_search(cx)))
         };
 
+        let only = self.only;
+        let all_types = i18n_value_search(cx, "type_all");
+        let type_picker = Button::new("vs-type")
+            .outline()
+            .small()
+            .label(only.map_or(all_types.clone(), |t| type_label(t).into()))
+            .dropdown_caret(true)
+            .tooltip(i18n_value_search(cx, "type_tooltip"))
+            // What a running search reads was fixed when it started.
+            .disabled(self.running)
+            .dropdown_menu(move |menu, _window, _cx| {
+                let menu =
+                    menu.menu_with_check(all_types.clone(), only.is_none(), Box::new(ValueSearchTypeFilter::All));
+                SearchableType::ALL.into_iter().fold(menu, |menu, t| {
+                    menu.menu_with_check(type_label(t), only == Some(t), Box::new(type_filter(Some(t))))
+                })
+            });
+
         let header = h_flex()
             .w_full()
             .gap_2()
             .items_center()
             .child(div().w(px(220.)).child(Input::new(&self.prefix_input).small()))
+            .child(type_picker)
             .child(div().flex_1().child(Input::new(&self.query_input).small()))
             .child(action)
             .when(has_file_dialogs() && !self.matches.is_empty(), |this| {
@@ -1086,6 +1285,11 @@ impl Render for ZedisValueSearch {
         v_flex()
             .size_full()
             .font_family(get_mono_font_family())
+            // The type dropdown dispatches these.
+            .on_action(cx.listener(|this, filter: &ValueSearchTypeFilter, _window, cx| {
+                this.only = searchable(*filter);
+                cx.notify();
+            }))
             .child(
                 h_flex()
                     .items_center()
@@ -1121,5 +1325,125 @@ impl Render for ZedisValueSearch {
                     // its viewport from it.
                     .child(v_flex().flex_1().min_h_0().w_full().child(body)),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::init_ui;
+    use gpui::{AppContext, TestAppContext, size};
+    use gpui_kit::component::Root;
+    use gpui_kit::test::TestWindowExt;
+
+    fn hit(key: &str) -> ValueMatch {
+        ValueMatch {
+            key: key.to_string(),
+            key_type: "string".to_string(),
+            location: MatchLocation::Value,
+        }
+    }
+
+    /// The hits past the match cap are answered, not dropped: their page is
+    /// behind the cursors, so a continue is the only way back to them.
+    #[test]
+    fn hits_past_the_cap_are_held_for_a_continue() {
+        let mut matches = vec![hit("a")];
+        let held = admit_up_to(&mut matches, vec![hit("b"), hit("c"), hit("d")], 3);
+        let keys = |hits: &[ValueMatch]| hits.iter().map(|m| m.key.clone()).collect::<Vec<_>>();
+        assert_eq!(keys(&matches), ["a", "b", "c"]);
+        assert_eq!(keys(&held), ["d"]);
+        assert!(
+            admit_up_to(&mut matches, vec![hit("e")], 3).len() == 1,
+            "a full list takes none"
+        );
+    }
+
+    /// Continue is offered for a search that stopped with something left to
+    /// read, and only while the form still asks what that search asked.
+    #[gpui::test]
+    fn continue_is_offered_while_the_form_asks_what_the_stopped_search_did(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let server_state = cx.new(|_| ZedisServerState::default());
+        let mut panel = None;
+        let handle = cx.open_window(size(px(1000.), px(600.)), |window, cx| {
+            let view = cx.new(|cx| ZedisValueSearch::new(server_state.clone(), window, cx));
+            panel = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let panel = panel.expect("the window built the panel");
+        let shows_continue = |cx: &mut TestAppContext| {
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                window.try_find(CONTINUE_BUTTON_ID).is_some()
+            })
+            .expect("the window is open")
+        };
+        let type_into = |cx: &mut TestAppContext, prefix: &'static str, query: &'static str| {
+            cx.update_window(handle.into(), |_, window, cx| {
+                panel.update(cx, |this, cx| {
+                    this.prefix_input.update(cx, |i, cx| i.set_value(prefix, window, cx));
+                    this.query_input.update(cx, |i, cx| i.set_value(query, window, cx));
+                });
+            })
+            .expect("the window is open");
+        };
+
+        type_into(cx, "user:", "alice");
+        assert!(!shows_continue(cx), "nothing has been searched");
+        panel.update(cx, |this, _| {
+            this.searched = Some((String::new(), 0));
+            this.stop_reason = Some(StopReason::Timeout);
+            this.resume = Some(Resume {
+                prefix: "user:".to_string(),
+                query: "alice".to_string(),
+                spec: ValueSearchSpec {
+                    pattern: "user:*".to_string(),
+                    needle_lower: "alice".to_string(),
+                    only: None,
+                    max_value_bytes: MAX_VALUE_BYTES,
+                    max_container_elems: MAX_CONTAINER_ELEMS,
+                    page_count: PAGE_COUNT,
+                },
+                cursors: Some(vec![42]),
+                held: Vec::new(),
+            });
+        });
+        assert!(shows_continue(cx), "a search the budget stopped");
+
+        type_into(cx, "user:", "bob");
+        assert!(!shows_continue(cx), "another query is a new search");
+        type_into(cx, "user:", "alice");
+        assert!(shows_continue(cx));
+
+        // The type is picked from the dropdown, whose items dispatch this.
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.dispatch_action(Box::new(ValueSearchTypeFilter::Hash), cx);
+        })
+        .expect("the window is open");
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("vs-type").label(), Some("Hash"));
+        })
+        .expect("the window is open");
+        assert!(!shows_continue(cx), "another type is a new search");
+        panel.update(cx, |this, _| this.only = None);
+        assert!(shows_continue(cx));
+
+        panel.update(cx, |this, _| {
+            if let Some(resume) = this.resume.as_mut() {
+                resume.cursors = Some(vec![0]);
+            }
+        });
+        assert!(!shows_continue(cx), "the keyspace is covered");
+        panel.update(cx, |this, _| {
+            if let Some(resume) = this.resume.as_mut() {
+                resume.held = vec![hit("user:9")];
+            }
+        });
+        assert!(shows_continue(cx), "hits held past the cap are still to come");
+        panel.update(cx, |this, _| this.stop_reason = Some(StopReason::Done));
+        assert!(!shows_continue(cx), "a finished search");
     }
 }

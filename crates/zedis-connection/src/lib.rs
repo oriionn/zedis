@@ -296,9 +296,9 @@ pub use manager::get_connection_manager;
 pub use manager::{
     AccessMode, CLUSTER_HASH_SLOTS, ClusterSlotMap, CommandLogKind, CommandStat, ExpireCondition, FAILOVER_TIMEOUT_MS,
     HeatMetric, HeatProbe, KeyMemoryUsage, MAX_PUBSUB_CHANNELS, MatchLocation, PubsubChannel, PubsubChannelsSnapshot,
-    REBALANCE_THRESHOLD_PCT, RebalanceMove, RedisClientDescription, SlowLogEntry, ValueMatch, ValueSearchRound,
-    command_log_reset, command_logs, group_slot_ranges, plan_cluster_rebalance, plan_reshard_slots, slots_in_ranges,
-    unassigned_slot_ranges,
+    REBALANCE_THRESHOLD_PCT, RebalanceMove, RedisClientDescription, SearchableType, SlowLogEntry, ValueMatch,
+    ValueSearchRound, ValueSearchSpec, command_log_reset, command_logs, group_slot_ranges, plan_cluster_rebalance,
+    plan_reshard_slots, slots_in_ranges, unassigned_slot_ranges,
 };
 /// Slot migration and sharded Pub/Sub are cluster surgery and a held socket
 /// — server-side work either way, and both are panels the web build drops
