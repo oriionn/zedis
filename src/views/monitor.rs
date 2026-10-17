@@ -16,7 +16,7 @@ use crate::assets::CustomIconName;
 use crate::connection::{Capability, MonitorFeeds, ServerDb, get_server, open_monitor_feeds};
 use crate::error::Error;
 use crate::helpers::channel;
-use crate::helpers::{MonitorAction, build_csv, format_clock, get_mono_font_family, group_thousands};
+use crate::helpers::{MonitorAction, build_csv, format_clock, get_mono_font_family, group_thousands, has_file_dialogs};
 use crate::states::{
     ConnectionErrorKind, GlobalEvent, NotificationAction, ServerEvent, ServerView, ZedisGlobalStore, ZedisServerState,
     back_to_editor_tooltip, content_area_width, escalate_dangerous_body, i18n_common, i18n_monitor, i18n_status_bar,
@@ -27,7 +27,7 @@ use crate::states::{
 /// the `MONITOR` command, and streams the output in real time into a
 /// scrollable table.  Supports keyword and command-type filtering.
 /// The buffer is capped at `MAX_RECORDS` entries.
-use crate::views::{export_to_file, open_key_in_editor};
+use crate::views::{BridgeMonitor, bridge_monitor, confirm_dangerous_command, export_to_file, open_key_in_editor};
 use gpui::{AnyElement, App, Div, Entity, Hsla, Render, SharedString, Subscription, Task, Window, div, prelude::*, px};
 use gpui_kit::component::button::ButtonVariants;
 use gpui_kit::component::{
@@ -44,8 +44,9 @@ use gpui_kit::component::{
 };
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::error;
+use web_time::Instant;
 use zedis_core::tally::{MonitorTally, Tally};
 use zedis_ui::{CellAction, CellActionProvider, TextColumn, ZedisDialog, ZedisTextTable, fitted_table};
 
@@ -416,9 +417,37 @@ impl ZedisMonitor {
             return;
         }
         let server_id = self.server_state.read(cx).server_id().to_string();
+        // The bridge's answer first, where it has one: a refusal said here,
+        // where the bridge's would only be "failed"; its question stands in
+        // for the warning below, with the same weight, and its answer is
+        // what lets `MONITOR` start there.
+        let bridge = {
+            let state = self.server_state.read(cx);
+            bridge_monitor(state.strict_readonly(), state.write_gate())
+        };
+        if bridge == BridgeMonitor::Refused {
+            let message = i18n_monitor(cx, "needs_full_account");
+            cx.global::<ZedisGlobalStore>().clone().update(cx, |_, cx| {
+                cx.emit(GlobalEvent::Notification(NotificationAction::new_warning(message)));
+            });
+            return;
+        }
+        if let BridgeMonitor::Ask(kind) = bridge
+            && let Ok(server) = get_server(&server_id)
+        {
+            let db = self.server_state.read(cx).db();
+            let entity = cx.entity();
+            let answer = server.name.clone();
+            confirm_dangerous_command(&server, db, &kind, Some("MONITOR"), window, cx, move |_window, cx| {
+                entity.update(cx, |this, cx| {
+                    this.handle_start(sample_seconds, Some(answer.clone()), cx)
+                });
+            });
+            return;
+        }
         let high_risk = get_server(&server_id).map(|s| s.is_high_risk_tag()).unwrap_or(false);
         if !high_risk {
-            self.handle_start(sample_seconds, cx);
+            self.handle_start(sample_seconds, None, cx);
             return;
         }
 
@@ -430,7 +459,7 @@ impl ZedisMonitor {
         ZedisDialog::new_alert(i18n_monitor(cx, "start_confirm_title"), body)
             .button_props(button_props)
             .on_ok(move |_, window, cx| {
-                entity.update(cx, |this, cx| this.handle_start(sample_seconds, cx));
+                entity.update(cx, |this, cx| this.handle_start(sample_seconds, None, cx));
                 window.close_dialog(cx);
                 true
             })
@@ -439,8 +468,9 @@ impl ZedisMonitor {
 
     /// Attach MONITOR. With `sample_seconds`, it is a sample: the table starts
     /// empty, every line is counted, and the stream ends by itself when the
-    /// time is up — then the summary is shown.
-    fn handle_start(&mut self, sample_seconds: Option<u64>, cx: &mut Context<Self>) {
+    /// time is up — then the summary is shown. `confirm` is the answer to
+    /// the bridge's question ([`bridge_monitor_question`]), when it asked.
+    fn handle_start(&mut self, sample_seconds: Option<u64>, confirm: Option<String>, cx: &mut Context<Self>) {
         // Observe is a read-class capability (allowed on read-only
         // connections); routed through the matrix so a stricter future mode
         // can turn observation off in one place.
@@ -485,6 +515,10 @@ impl ZedisMonitor {
             // task, where a failed node vanished silently, and on a
             // standalone that meant MONITOR appeared to do nothing at all.
             let at = ServerDb::new(server_id, db);
+            let at = match confirm {
+                Some(answer) => at.confirmed(answer),
+                None => at,
+            };
             let opened: Result<MonitorFeeds> = cx
                 .background_spawn(async move { Ok(open_monitor_feeds(&at).await?) })
                 .await;
@@ -1076,7 +1110,7 @@ impl Render for ZedisMonitor {
                                         })),
                                 )
                             })
-                            .when(total > 0, |this| {
+                            .when(has_file_dialogs() && total > 0, |this| {
                                 this.child(
                                     Button::new("monitor-export")
                                         .outline()

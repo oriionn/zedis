@@ -17,22 +17,35 @@
 //! both but different. The comparison itself is `compare_prefix`; this
 //! window is the form, the progress, the three lists, and the hand-off to
 //! the copy window for what the target lacks.
+//!
+//! A window of its own on the desktop; in the browser, which has one canvas
+//! per tab, the same view in a dialog over the page ([`open_compare`]), and
+//! without the hand-off: the copy window is the desktop's migration window.
 
+#[cfg(not(target_family = "wasm"))]
+use crate::connection::ConflictMode;
 use crate::connection::{
-    CompareOptions, CompareProgress, CompareReport, CompareSide, CompareStage, ConflictMode, KeyDifference,
-    compare_prefix, get_servers,
+    CompareOptions, CompareProgress, CompareReport, CompareSide, CompareStage, KeyDifference, compare_prefix,
+    get_servers,
 };
 use crate::error::Error;
 use crate::helpers::channel;
-use crate::helpers::{get_mono_font_family, with_app_identity};
+use crate::helpers::get_mono_font_family;
+#[cfg(not(target_family = "wasm"))]
+use crate::helpers::with_app_identity;
 use crate::states::{ZedisGlobalStore, i18n_common, i18n_compare, i18n_copy};
+#[cfg(not(target_family = "wasm"))]
 use crate::views::{CopyPreset, open_migration_copy_window};
 use gpui::{
-    App, Bounds, ClipboardItem, Entity, FocusHandle, Focusable, KeyDownEvent, SharedString, Subscription, Task,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
+    AnyElement, App, ClipboardItem, Entity, FocusHandle, Focusable, KeyDownEvent, SharedString, Subscription, Task,
+    Window, div, prelude::*, px,
 };
+#[cfg(not(target_family = "wasm"))]
+use gpui::{Bounds, TitlebarOptions, WindowBounds, WindowOptions, size};
+#[cfg(not(target_family = "wasm"))]
+use gpui_kit::component::Root;
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Root, Selectable, Sizable, WindowExt,
+    ActiveTheme, Disableable, Selectable, Sizable, WindowExt,
     button::{Button, ButtonGroup, ButtonVariants},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -45,10 +58,24 @@ use gpui_kit::component::{
 use rust_i18n::t;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_family = "wasm")]
+use zedis_ui::ZedisDialog;
 use zedis_ui::{TextColumn, ZedisTextTable};
 
 const WINDOW_WIDTH: f32 = 920.0;
 const WINDOW_HEIGHT: f32 = 660.0;
+/// Whether the view draws its own title: a window's page does; a dialog has
+/// one already.
+#[cfg(not(target_family = "wasm"))]
+const OWN_TITLE: bool = true;
+#[cfg(target_family = "wasm")]
+const OWN_TITLE: bool = false;
+/// The dialog's title and margins around its body, in the browser.
+#[cfg(target_family = "wasm")]
+const COMPARE_DIALOG_CHROME: f32 = 160.0;
+/// The least the browser's dialog body is given.
+#[cfg(target_family = "wasm")]
+const COMPARE_DIALOG_MIN_HEIGHT: f32 = 360.0;
 /// Keys scanned per side before the report is marked partial.
 const DEFAULT_LIMIT: usize = 10_000;
 const KEY_WIDTH: f32 = 430.0;
@@ -388,37 +415,6 @@ impl ZedisCompareWindow {
         self.report.iter().flat_map(keys_to_copy)
     }
 
-    /// [`Self::target_keys`], owned — what the copy dialog is opened with.
-    fn keys_for_target(&self) -> Vec<SharedString> {
-        self.target_keys()
-            .map(|key| SharedString::from(key.to_string()))
-            .collect()
-    }
-
-    fn open_copy(&mut self, cx: &mut Context<Self>) {
-        let Some(target_id) = self.target_server_id.clone() else {
-            return;
-        };
-        let keys = self.keys_for_target();
-        if keys.is_empty() {
-            return;
-        }
-        open_migration_copy_window(
-            self.source_id.clone(),
-            self.source_name.clone(),
-            self.source_db,
-            keys,
-            CopyPreset {
-                target_id,
-                target_db: self.target_db(cx),
-                // The differing keys exist on the target: a copy that skipped
-                // them would change nothing.
-                conflict: ConflictMode::Overwrite,
-            },
-            cx,
-        );
-    }
-
     /// The visible keys of the open list, one per line.
     fn copy_key_names(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let table = &self.tables[self.tab.index()];
@@ -500,9 +496,77 @@ impl ZedisCompareWindow {
         Some(i18n_compare(cx, "capped_note").replace("{side}", &side).into())
     }
 
-    fn handle_close(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
-        window.remove_window();
+    fn handle_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        close_compare(window, cx);
     }
+}
+
+/// The hand-off to the copy window, which is the desktop's migration window
+/// — a second window over files the browser has neither of.
+#[cfg(not(target_family = "wasm"))]
+impl ZedisCompareWindow {
+    /// [`Self::target_keys`], owned — what the copy dialog is opened with.
+    fn keys_for_target(&self) -> Vec<SharedString> {
+        self.target_keys()
+            .map(|key| SharedString::from(key.to_string()))
+            .collect()
+    }
+
+    fn open_copy(&mut self, cx: &mut Context<Self>) {
+        let Some(target_id) = self.target_server_id.clone() else {
+            return;
+        };
+        let keys = self.keys_for_target();
+        if keys.is_empty() {
+            return;
+        }
+        open_migration_copy_window(
+            self.source_id.clone(),
+            self.source_name.clone(),
+            self.source_db,
+            keys,
+            CopyPreset {
+                target_id,
+                target_db: self.target_db(cx),
+                // The differing keys exist on the target: a copy that skipped
+                // them would change nothing.
+                conflict: ConflictMode::Overwrite,
+            },
+            cx,
+        );
+    }
+
+    /// The footer's "Copy to target (n)".
+    fn copy_to_target_button(&self, copy_keys: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
+        Some(
+            Button::new("compare-copy-to-target")
+                .primary()
+                .disabled(copy_keys == 0)
+                .label(format!("{} ({copy_keys})", i18n_compare(cx, "copy_to_target")))
+                .tooltip(i18n_compare(cx, "copy_to_target_hint"))
+                .on_click(cx.listener(|this, _, _window, cx| this.open_copy(cx)))
+                .into_any_element(),
+        )
+    }
+}
+
+/// None in the browser: the copy window is not there.
+#[cfg(target_family = "wasm")]
+impl ZedisCompareWindow {
+    fn copy_to_target_button(&self, _copy_keys: usize, _cx: &mut Context<Self>) -> Option<AnyElement> {
+        None
+    }
+}
+
+/// Close the comparison: its window on the desktop…
+#[cfg(not(target_family = "wasm"))]
+fn close_compare(window: &mut Window, _cx: &mut App) {
+    window.remove_window();
+}
+/// …its dialog in the browser, where the window is the page's own.
+#[cfg(target_family = "wasm")]
+fn close_compare(window: &mut Window, cx: &mut App) {
+    window.close_dialog(cx);
 }
 
 impl Focusable for ZedisCompareWindow {
@@ -537,11 +601,14 @@ impl Render for ZedisCompareWindow {
         let header = div()
             .px_6()
             .pt_6()
-            .child(
-                Label::new(i18n_compare(cx, "title"))
-                    .text_lg()
-                    .font_weight(gpui::FontWeight::BOLD),
-            )
+            // A dialog in the browser carries the title itself.
+            .when(OWN_TITLE, |this| {
+                this.child(
+                    Label::new(i18n_compare(cx, "title"))
+                        .text_lg()
+                        .font_weight(gpui::FontWeight::BOLD),
+                )
+            })
             .child(div().pt_1().child(Label::new(source_line).text_sm().text_color(muted)));
 
         let selected = self.target_server_id.clone();
@@ -712,22 +779,16 @@ impl Render for ZedisCompareWindow {
                         .label(i18n_compare(cx, "copy_names"))
                         .on_click(cx.listener(|this, _, window, cx| this.copy_key_names(window, cx))),
                 )
-                .child(
-                    Button::new("compare-copy-to-target")
-                        .primary()
-                        .disabled(copy_keys == 0)
-                        .label(format!("{} ({copy_keys})", i18n_compare(cx, "copy_to_target")))
-                        .tooltip(i18n_compare(cx, "copy_to_target_hint"))
-                        .on_click(cx.listener(|this, _, _window, cx| this.open_copy(cx))),
-                )
+                .children(self.copy_to_target_button(copy_keys, cx))
             });
 
         div()
             .size_full()
             .track_focus(&self.focus_handle)
-            .capture_key_down(cx.listener(|_this, event: &KeyDownEvent, window, _cx| {
+            .capture_key_down(cx.listener(|_this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
-                    window.remove_window();
+                    cx.stop_propagation();
+                    close_compare(window, cx);
                 }
             }))
             .child(
@@ -757,8 +818,34 @@ fn new_table(
     cx.new(|cx| TableState::new(table, window, cx))
 }
 
-/// Opens the compare window with this server / db as the source.
-pub fn open_compare_window(server_id: SharedString, server_name: SharedString, db: usize, cx: &mut App) {
+/// Open the comparison with this server / db as the source: a window of its
+/// own on the desktop…
+#[cfg(not(target_family = "wasm"))]
+pub fn open_compare(server_id: SharedString, server_name: SharedString, db: usize, _window: &mut Window, cx: &mut App) {
+    open_compare_window(server_id, server_name, db, cx);
+}
+
+/// …and in the browser a dialog over the page, which cannot open a second
+/// window: the same view, given a definite height to lay its lists out in.
+#[cfg(target_family = "wasm")]
+pub fn open_compare(server_id: SharedString, server_name: SharedString, db: usize, window: &mut Window, cx: &mut App) {
+    // One at a time, like Settings.
+    if window.has_active_dialog(cx) {
+        return;
+    }
+    let height = (window.viewport_size().height - px(COMPARE_DIALOG_CHROME))
+        .min(px(WINDOW_HEIGHT))
+        .max(px(COMPARE_DIALOG_MIN_HEIGHT));
+    let view = cx.new(|cx| ZedisCompareWindow::new(server_id, server_name, db, window, cx));
+    ZedisDialog::new(i18n_compare(cx, "title"))
+        .w(px(WINDOW_WIDTH))
+        .child(move || div().w_full().h(height).child(view.clone()).into_any_element())
+        .open(window, cx);
+}
+
+/// The compare window of the desktop app.
+#[cfg(not(target_family = "wasm"))]
+fn open_compare_window(server_id: SharedString, server_name: SharedString, db: usize, cx: &mut App) {
     let window_size = size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT));
     let title = i18n_compare(cx, "title");
     let options = with_app_identity(WindowOptions {

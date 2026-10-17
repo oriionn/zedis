@@ -23,11 +23,11 @@ use crate::{
     db::get_cmd_history_manager,
     error::Error,
     helpers::{
-        TerminalAction, get_download_dir, get_mono_font_family, get_or_create_config_dir, has_pubsub,
+        TerminalAction, get_download_dir, get_mono_font_family, get_or_create_config_dir,
         starts_with_ignore_ascii_case, write_file_atomic,
     },
     states::{
-        ServerEvent, ServerView, WriteGate, ZedisGlobalStore, ZedisServerState, i18n_common, i18n_terminal,
+        ServerEvent, WriteGate, ZedisGlobalStore, ZedisServerState, i18n_common, i18n_terminal,
         update_app_state_and_save_quiet,
     },
     views::{bridge_danger, confirm_dangerous_command},
@@ -98,19 +98,11 @@ fn refusal(cmd_name: &str, args: &[String]) -> Option<String> {
     let (reason, instead) = match cmd_name.to_ascii_uppercase().as_str() {
         "SUBSCRIBE" | "PSUBSCRIBE" | "SSUBSCRIBE" => (
             SUBSCRIBE_REJECT_MSG,
-            if has_pubsub() {
-                " Use Pubsub Mode instead (≡ › Observability › Pubsub Mode)."
-            } else {
-                " The web version has no Pub/Sub panel."
-            },
+            " Use Pubsub Mode instead (≡ › Observability › Pubsub Mode).",
         ),
         "MONITOR" => (
             MONITOR_REJECT_MSG,
-            if ServerView::Monitor.in_this_build() {
-                " Use Live Monitor instead (≡ › Observability › Live Monitor)."
-            } else {
-                " The web version has no Monitor panel."
-            },
+            " Use Live Monitor instead (≡ › Observability › Live Monitor).",
         ),
         "SYNC" | "PSYNC" => (REPLICATION_REJECT_MSG, ""),
         _ => return None,

@@ -62,6 +62,14 @@ use zedis_ui::{ZedisSelect, ZedisSelectEvent};
 /// page has the room and never shorter than a few rows.
 #[cfg(target_family = "wasm")]
 const SETTINGS_DIALOG_WIDTH: f32 = 760.;
+
+/// The recycle-bin row's wording: a local copy on the desktop…
+#[cfg(not(target_family = "wasm"))]
+const SOFT_DELETE_ROW: &str = "soft_delete";
+/// …a copy on the bridge, which everyone who sees the server sees, in the
+/// browser.
+#[cfg(target_family = "wasm")]
+const SOFT_DELETE_ROW: &str = "soft_delete_web";
 #[cfg(target_family = "wasm")]
 const SETTINGS_DIALOG_MAX_HEIGHT: f32 = 520.;
 #[cfg(target_family = "wasm")]
@@ -846,9 +854,7 @@ impl ZedisSettingEditor {
         });
     }
 
-    /// The recycle-bin switch — a row the browser build does not have (see
-    /// `ZedisAppState::soft_delete`).
-    #[cfg(not(target_family = "wasm"))]
+    /// The recycle-bin switch.
     fn render_soft_delete_row(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let switch = Switch::new("soft-delete")
             .checked(self.soft_delete)
@@ -859,11 +865,7 @@ impl ZedisSettingEditor {
                     state.set_soft_delete(enabled);
                 });
             }));
-        Some(Self::render_setting_row(cx, "soft_delete", switch).into_any_element())
-    }
-    #[cfg(target_family = "wasm")]
-    fn render_soft_delete_row(&self, _cx: &mut Context<Self>) -> Option<AnyElement> {
-        None
+        Some(Self::render_setting_row(cx, SOFT_DELETE_ROW, switch).into_any_element())
     }
 
     fn render_setting_row(cx: &Context<Self>, label_key: &str, input_element: impl IntoElement) -> impl IntoElement {

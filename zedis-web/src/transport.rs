@@ -28,8 +28,9 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use zedis_connection::{
-    BridgeError, BridgeErrorKind, BridgeReply, BridgeRequest, BridgeServerStore, BridgeTransport, RedisServer,
-    describe_commands, get_servers, set_account_read_only_on,
+    BridgeError, BridgeErrorKind, BridgeReply, BridgeRequest, BridgeServerStore, BridgeStorage, BridgeTransport,
+    BridgeTrashEntry, RedisServer, WatchBatch, WatchItem, WatchKind, WatchOpened, describe_commands, get_servers,
+    set_account_read_only_on,
 };
 
 /// Talks to one `zedis-bridge`.
@@ -373,6 +374,283 @@ impl BridgeTransport for HttpBridgeTransport {
             Ok(())
         })
     }
+    fn open_watch(
+        &self,
+        server_id: String,
+        db: usize,
+        kind: WatchKind,
+        channels: Vec<String>,
+        confirm: Option<String>,
+    ) -> BoxFuture<'static, Result<WatchOpened, BridgeError>> {
+        let client = self.client.clone();
+        let url = format!("{}/v1/watch", self.base_url);
+        Box::pin(async move {
+            let mut body = serde_json::json!({
+                "server": server_id,
+                "db": db,
+                "kind": kind.as_str(),
+                "channels": channels,
+            });
+            if let Some(confirm) = confirm {
+                body["confirm"] = serde_json::Value::String(confirm);
+            }
+            let body = body.to_string();
+            let (status, bytes) = Self::post(client, url, body).await?;
+            if status != 200 {
+                return Err(failure(status, &bytes));
+            }
+            #[derive(Deserialize)]
+            struct Failure {
+                node: String,
+                error: String,
+            }
+            #[derive(Deserialize)]
+            struct Body {
+                token: String,
+                #[serde(default)]
+                nodes: Vec<String>,
+                #[serde(default)]
+                failures: Vec<Failure>,
+            }
+            let body = serde_json::from_slice::<Body>(&bytes)
+                .map_err(|e| BridgeError::transport(format!("the bridge's watch reply is not JSON: {e}")))?;
+            Ok(WatchOpened {
+                token: body.token,
+                nodes: body.nodes,
+                failures: body.failures.into_iter().map(|f| (f.node, f.error)).collect(),
+            })
+        })
+    }
+
+    fn poll_watch(&self, token: String) -> BoxFuture<'static, Result<WatchBatch, BridgeError>> {
+        let client = self.client.clone();
+        let url = format!("{}/v1/watch/{token}/poll", self.base_url);
+        Box::pin(async move {
+            let body = serde_json::json!({ "wait_ms": WATCH_WAIT_MS }).to_string();
+            let (status, bytes) = Self::post(client, url, body).await?;
+            if status != 200 {
+                return Err(failure(status, &bytes));
+            }
+            watch_batch(&bytes)
+        })
+    }
+
+    fn release_watch(&self, token: String) {
+        let client = self.client.clone();
+        let url = format!("{}/v1/watch/{token}", self.base_url);
+        start_detached(async move {
+            // Idempotent on the bridge, and nobody is waiting to hear.
+            let _ = Self::call(client, "DELETE", url, String::new()).await;
+        });
+    }
+}
+
+/// The recycle bin and the Metrics history, kept on the bridge for the
+/// page (ADR 9, amended 2026-10-17).
+impl BridgeStorage for HttpBridgeTransport {
+    fn trash_put(&self, server_id: String, entry: BridgeTrashEntry) -> BoxFuture<'static, Result<(), BridgeError>> {
+        let client = self.client.clone();
+        let url = format!("{}/v1/servers/{server_id}/trash", self.base_url);
+        Box::pin(async move {
+            let body = serde_json::json!({
+                "key": entry.key,
+                "db": entry.db,
+                "pttl_ms": entry.pttl_ms,
+                "payload": B64.encode(&entry.payload),
+            })
+            .to_string();
+            let (status, bytes) = Self::post(client, url, body).await?;
+            if status != 200 {
+                return Err(failure(status, &bytes));
+            }
+            Ok(())
+        })
+    }
+
+    fn trash_list(&self, server_id: String) -> BoxFuture<'static, Result<Vec<BridgeTrashEntry>, BridgeError>> {
+        let client = self.client.clone();
+        let url = format!("{}/v1/servers/{server_id}/trash", self.base_url);
+        Box::pin(async move {
+            let (status, bytes) = Self::call(client, "GET", url, String::new()).await?;
+            if status != 200 {
+                return Err(failure(status, &bytes));
+            }
+            let entries = serde_json::from_slice::<Vec<TrashBody>>(&bytes)
+                .map_err(|e| BridgeError::transport(format!("the bin's listing is not JSON: {e}")))?;
+            entries.into_iter().map(TrashBody::into_entry).collect()
+        })
+    }
+
+    fn trash_get(
+        &self,
+        server_id: String,
+        id: String,
+    ) -> BoxFuture<'static, Result<Option<BridgeTrashEntry>, BridgeError>> {
+        let client = self.client.clone();
+        let url = format!("{}/v1/servers/{server_id}/trash/{id}", self.base_url);
+        Box::pin(async move {
+            let (status, bytes) = Self::call(client, "GET", url, String::new()).await?;
+            if status != 200 {
+                return Err(failure(status, &bytes));
+            }
+            let entry = serde_json::from_slice::<Option<TrashBody>>(&bytes)
+                .map_err(|e| BridgeError::transport(format!("the bin's entry is not JSON: {e}")))?;
+            entry.map(TrashBody::into_entry).transpose()
+        })
+    }
+
+    fn trash_remove(&self, server_id: String, id: String) -> BoxFuture<'static, Result<(), BridgeError>> {
+        let client = self.client.clone();
+        let url = format!("{}/v1/servers/{server_id}/trash/{id}", self.base_url);
+        Box::pin(async move {
+            let (status, bytes) = Self::call(client, "DELETE", url, String::new()).await?;
+            if status != 204 && status != 200 {
+                return Err(failure(status, &bytes));
+            }
+            Ok(())
+        })
+    }
+
+    fn metrics_put(
+        &self,
+        server_id: String,
+        ts_ms: i64,
+        sample: Vec<u8>,
+    ) -> BoxFuture<'static, Result<(), BridgeError>> {
+        let client = self.client.clone();
+        let url = format!("{}/v1/servers/{server_id}/metrics", self.base_url);
+        Box::pin(async move {
+            let sample = serde_json::from_slice::<serde_json::Value>(&sample)
+                .map_err(|e| BridgeError::transport(format!("the sample is not JSON: {e}")))?;
+            let body = serde_json::json!({ "ts_ms": ts_ms, "sample": sample }).to_string();
+            let (status, bytes) = Self::post(client, url, body).await?;
+            if status != 204 && status != 200 {
+                return Err(failure(status, &bytes));
+            }
+            Ok(())
+        })
+    }
+
+    fn metrics_since(
+        &self,
+        server_id: String,
+        from_ms: i64,
+        max_points: usize,
+    ) -> BoxFuture<'static, Result<Vec<Vec<u8>>, BridgeError>> {
+        let client = self.client.clone();
+        let url = format!(
+            "{}/v1/servers/{server_id}/metrics?from_ms={from_ms}&max_points={max_points}",
+            self.base_url
+        );
+        Box::pin(async move {
+            let (status, bytes) = Self::call(client, "GET", url, String::new()).await?;
+            if status != 200 {
+                return Err(failure(status, &bytes));
+            }
+            #[derive(Deserialize)]
+            struct Body {
+                samples: Vec<serde_json::Value>,
+            }
+            let body = serde_json::from_slice::<Body>(&bytes)
+                .map_err(|e| BridgeError::transport(format!("the metrics history is not JSON: {e}")))?;
+            body.samples
+                .iter()
+                .map(|sample| serde_json::to_vec(sample).map_err(|e| BridgeError::transport(format!("a sample: {e}"))))
+                .collect()
+        })
+    }
+}
+
+/// A bin entry as the bridge answers it.
+#[derive(Deserialize)]
+struct TrashBody {
+    id: String,
+    key: String,
+    #[serde(default)]
+    db: usize,
+    #[serde(default)]
+    pttl_ms: i64,
+    #[serde(default)]
+    deleted_at_ms: i64,
+    #[serde(default)]
+    deleted_by: String,
+    #[serde(default)]
+    payload: Option<String>,
+}
+
+impl TrashBody {
+    fn into_entry(self) -> Result<BridgeTrashEntry, BridgeError> {
+        let payload = match self.payload {
+            Some(payload) => B64
+                .decode(payload)
+                .map_err(|e| BridgeError::transport(format!("a bin payload is not base64: {e}")))?,
+            None => Vec::new(),
+        };
+        Ok(BridgeTrashEntry {
+            id: self.id,
+            key: self.key,
+            db: self.db,
+            pttl_ms: self.pttl_ms,
+            deleted_at_ms: self.deleted_at_ms,
+            deleted_by: self.deleted_by,
+            payload,
+        })
+    }
+}
+
+/// How long a watch's poll may wait on the bridge for something to arrive:
+/// under the bridge's own cap, so the bridge is what decides.
+const WATCH_WAIT_MS: u64 = 15_000;
+
+/// A poll's reply: Pub/Sub messages carry their payload in base64.
+fn watch_batch(bytes: &[u8]) -> Result<WatchBatch, BridgeError> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Item {
+        Message { channel: String, payload: String },
+        Line { node: String, line: String },
+    }
+    #[derive(Deserialize)]
+    struct Body {
+        #[serde(default)]
+        items: Vec<Item>,
+        #[serde(default)]
+        dropped: u64,
+        #[serde(default)]
+        closed: Option<String>,
+    }
+    let body = serde_json::from_slice::<Body>(bytes)
+        .map_err(|e| BridgeError::transport(format!("the bridge's poll reply is not JSON: {e}")))?;
+    let mut items = Vec::with_capacity(body.items.len());
+    for item in body.items {
+        items.push(match item {
+            Item::Message { channel, payload } => WatchItem::Message {
+                channel,
+                payload: B64
+                    .decode(payload)
+                    .map_err(|e| BridgeError::transport(format!("a message's payload is not base64: {e}")))?,
+            },
+            Item::Line { node, line } => WatchItem::Line { node, line },
+        });
+    }
+    Ok(WatchBatch {
+        items,
+        dropped: body.dropped,
+        closed: body.closed,
+    })
+}
+
+/// Start `work` and let it run unwatched: on the page's executor in the
+/// browser…
+#[cfg(target_family = "wasm")]
+fn start_detached(work: impl std::future::Future<Output = ()> + 'static) {
+    wasm_bindgen_futures::spawn_local(work);
+}
+/// …and on a thread of its own in a native build, which is this crate's
+/// tests and nothing else.
+#[cfg(not(target_family = "wasm"))]
+fn start_detached(work: impl std::future::Future<Output = ()> + Send + 'static) {
+    std::thread::spawn(move || futures::executor::block_on(work));
 }
 
 /// Saving the list from a browser is a diff, not a write.
@@ -696,5 +974,54 @@ mod tests {
         // transport never has to guess whether to add a separator.
         let joined = "http://host:7379///".trim_end_matches('/').to_string();
         assert_eq!(format!("{joined}/v1/exec"), "http://host:7379/v1/exec");
+    }
+
+    /// A poll's reply: a message's payload comes back as the bytes that
+    /// were published, a line as the node wrote it, and the end is said.
+    #[test]
+    fn a_poll_reply_is_read_back_into_messages_and_lines() {
+        let batch = watch_batch(
+            br#"{"items":[{"channel":"news","payload":"aGVsbG8g5L2g5aW9"},{"node":"10.0.0.5:6379","line":"1.0 [0 x] \"GET\" \"k\""}],"dropped":3,"closed":"time limit"}"#,
+        )
+        .expect("batch");
+        assert_eq!(
+            batch.items,
+            [
+                WatchItem::Message {
+                    channel: "news".to_string(),
+                    payload: "hello 你好".as_bytes().to_vec(),
+                },
+                WatchItem::Line {
+                    node: "10.0.0.5:6379".to_string(),
+                    line: r#"1.0 [0 x] "GET" "k""#.to_string(),
+                },
+            ]
+        );
+        assert_eq!((batch.dropped, batch.closed.as_deref()), (3, Some("time limit")));
+        assert_eq!(
+            watch_batch(br#"{"items":[],"dropped":0}"#).expect("empty"),
+            WatchBatch::default()
+        );
+        assert!(
+            watch_batch(br#"{"items":[{"channel":"c","payload":"!!"}]}"#).is_err(),
+            "not base64"
+        );
+    }
+
+    /// A bin entry: listed without its payload, fetched with it.
+    #[test]
+    fn a_bin_entry_is_read_with_or_without_its_payload() {
+        let listed: TrashBody = serde_json::from_str(
+            r#"{"id":"a1","key":"k","db":2,"pttl_ms":-1,"deleted_at_ms":7,"deleted_by":"alice","size":3}"#,
+        )
+        .expect("listed");
+        let entry = listed.into_entry().expect("entry");
+        assert_eq!(
+            (entry.id.as_str(), entry.db, entry.deleted_by.as_str()),
+            ("a1", 2, "alice")
+        );
+        assert!(entry.payload.is_empty());
+        let fetched: TrashBody = serde_json::from_str(r#"{"id":"a1","key":"k","payload":"AAEC"}"#).expect("fetched");
+        assert_eq!(fetched.into_entry().expect("entry").payload, [0, 1, 2]);
     }
 }

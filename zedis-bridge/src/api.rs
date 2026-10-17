@@ -19,13 +19,16 @@
 //! never sees a host, a password or a key (ADR 9).
 
 use crate::audit::{self, Audit, Event, Origin, ServerRef};
+use crate::metrics::MetricsStore;
 use crate::presence::{Client, ClientKey, ONLINE_WINDOW, Presence};
 use crate::static_files::{Representation, WebBuild};
+use crate::trash::{NewEntry, PutError, TrashStore};
+use crate::watch::{Batch, WatchError, WatchKind, Watches};
 use crate::{auth, mcp, policy, resp, session::Sessions, static_files};
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{ConnectInfo, Path, Request, State},
+    extract::{ConnectInfo, Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
@@ -67,6 +70,12 @@ pub struct AppState {
     pub mcp_calls: mcp::Limiter,
     /// Who has made a request in the last five minutes (`GET /v1/clients`).
     pub presence: Presence,
+    /// What the server pushes, held for the pages that asked (`/v1/watch`).
+    pub watches: Watches,
+    /// The browser build's recycle bin (`/v1/servers/{id}/trash`).
+    pub trash: TrashStore,
+    /// The browser build's Metrics history (`/v1/servers/{id}/metrics`).
+    pub metrics: MetricsStore,
 }
 
 /// The page and the API, under `state.base_path` when there is one.
@@ -90,9 +99,18 @@ pub fn router(state: AppState) -> Router {
         .route(&at("/v1/servers"), get(servers).post(add_server))
         .route(&at("/v1/servers/{id}"), delete(delete_server).put(update_server))
         .route(&at("/v1/servers/{id}/unlock"), post(unlock_writes).delete(lock_writes))
+        .route(&at("/v1/servers/{id}/trash"), get(list_trash).post(put_trash))
+        .route(&at("/v1/servers/{id}/metrics"), get(metrics_since).post(put_metrics))
+        .route(
+            &at("/v1/servers/{id}/trash/{entry}"),
+            get(get_trash).delete(remove_trash),
+        )
         .route(&at("/v1/exec"), post(exec))
         .route(&at("/v1/session"), post(open_session))
         .route(&at("/v1/session/{token}"), delete(close_session))
+        .route(&at("/v1/watch"), post(open_watch))
+        .route(&at("/v1/watch/{token}"), delete(close_watch))
+        .route(&at("/v1/watch/{token}/poll"), post(poll_watch))
         .route(&at("/v1/clients"), get(clients))
         // The MCP entry point (ADR 15): JSON-RPC over POST alone. GET is
         // the server-initiated stream this bridge does not offer, DELETE a
@@ -1038,8 +1056,206 @@ async fn delete_server(
     // Only a deletion that deleted something: the second of two asks for
     // the same id changed nothing.
     if let Some(server) = removed {
+        // What was deleted from it goes with it: nobody can restore into an
+        // entry that is not there, and the values were someone's.
+        let (trash, metrics) = (state.trash.clone(), state.metrics.clone());
+        let id = server.id.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            trash.remove_server(&id);
+            metrics.remove_server(&id);
+        })
+        .await;
         state.audit.record(&account, &origin, Event::ServerDeleted { server });
     }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct PutMetricsRequest {
+    ts_ms: i64,
+    /// The sample as the page holds it — JSON the bridge keeps unread.
+    sample: Box<serde_json::value::RawValue>,
+}
+
+#[derive(Deserialize)]
+struct MetricsQuery {
+    from_ms: i64,
+    #[serde(default = "default_points")]
+    max_points: usize,
+}
+
+fn default_points() -> usize {
+    crate::metrics::MAX_POINTS
+}
+
+#[derive(Serialize)]
+struct MetricsResponse {
+    samples: Vec<Box<serde_json::value::RawValue>>,
+}
+
+/// Keep a page's metrics sample: one a minute per server, whichever page
+/// sent it (`metrics.rs`). Any account that may see the server sends them —
+/// a read-only one's page beats like any other.
+async fn put_metrics(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<PutMetricsRequest>,
+) -> ApiResult<StatusCode> {
+    let account = authorize(&state, &headers, &mut Origin::new(peer, &headers))?;
+    let server = visible_server(&state.accounts, &id, &account)?;
+    let metrics = state.metrics.clone();
+    let kept = tokio::task::spawn_blocking(move || metrics.put(&server.id, req.ts_ms, req.sample.get()))
+        .await
+        .map_err(|e| ApiError::Upstream(e.to_string()))?;
+    match kept {
+        // Kept, or this minute already was: both are what the page wanted.
+        Ok(_) => Ok(StatusCode::NO_CONTENT),
+        Err(crate::metrics::PutError::Invalid(m)) => Err(ApiError::BadRequest(m)),
+        Err(crate::metrics::PutError::OutOfTime) => Err(ApiError::BadRequest(
+            "the sample's time is too far from the bridge's clock".to_string(),
+        )),
+        Err(crate::metrics::PutError::Io(m)) => {
+            Err(ApiError::Upstream(format!("the history could not be written: {m}")))
+        }
+    }
+}
+
+/// The server's samples since `from_ms`, thinned to `max_points`.
+async fn metrics_since(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<MetricsQuery>,
+) -> ApiResult<Json<MetricsResponse>> {
+    let account = authorize(&state, &headers, &mut Origin::new(peer, &headers))?;
+    let server = visible_server(&state.accounts, &id, &account)?;
+    let metrics = state.metrics.clone();
+    let samples = tokio::task::spawn_blocking(move || metrics.since(&server.id, query.from_ms, query.max_points))
+        .await
+        .map_err(|e| ApiError::Upstream(e.to_string()))?;
+    Ok(Json(MetricsResponse { samples }))
+}
+
+#[derive(Deserialize)]
+struct PutTrashRequest {
+    key: String,
+    #[serde(default)]
+    db: usize,
+    #[serde(default)]
+    pttl_ms: i64,
+    /// The key's `DUMP`, base64.
+    payload: String,
+}
+
+#[derive(Serialize)]
+struct TrashEntryBody {
+    #[serde(flatten)]
+    meta: crate::trash::Meta,
+    /// The `DUMP`, base64 — on a fetch of one entry, never in a listing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload: Option<String>,
+}
+
+/// What `id`'s recycle bin holds, newest first (`trash.rs`). Whoever may
+/// see the entry may see what was deleted from it, and by whom.
+async fn list_trash(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<TrashEntryBody>>> {
+    let account = authorize(&state, &headers, &mut Origin::new(peer, &headers))?;
+    let server = visible_server(&state.accounts, &id, &account)?;
+    let trash = state.trash.clone();
+    let metas = tokio::task::spawn_blocking(move || trash.list(&server.id))
+        .await
+        .map_err(|e| ApiError::Upstream(e.to_string()))?;
+    Ok(Json(
+        metas
+            .into_iter()
+            .map(|meta| TrashEntryBody { meta, payload: None })
+            .collect(),
+    ))
+}
+
+/// Keep a key the page is about to delete. The page took the `DUMP`
+/// through `/v1/exec`; this stores the bytes. An account that may not write
+/// to the entry could not delete from it either.
+async fn put_trash(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<PutTrashRequest>,
+) -> ApiResult<Json<TrashEntryBody>> {
+    let mut origin = Origin::new(peer, &headers);
+    let account = authorize_write(&state, &headers, &mut origin, "trash")?;
+    let server = visible_server(&state.accounts, &id, &account)?;
+    refuse_read_only_on(&state, &account, &server, &origin, "trash")?;
+    let payload = B64
+        .decode(req.payload)
+        .map_err(|e| ApiError::BadRequest(format!("the payload is not base64: {e}")))?;
+    let trash = state.trash.clone();
+    let meta = tokio::task::spawn_blocking(move || {
+        trash.put(
+            &server.id,
+            NewEntry {
+                key: &req.key,
+                db: req.db,
+                pttl_ms: req.pttl_ms,
+                deleted_by: &account,
+                payload: &payload,
+            },
+        )
+    })
+    .await
+    .map_err(|e| ApiError::Upstream(e.to_string()))?
+    .map_err(|e| match e {
+        PutError::TooLarge => {
+            ApiError::BadRequest(format!("a value over {} bytes is not kept", crate::trash::MAX_PAYLOAD))
+        }
+        PutError::Io(e) => ApiError::Upstream(format!("the bin could not be written: {e}")),
+    })?;
+    Ok(Json(TrashEntryBody { meta, payload: None }))
+}
+
+/// One deleted key with its `DUMP`, for the page to `RESTORE` through
+/// `/v1/exec`, where the account's role and the entry's lock decide;
+/// `null` once it is gone (restored by someone else, or a day old).
+async fn get_trash(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path((id, entry)): Path<(String, String)>,
+) -> ApiResult<Json<Option<TrashEntryBody>>> {
+    let account = authorize(&state, &headers, &mut Origin::new(peer, &headers))?;
+    let server = visible_server(&state.accounts, &id, &account)?;
+    let trash = state.trash.clone();
+    let found = tokio::task::spawn_blocking(move || trash.get(&server.id, &entry))
+        .await
+        .map_err(|e| ApiError::Upstream(e.to_string()))?;
+    Ok(Json(found.map(|(meta, payload)| TrashEntryBody {
+        meta,
+        payload: Some(B64.encode(payload)),
+    })))
+}
+
+/// Forget one deleted key: restored, or not wanted.
+async fn remove_trash(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path((id, entry)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
+    let mut origin = Origin::new(peer, &headers);
+    let account = authorize_write(&state, &headers, &mut origin, "trash")?;
+    let server = visible_server(&state.accounts, &id, &account)?;
+    refuse_read_only_on(&state, &account, &server, &origin, "trash")?;
+    let trash = state.trash.clone();
+    let _ = tokio::task::spawn_blocking(move || trash.remove(&server.id, &entry)).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1164,6 +1380,175 @@ async fn close_session(
     authorize(&state, &headers, &mut Origin::new(peer, &headers))?;
     state.sessions.close(&token).await;
     // Idempotent: closing a session that has already expired is not an error.
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct WatchRequest {
+    server: String,
+    #[serde(default)]
+    db: usize,
+    /// `patterns`, `sharded`, `keyspace_events` or `monitor`.
+    kind: String,
+    /// The patterns or channels, for a subscription.
+    #[serde(default)]
+    channels: Vec<String>,
+    /// The answer to the lock's question, for `MONITOR` on an entry whose
+    /// writes are locked: the entry's name on production.
+    #[serde(default)]
+    confirm: Option<String>,
+}
+
+#[derive(Serialize)]
+struct WatchResponse {
+    token: String,
+    /// The nodes a `MONITOR` reads, as `host:port`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    nodes: Vec<String>,
+    /// The nodes it could not start on.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    failures: Vec<WatchFailure>,
+}
+
+#[derive(Serialize)]
+struct WatchFailure {
+    node: String,
+    error: String,
+}
+
+#[derive(Deserialize, Default)]
+struct PollRequest {
+    /// How long to wait for something to arrive, capped at `watch::MAX_WAIT`.
+    #[serde(default)]
+    wait_ms: u64,
+}
+
+fn watch_error(e: WatchError) -> ApiError {
+    match e {
+        WatchError::TooMany => ApiError::BadRequest(format!(
+            "at most {} subscriptions and monitors at once; close one first",
+            crate::watch::MAX_PER_ACCOUNT
+        )),
+        // Gone (ended, swept, closed) answers like never there: a page that
+        // asks after the end is told so with `closed`, not with an error.
+        WatchError::Unknown => ApiError::BadRequest("no such watch".to_string()),
+        WatchError::Invalid(m) => ApiError::BadRequest(m),
+        WatchError::Upstream(m) => ApiError::Upstream(m),
+    }
+}
+
+/// Subscribe to channels or keyspace notifications, or start `MONITOR`, and
+/// get the token that polls for what arrives (`watch.rs`).
+///
+/// A subscription is observation, and a read-only account may watch: what
+/// it hears is what it could read. `MONITOR` is not — it shows every other
+/// client's commands, values and all, and slows the server — so it is a full
+/// account's; on an entry whose writes are locked it takes the lock's
+/// question answered (the entry's name on production) unless the write
+/// window is open (ADR 14); and every start is a line of the audit log.
+async fn open_watch(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<WatchRequest>,
+) -> ApiResult<Json<WatchResponse>> {
+    let mut origin = Origin::new(peer, &headers);
+    let account = authorize(&state, &headers, &mut origin)?;
+    let kind = WatchKind::from_name(&req.kind)
+        .ok_or_else(|| ApiError::BadRequest(format!("unknown watch kind {:?}", req.kind)))?;
+    let server = visible_server(&state.accounts, &req.server, &account)?;
+    let mut confirmed = None;
+    if kind == WatchKind::Monitor {
+        refuse_read_only_on(&state, &account, &server, &origin, "monitor")?;
+        if server.write_locked() && !state.unlocks.active(&account, &server.id) {
+            let strictness = zedis_connection::confirm_strictness(&server, &zedis_connection::DangerKind::WriteLocked);
+            let name = match strictness {
+                zedis_connection::ConfirmStrictness::Click => "click",
+                zedis_connection::ConfirmStrictness::TypeName => "type_name",
+            };
+            let answer = req.confirm.as_deref().map(str::trim).unwrap_or_default();
+            let answered = match strictness {
+                zedis_connection::ConfirmStrictness::Click => !answer.is_empty(),
+                zedis_connection::ConfirmStrictness::TypeName => answer == server.name.trim(),
+            };
+            if !answered {
+                return Err(ApiError::ConfirmationRequired {
+                    kind: zedis_connection::DangerKind::WriteLocked.i18n_key().to_string(),
+                    strictness: name,
+                });
+            }
+            confirmed = Some(name);
+        }
+    }
+    let opened = state
+        .watches
+        .open(&account, &server.id, req.db, kind, &req.channels)
+        .await;
+    if kind == WatchKind::Monitor {
+        state.audit.record(
+            &account,
+            &origin,
+            Event::Command(audit::CommandLine {
+                server: ServerRef::from(&server),
+                db: req.db,
+                command: "MONITOR".to_string(),
+                args: Vec::new(),
+                count: 1,
+                outcome: if confirmed.is_some() {
+                    audit::Outcome::Confirmed
+                } else {
+                    audit::Outcome::Allowed
+                },
+                kind: confirmed.map(|_| "write_locked"),
+                confirm: confirmed,
+                error: opened.as_ref().err().map(|e| format!("{e:?}")),
+            }),
+        );
+    }
+    let opened = opened.map_err(watch_error)?;
+    tracing::info!(account, kind = req.kind, server = server.name, "watch opened");
+    Ok(Json(WatchResponse {
+        token: opened.token,
+        nodes: opened.nodes,
+        failures: opened
+            .failures
+            .into_iter()
+            .map(|(node, error)| WatchFailure { node, error })
+            .collect(),
+    }))
+}
+
+/// What has arrived on a watch, waiting up to `wait_ms` for something to.
+async fn poll_watch(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+    body: Option<Json<PollRequest>>,
+) -> ApiResult<Json<Batch>> {
+    let account = authorize(&state, &headers, &mut Origin::new(peer, &headers))?;
+    let wait = std::time::Duration::from_millis(body.map(|Json(b)| b.wait_ms).unwrap_or_default());
+    match state.watches.poll(&token, &account, wait).await {
+        Ok(batch) => Ok(Json(batch)),
+        // Ended and gone, or swept while the page was away: it has ended,
+        // which is an answer the page acts on rather than an error.
+        Err(WatchError::Unknown) => Ok(Json(Batch {
+            closed: Some("gone".to_string()),
+            ..Batch::default()
+        })),
+        Err(e) => Err(watch_error(e)),
+    }
+}
+
+/// End a watch now. Idempotent, like closing a session.
+async fn close_watch(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+) -> ApiResult<StatusCode> {
+    let account = authorize(&state, &headers, &mut Origin::new(peer, &headers))?;
+    state.watches.close(&token, &account);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1881,6 +2266,9 @@ mod mcp_auth_tests {
             web_root: None,
             mcp_calls: mcp::Limiter::new(),
             presence: Presence::new(),
+            watches: Watches::new(),
+            trash: TrashStore::new(std::env::temp_dir().join("zedis-bridge-test-trash")),
+            metrics: MetricsStore::new(std::env::temp_dir().join("zedis-bridge-test-metrics")),
         }
     }
 

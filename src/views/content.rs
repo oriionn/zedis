@@ -29,8 +29,9 @@ use crate::{
 // the two local-file managers are the bridge's side of the wire (ADR 9).
 #[cfg(target_family = "wasm")]
 use crate::connection::{CommandStatus, ServerCommand};
+use crate::views::{ZedisKeyspaceNotifications, ZedisMonitor};
 #[cfg(not(target_family = "wasm"))]
-use crate::views::{ZedisKeyspaceNotifications, ZedisMonitor, ZedisProtoEditor, ZedisScriptEditor, ZedisTopology};
+use crate::views::{ZedisProtoEditor, ZedisScriptEditor, ZedisTopology};
 use gpui::{AnyView, App, Entity, FocusHandle, Focusable, Pixels, Subscription, Window, div, prelude::*, px};
 use gpui_kit::component::{
     resizable::{ResizableState, h_resizable, resizable_panel},
@@ -504,7 +505,6 @@ impl ZedisContent {
             ServerView::Slowlog => cx.new(|cx| ZedisSlowlogEditor::new(state, window, cx)).into(),
             ServerView::MemoryAnalysis => cx.new(|cx| ZedisMemoryAnalysis::new(state, window, cx)).into(),
             ServerView::Clients => cx.new(|cx| ZedisClientsManager::new(state, window, cx)).into(),
-            #[cfg(not(target_family = "wasm"))]
             ServerView::Monitor => cx.new(|cx| ZedisMonitor::new(state, window, cx)).into(),
             ServerView::Config => cx.new(|cx| ZedisConfigEditor::new(state, window, cx)).into(),
             ServerView::Acl => cx.new(|cx| ZedisAclManager::new(state, window, cx)).into(),
@@ -512,15 +512,14 @@ impl ZedisContent {
             ServerView::Functions => cx.new(|cx| ZedisFunctionEditor::new(state, window, cx)).into(),
             ServerView::LuaScripts => cx.new(|cx| ZedisLuaScriptLibrary::new(state, window, cx)).into(),
             ServerView::Persistence => cx.new(|cx| ZedisPersistence::new(state, window, cx)).into(),
-            #[cfg(not(target_family = "wasm"))]
             ServerView::KeyspaceNotifications => cx.new(|cx| ZedisKeyspaceNotifications::new(state, window, cx)).into(),
             #[cfg(not(target_family = "wasm"))]
             ServerView::Topology => cx.new(|cx| ZedisTopology::new(state, window, cx)).into(),
-            // A held socket, or administration that dials each node: the
-            // bridge's side of the wire (ADR 9). The same placeholder a
-            // missing command gets, in the same cache slot.
+            // Administration that dials each node: the bridge's side of the
+            // wire (ADR 9). The same placeholder a missing command gets, in
+            // the same cache slot.
             #[cfg(target_family = "wasm")]
-            ServerView::Monitor | ServerView::KeyspaceNotifications | ServerView::Topology => {
+            ServerView::Topology => {
                 let command = view.required_commands().first().copied().unwrap_or(ServerCommand::Info);
                 self.placeholders.insert(view);
                 cx.new(|_| ZedisUnsupportedPanel::new(state, view, command, CommandStatus::Missing))

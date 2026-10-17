@@ -63,20 +63,6 @@ pub const fn reads_clipboard_on_demand() -> bool {
     false
 }
 
-/// Pub/Sub — the editor's channel mode.
-///
-/// A subscription is a connection the server pushes on, and the bridge
-/// forwards requests and their replies (ADR 9); the mode's panel is not in
-/// the browser build.
-#[cfg(not(target_family = "wasm"))]
-pub const fn has_pubsub() -> bool {
-    true
-}
-#[cfg(target_family = "wasm")]
-pub const fn has_pubsub() -> bool {
-    false
-}
-
 /// The connection diagnostics window — a second window, which a page
 /// cannot open, and a probe the bridge does not run.
 #[cfg(not(target_family = "wasm"))]
@@ -99,7 +85,6 @@ mod tests {
     fn the_desktop_has_all_of_it() {
         assert!(has_file_dialogs());
         assert!(reads_clipboard_on_demand());
-        assert!(has_pubsub());
         assert!(has_connection_diagnostics());
     }
 }

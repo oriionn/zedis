@@ -61,17 +61,17 @@ pub fn first_connect_hint(cx: &App) -> SharedString {
     )
     .into()
 }
-/// The browser's first-connect toast. Not the desktop's: that one points at
-/// multi-database search, which the web build does not have — and this one
-/// has something of its own to say once: tags, notes, favorites and saved
-/// scripts live in the page's memory there until the bridge stores them, so
-/// a reload empties them, and nothing else in the UI says so.
+/// The browser's first-connect toast: the desktop's, and something of its
+/// own to say once — tags, notes, favorites and saved scripts live in the
+/// page's memory there until the bridge stores them, so a reload empties
+/// them, and nothing else in the UI says so.
 #[cfg(target_family = "wasm")]
 pub fn first_connect_hint(cx: &App) -> SharedString {
     let locale = cx.global::<ZedisGlobalStore>().read(cx).locale();
     t!(
         "hints.first_connect_web",
         palette = hot_key_label("command_palette").unwrap_or_default(),
+        search = hot_key_label("multi_search").unwrap_or_default(),
         locale = locale
     )
     .into()

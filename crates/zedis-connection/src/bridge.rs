@@ -377,6 +377,56 @@ pub struct BridgeReply {
     pub nodes: Vec<String>,
 }
 
+/// What a page asks the bridge to hold for it: a subscription, or
+/// `MONITOR` — what the server pushes, which a request and its reply cannot
+/// carry, so the bridge keeps it and the page polls (`/v1/watch`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchKind {
+    Patterns,
+    Sharded,
+    KeyspaceEvents,
+    Monitor,
+}
+
+impl WatchKind {
+    /// As the bridge's route names it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Patterns => "patterns",
+            Self::Sharded => "sharded",
+            Self::KeyspaceEvents => "keyspace_events",
+            Self::Monitor => "monitor",
+        }
+    }
+}
+
+/// A watch the bridge opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchOpened {
+    pub token: String,
+    /// The nodes a `MONITOR` reads, as `host:port`.
+    pub nodes: Vec<String>,
+    /// The nodes it could not start on, and why.
+    pub failures: Vec<(String, String)>,
+}
+
+/// One thing a watch heard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchItem {
+    Message { channel: String, payload: Vec<u8> },
+    Line { node: String, line: String },
+}
+
+/// What one poll of a watch answered.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WatchBatch {
+    pub items: Vec<WatchItem>,
+    /// Dropped on the bridge since the last poll: the page fell behind.
+    pub dropped: u64,
+    /// Why it has ended, once it has.
+    pub closed: Option<String>,
+}
+
 /// The HTTP (or any other) carrier for [`BridgeRequest`]s.
 ///
 /// Implemented outside this crate so that neither an HTTP client nor gpui
@@ -410,6 +460,26 @@ pub trait BridgeTransport: Send + Sync + 'static {
     /// asked for. The bridge forgets the login, not just the page: a cookie
     /// dropped on one side alone would still be good until it lapsed.
     fn sign_out(&self) -> BoxFuture<'static, Result<(), BridgeError>>;
+
+    /// Have the bridge subscribe, or start `MONITOR`, for this caller.
+    /// `confirm` answers the question the bridge asks before `MONITOR` on
+    /// an entry whose writes are locked (`ServerDb::confirmed`).
+    fn open_watch(
+        &self,
+        server_id: String,
+        db: usize,
+        kind: WatchKind,
+        channels: Vec<String>,
+        confirm: Option<String>,
+    ) -> BoxFuture<'static, Result<WatchOpened, BridgeError>>;
+
+    /// What has arrived on `token`, waiting a while for something to.
+    fn poll_watch(&self, token: String) -> BoxFuture<'static, Result<WatchBatch, BridgeError>>;
+
+    /// End it, without waiting to hear back: this is what dropping a
+    /// subscription calls, and a `Drop` cannot await. The bridge also ends
+    /// a watch nobody polls, which covers a tab that closed first.
+    fn release_watch(&self, token: String);
 }
 
 /// The transport every bridge connection in this process uses.
@@ -469,6 +539,66 @@ pub trait BridgeServerStore: Send + Sync + 'static {
 }
 
 static SERVER_STORE: OnceLock<Arc<dyn BridgeServerStore>> = OnceLock::new();
+
+/// A deleted key in the bridge's recycle bin.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BridgeTrashEntry {
+    /// The bridge's id for it; empty on one being put.
+    pub id: String,
+    pub key: String,
+    pub db: usize,
+    pub pttl_ms: i64,
+    pub deleted_at_ms: i64,
+    pub deleted_by: String,
+    /// The `DUMP`: sent with a put, answered by a fetch of one, empty in a
+    /// listing.
+    pub payload: Vec<u8>,
+}
+
+/// What the browser keeps on the bridge because a page keeps nothing past a
+/// reload: the recycle bin and the metrics history (ADR 9, amended
+/// 2026-10-17). The desktop keeps both in its own database.
+pub trait BridgeStorage: Send + Sync + 'static {
+    /// Keep a key that is about to be deleted.
+    fn trash_put(&self, server_id: String, entry: BridgeTrashEntry) -> BoxFuture<'static, Result<(), BridgeError>>;
+    /// The server's bin, newest first, without payloads.
+    fn trash_list(&self, server_id: String) -> BoxFuture<'static, Result<Vec<BridgeTrashEntry>, BridgeError>>;
+    /// One entry with its payload; `None` once it is gone.
+    fn trash_get(
+        &self,
+        server_id: String,
+        id: String,
+    ) -> BoxFuture<'static, Result<Option<BridgeTrashEntry>, BridgeError>>;
+    fn trash_remove(&self, server_id: String, id: String) -> BoxFuture<'static, Result<(), BridgeError>>;
+    /// Keep one metrics sample, as JSON; the bridge keeps one a minute.
+    fn metrics_put(
+        &self,
+        server_id: String,
+        ts_ms: i64,
+        sample: Vec<u8>,
+    ) -> BoxFuture<'static, Result<(), BridgeError>>;
+    /// The samples since `from_ms`, oldest first, thinned to `max_points`.
+    fn metrics_since(
+        &self,
+        server_id: String,
+        from_ms: i64,
+        max_points: usize,
+    ) -> BoxFuture<'static, Result<Vec<Vec<u8>>, BridgeError>>;
+}
+
+static STORAGE: OnceLock<Arc<dyn BridgeStorage>> = OnceLock::new();
+
+/// Install the bridge storage. The first call wins, as with the transport.
+pub fn set_bridge_storage(storage: Arc<dyn BridgeStorage>) {
+    if STORAGE.set(storage).is_err() {
+        tracing::warn!("the bridge storage was already installed; keeping the first");
+    }
+}
+
+/// The installed storage, or `None` — on the desktop, always.
+pub fn bridge_storage() -> Option<Arc<dyn BridgeStorage>> {
+    STORAGE.get().cloned()
+}
 
 /// Install the server-list sink. The first call wins, as with the transport.
 pub fn set_bridge_server_store(store: Arc<dyn BridgeServerStore>) {
@@ -880,6 +1010,23 @@ mod tests {
         fn sign_out(&self) -> BoxFuture<'static, Result<(), BridgeError>> {
             Box::pin(async { Ok(()) })
         }
+
+        fn open_watch(
+            &self,
+            _server_id: String,
+            _db: usize,
+            _kind: WatchKind,
+            _channels: Vec<String>,
+            _confirm: Option<String>,
+        ) -> BoxFuture<'static, Result<WatchOpened, BridgeError>> {
+            Box::pin(async { Err(BridgeError::transport("no watches here")) })
+        }
+
+        fn poll_watch(&self, _token: String) -> BoxFuture<'static, Result<WatchBatch, BridgeError>> {
+            Box::pin(async { Ok(WatchBatch::default()) })
+        }
+
+        fn release_watch(&self, _token: String) {}
     }
 
     /// The desktop dials Redis itself: with no transport installed there is

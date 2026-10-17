@@ -75,6 +75,9 @@ pub struct TrashMeta {
     pub db: usize,
     pub pttl_ms: i64,
     pub deleted_at_ms: i64,
+    /// Who deleted it, where a bin is shared (the browser build's, on the
+    /// bridge); the desktop's own bin is one person's and leaves it empty.
+    pub deleted_by: Option<String>,
 }
 
 /// One full trashed key (meta + `DUMP` payload).
@@ -150,6 +153,7 @@ pub fn list_trash_meta(server_id: &str) -> Result<Vec<TrashMeta>> {
             db: meta.db,
             pttl_ms: meta.pttl_ms,
             deleted_at_ms: meta.deleted_at_ms,
+            deleted_by: None,
         });
     }
     rows.reverse();

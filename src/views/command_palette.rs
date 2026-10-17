@@ -19,12 +19,11 @@
 
 use crate::connection::get_servers;
 use crate::db::get_favorites_manager;
-use crate::helpers::{ShortcutsAction, fuzzy_score_prepared, has_pubsub, prepare_fuzzy_query};
+use crate::helpers::{ShortcutsAction, fuzzy_score_prepared, prepare_fuzzy_query};
 use crate::states::{
     Route, ServerToolsAction, ServerView, SettingsAction, ZedisGlobalStore, ZedisServerState, command_status_label,
     i18n_command_palette, i18n_features, i18n_shortcuts,
 };
-#[cfg(not(target_family = "wasm"))]
 use crate::states::{i18n_status_bar, i18n_trash};
 use crate::views::placeholders::Placeholders;
 use gpui::{Context, FocusHandle, Focusable, KeyDownEvent, ScrollHandle, Window, div, prelude::*, px};
@@ -478,7 +477,7 @@ impl ZedisCommandPalette {
             command: PaletteCommand::OpenSettings,
         });
         // Pub/Sub mode only makes sense against a connection.
-        if conn.is_some() && has_pubsub() {
+        if conn.is_some() {
             let label = i18n_command_palette(cx, "cmd_pubsub");
             items.push(PaletteItem {
                 label: label.clone(),
@@ -489,18 +488,18 @@ impl ZedisCommandPalette {
             });
         }
         // The Tools menu's dialogs and windows, on the menu's terms (#221):
-        // the recycle bin, import, export and compare are desktop features,
-        // and import writes, so a read-only connection does not list it — a
-        // palette row cannot carry the menu's "disabled, and why".
+        // import and export are desktop features, and import writes, so a
+        // read-only connection does not list it — a palette row cannot carry
+        // the menu's "disabled, and why".
         if conn.is_some() {
             let mut tools: Vec<(gpui::SharedString, Option<gpui::SharedString>, ServerToolsAction)> = Vec::new();
+            tools.push((
+                i18n_trash(cx, "menu"),
+                Some(i18n_command_palette(cx, "recycle_bin_keywords")),
+                ServerToolsAction::Trash,
+            ));
             #[cfg(not(target_family = "wasm"))]
             {
-                tools.push((
-                    i18n_trash(cx, "menu"),
-                    Some(i18n_command_palette(cx, "recycle_bin_keywords")),
-                    ServerToolsAction::Trash,
-                ));
                 if !self.server_state.read(cx).readonly() {
                     tools.push((
                         i18n_status_bar(cx, "import_keys_menu"),
@@ -513,12 +512,12 @@ impl ZedisCommandPalette {
                     None,
                     ServerToolsAction::ExportKeys,
                 ));
-                tools.push((
-                    i18n_status_bar(cx, "compare_keys_menu"),
-                    None,
-                    ServerToolsAction::CompareKeys,
-                ));
             }
+            tools.push((
+                i18n_status_bar(cx, "compare_keys_menu"),
+                None,
+                ServerToolsAction::CompareKeys,
+            ));
             tools.push((
                 format!("{}…", i18n_features(cx, "dialog_title")).into(),
                 None,

@@ -25,17 +25,17 @@
 //! 4. Pause (drop inbound), export filtered rows as CSV, rate hint.
 
 use crate::connection::{
-    Capability, ChannelSubscription, ServerDb, SubscribeKind, config_get_one, config_set, get_server,
+    Capability, ChannelSubscription, DangerKind, ServerDb, SubscribeKind, config_get_one, config_set, get_server,
 };
 use crate::error::Error;
 use crate::helpers::channel;
-use crate::helpers::{build_csv, get_mono_font_family, now_clock};
+use crate::helpers::{build_csv, get_mono_font_family, has_file_dialogs, now_clock};
 use crate::states::{
     ServerEvent, ServerView, ZedisGlobalStore, ZedisServerState, back_to_editor_tooltip, content_area_width,
     dialog_button_props, i18n_common, i18n_keyspace_notifications,
 };
 use crate::views::unavailable_chip;
-use crate::views::{export_to_file, open_key_in_editor};
+use crate::views::{bridge_asks_first, confirm_dangerous_command, export_to_file, open_key_in_editor};
 use ahash::AHashSet;
 use gpui::{App, Edges, Entity, SharedString, Subscription, Task, Window, div, prelude::*, px};
 use gpui_kit::component::{
@@ -51,8 +51,8 @@ use gpui_kit::component::{
 };
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::time::Instant;
 use tracing::error;
+use web_time::Instant;
 use zedis_ui::{
     CellRenderer, CellStyle, CellStyleProvider, RowPredicate, TextColumn, ZedisDialog, ZedisTextTable, fitted_table,
     help_popover,
@@ -596,12 +596,25 @@ impl ZedisKeyspaceNotifications {
         if server_id.is_empty() {
             return;
         }
-        let high_risk = get_server(&server_id).map(|s| s.is_high_risk_tag()).unwrap_or(false);
         let flags = flags.to_string();
+        if let Some(kind) = bridge_asks_first(DangerKind::ConfigSet)
+            && let Ok(server) = get_server(&server_id)
+        {
+            let db = self.server_state.read(cx).db();
+            let line = format!("CONFIG SET notify-keyspace-events {flags}");
+            let editor = cx.entity().downgrade();
+            confirm_dangerous_command(&server, db, &kind, Some(&line), window, cx, move |_window, cx| {
+                if let Some(editor) = editor.upgrade() {
+                    editor.update(cx, |this, cx| this.run_enable(&flags, true, cx));
+                }
+            });
+            return;
+        }
+        let high_risk = get_server(&server_id).map(|s| s.is_high_risk_tag()).unwrap_or(false);
         if high_risk {
             self.open_enable_confirm(&flags, window, cx);
         } else {
-            self.run_enable(&flags, cx);
+            self.run_enable(&flags, false, cx);
         }
     }
 
@@ -621,7 +634,7 @@ impl ZedisKeyspaceNotifications {
             .button_props(dialog_button_props(cx).ok_text(i18n_common(cx, "confirm")))
             .on_ok(move |_, window, cx| {
                 if let Some(editor) = editor.upgrade() {
-                    editor.update(cx, |this, cx| this.run_enable(&flags, cx));
+                    editor.update(cx, |this, cx| this.run_enable(&flags, false, cx));
                 }
                 window.close_dialog(cx);
                 true
@@ -629,14 +642,19 @@ impl ZedisKeyspaceNotifications {
             .open(window, cx);
     }
 
-    fn run_enable(&mut self, flags: &str, cx: &mut Context<Self>) {
-        let server_id = self.server_state.read(cx).server_id().to_string();
-        let db = self.server_state.read(cx).db();
+    /// `CONFIG SET notify-keyspace-events`; `confirmed` when the bridge's
+    /// question was asked and answered ([`bridge_asks_first`]).
+    fn run_enable(&mut self, flags: &str, confirmed: bool, cx: &mut Context<Self>) {
+        let at = if confirmed {
+            self.server_state.read(cx).at_confirmed()
+        } else {
+            self.server_state.read(cx).at()
+        };
         let entity = cx.entity().downgrade();
         let flags = flags.to_string();
         cx.spawn(async move |_handle, cx| {
             let task = cx.background_spawn(async move {
-                config_set(&ServerDb::new(&*server_id, db), "notify-keyspace-events", &flags).await?;
+                config_set(&at, "notify-keyspace-events", &flags).await?;
                 Ok::<_, Error>(())
             });
             let result = task.await;
@@ -869,15 +887,17 @@ impl ZedisKeyspaceNotifications {
                                 .on_click(cx.listener(|this, _, _w, cx| this.toggle_pause(cx))),
                         )
                     })
-                    .child(
-                        Button::new("ksn-export")
-                            .ghost()
-                            .small()
-                            .label(i18n_keyspace_notifications(cx, "export"))
-                            .tooltip(i18n_keyspace_notifications(cx, "export_tooltip"))
-                            .disabled(total == 0)
-                            .on_click(cx.listener(|this, _, _w, cx| this.export_csv(cx))),
-                    )
+                    .when(has_file_dialogs(), |this| {
+                        this.child(
+                            Button::new("ksn-export")
+                                .ghost()
+                                .small()
+                                .label(i18n_keyspace_notifications(cx, "export"))
+                                .tooltip(i18n_keyspace_notifications(cx, "export_tooltip"))
+                                .disabled(total == 0)
+                                .on_click(cx.listener(|this, _, _w, cx| this.export_csv(cx))),
+                        )
+                    })
                     .child(action_btn)
                     .child(
                         Button::new("ksn-clear")

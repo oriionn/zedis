@@ -13,19 +13,18 @@
 // limitations under the License.
 
 //! What only the desktop app has on its root: the updater, the crash report
-//! the previous run left behind, window placement and the multi-database
-//! search palette. The browser build has none of it (ADR 9), and this module
+//! the previous run left behind and window placement. The browser build has
+//! none of it (ADR 9), and this module
 //! is how it leaves them out — `mod desktop` is gated once in `root.rs`, and
 //! the state lives in one struct so `Zedis` carries one gated field instead
 //! of a gate per field, per initialiser and per method (CLAUDE.md, *Desktop
 //! first*).
 
 use super::*;
-use gpui::{FocusHandle, Subscription};
+use gpui::Subscription;
 
 /// The desktop-only state of the [`Zedis`] root.
 pub(crate) struct DesktopOnly {
-    pub(crate) multi_search: Entity<ZedisMultiSearch>,
     /// A newer release found by a check, awaiting its prompt. Consumed in
     /// `render` (which has the `Window` needed to open the dialog).
     pub(crate) pending_update: Option<UpdateInfo>,
@@ -48,12 +47,11 @@ pub(crate) struct DesktopOnly {
 }
 
 impl DesktopOnly {
-    pub(super) fn new(page_focus: FocusHandle, window: &mut Window, cx: &mut Context<Zedis>) -> Self {
+    pub(super) fn new(window: &mut Window, cx: &mut Context<Zedis>) -> Self {
         let activation = cx.observe_window_activation(window, |zedis, window, cx| {
             zedis.on_window_activation(window.is_window_active(), cx);
         });
         Self {
-            multi_search: cx.new(|cx| ZedisMultiSearch::new(page_focus, window, cx)),
             pending_update: None,
             update_task: None,
             download_task: None,
@@ -400,11 +398,5 @@ impl Zedis {
             .await;
         });
         self.save_task = Some(task);
-    }
-
-    /// Toggle the multi-database search palette (⌘⇧F). Global handler so
-    /// it works regardless of focus, matching the command palette.
-    pub fn toggle_multi_search(&mut self, cx: &mut Context<Self>) {
-        self.desktop.multi_search.update(cx, |palette, cx| palette.toggle(cx));
     }
 }

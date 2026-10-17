@@ -1181,3 +1181,53 @@ to a consumer, and everything under *Per-crate cost* below.
 
 Steps 2 and 3 before step 4 is the point: a bridge bug and a wasm toolchain bug
 should never be diagnosed at the same time.
+
+## Amended 2026-10-17 — the panels the browser lacked
+
+Every panel §5 and the gates after it left out of the page, except Topology,
+Sentinel administration and the file-based ones (migration, the script
+viewers, the proto editor, connection diagnostics), is in the browser now.
+Three kinds of change did it, and only the last two add to the bridge.
+
+**Gates that had outlived their reason.** Multi-database key search and
+prefix compare were native-only because `scan` once was; both are per
+`(server, db)` reads through the bridge like the key tree's. The search is
+the same overlay; compare, which is a window on the desktop, is the same
+view in a dialog (`open_compare`, as Settings is), without "Copy to target",
+which hands off to the migration window.
+
+**What the server pushes: `/v1/watch`.** A subscribed connection cannot be a
+session — a RESP2 push that arrives between requests is dropped or handed to
+the next request on it — so the bridge holds the desktop's own
+`ChannelSubscription` / `open_monitor_feeds`, buffers what arrives, and the
+page polls with a request that waits until something has come or 20s pass
+(`zedis-bridge/src/watch.rs`; the page's side is `subscription_web.rs`, the
+same types the panels already loop on). A long poll and not a server-sent
+stream or a WebSocket: it is a plain request and reply, which every reverse
+proxy in front of a bridge already forwards. Like `session` and `fanout` it
+is a transport concept — what it carries is whatever the server pushes, so
+the protocol does not grow with the panels. A watch is its account's alone,
+bounded (10,000 items, the oldest dropped and counted), ended by the page
+on drop, by the bridge after 60s unpolled, and for `MONITOR` after ten
+minutes. A subscription is observation and a read-only account may watch;
+`MONITOR` shows every client's commands, values and all, so it is a full
+account's, needs the lock's answer on a write-locked entry outside its
+window (not the window itself, which would open writes to watch), and every
+start is an audit line (`MONITOR` joined `is_administration_command`).
+
+**Storage a page cannot keep.** The recycle bin and the Metrics history were
+left out because a page's store is its memory. The bridge keeps both, as
+files beside its others: `bridge-trash/<server>/` (a deleted key's `DUMP`,
+24h, at most 1,000 entries / 128 MiB a server, the oldest making room) and
+`bridge-metrics/<server>/<day>.jsonl` (one sample a minute per server, a
+week). Both stay byte stores: the page takes the `DUMP` and sends the
+`RESTORE` through `/v1/exec`, where role, lock and audit decide as for any
+write, and it sends the sample it already drew — the bridge never asks
+Redis anything for either. A bin is the server's, not the deleter's: whoever
+sees the entry sees what was deleted from it and by whom (they could read
+it before). The page reaches both through `BridgeStorage`, installed beside
+the transport, behind `states/trash_store.rs` and `stat/persist_web.rs`.
+
+This is the first feature-shaped surface on the bridge since ADR 10 kept
+features out of it, and it is kept to what a page cannot do itself: hold a
+socket, and remember.

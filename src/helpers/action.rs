@@ -478,13 +478,12 @@ fn web_twin(keystroke: &str) -> Option<String> {
 const fn listed_in_reference(_hot_key: &HotKey) -> bool {
     true
 }
-/// In the browser, not the ones that cannot work there: a feature the web
-/// build leaves out (multi-database search), and a chord the browser keeps
-/// for itself — listing ⌘N as "New key" teaches people to open a browser
-/// window.
+/// In the browser, not the ones that cannot work there: a chord the browser
+/// keeps for itself — listing ⌘N as "New key" teaches people to open a
+/// browser window.
 #[cfg(target_family = "wasm")]
 fn listed_in_reference(hot_key: &HotKey) -> bool {
-    hot_key.id != "multi_search" && !browser_keeps(hot_key.effective())
+    !browser_keeps(hot_key.effective())
 }
 
 /// A chord a page never receives: ⌘N ⌘T ⌘W ⌘Q on a Mac, the Ctrl forms
@@ -695,9 +694,8 @@ pub fn hot_key_table() -> &'static [HotKey] {
 /// in a tooltip, a placeholder, a toast or the welcome card. Read from the
 /// table, never written at the call site: the hints used to spell out the
 /// defaults and kept saying ⌘K after `keybindings.toml` had moved the
-/// palette. `None` where the chord does not work — in the browser, ⌘N and
-/// multi-database search ([`listed_in_reference`]) — so a hint never
-/// teaches a dead key.
+/// palette. `None` where the chord does not work — in the browser, ⌘N
+/// ([`listed_in_reference`]) — so a hint never teaches a dead key.
 pub fn hot_key_label(id: &str) -> Option<String> {
     hot_key_label_in(id, keybinding_overrides())
 }

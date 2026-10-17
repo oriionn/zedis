@@ -16,7 +16,7 @@
 use crate::connection::classify_guarded_script;
 use crate::{
     connection::{ConfirmStrictness, DangerKind, RedisServer, WRITE_UNLOCK_SECS, confirm_strictness},
-    states::{ZedisGlobalStore, dialog_button_props, escalate_dangerous_body, i18n_common},
+    states::{WriteGate, ZedisGlobalStore, dialog_button_props, escalate_dangerous_body, i18n_common},
 };
 use gpui::{App, Context, Entity, SharedString, Subscription, Window, div, prelude::*};
 use gpui_kit::component::{
@@ -45,6 +45,52 @@ pub fn bridge_danger(_server: &RedisServer, _cmd_name: &str) -> Option<DangerKin
 #[cfg(target_family = "wasm")]
 pub fn bridge_danger(server: &RedisServer, cmd_name: &str) -> Option<DangerKind> {
     classify_guarded_script(server, cmd_name)
+}
+
+/// What the bridge asks about a command a panel sends from a button of its
+/// own — `CONFIG SET` from the keyspace panel's Enable — where the desktop
+/// trusts the press: the bridge confirms `kind` every time, so the page asks
+/// first and sends the answer with the command.
+#[cfg(not(target_family = "wasm"))]
+pub fn bridge_asks_first(_kind: DangerKind) -> Option<DangerKind> {
+    None
+}
+/// In the browser: always.
+#[cfg(target_family = "wasm")]
+pub fn bridge_asks_first(kind: DangerKind) -> Option<DangerKind> {
+    Some(kind)
+}
+
+/// What the bridge says about `MONITOR` before it starts, where it says
+/// more than the desktop — `MONITOR` shows every client's commands, values
+/// and all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BridgeMonitor {
+    /// Start it.
+    Go,
+    /// Ask this first and start with the answer: the lock's question on an
+    /// entry whose writes are locked and not open (ADR 14).
+    Ask(DangerKind),
+    /// Not for this account: one that may not write anywhere here.
+    Refused,
+}
+
+/// The desktop's own `MONITOR` asks nothing more.
+#[cfg(not(target_family = "wasm"))]
+pub fn bridge_monitor(_strict_readonly: bool, _gate: WriteGate) -> BridgeMonitor {
+    BridgeMonitor::Go
+}
+/// In the browser: refused to a read-only account (or ACL user), the
+/// lock's question while the entry is locked.
+#[cfg(target_family = "wasm")]
+pub fn bridge_monitor(strict_readonly: bool, gate: WriteGate) -> BridgeMonitor {
+    if strict_readonly {
+        BridgeMonitor::Refused
+    } else if gate == WriteGate::Locked {
+        BridgeMonitor::Ask(DangerKind::WriteLocked)
+    } else {
+        BridgeMonitor::Go
+    }
 }
 
 /// Open a confirm dialog before running a dangerous Redis command.

@@ -33,11 +33,14 @@ mod api;
 mod audit;
 mod auth;
 mod mcp;
+mod metrics;
 mod policy;
 mod presence;
 mod resp;
 mod session;
 mod static_files;
+mod trash;
+mod watch;
 mod webhook;
 
 use auth::{Accounts, USERS_ENV, USERS_FILE_ENV};
@@ -373,6 +376,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let unlock_sweeper = unlocks.clone();
     let presence = presence::Presence::new();
     let presence_sweeper = presence.clone();
+    let watches = watch::Watches::new();
+    let watch_sweeper = watches.clone();
+    let trash = trash::TrashStore::new(get_or_create_config_dir()?.join("bridge-trash"));
+    let trash_sweeper = trash.clone();
+    let metrics = metrics::MetricsStore::new(get_or_create_config_dir()?.join("bridge-metrics"));
+    let metrics_pruner = metrics.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         loop {
@@ -395,6 +404,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let ended = unlock_sweeper.sweep();
             if ended > 0 {
                 tracing::info!(ended, "swept ended write windows");
+            }
+            let purger = trash_sweeper.clone();
+            match tokio::task::spawn_blocking(move || purger.purge_expired()).await {
+                Ok(0) => {}
+                Ok(purged) => tracing::info!(purged, "purged day-old recycle bin entries"),
+                Err(e) => tracing::warn!(error = %e, "the recycle bin purge did not finish"),
+            }
+            let pruner = metrics_pruner.clone();
+            if let Ok(pruned) = tokio::task::spawn_blocking(move || pruner.prune()).await
+                && pruned > 0
+            {
+                tracing::info!(pruned, "pruned week-old metrics days");
+            }
+            let ended = watch_sweeper.sweep();
+            if ended > 0 {
+                tracing::info!(ended, live = watch_sweeper.len(), "swept idle and expired watches");
             }
             let dropped = sweeper.sweep().await;
             if dropped > 0 {
@@ -448,6 +473,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         web_root,
         mcp_calls: mcp::Limiter::new(),
         presence,
+        watches,
+        trash,
+        metrics,
     });
     // With the peer's address, which the audit log records beside whatever
     // a proxy wrote in `X-Forwarded-For`.

@@ -14,12 +14,13 @@
 
 #[cfg(target_family = "wasm")]
 use crate::assets::Assets;
-// What only the desktop's menu lists: multi-database search, and the
-// application's own chores below it (settings, updates, logs, diagnostics).
+// What only the desktop's menu lists: the application's own chores (settings,
+// updates, logs, diagnostics).
 #[cfg(not(target_family = "wasm"))]
-use crate::helpers::{DiagnosticsAction, MultiSearchAction, is_app_store_build};
-use crate::helpers::{MemuAction, PaletteAction, ShortcutsAction, UpdateAction, get_mono_font_family};
-#[cfg(not(target_family = "wasm"))]
+use crate::helpers::{DiagnosticsAction, is_app_store_build};
+use crate::helpers::{
+    MemuAction, MultiSearchAction, PaletteAction, ShortcutsAction, UpdateAction, get_mono_font_family,
+};
 use crate::states::i18n_shortcuts;
 use crate::{
     assets::CustomIconName,
@@ -211,9 +212,7 @@ impl ZedisTitleBar {
         );
         // Multi-database search (⌘⇧F): the only global overlay without a
         // click entry — surfaced here beside the palette for parity and
-        // discoverability. Label reuses the shortcuts-panel string. A
-        // desktop feature: the browser build has no handler for the action.
-        #[cfg(not(target_family = "wasm"))]
+        // discoverability. Label reuses the shortcuts-panel string.
         let this = this.menu_with_icon(
             i18n_shortcuts(cx, "multi_search"),
             Icon::new(IconName::Search),

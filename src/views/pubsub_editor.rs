@@ -24,7 +24,7 @@ use crate::error::Error;
 /// Channels button opens the channel browser (`PUBSUB CHANNELS`), so a channel
 /// can be picked instead of typed.
 use crate::helpers::channel;
-use crate::helpers::{build_csv, format_duration, get_mono_font_family, now_datetime, unix_ts};
+use crate::helpers::{build_csv, format_duration, get_mono_font_family, has_file_dialogs, now_datetime, unix_ts};
 use crate::states::{ZedisGlobalStore, ZedisServerState, detect_and_decode, i18n_common, i18n_pubsub_editor};
 use crate::views::{ChannelPick, export_to_file, open_pubsub_channels_dialog, unavailable_chip};
 use gpui::{Entity, SharedString, Subscription, Task, Window, div, prelude::*, px};
@@ -608,32 +608,37 @@ impl ZedisPubsubEditor {
             })
             .child(channels_control)
             .child(subscribe_btn)
-            .child(div().w(px(1.)).h_5().flex_shrink_0().bg(cx.theme().border))
-            .child(
-                Button::new("pubsub-export-btn")
-                    .outline()
-                    .icon(Icon::new(CustomIconName::Download))
-                    .label(i18n_common(cx, "export"))
-                    .disabled(!has_messages)
-                    .dropdown_menu(move |menu, _window, cx| {
-                        let csv = exporter.clone();
-                        let json = exporter.clone();
-                        menu.item(
-                            PopupMenuItem::new(i18n_common(cx, "export_csv")).on_click(move |_, _window, cx| {
-                                if let Some(editor) = csv.upgrade() {
-                                    editor.update(cx, |this, cx| this.export_csv(cx));
-                                }
+            // Exports save a file: not where the build has no save dialog.
+            .when(has_file_dialogs(), |this| {
+                this.child(div().w(px(1.)).h_5().flex_shrink_0().bg(cx.theme().border))
+                    .child(
+                        Button::new("pubsub-export-btn")
+                            .outline()
+                            .icon(Icon::new(CustomIconName::Download))
+                            .label(i18n_common(cx, "export"))
+                            .disabled(!has_messages)
+                            .dropdown_menu(move |menu, _window, cx| {
+                                let csv = exporter.clone();
+                                let json = exporter.clone();
+                                menu.item(PopupMenuItem::new(i18n_common(cx, "export_csv")).on_click(
+                                    move |_, _window, cx| {
+                                        if let Some(editor) = csv.upgrade() {
+                                            editor.update(cx, |this, cx| this.export_csv(cx));
+                                        }
+                                    },
+                                ))
+                                .item(
+                                    PopupMenuItem::new(i18n_common(cx, "export_json")).on_click(
+                                        move |_, _window, cx| {
+                                            if let Some(editor) = json.upgrade() {
+                                                editor.update(cx, |this, cx| this.export_json(cx));
+                                            }
+                                        },
+                                    ),
+                                )
                             }),
-                        )
-                        .item(
-                            PopupMenuItem::new(i18n_common(cx, "export_json")).on_click(move |_, _window, cx| {
-                                if let Some(editor) = json.upgrade() {
-                                    editor.update(cx, |this, cx| this.export_json(cx));
-                                }
-                            }),
-                        )
-                    }),
-            )
+                    )
+            })
             .child(
                 Button::new("pubsub-clear-btn")
                     .outline()

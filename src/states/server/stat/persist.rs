@@ -13,11 +13,9 @@
 // limitations under the License.
 
 //! The Metrics panel's history on disk: one sample a minute per server, a
-//! week of them. Desktop only. In the browser "disk" is the page's memory
-//! (`mem_store`), so a stored sample would be gone with the next reload —
-//! the 1h / 24h / 7d windows could only ever show "since this page opened",
-//! which the Live window already does. The browser build therefore neither
-//! writes samples nor offers those windows (`MetricsRange::offered`).
+//! week of them. Desktop only: in the browser "disk" is the page's memory
+//! (`mem_store`), gone at the next reload, so the page sends its samples to
+//! the bridge instead (`persist_web.rs`).
 
 use super::*;
 use crate::db::{insert_metrics_sample, prune_metrics_history};

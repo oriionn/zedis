@@ -51,13 +51,12 @@ use crate::states::{
 use crate::states::{WindowPlacement, save_app_state};
 #[cfg(not(target_family = "wasm"))]
 use crate::views::{
-    ExportSource, ZedisMultiSearch, open_compare_window, open_connection_diagnostics, open_migration_export_window,
-    open_migration_import_window,
+    ExportSource, open_connection_diagnostics, open_migration_export_window, open_migration_import_window,
 };
 use crate::views::{
-    ZedisCommandPalette, ZedisContent, ZedisRecentKeysPalette, ZedisShortcutsOverlay, ZedisSidebar, ZedisTitleBar,
-    confirm_dangerous_command, confirm_remove_server, open_features_dialog, open_new_group_dialog, open_settings,
-    open_trash_dialog,
+    ZedisCommandPalette, ZedisContent, ZedisMultiSearch, ZedisRecentKeysPalette, ZedisShortcutsOverlay, ZedisSidebar,
+    ZedisTitleBar, confirm_dangerous_command, confirm_remove_server, open_compare, open_features_dialog,
+    open_new_group_dialog, open_settings, open_trash_dialog,
 };
 use crate::window_setup::*;
 use gpui::{
@@ -167,12 +166,14 @@ pub struct Zedis {
     pending_new_tab: Option<(String, usize)>,
     command_palette: Entity<ZedisCommandPalette>,
     recent_keys_palette: Entity<ZedisRecentKeysPalette>,
+    /// The multi-database search palette (⌘⇧F).
+    multi_search: Entity<ZedisMultiSearch>,
     shortcuts_overlay: Entity<ZedisShortcutsOverlay>,
     title_bar: Option<Entity<ZedisTitleBar>>,
     theme_update_task: Option<Task<()>>,
     _clear_expired_cache: Option<Task<()>>,
     /// Everything only the desktop app has — the updater, the crash report,
-    /// the multi-database search palette. One gated field, so the browser
+    /// window placement. One gated field, so the browser
     /// build drops the feature set in one place (`root/desktop.rs`).
     #[cfg(not(target_family = "wasm"))]
     pub(crate) desktop: DesktopOnly,
@@ -266,8 +267,9 @@ impl Zedis {
             cx.new(|cx| ZedisCommandPalette::new(server_state.clone(), page_focus.clone(), window, cx));
         let recent_keys_palette =
             cx.new(|cx| ZedisRecentKeysPalette::new(server_state, page_focus.clone(), window, cx));
+        let multi_search = cx.new(|cx| ZedisMultiSearch::new(page_focus.clone(), window, cx));
         #[cfg(not(target_family = "wasm"))]
-        let desktop = DesktopOnly::new(page_focus.clone(), window, cx);
+        let desktop = DesktopOnly::new(window, cx);
         let shortcuts_overlay = cx.new(|cx| ZedisShortcutsOverlay::new(page_focus, cx));
         let global_state = cx.global::<ZedisGlobalStore>().state();
         cx.subscribe(&global_state, |this, _server_state, event, cx| {
@@ -419,6 +421,7 @@ impl Zedis {
             pending_new_tab: None,
             command_palette,
             recent_keys_palette,
+            multi_search,
             #[cfg(not(target_family = "wasm"))]
             desktop,
             shortcuts_overlay,
@@ -576,9 +579,7 @@ impl Zedis {
         });
         self.recent_keys_palette
             .update(cx, |palette, _| palette.bind_to_tab(server_state, page_focus.clone()));
-        #[cfg(not(target_family = "wasm"))]
-        self.desktop
-            .multi_search
+        self.multi_search
             .update(cx, |search, _| search.bind_to_page(page_focus.clone()));
         self.shortcuts_overlay
             .update(cx, |overlay, _| overlay.bind_to_page(page_focus));
@@ -854,6 +855,12 @@ impl Zedis {
 
     /// Toggle the recent-keys Quick Open palette (⌘P). Global handler so
     /// it works regardless of focus, matching the command palette.
+    /// Toggle the multi-database search palette (⌘⇧F). Global handler so
+    /// it works regardless of focus, matching the command palette.
+    pub fn toggle_multi_search(&mut self, cx: &mut Context<Self>) {
+        self.multi_search.update(cx, |palette, cx| palette.toggle(cx));
+    }
+
     pub fn toggle_recent_keys_palette(&mut self, cx: &mut Context<Self>) {
         self.recent_keys_palette.update(cx, |palette, cx| palette.toggle(cx));
     }
@@ -1108,10 +1115,8 @@ impl Render for Zedis {
             .child(self.command_palette.clone())
             // Recent-keys Quick Open (⌘P); same overlay model.
             .child(self.recent_keys_palette.clone());
-        // Multi-database search fans out to several servers at once, which
-        // is the bridge's side of the wire (ADR 9).
-        #[cfg(not(target_family = "wasm"))]
-        let content = content.child(self.desktop.multi_search.clone());
+        // Multi-database search (⌘⇧F); same overlay model.
+        let content = content.child(self.multi_search.clone());
         // Keyboard-shortcuts reference overlay (⌘/), same overlay
         // model as the palette; rendered last so it stacks on top.
         let content = content.child(self.shortcuts_overlay.clone());
@@ -1191,7 +1196,7 @@ impl Render for Zedis {
             .on_action(cx.listener(|this, _: &DiagnosticsAction, window, cx| {
                 this.export_diagnostics(window, cx);
             }))
-            .on_action(cx.listener(move |_this, e: &ServerToolsAction, window, cx| {
+            .on_action(cx.listener(move |this, e: &ServerToolsAction, window, cx| {
                 let target = match e {
                     ServerToolsAction::Monitor => ServerView::Monitor,
                     ServerToolsAction::Config => ServerView::Config,
@@ -1223,7 +1228,7 @@ impl Render for Zedis {
                         };
                         let kind = if all { DangerKind::FlushAll } else { DangerKind::FlushDb };
                         let line = if all { "FLUSHALL" } else { "FLUSHDB" };
-                        let server_state = _this.active_content().read(cx).server_state();
+                        let server_state = this.active_content().read(cx).server_state();
                         let db = server_state.read(cx).db();
                         confirm_dangerous_command(&server, db, &kind, Some(line), window, cx, move |_window, cx| {
                             server_state.update(cx, |state, cx| {
@@ -1235,13 +1240,13 @@ impl Render for Zedis {
                     // A dialog, not a sub-route: keeps whatever view is
                     // active underneath.
                     ServerToolsAction::Trash => {
-                        let server_state = _this.active_content().read(cx).server_state();
+                        let server_state = this.active_content().read(cx).server_state();
                         open_trash_dialog(server_state, window, cx);
                         return;
                     }
                     // The probed command matrix of the active tab's connection.
                     ServerToolsAction::Capabilities => {
-                        let server_state = _this.active_content().read(cx).server_state();
+                        let server_state = this.active_content().read(cx).server_state();
                         open_features_dialog(server_state, window, cx);
                         return;
                     }
@@ -1266,7 +1271,7 @@ impl Render for Zedis {
                     // not on a tool route — flip the mode, then land on the
                     // editor view so the panel is visible.
                     ServerToolsAction::PubsubMode => {
-                        let server_state = _this.active_content().read(cx).server_state();
+                        let server_state = this.active_content().read(cx).server_state();
                         server_state.update(cx, |state, cx| state.change_channel_mode(cx));
                         cx.update_global::<ZedisGlobalStore, ()>(|store, cx| {
                             store.update(cx, |state, cx| state.go_to_view(ServerView::Editor, cx));
@@ -1276,18 +1281,15 @@ impl Render for Zedis {
                     // Compare a prefix of the active server / db with another
                     // server / db, in its own window.
                     ServerToolsAction::CompareKeys => {
-                        #[cfg(not(target_family = "wasm"))]
-                        {
-                            let Some((server_id, db)) =
-                                cx.global::<ZedisGlobalStore>().read(cx).selected_server().cloned()
-                            else {
-                                return;
-                            };
-                            let server_name: gpui::SharedString = get_server(&server_id)
-                                .map(|s| s.name.into())
-                                .unwrap_or_else(|_| server_id.clone().into());
-                            open_compare_window(server_id.into(), server_name, db, cx);
-                        }
+                        let Some((server_id, db)) = cx.global::<ZedisGlobalStore>().read(cx).selected_server().cloned()
+                        else {
+                            return;
+                        };
+                        let server_name: gpui::SharedString = get_server(&server_id)
+                            .map(|s| s.name.into())
+                            .unwrap_or_else(|_| server_id.clone().into());
+                        this.keep_focus_in_page(window, cx);
+                        open_compare(server_id.into(), server_name, db, window, cx);
                         return;
                     }
                     // Export every key loaded in the active tab's tree (a
@@ -1303,7 +1305,7 @@ impl Render for Zedis {
                             let server_name: gpui::SharedString = get_server(&server_id)
                                 .map(|s| s.name.into())
                                 .unwrap_or_else(|_| server_id.clone().into());
-                            let mut keys: Vec<gpui::SharedString> = _this
+                            let mut keys: Vec<gpui::SharedString> = this
                                 .active_content()
                                 .read(cx)
                                 .server_state()

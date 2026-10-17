@@ -13,9 +13,12 @@
 // limitations under the License.
 
 use super::RedisServerStatus;
+#[cfg(target_family = "wasm")]
+use crate::connection::bridge_storage;
 use crate::connection::{
     ReplicationInfo, ServerDb, dbsize, forget_client, get_server, heartbeat_probe, master_infos, slow_logs,
 };
+#[cfg(not(target_family = "wasm"))]
 use crate::db::list_metrics_samples;
 use crate::helpers::{pacing, unix_ts, unix_ts_millis};
 use crate::states::{
@@ -31,11 +34,16 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use web_time::Instant;
 
-// Writing the Metrics history — see the module for why the browser has none.
+// Writing the Metrics history: to the local database on the desktop, to
+// the bridge in the browser, whose page keeps nothing past a reload.
 #[cfg(not(target_family = "wasm"))]
 mod persist;
+#[cfg(target_family = "wasm")]
+mod persist_web;
 #[cfg(not(target_family = "wasm"))]
 use persist::maybe_persist_metrics;
+#[cfg(target_family = "wasm")]
+use persist_web::maybe_persist_metrics;
 
 #[derive(Debug, Default, Clone)]
 pub struct RedisKeySpaceStats {
@@ -184,9 +192,39 @@ pub fn get_metrics_cache() -> &'static MetricsCache {
 /// Load persisted history for the trailing `duration_ms`, decimated to at
 /// most `max_points` samples. Blocking (redb read + JSON decode) — call
 /// from a background task, not the render path.
-pub fn load_persisted_metrics(server_id: &str, duration_ms: i64, max_points: usize) -> Vec<RedisMetrics> {
+#[cfg(not(target_family = "wasm"))]
+pub async fn load_persisted_metrics(server_id: &str, duration_ms: i64, max_points: usize) -> Vec<RedisMetrics> {
     let from_ms = unix_ts_millis() - duration_ms;
     let raw = match list_metrics_samples(server_id, from_ms) {
+        Ok(raw) => raw,
+        Err(e) => {
+            warn!(error = %e, "load metrics history failed");
+            return vec![];
+        }
+    };
+    let samples: Vec<RedisMetrics> = raw
+        .iter()
+        .filter_map(|bytes| serde_json::from_slice(bytes).ok())
+        .collect();
+    decimate_samples(samples, max_points)
+}
+
+/// The most samples the bridge hands back in one read (its
+/// `metrics::MAX_POINTS`); a CSV export of the whole range asks for more.
+#[cfg(target_family = "wasm")]
+const MAX_BRIDGE_POINTS: usize = 2_000;
+
+/// The browser's history is the bridge's, which thins it on the way out.
+#[cfg(target_family = "wasm")]
+pub async fn load_persisted_metrics(server_id: &str, duration_ms: i64, max_points: usize) -> Vec<RedisMetrics> {
+    let Some(storage) = bridge_storage() else {
+        return vec![];
+    };
+    let from_ms = unix_ts_millis() - duration_ms;
+    let raw = match storage
+        .metrics_since(server_id.to_string(), from_ms, max_points.min(MAX_BRIDGE_POINTS))
+        .await
+    {
         Ok(raw) => raw,
         Err(e) => {
             warn!(error = %e, "load metrics history failed");
@@ -1066,7 +1104,6 @@ impl ZedisServerState {
                         }
                         if has_info {
                             METRICS_CACHE.add_metrics(&server_id_clone, info.metrics);
-                            #[cfg(not(target_family = "wasm"))]
                             maybe_persist_metrics(&server_id_clone, info.metrics, cx);
                         }
                         if refresh_dbsize && this.last_dbsize_refreshed_at == dbsize_stamp {

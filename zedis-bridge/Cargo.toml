@@ -39,7 +39,10 @@ base64 = { workspace = true }
 rust-embed = { version = "8.12.0", default-features = false, features = ["include-exclude"] }
 redis = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
+# `raw_value`: a metrics sample is kept as the JSON the page sent (`metrics.rs`),
+# not parsed into a tree and written out again. Asked for here rather than left
+# to feature unification, which happens to turn it on today.
+serde_json = { workspace = true, features = ["raw_value"] }
 # `fs` for reading the web build's files off disk; the workspace set has
 # rt/net/macros/time but not fs, and a blocking read in an async handler is
 # not an improvement.
@@ -55,3 +58,8 @@ toml.workspace = true
 # The audit webhook's POSTs (`--audit-webhook`): the blocking client the
 # desktop already uses, run off the async workers, on the same rustls + ring.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+# Paused time for the watch tests (`watch.rs`): a long poll's twenty seconds
+# and `MONITOR`'s ten minutes, without waiting for them.
+tokio = { workspace = true, features = ["test-util"] }

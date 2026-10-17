@@ -24,8 +24,7 @@ use crate::helpers::has_file_dialogs;
 /// would be misleading there), find/browse on the left, act on the right.
 /// Each id is also its description key in the `shortcuts.` section, as in
 /// the ⌘/ overlay. A shortcut that does not work here drops out through
-/// [`hot_key_label`]: in the browser, ⌘N (a browser window) and
-/// multi-database search (not in the web build).
+/// [`hot_key_label`]: in the browser, ⌘N (a browser window).
 pub(super) const FIND_HINTS: [&str; 4] = ["search", "command_palette", "recent_keys", "multi_search"];
 pub(super) const ACT_HINTS: [&str; 4] = ["new_key", "reload_keys", "terminal", "keyboard_shortcuts"];
 
@@ -516,7 +515,6 @@ impl ZedisEditor {
                 });
                 editor.clone().into_any_element()
             }
-            #[cfg(not(target_family = "wasm"))]
             KeyType::Channel => {
                 self.reset_editors(KeyType::Channel);
                 let editor = self.pubsub_editor.get_or_insert_with(|| {
@@ -524,18 +522,6 @@ impl ZedisEditor {
                     cx.new(|cx| ZedisPubsubEditor::new(self.server_state.clone(), window, cx))
                 });
                 editor.clone().into_any_element()
-            }
-            // A subscription holds a socket open for as long as the panel is
-            // up; the browser has no socket to hold (ADR 9).
-            #[cfg(target_family = "wasm")]
-            KeyType::Channel => {
-                use rust_i18n::t;
-                self.reset_editors(KeyType::Channel);
-                let locale = cx.global::<ZedisGlobalStore>().read(cx).locale().to_string();
-                div()
-                    .p_4()
-                    .child(t!("features.panel_unavailable_title", panel = "Pub/Sub", locale = &locale).to_string())
-                    .into_any_element()
             }
             KeyType::TimeSeries => {
                 self.reset_editors(KeyType::TimeSeries);

@@ -12,10 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::states::{command_status_label, i18n_features};
-// The recycle bin's menu entry is the desktop's: the browser keeps no bin.
-#[cfg(not(target_family = "wasm"))]
-use crate::states::i18n_trash;
+use crate::states::{command_status_label, i18n_features, i18n_trash};
 use crate::{
     assets::CustomIconName,
     connection::{
@@ -24,8 +21,7 @@ use crate::{
     },
     constants::STATUS_BAR_HEIGHT,
     helpers::{
-        client_counts, format_lag_bytes, get_mono_font_family, group_thousands, has_pubsub, pacing, resolve_tag_chip,
-        with_hot_key,
+        client_counts, format_lag_bytes, get_mono_font_family, group_thousands, pacing, resolve_tag_chip, with_hot_key,
     },
     states::{
         ConnectionErrorKind, ConnectionHealth, ErrorMessage, RedisKeySpaceStats, ReplicaInfo, SOFT_WRAP_MAX_BYTES,
@@ -906,17 +902,13 @@ impl ZedisStatusBar {
             ),
             // Pub/Sub is the editor suite's channel mode, mirrored here next
             // to its observability siblings.
-            has_pubsub()
-                .then(|| {
-                    tool(
-                        i18n_key_tree(cx, "pubsub_mode"),
-                        Icon::new(CustomIconName::Rss),
-                        ServerToolsAction::PubsubMode,
-                        &[],
-                        false,
-                    )
-                })
-                .flatten(),
+            tool(
+                i18n_key_tree(cx, "pubsub_mode"),
+                Icon::new(CustomIconName::Rss),
+                ServerToolsAction::PubsubMode,
+                &[],
+                false,
+            ),
             tool(
                 i18n_server_info(cx, "title"),
                 Icon::new(IconName::Info),
@@ -975,13 +967,8 @@ impl ZedisStatusBar {
         .flatten()
         .collect();
 
-        #[cfg(not(target_family = "wasm"))]
         let mut data: Vec<ToolEntry> = Vec::new();
-        #[cfg(target_family = "wasm")]
-        let data: Vec<ToolEntry> = Vec::new();
-        // The local recycle bin — a dialog, and not in the browser, which
-        // keeps no bin (`ZedisAppState::soft_delete`).
-        #[cfg(not(target_family = "wasm"))]
+        // The recycle bin — the local database's, or the bridge's.
         data.extend(tool(
             i18n_trash(cx, "menu"),
             Icon::new(CustomIconName::FileXCorner),
@@ -989,9 +976,8 @@ impl ZedisStatusBar {
             &[],
             false,
         ));
-        // Import, export and compare each open a window of their own, over
-        // files or a second server: desktop features, like the bin above.
-        // With all four out, the browser's menu has no "Keys & Data" group.
+        // Import and export each open a window of their own over files:
+        // desktop features, like the bin above.
         #[cfg(not(target_family = "wasm"))]
         data.extend(
             [
@@ -1011,17 +997,18 @@ impl ZedisStatusBar {
                     &[],
                     false,
                 ),
-                tool(
-                    i18n_status_bar(cx, "compare_keys_menu"),
-                    Icon::new(CustomIconName::GitCompareArrows),
-                    ServerToolsAction::CompareKeys,
-                    &[],
-                    false,
-                ),
             ]
             .into_iter()
             .flatten(),
         );
+        // A window on the desktop, a dialog in the browser.
+        data.extend(tool(
+            i18n_status_bar(cx, "compare_keys_menu"),
+            Icon::new(CustomIconName::GitCompareArrows),
+            ServerToolsAction::CompareKeys,
+            &[],
+            false,
+        ));
 
         let mut admin: Vec<ToolEntry> = [
             // CONFIG GET is the one managed clouds most often take away.

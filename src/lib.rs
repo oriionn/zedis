@@ -28,14 +28,14 @@ use crate::db::LuaScriptManager;
 use crate::db::{ProtoManager, ScriptManager, init_database, open_failure_kind};
 #[cfg(not(target_family = "wasm"))]
 use crate::helpers::{
-    BuildVariant, CrashContext, InstanceMessage, InstanceRole, MultiSearchAction, UpdateAction, claim_instance,
-    get_or_create_config_dir, init_logger, install_panic_hook, instance_messages, is_app_store_build, logs_dir,
-    platform_info, post_instance_message, register_editing_rules, register_extra_languages, release_instance,
-    set_configured_proxy, take_instance_server, take_pending_crash,
+    BuildVariant, CrashContext, InstanceMessage, InstanceRole, UpdateAction, claim_instance, get_or_create_config_dir,
+    init_logger, install_panic_hook, instance_messages, is_app_store_build, logs_dir, platform_info,
+    post_instance_message, register_editing_rules, register_extra_languages, release_instance, set_configured_proxy,
+    take_instance_server, take_pending_crash,
 };
 use crate::helpers::{
-    MemuAction, PaletteAction, RecentKeysAction, ShortcutsAction, apply_fonts, load_keybinding_overrides, new_hot_keys,
-    set_datetime_prefs, take_config_recoveries, with_app_identity,
+    MemuAction, MultiSearchAction, PaletteAction, RecentKeysAction, ShortcutsAction, apply_fonts,
+    load_keybinding_overrides, new_hot_keys, set_datetime_prefs, take_config_recoveries, with_app_identity,
 };
 use crate::states::{
     GlobalEvent, HINT_WELCOME, NotificationAction, Route, ServerView, ZedisAppState, ZedisGlobalStore,
@@ -652,15 +652,12 @@ pub fn launch(cx: &mut App, app_state: ZedisAppState) {
                     }
                 });
                 // Global (focus-independent) ⌘⇧F — multi-database search.
-                #[cfg(not(target_family = "wasm"))]
-                {
-                    let weak_zedis_multi_search = zedis_view.downgrade();
-                    cx.on_action(move |_: &MultiSearchAction, cx: &mut App| {
-                        if let Some(view) = weak_zedis_multi_search.upgrade() {
-                            view.update(cx, |zedis, cx| zedis.toggle_multi_search(cx));
-                        }
-                    });
-                }
+                let weak_zedis_multi_search = zedis_view.downgrade();
+                cx.on_action(move |_: &MultiSearchAction, cx: &mut App| {
+                    if let Some(view) = weak_zedis_multi_search.upgrade() {
+                        view.update(cx, |zedis, cx| zedis.toggle_multi_search(cx));
+                    }
+                });
                 // Global (focus-independent) ⌘/ handler — same
                 // rationale as the ⌘K handler above; also the target
                 // of the command palette's "Keyboard Shortcuts" row.

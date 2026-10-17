@@ -33,11 +33,10 @@ use crate::connection::{
     rename_key, run_key_op, scan_page, server_supports, set_keys_ttl, set_ttl_matching, snapshot_key,
 };
 use crate::db::{
-    TRASH_MAX_BULK_KEYS, TRASH_MAX_PAYLOAD, TRASH_MAX_VALUE_MEMORY, TRASH_RETENTION_MS, TrashEntry,
-    get_favorites_manager, get_key_metadata_manager, get_recent_keys_manager, insert_trash_entry, purge_trash,
-    recent_keys_scope,
+    TRASH_MAX_BULK_KEYS, TRASH_MAX_PAYLOAD, TRASH_MAX_VALUE_MEMORY, TrashEntry, get_favorites_manager,
+    get_key_metadata_manager, get_recent_keys_manager, recent_keys_scope,
 };
-use crate::states::{QueryMode, ZedisGlobalStore, i18n_key_tree, i18n_status_bar};
+use crate::states::{QueryMode, ZedisGlobalStore, i18n_key_tree, i18n_status_bar, trash_store};
 use crate::{
     connection::{Capability, ServerDb},
     error::Error,
@@ -131,17 +130,17 @@ struct ScanPrefixPage {
     epoch: u64,
 }
 
-/// Best-effort stash of a key into the local recycle bin before deletion:
-/// `DUMP` + `PTTL`, framed into the redb trash table (24h retention).
-/// Every failure path only warns and falls through to a permanent delete —
-/// the bin must never turn a working delete into an error. Oversized
-/// payloads (> [`TRASH_MAX_PAYLOAD`]) are skipped: the bin is a safety net
-/// for fat-finger deletes, not a big-key backup store.
+/// Best-effort stash of a key into the recycle bin before deletion: its
+/// `DUMP` and `PTTL`, kept for 24h by `trash_store` — the local database,
+/// or the bridge. Every failure path only warns and falls through to a
+/// permanent delete — the bin must never turn a working delete into an
+/// error.
+/// Oversized payloads (> [`TRASH_MAX_PAYLOAD`]) are skipped: the bin is a
+/// safety net for fat-finger deletes, not a big-key backup store.
 async fn stash_key_to_trash(at: &ServerDb, key: &str) {
     let Some(snapshot) = snapshot_key(at, key, TRASH_MAX_VALUE_MEMORY, TRASH_MAX_PAYLOAD).await else {
         return;
     };
-    let server_id = at.server_id();
     let entry = TrashEntry {
         key: key.to_string(),
         db: at.db(),
@@ -149,13 +148,8 @@ async fn stash_key_to_trash(at: &ServerDb, key: &str) {
         deleted_at_ms: unix_ts_millis(),
         payload: snapshot.payload,
     };
-    if let Err(e) = insert_trash_entry(server_id, &entry) {
+    if let Err(e) = trash_store::stash(at.server_id(), entry).await {
         warn!(key, error = %e, "trash: stash failed, deleting permanently");
-        return;
-    }
-    // Opportunistic cleanup so the bin never outgrows its retention.
-    if let Err(e) = purge_trash(server_id, unix_ts_millis() - TRASH_RETENTION_MS) {
-        warn!(error = %e, "trash: purge failed");
     }
 }
 

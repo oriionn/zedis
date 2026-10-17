@@ -21,7 +21,6 @@ mod charts;
 mod client_dialogs;
 mod clients_manager;
 mod command_palette;
-#[cfg(not(target_family = "wasm"))]
 mod compare_window;
 mod config_doc;
 mod config_editor;
@@ -45,7 +44,6 @@ mod jsonpath_completion;
 mod key_op_dialog;
 mod key_tag_dialog;
 mod key_tree;
-#[cfg(not(target_family = "wasm"))]
 mod keyspace_notifications;
 mod kv_table;
 mod list_editor;
@@ -54,9 +52,7 @@ mod memory_analysis;
 mod metrics;
 #[cfg(not(target_family = "wasm"))]
 mod migration_window;
-#[cfg(not(target_family = "wasm"))]
 mod monitor;
-#[cfg(not(target_family = "wasm"))]
 mod multi_search;
 mod panel_poll;
 mod persistence;
@@ -65,7 +61,6 @@ mod probabilistic_editor;
 #[cfg(not(target_family = "wasm"))]
 mod proto_editor;
 mod pubsub_channels_dialog;
-#[cfg(not(target_family = "wasm"))]
 mod pubsub_editor;
 mod recent_keys_palette;
 mod score_filter_dialog;
@@ -115,7 +110,9 @@ pub use config_editor::ZedisConfigEditor;
 pub use connection_diagnostics::open_connection_diagnostics;
 pub use content::ZedisContent;
 pub use copy_key_dialog::ZedisCopyKeyDialog;
-pub use danger_confirm::{bridge_danger, confirm_dangerous_command, confirm_delete_key};
+pub use danger_confirm::{
+    BridgeMonitor, bridge_asks_first, bridge_danger, bridge_monitor, confirm_dangerous_command, confirm_delete_key,
+};
 pub use editor::ZedisEditor;
 pub use expire_at_dialog::ZedisExpireAtDialog;
 pub(crate) use export::{export_filename, export_to_file, export_to_file_global};
@@ -133,7 +130,6 @@ pub use key_op_dialog::{
 };
 pub use key_tag_dialog::{OnTagDialogDone, open_batch_key_tag_dialog, open_key_tag_dialog};
 pub use key_tree::ZedisKeyTree;
-#[cfg(not(target_family = "wasm"))]
 pub use keyspace_notifications::ZedisKeyspaceNotifications;
 pub use kv_table::ZedisKvTable;
 pub use list_editor::ZedisListEditor;
@@ -149,8 +145,7 @@ pub use timeseries_explorer::ZedisTimeSeriesExplorer;
 pub(crate) use charts::{
     ChartParams, ChartSeries, ValueLabel, make_bar_chart, make_line_chart, make_series_chart, value_range,
 };
-#[cfg(not(target_family = "wasm"))]
-pub use compare_window::open_compare_window;
+pub use compare_window::open_compare;
 pub use features_dialog::open_features_dialog;
 pub use metrics::ZedisMetrics;
 pub(crate) use metrics::format_timestamp_ms;
@@ -158,16 +153,13 @@ pub(crate) use metrics::format_timestamp_ms;
 pub use migration_window::{
     CopyPreset, ExportSource, open_migration_copy_window, open_migration_export_window, open_migration_import_window,
 };
-#[cfg(not(target_family = "wasm"))]
 pub use monitor::ZedisMonitor;
-#[cfg(not(target_family = "wasm"))]
 pub use multi_search::ZedisMultiSearch;
 pub use persistence::ZedisPersistence;
 pub use probabilistic_editor::ZedisProbabilisticEditor;
 #[cfg(not(target_family = "wasm"))]
 pub use proto_editor::ZedisProtoEditor;
 pub use pubsub_channels_dialog::{ChannelPick, open_pubsub_channels_dialog};
-#[cfg(not(target_family = "wasm"))]
 pub use pubsub_editor::ZedisPubsubEditor;
 pub use recent_keys_palette::ZedisRecentKeysPalette;
 #[cfg(not(target_family = "wasm"))]

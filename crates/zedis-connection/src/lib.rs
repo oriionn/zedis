@@ -52,7 +52,6 @@ mod bridge;
 #[cfg(not(target_family = "wasm"))]
 mod cluster_ops;
 mod command;
-#[cfg(not(target_family = "wasm"))]
 mod compare;
 mod config;
 mod conn;
@@ -73,7 +72,6 @@ mod logical_copy;
 mod lua_script;
 mod manager;
 mod module_ops;
-#[cfg(not(target_family = "wasm"))]
 mod multi_search;
 mod panel_ops;
 mod probabilistic;
@@ -92,6 +90,9 @@ mod stream_tail;
 mod string_ops;
 #[cfg(not(target_family = "wasm"))]
 mod subscription;
+/// The same types in the browser, held by the bridge and polled for.
+#[cfg(target_family = "wasm")]
+mod subscription_web;
 mod terminal;
 mod vector_set;
 mod zset_ops;
@@ -109,9 +110,10 @@ pub use async_connection::{
 pub use audit::{is_administration_command, redact_secrets};
 pub use bitmap::{BitOpKind, BitmapInfo, bit_field, bit_op, bitmap_info, set_bit};
 pub use bridge::{
-    BridgeConn, BridgeError, BridgeErrorKind, BridgeReply, BridgeRequest, BridgeServerStore, BridgeTransport,
-    DESCRIBED_COMMANDS, PipelineSpec, bridge_server_store, bridge_transport, describe_commands,
-    describe_packed_command, set_bridge_server_store, set_bridge_transport, sign_out_of_bridge, signed_in_to_bridge,
+    BridgeConn, BridgeError, BridgeErrorKind, BridgeReply, BridgeRequest, BridgeServerStore, BridgeStorage,
+    BridgeTransport, BridgeTrashEntry, DESCRIBED_COMMANDS, PipelineSpec, WatchBatch, WatchItem, WatchKind, WatchOpened,
+    bridge_server_store, bridge_storage, bridge_transport, describe_commands, describe_packed_command,
+    set_bridge_server_store, set_bridge_storage, set_bridge_transport, sign_out_of_bridge, signed_in_to_bridge,
 };
 /// What stands in for redis-rs's `Cmd::query_async` / `Pipeline::query_async`
 /// in the browser, where the `aio` feature that provides them cannot be built.
@@ -131,7 +133,6 @@ pub use cluster_ops::{
     node_cancel_slot_migrations, node_failover, node_load, node_migrate_slots, node_replicate, node_slot_migrations,
     node_stabilize_slot,
 };
-#[cfg(not(target_family = "wasm"))]
 pub use compare::{
     CompareOptions, CompareProgress, CompareReport, CompareSide, CompareStage, DifferingKey, KeyDifference,
     compare_prefix, prefix_pattern, values_equal,
@@ -201,7 +202,6 @@ pub use module_ops::{
     TS_AGGREGATORS, TsAlter, TsInfo, TsMRange, TsRule, TsSeries, TsWindow, has_positive_matcher, ts_add, ts_alter,
     ts_create_rule, ts_delete_rule, ts_mrange, ts_window,
 };
-#[cfg(not(target_family = "wasm"))]
 pub use multi_search::{MultiSearchHit, MultiSearchServerResult, multi_search_exact, multi_search_scan};
 pub use panel_ops::{
     cluster_slot_stats, command_stats, hotkeys_report, hotkeys_reset, hotkeys_start, hotkeys_stop, key_bytes,
@@ -254,11 +254,15 @@ pub use stream_ops::{
 };
 pub use stream_tail::{StreamTail, StreamTailEntry};
 pub use string_ops::{StringWrite, json_get, json_merge, json_set, string_get, string_prefix, string_set};
-/// A held socket the server pushes on — Pub/Sub, `MONITOR` — has no
-/// equivalent over the HTTP bridge, and the panels that read one are left out
-/// of the web build (ADR 9).
+/// A held socket the server pushes on — Pub/Sub, `MONITOR`. The page cannot
+/// hold one: there the bridge does, and the same types poll it (ADR 9,
+/// amended 2026-10-17).
 #[cfg(not(target_family = "wasm"))]
 pub use subscription::{
+    ChannelMessage, ChannelSubscription, MonitorFeed, MonitorFeeds, SubscribeKind, open_monitor_feeds,
+};
+#[cfg(target_family = "wasm")]
+pub use subscription_web::{
     ChannelMessage, ChannelSubscription, MonitorFeed, MonitorFeeds, SubscribeKind, open_monitor_feeds,
 };
 pub use terminal::{ExecReplies, TerminalReply, TerminalSession};

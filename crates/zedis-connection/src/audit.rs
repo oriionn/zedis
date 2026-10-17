@@ -38,6 +38,9 @@ pub fn is_administration_command(name: &str, args: &[String]) -> bool {
     match name.to_ascii_uppercase().as_str() {
         "FLUSHALL" | "FLUSHDB" | "SWAPDB" | "SHUTDOWN" | "REPLICAOF" | "SLAVEOF" | "FAILOVER" | "SAVE" | "BGSAVE"
         | "BGREWRITEAOF" | "AUTH" | "PSYNC" | "SYNC" => true,
+        // Redis files it under `@admin`: it shows every client's commands,
+        // values and all, and slows the server serving them.
+        "MONITOR" => true,
         // A script runs whatever commands it holds, every one above included:
         // `EVAL "return redis.call('FLUSHALL')" 0` went unlogged. The `_RO`
         // variants cannot write and are not here.

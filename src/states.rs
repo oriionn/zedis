@@ -18,6 +18,7 @@ mod i18n;
 mod migration;
 mod server;
 mod session;
+pub mod trash_store;
 
 pub use crate::error::ConnectionErrorKind;
 pub use app::*;

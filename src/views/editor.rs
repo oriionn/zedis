@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(not(target_family = "wasm"))]
 use crate::views::ZedisPubsubEditor;
 use crate::views::placeholders::Placeholders;
 // The link panel's Diagnose button opens the desktop's diagnostics window.
@@ -157,7 +156,6 @@ pub struct ZedisEditor {
     geo_probe_task: Option<Task<()>>,
     hash_editor: Option<Entity<ZedisHashEditor>>,
     stream_editor: Option<Entity<ZedisStreamEditor>>,
-    #[cfg(not(target_family = "wasm"))]
     pubsub_editor: Option<Entity<ZedisPubsubEditor>>,
     timeseries_editor: Option<Entity<ZedisTimeSeriesEditor>>,
     probabilistic_editor: Option<Entity<ZedisProbabilisticEditor>>,
@@ -516,7 +514,6 @@ impl ZedisEditor {
             geo_probe_task: None,
             hash_editor: None,
             stream_editor: None,
-            #[cfg(not(target_family = "wasm"))]
             pubsub_editor: None,
             timeseries_editor: None,
             probabilistic_editor: None,
@@ -1004,7 +1001,6 @@ impl ZedisEditor {
             let _ = self.stream_editor.take();
         }
         if key_type != KeyType::Channel {
-            #[cfg(not(target_family = "wasm"))]
             let _ = self.pubsub_editor.take();
         }
         if key_type != KeyType::TimeSeries {

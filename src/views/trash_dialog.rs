@@ -22,11 +22,12 @@
 
 use crate::assets::CustomIconName;
 use crate::connection::{Capability, ServerDb, restore_key};
-use crate::db::{TRASH_RETENTION_MS, TrashMeta, get_trash_entry, list_trash_meta, purge_trash, remove_trash_entry};
+use crate::db::TrashMeta;
 use crate::error::Error;
-use crate::helpers::{format_unix_millis_with, get_mono_font_family, unix_ts_millis};
+use crate::helpers::{format_unix_millis_with, get_mono_font_family};
 use crate::states::{
     GlobalEvent, NotificationAction, RestoredKey, ZedisGlobalStore, ZedisServerState, i18n_common, i18n_trash,
+    trash_store,
 };
 use gpui::{App, Entity, SharedString, Subscription, Window, div, prelude::*, px};
 use gpui_kit::component::{
@@ -56,6 +57,13 @@ pub struct ZedisTrashDialog {
     filter_state: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
 }
+
+/// What the dialog says about where the bin is: on this machine…
+#[cfg(not(target_family = "wasm"))]
+const BIN_NOTE: &str = "note";
+/// …or on the bridge, for everyone who sees the server.
+#[cfg(target_family = "wasm")]
+const BIN_NOTE: &str = "note_web";
 
 fn format_deleted_at(ts_ms: i64) -> SharedString {
     format_unix_millis_with(ts_ms, "%m-%d %H:%M")
@@ -140,7 +148,7 @@ impl ZedisTrashDialog {
                     let mut skipped = 0usize;
                     let mut failed = 0usize;
                     for id in ids {
-                        let Ok(Some(entry)) = get_trash_entry(&sid, &id) else {
+                        let Ok(Some(entry)) = trash_store::fetch(&sid, &id).await else {
                             failed += 1;
                             continue;
                         };
@@ -152,7 +160,7 @@ impl ZedisTrashDialog {
                         .await;
                         match result {
                             Ok(()) => {
-                                let _ = remove_trash_entry(&sid, &id);
+                                let _ = trash_store::forget(&sid, &id).await;
                                 restored.push(RestoredKey {
                                     key: entry.key.into(),
                                     db: entry.db,
@@ -196,10 +204,7 @@ impl ZedisTrashDialog {
         cx.spawn(async move |this, cx| {
             let entries = cx
                 .background_spawn(async move {
-                    if let Err(e) = purge_trash(&server_id, unix_ts_millis() - TRASH_RETENTION_MS) {
-                        warn!(error = %e, "trash purge failed");
-                    }
-                    list_trash_meta(&server_id).unwrap_or_else(|e| {
+                    trash_store::list(&server_id).await.unwrap_or_else(|e| {
                         warn!(error = %e, "trash listing unavailable");
                         Vec::new()
                     })
@@ -223,7 +228,9 @@ impl ZedisTrashDialog {
         cx.spawn(async move |this, cx| {
             let sid = server_id.clone();
             let row_id = id.clone();
-            let entry = cx.background_spawn(async move { get_trash_entry(&sid, &row_id) }).await;
+            let entry = cx
+                .background_spawn(async move { trash_store::fetch(&sid, &row_id).await })
+                .await;
             let mut came_back: Vec<RestoredKey> = Vec::new();
             let notification = match entry {
                 Ok(Some(entry)) => {
@@ -238,7 +245,7 @@ impl ZedisTrashDialog {
                             let sid = server_id.clone();
                             let row_id = id.clone();
                             let _ = cx
-                                .background_spawn(async move { remove_trash_entry(&sid, &row_id) })
+                                .background_spawn(async move { trash_store::forget(&sid, &row_id).await })
                                 .await;
                             came_back.push(RestoredKey {
                                 key: entry.key.clone().into(),
@@ -295,7 +302,7 @@ impl ZedisTrashDialog {
         let server_id = self.server_id.clone();
         cx.spawn(async move |this, cx| {
             let _ = cx
-                .background_spawn(async move { remove_trash_entry(&server_id, &id) })
+                .background_spawn(async move { trash_store::forget(&server_id, &id).await })
                 .await;
             let _ = this.update(cx, |state, cx| state.reload(cx));
         })
@@ -309,6 +316,7 @@ impl Render for ZedisTrashDialog {
         let muted = cx.theme().muted_foreground;
 
         let entries = self.filtered_entries(cx);
+        let deleted_by = i18n_trash(cx, "deleted_by");
         let mut list = v_flex().w_full().gap_2();
         if self.loading {
             list = list.child(Label::new(i18n_common(cx, "loading")).text_sm().text_color(muted));
@@ -339,6 +347,11 @@ impl Render for ZedisTrashDialog {
                                 if entry.pttl_ms > 0 {
                                     meta.push_str(&format!(" · TTL {}s", entry.pttl_ms / 1000));
                                 }
+                                // A shared bin (the bridge's) says whose delete it was.
+                                if let Some(by) = &entry.deleted_by {
+                                    meta.push_str(" · ");
+                                    meta.push_str(&deleted_by.replace("%{account}", by));
+                                }
                                 Label::new(meta).text_xs().text_color(muted)
                             }),
                     )
@@ -367,7 +380,7 @@ impl Render for ZedisTrashDialog {
         v_flex()
             .w_full()
             .gap_3()
-            .child(Label::new(i18n_trash(cx, "note")).text_xs().text_color(muted))
+            .child(Label::new(i18n_trash(cx, BIN_NOTE)).text_xs().text_color(muted))
             .child(
                 h_flex()
                     .w_full()

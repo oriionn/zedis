@@ -70,7 +70,7 @@ use zedis_connection::{
     copy_key_logically, function_delete, function_load, function_stats, is_foreign_payload, migrate_slot,
     restore_or_recreate_chunk,
 };
-use zedis_connection::{SearchableType, ValueSearchSpec, scan_values_round};
+use zedis_connection::{SearchableType, ValueSearchSpec, multi_search_exact, multi_search_scan, scan_values_round};
 use zedis_core::json::JsonPathOp;
 use zedis_core::keysizes::KeysizesUnit;
 use zedis_core::search_params::{ParamKind, encode_param};
@@ -347,6 +347,61 @@ fn standalone_scan_sees_every_type_it_wrote() {
     smol::block_on(async {
         let id = register(server("it-standalone", standalone())).await;
         scan_sees_every_type_it_wrote(id).await;
+    });
+}
+
+/// Multi-database search finds a key by its exact name and by a part of it,
+/// per target, and says which target could not be searched instead of
+/// failing the others.
+#[test]
+#[ignore]
+fn standalone_multi_search_finds_keys_per_target() {
+    smol::block_on(async {
+        let id = register(server("it-multi-search", standalone())).await;
+        let mut c = conn(&id, 0).await;
+        let prefix = unique("multi-search");
+        let hash = format!("{prefix}:needle-hash");
+        cmd("HSET")
+            .arg(&hash)
+            .arg("f")
+            .arg("v")
+            .exec_async(&mut c)
+            .await
+            .expect("hset");
+        cmd("SET")
+            .arg(format!("{prefix}:other"))
+            .arg("v")
+            .exec_async(&mut c)
+            .await
+            .expect("set");
+
+        let targets = vec![(id.clone(), 0), ("it-no-such-server".to_string(), 0)];
+        let exact = multi_search_exact(targets.clone(), hash.clone()).await;
+        assert_eq!(exact.len(), 2);
+        let found = exact.iter().find(|r| r.server_id == id).expect("the server's result");
+        assert_eq!(found.error, None);
+        assert_eq!(
+            found
+                .hits
+                .iter()
+                .map(|h| (h.key.as_str(), h.key_type.as_str()))
+                .collect::<Vec<_>>(),
+            [(hash.as_str(), "hash")]
+        );
+        let missing = exact.iter().find(|r| r.server_id != id).expect("the other target");
+        assert!(missing.error.is_some(), "an unknown target answers with its own error");
+
+        let scan = multi_search_scan(vec![(id.clone(), 0)], format!("{prefix}:needle"), 1000).await;
+        let keys: Vec<&str> = scan[0].hits.iter().map(|h| h.key.as_str()).collect();
+        assert_eq!(keys, [hash.as_str()], "contains-match on the name, not the other key");
+        assert!(!scan[0].truncated);
+
+        cmd("DEL")
+            .arg(&hash)
+            .arg(format!("{prefix}:other"))
+            .exec_async(&mut c)
+            .await
+            .expect("cleanup");
     });
 }
 
