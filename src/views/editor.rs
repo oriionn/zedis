@@ -20,7 +20,8 @@ use crate::{
     components::KeyTypeBadge,
     connection::HeatMetric,
     connection::{
-        ConflictMode, RestoreStatus, ServerDb, copy_key, floors, get_server, get_servers, key_bytes, zset_looks_geo,
+        ConflictMode, CopyLoss, CopyPreflight, RestoreStatus, ServerDb, copy_key, copy_preflight, floors, get_server,
+        get_servers, key_bytes, zset_looks_geo,
     },
     constants::EDITOR_KEY_BAR_HEIGHT,
     db::get_favorites_manager,
@@ -316,6 +317,7 @@ fn copy_failure_message(cx: &gpui::App, raw: &str) -> SharedString {
 
 /// Parameters for a cross-server key copy, bundled to keep `run_copy`
 /// under the argument-count limit.
+#[derive(Clone)]
 struct CopyRequest {
     source_id: String,
     source_db: usize,

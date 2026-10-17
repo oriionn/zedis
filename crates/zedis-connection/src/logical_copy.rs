@@ -34,8 +34,9 @@
 use super::conn::RedisAsyncConn;
 #[cfg(target_family = "wasm")]
 use crate::bridge::{BridgePipeline as _, BridgeQuery as _};
-use crate::dump_restore::{ConflictMode, DumpEntry, RestoreStatus, restore_keys_chunk};
+use crate::dump_restore::{ConflictMode, DumpEntry, RestoreStatus, dump_keys_chunk, restore_keys_chunk};
 use crate::error::Error;
+use crate::floors;
 use crate::reply;
 use crate::server_db::ServerDb;
 use futures::future::try_join_all;
@@ -98,6 +99,167 @@ pub async fn copy_key_logically(
     let mut source = src.connection().await?;
     let mut target = dst.connection().await?;
     copy_one(&mut source, &mut target, key, pttl_ms, conflict).await
+}
+
+/// How many of a hash's fields the field-TTL check reads before it stops
+/// and says it did not read them all.
+const FIELD_TTL_CHECK: usize = 10_000;
+
+/// What copying one key to another server would come to, asked before it is
+/// copied: restored as it is, or — where the target cannot read the source's
+/// `DUMP` — re-created by type, and then what would not travel. A copy that
+/// lost a stream's consumer groups used to say "copied" like any other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyPreflight {
+    /// The target refuses the source's payload: the key will be re-created
+    /// by type ([`copy_key_logically`]).
+    pub recreated: bool,
+    /// The two servers as they name themselves (`Redis 8.6.1`).
+    pub source: String,
+    pub target: String,
+    /// What a re-created key leaves behind; empty when it is restored.
+    pub losses: Vec<CopyLoss>,
+    /// The `DUMP` the check took, which [`CopyPreflight::copy`] restores.
+    dumped: DumpEntry,
+}
+
+impl CopyPreflight {
+    /// Copy what the check dumped — right after it, before the key can have
+    /// changed, so a big key is not dumped twice. A copy someone confirms
+    /// after reading what it loses dumps again ([`crate::copy_key`]).
+    pub async fn copy(&self, src: &ServerDb, dst: &ServerDb, conflict: ConflictMode) -> Result<RestoreStatus> {
+        let mut statuses = restore_or_recreate_chunk(src, dst, std::slice::from_ref(&self.dumped), conflict).await?;
+        statuses.pop().ok_or_else(|| Error::Invalid {
+            message: "the copy answered nothing".to_string(),
+        })
+    }
+}
+
+/// One thing a key re-created by type would not take with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyLoss {
+    /// The whole key: a type with no portable read (a module type other
+    /// than JSON). The copy fails rather than writing part of it.
+    Uncopyable { key_type: String },
+    /// The stream's consumer groups, their pending entries with them.
+    ConsumerGroups(usize),
+    /// Hash fields with a TTL of their own. `all_checked` is false when the
+    /// hash had more fields than the check reads ([`FIELD_TTL_CHECK`]).
+    FieldTtls { count: usize, all_checked: bool },
+}
+
+/// [`CopyPreflight`] for `key` from `src` to `dst`; `None` when the key is
+/// gone from the source.
+///
+/// Whether the target can read the payload is asked of the target, not
+/// worked out from version numbers (the flavors number their RDB versions
+/// apart, and a table of them would be wrong on the next release): a
+/// `RESTORE` of the payload under a name nobody uses, already expired
+/// (`ABSTTL 1`). Redis and Valkey check the payload before the expiry and,
+/// finding it expired, answer `OK` and write nothing — or refuse it as
+/// another server's. Any other refusal (a replica, a missing permission) is
+/// left for the copy itself to report.
+pub async fn copy_preflight(src: &ServerDb, dst: &ServerDb, key: &str) -> Result<Option<CopyPreflight>> {
+    let entries = dump_keys_chunk(src, &[key.to_string()]).await?;
+    let Some(entry) = entries.into_iter().next() else {
+        return Ok(None);
+    };
+    let source_client = src.client().await?;
+    let target_client = dst.client().await?;
+    let recreated = target_refuses(dst, &entry.payload).await?;
+    let losses = if recreated {
+        let mut source = src.connection().await?;
+        what_stays_behind(
+            &mut source,
+            key.as_bytes(),
+            source_client.supports(floors::HASH_FIELD_TTL),
+        )
+        .await?
+    } else {
+        Vec::new()
+    };
+    Ok(Some(CopyPreflight {
+        recreated,
+        source: source_client.product(),
+        target: target_client.product(),
+        losses,
+        dumped: entry,
+    }))
+}
+
+/// Whether `dst` refuses `payload` as another server's (see
+/// [`copy_preflight`]).
+async fn target_refuses(dst: &ServerDb, payload: &[u8]) -> Result<bool> {
+    let probe = format!("zedis:copy-probe:{}", uuid::Uuid::now_v7().simple());
+    let mut target = dst.connection().await?;
+    let answer: redis::RedisResult<()> = cmd("RESTORE")
+        .arg(&probe)
+        .arg(1)
+        .arg(payload)
+        .arg("ABSTTL")
+        .query_async(&mut target)
+        .await;
+    Ok(matches!(answer, Err(e) if is_foreign_payload(&e.to_string())))
+}
+
+/// What re-creating `key` by type would leave behind.
+async fn what_stays_behind(src: &mut RedisAsyncConn, key: &[u8], field_ttls: bool) -> Result<Vec<CopyLoss>> {
+    let kind: String = cmd("TYPE").arg(key).query_async(src).await?;
+    if !RECREATABLE.contains(&kind.as_str()) {
+        return Ok(vec![CopyLoss::Uncopyable { key_type: kind }]);
+    }
+    let mut losses = Vec::new();
+    match kind.as_str() {
+        "stream" => {
+            let groups: Vec<Value> = cmd("XINFO").arg("GROUPS").arg(key).query_async(src).await?;
+            if !groups.is_empty() {
+                losses.push(CopyLoss::ConsumerGroups(groups.len()));
+            }
+        }
+        "hash" if field_ttls => {
+            let (count, all_checked) = fields_with_ttl(src, key).await?;
+            if count > 0 {
+                losses.push(CopyLoss::FieldTtls { count, all_checked });
+            }
+        }
+        _ => {}
+    }
+    Ok(losses)
+}
+
+/// How many of the hash's fields have a TTL of their own, reading up to
+/// [`FIELD_TTL_CHECK`] of them; and whether that was all of them.
+async fn fields_with_ttl(src: &mut RedisAsyncConn, key: &[u8]) -> Result<(usize, bool)> {
+    let mut cursor: u64 = 0;
+    let (mut read, mut with_ttl) = (0usize, 0usize);
+    loop {
+        let (next, flat): (u64, Vec<Vec<u8>>) = cmd("HSCAN")
+            .arg(key)
+            .arg(cursor)
+            .arg("COUNT")
+            .arg(BATCH)
+            .query_async(src)
+            .await?;
+        // Field, value, field, value…
+        let fields: Vec<&Vec<u8>> = flat.iter().step_by(2).collect();
+        if !fields.is_empty() {
+            let mut httl = cmd("HTTL");
+            httl.arg(key).arg("FIELDS").arg(fields.len());
+            for field in &fields {
+                httl.arg(field.as_slice());
+            }
+            let ttls: Vec<i64> = httl.query_async(src).await?;
+            with_ttl += ttls.iter().filter(|ttl| **ttl >= 0).count();
+            read += fields.len();
+        }
+        cursor = next;
+        if cursor == 0 {
+            return Ok((with_ttl, true));
+        }
+        if read >= FIELD_TTL_CHECK {
+            return Ok((with_ttl, false));
+        }
+    }
 }
 
 /// The `TYPE` answers `copy_one` can re-create by commands.

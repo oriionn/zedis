@@ -66,11 +66,13 @@ use zedis_connection::{
     zset_range_by_score, zset_remove, zset_scan,
 };
 use zedis_connection::{
+    CopyLoss, SearchableType, ValueSearchSpec, copy_preflight, multi_search_exact, multi_search_scan, scan_values_round,
+};
+use zedis_connection::{
     MonitorFeed, SlotMigrationDialect, SlotMove, bgsave_cancel, client_name, command_stats, copy_key,
     copy_key_logically, function_delete, function_load, function_stats, is_foreign_payload, migrate_slot,
     restore_or_recreate_chunk,
 };
-use zedis_connection::{SearchableType, ValueSearchSpec, multi_search_exact, multi_search_scan, scan_values_round};
 use zedis_core::json::JsonPathOp;
 use zedis_core::keysizes::KeysizesUnit;
 use zedis_core::search_params::{ParamKind, encode_param};
@@ -8027,6 +8029,166 @@ fn standalone_copy_lands_on_a_server_of_the_other_flavor() {
         eprintln!("{key} landed on the other flavor as {status:?}");
         cmd("DEL").arg(&key).exec_async(&mut near).await.expect("del");
         cmd("DEL").arg(&key).exec_async(&mut there).await.expect("del");
+    });
+}
+
+/// Before a key is copied, the preflight says whether the target can take
+/// its `DUMP` — asked of the target with a `RESTORE` that writes nothing —
+/// and, where it cannot, what re-creating the key by type would leave
+/// behind: a stream's consumer groups, a hash's field TTLs. Its answer is
+/// the copy's: a key it calls re-created comes back `Recreated`.
+/// `ZEDIS_IT_FOREIGN` names a server of the other flavor for the second half.
+#[test]
+#[ignore]
+fn standalone_copy_preflight_says_what_a_copy_would_leave_behind() {
+    smol::block_on(async {
+        let id = register(server("it-standalone", standalone())).await;
+        let mut near = conn(&id, 0).await;
+        let stream = unique("preflight-stream");
+        cmd("XADD")
+            .arg(&stream)
+            .arg("*")
+            .arg("f")
+            .arg("v")
+            .exec_async(&mut near)
+            .await
+            .expect("xadd");
+        for group in ["g1", "g2"] {
+            cmd("XGROUP")
+                .arg("CREATE")
+                .arg(&stream)
+                .arg(group)
+                .arg("0")
+                .exec_async(&mut near)
+                .await
+                .expect("group");
+        }
+        let hash = unique("preflight-hash");
+        cmd("HSET")
+            .arg(&hash)
+            .arg("a")
+            .arg("1")
+            .arg("b")
+            .arg("2")
+            .exec_async(&mut near)
+            .await
+            .expect("hset");
+        let field_ttls = supports(&id, floors::HASH_FIELD_TTL).await;
+        if field_ttls {
+            cmd("HEXPIRE")
+                .arg(&hash)
+                .arg(300)
+                .arg("FIELDS")
+                .arg(1)
+                .arg("a")
+                .exec_async(&mut near)
+                .await
+                .expect("hexpire");
+        }
+        let plain = unique("preflight-plain");
+        cmd("SET")
+            .arg(&plain)
+            .arg("v")
+            .exec_async(&mut near)
+            .await
+            .expect("set");
+        let source = ServerDb::new(&id, 0);
+
+        // One server, another database: it reads its own payloads.
+        let same = copy_preflight(&source, &ServerDb::new(&id, 1), &stream)
+            .await
+            .expect("preflight")
+            .expect("the key is there");
+        assert!(!same.recreated, "{same:?}");
+        assert!(same.losses.is_empty());
+        assert_eq!(same.source, same.target);
+        assert!(!same.source.is_empty());
+        assert_eq!(
+            copy_preflight(&source, &ServerDb::new(&id, 1), &unique("preflight-gone"))
+                .await
+                .expect("preflight"),
+            None,
+            "a key that is not there"
+        );
+
+        let Some(foreign) = scenario("ZEDIS_IT_FOREIGN") else {
+            eprintln!("skipped the other flavor: ZEDIS_IT_FOREIGN not set");
+            cmd("DEL")
+                .arg(&stream)
+                .arg(&hash)
+                .arg(&plain)
+                .exec_async(&mut near)
+                .await
+                .expect("cleanup");
+            return;
+        };
+        let far = register(server("it-foreign", foreign)).await;
+        let target = ServerDb::new(&far, 0);
+        let mut there = conn(&far, 0).await;
+        let check = |key: String| {
+            let (source, target) = (source.clone(), target.clone());
+            async move {
+                copy_preflight(&source, &target, &key)
+                    .await
+                    .expect("preflight")
+                    .expect("there")
+            }
+        };
+        let plain_check = check(plain.clone()).await;
+        assert_ne!(plain_check.source, plain_check.target, "{plain_check:?}");
+        let stream_check = check(stream.clone()).await;
+        let hash_check = check(hash.clone()).await;
+        if plain_check.recreated {
+            assert!(plain_check.losses.is_empty(), "a string loses nothing");
+            assert_eq!(stream_check.losses, [CopyLoss::ConsumerGroups(2)]);
+            if field_ttls {
+                assert_eq!(
+                    hash_check.losses,
+                    [CopyLoss::FieldTtls {
+                        count: 1,
+                        all_checked: true
+                    }]
+                );
+            }
+        } else {
+            assert!(stream_check.losses.is_empty() && hash_check.losses.is_empty());
+        }
+        // The probe wrote nothing on the target.
+        let (_, probes): (u64, Vec<String>) = cmd("SCAN")
+            .arg(0)
+            .arg("MATCH")
+            .arg("zedis:copy-probe:*")
+            .arg("COUNT")
+            .arg(10_000)
+            .query_async(&mut there)
+            .await
+            .expect("scan");
+        assert!(probes.is_empty(), "{probes:?}");
+        // And the copy of what it dumped does what it said it would.
+        let status = plain_check
+            .copy(&source, &target, ConflictMode::Overwrite)
+            .await
+            .expect("copy");
+        let expected = if plain_check.recreated {
+            RestoreStatus::Recreated
+        } else {
+            RestoreStatus::Written
+        };
+        assert_eq!(status, expected);
+        let copied: String = cmd("GET").arg(&plain).query_async(&mut there).await.expect("get");
+        assert_eq!(copied, "v");
+        eprintln!(
+            "{} -> {}: re-created = {}",
+            plain_check.source, plain_check.target, plain_check.recreated
+        );
+        cmd("DEL")
+            .arg(&stream)
+            .arg(&hash)
+            .arg(&plain)
+            .exec_async(&mut near)
+            .await
+            .expect("cleanup");
+        cmd("DEL").arg(&plain).exec_async(&mut there).await.expect("cleanup");
     });
 }
 

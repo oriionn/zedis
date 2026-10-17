@@ -100,7 +100,7 @@ impl TypeHint {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DumpEntry {
     pub key: Vec<u8>,
     /// -1 means no TTL.

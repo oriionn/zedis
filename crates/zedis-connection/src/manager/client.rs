@@ -76,6 +76,17 @@ impl RedisClient {
     pub fn is_valkey(&self) -> bool {
         self.is_valkey
     }
+    /// What the server is, as a person names it: `Valkey 9.0.0`, `Redis
+    /// 8.6.1`, `Dragonfly 2.0.2` — the product's own version, not the one it
+    /// claims for Redis's sake.
+    pub fn product(&self) -> String {
+        let version = if self.flavor_version.is_empty() {
+            self.version()
+        } else {
+            self.flavor_version.clone()
+        };
+        format!("{} {version}", self.flavor.label()).trim_end().to_string()
+    }
     pub fn databases(&self) -> usize {
         self.databases
     }

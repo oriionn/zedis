@@ -174,7 +174,7 @@ Redis 无法索引值，所以这种 `O(keyspace)` 的搜索加了几道限制�
 ### 跨服务器工具
 **在两台服务器间复制 / 对比 key、或对比完整配置。**
 
-**复制** key（连值带 TTL，`DUMP`/`RESTORE`）、**对比** string key 与对端同名 key（并排 diff）、或**对比**两台的 `CONFIG GET *`（斑马线表格只列差异）。专为排查"prod 和 staging 为何不一致"。整个**前缀**也能复制：按模式选定 key，Zedis 直接经 `DUMP` / `RESTORE` 流式送到另一台服务器，保留 TTL，并给出逐 key 的结果列表。Redis 与 Valkey 之间的复制——单个 key 或整个前缀——同样可行：两者 `DUMP` 载荷的 RDB 版本号各有一套，除 Valkey 8 → Redis 外 `RESTORE` 都会拒绝，这时 Zedis 改为从源端**按类型重建**该 key（string、hash、list、set、sorted set、带条目 id 的 stream、JSON，TTL 一并保留），日志会标出哪些 key 是这样复制的；模块类型、消费者组和字段级 TTL 无法这样复制，会作为丢失项逐一列出。两个**数据库**还可以按前缀比对——两边都有、只这边有、只那边有、或两边都有但值不同——迁移结果可以逐项核对，而不是想当然。
+**复制** key（连值带 TTL，`DUMP`/`RESTORE`）、**对比** string key 与对端同名 key（并排 diff）、或**对比**两台的 `CONFIG GET *`（斑马线表格只列差异）。专为排查"prod 和 staging 为何不一致"。整个**前缀**也能复制：按模式选定 key，Zedis 直接经 `DUMP` / `RESTORE` 流式送到另一台服务器，保留 TTL，并给出逐 key 的结果列表。Redis 与 Valkey 之间的复制——单个 key 或整个前缀——同样可行：两者 `DUMP` 载荷的 RDB 版本号各有一套，除 Valkey 8 → Redis 外 `RESTORE` 都会拒绝，这时 Zedis 改为从源端**按类型重建**该 key（string、hash、list、set、sorted set、带条目 id 的 stream、JSON，TTL 一并保留），日志会标出哪些 key 是这样复制的；模块类型、消费者组和字段级 TTL 无法这样复制，会作为丢失项逐一列出。单个 key 的复制会先向目标端试探（不写入任何数据）：若需要按类型重建，确认框会在复制前列出带不过去的部分（如“它的 2 个消费者组（连同待确认的消息）”“3 个字段的 TTL”），模块类型直接拒绝，复制完成后提示该 key 是按类型重建的。两个**数据库**还可以按前缀比对——两边都有、只这边有、只那边有、或两边都有但值不同——迁移结果可以逐项核对，而不是想当然。
 
 ---
 

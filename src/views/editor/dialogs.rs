@@ -165,7 +165,7 @@ impl ZedisEditor {
                     .cancel_text(i18n_common(cx, "cancel")),
             )
             .child(move || view_child.clone())
-            .on_ok(move |_, _window, cx| {
+            .on_ok(move |_, window, cx| {
                 let Some(target_id) = view_ok.read(cx).target_server_id() else {
                     return false;
                 };
@@ -180,7 +180,7 @@ impl ZedisEditor {
                         key: key_ok.clone(),
                         conflict,
                     };
-                    editor.update(cx, move |this, cx| this.run_copy(req, cx));
+                    editor.update(cx, move |this, cx| this.run_copy(req, window, cx));
                 }
                 true
             })
@@ -342,48 +342,185 @@ impl ZedisEditor {
         .detach();
     }
 
-    /// Run the cross-server copy (`DUMP` + `RESTORE`) in the background and
-    /// report the outcome via a notification.
-    pub(super) fn run_copy(&mut self, req: CopyRequest, cx: &mut Context<Self>) {
-        let CopyRequest {
-            source_id,
-            source_db,
-            target_id,
-            target_db,
-            key,
-            conflict,
-        } = req;
-        let target_name: SharedString = get_server(&target_id)
-            .map(|s| s.name.into())
-            .unwrap_or_else(|_| target_id.clone());
-        cx.spawn(async move |this, cx| {
-            let result = copy_key(
-                source_id,
-                source_db,
-                target_id.to_string(),
-                target_db,
-                key.to_string(),
-                conflict,
-            )
-            .await;
-            let _ = this.update(cx, move |this, cx| {
-                this.server_state.update(cx, |state, cx| match result {
-                    Ok(Some(RestoreStatus::Written | RestoreStatus::Recreated)) => state.emit_success_notification(
-                        format!("{target_name} / db{target_db}").into(),
-                        i18n_copy(cx, "done"),
-                        cx,
-                    ),
-                    Ok(Some(RestoreStatus::Skipped)) => state.emit_warning_notification(i18n_copy(cx, "skipped"), cx),
-                    Ok(None) => state.emit_warning_notification(i18n_copy(cx, "key_gone"), cx),
-                    Ok(Some(RestoreStatus::Failed(msg))) => {
-                        state.emit_error_notification(copy_failure_message(cx, &msg), cx)
-                    }
-                    Err(e) => state.emit_error_notification(copy_failure_message(cx, &e.to_string()), cx),
-                });
+    /// Copy the key to another server / db and say how it went.
+    ///
+    /// Between two servers it is checked first (`copy_preflight`, ADR 16):
+    /// a key the target cannot take as a `DUMP` — another product, an older
+    /// version — is re-created by type, and what that would leave behind (a
+    /// stream's consumer groups, a hash's field TTLs) is put to the user
+    /// before anything is written. Within one server there is nothing to ask:
+    /// it reads its own payloads.
+    pub(super) fn run_copy(&mut self, req: CopyRequest, window: &mut Window, cx: &mut Context<Self>) {
+        if req.source_id == req.target_id.as_ref() {
+            self.copy_without_check(req, cx);
+            return;
+        }
+        let source = ServerDb::new(req.source_id.clone(), req.source_db);
+        let target = ServerDb::new(req.target_id.to_string(), req.target_db);
+        let key = req.key.to_string();
+        cx.spawn_in(window, async move |this, cx| {
+            let checked = copy_preflight(&source, &target, &key).await;
+            let _ = this.update_in(cx, move |this, window, cx| match checked {
+                Ok(Some(check)) => this.copy_checked(req, check, window, cx),
+                Ok(None) => this.report_copy(&req, Ok(None), None, cx),
+                Err(e) => this.report_copy(&req, Err(e.to_string()), None, cx),
             });
         })
         .detach();
     }
+
+    /// What the check found decides: a key that cannot travel at all is
+    /// refused here, one that loses something is asked about, and one that
+    /// loses nothing is copied from the check's own `DUMP`.
+    fn copy_checked(&mut self, req: CopyRequest, check: CopyPreflight, window: &mut Window, cx: &mut Context<Self>) {
+        let locale = cx.global::<ZedisGlobalStore>().read(cx).locale().to_string();
+        if let Some(CopyLoss::Uncopyable { key_type }) = check
+            .losses
+            .iter()
+            .find(|loss| matches!(loss, CopyLoss::Uncopyable { .. }))
+        {
+            let message: SharedString = rust_i18n::t!(
+                "copy.cannot_recreate",
+                target = &check.target,
+                source = &check.source,
+                key_type = key_type,
+                locale = &locale
+            )
+            .to_string()
+            .into();
+            self.server_state
+                .update(cx, |state, cx| state.emit_error_notification(message, cx));
+            return;
+        }
+        if check.losses.is_empty() {
+            let source = ServerDb::new(req.source_id.clone(), req.source_db);
+            let target = ServerDb::new(req.target_id.to_string(), req.target_db);
+            cx.spawn(async move |this, cx| {
+                let status = check.copy(&source, &target, req.conflict).await;
+                let _ = this.update(cx, |this, cx| {
+                    this.report_copy(&req, status.map(Some).map_err(|e| e.to_string()), Some(&check), cx);
+                });
+            })
+            .detach();
+            return;
+        }
+        let mut body = rust_i18n::t!(
+            "copy.recreate_body",
+            target = &check.target,
+            source = &check.source,
+            locale = &locale
+        )
+        .to_string();
+        for loss in &check.losses {
+            body.push_str("\n• ");
+            body.push_str(&loss_line(loss, &locale));
+        }
+        let editor = cx.entity().downgrade();
+        ZedisDialog::new_alert(i18n_copy(cx, "recreate_title"), body)
+            .button_props(
+                dialog_button_props(cx)
+                    .ok_text(i18n_copy(cx, "copy"))
+                    .cancel_text(i18n_common(cx, "cancel")),
+            )
+            .on_ok(move |_, _window, cx| {
+                if let Some(editor) = editor.upgrade() {
+                    let (req, check) = (req.clone(), check.clone());
+                    editor.update(cx, move |this, cx| this.copy_confirmed(req, check, cx));
+                }
+                true
+            })
+            .open(window, cx);
+    }
+
+    /// The copy someone agreed to after reading what it leaves behind. It
+    /// dumps the key again: it may have changed while the question was up.
+    fn copy_confirmed(&mut self, req: CopyRequest, check: CopyPreflight, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let result = copy_key(
+                req.source_id.clone(),
+                req.source_db,
+                req.target_id.to_string(),
+                req.target_db,
+                req.key.to_string(),
+                req.conflict,
+            )
+            .await
+            .map_err(|e| e.to_string());
+            let _ = this.update(cx, |this, cx| this.report_copy(&req, result, Some(&check), cx));
+        })
+        .detach();
+    }
+
+    /// A copy within one server: `DUMP` and `RESTORE`, nothing to check.
+    fn copy_without_check(&mut self, req: CopyRequest, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let result = copy_key(
+                req.source_id.clone(),
+                req.source_db,
+                req.target_id.to_string(),
+                req.target_db,
+                req.key.to_string(),
+                req.conflict,
+            )
+            .await
+            .map_err(|e| e.to_string());
+            let _ = this.update(cx, |this, cx| this.report_copy(&req, result, None, cx));
+        })
+        .detach();
+    }
+
+    /// Say how a copy went. A key re-created by type says so, and names
+    /// what it left behind — it used to read "Copied" like any other.
+    fn report_copy(
+        &mut self,
+        req: &CopyRequest,
+        result: Result<Option<RestoreStatus>, String>,
+        check: Option<&CopyPreflight>,
+        cx: &mut Context<Self>,
+    ) {
+        let target_name: SharedString = get_server(&req.target_id)
+            .map(|s| s.name.into())
+            .unwrap_or_else(|_| req.target_id.clone());
+        let title: SharedString = format!("{target_name} / db{}", req.target_db).into();
+        let locale = cx.global::<ZedisGlobalStore>().read(cx).locale().to_string();
+        let recreated: SharedString = match check.map(|check| check.losses.as_slice()).unwrap_or_default() {
+            [] => i18n_copy(cx, "done_recreated"),
+            losses => {
+                let lost: Vec<String> = losses.iter().map(|loss| loss_line(loss, &locale)).collect();
+                rust_i18n::t!("copy.done_recreated_lost", lost = lost.join("; "), locale = &locale)
+                    .to_string()
+                    .into()
+            }
+        };
+        self.server_state.update(cx, |state, cx| match result {
+            Ok(Some(RestoreStatus::Written)) => state.emit_success_notification(title, i18n_copy(cx, "done"), cx),
+            Ok(Some(RestoreStatus::Recreated)) => state.emit_success_notification(title, recreated, cx),
+            Ok(Some(RestoreStatus::Skipped)) => state.emit_warning_notification(i18n_copy(cx, "skipped"), cx),
+            Ok(None) => state.emit_warning_notification(i18n_copy(cx, "key_gone"), cx),
+            Ok(Some(RestoreStatus::Failed(msg))) => state.emit_error_notification(copy_failure_message(cx, &msg), cx),
+            Err(e) => state.emit_error_notification(copy_failure_message(cx, &e), cx),
+        });
+    }
+}
+
+/// One thing a key re-created by type leaves behind, as a line of the
+/// question and of the result.
+fn loss_line(loss: &CopyLoss, locale: &str) -> String {
+    match loss {
+        CopyLoss::ConsumerGroups(count) => rust_i18n::t!("copy.loss_groups", count = count, locale = locale),
+        CopyLoss::FieldTtls {
+            count,
+            all_checked: true,
+        } => rust_i18n::t!("copy.loss_field_ttls", count = count, locale = locale),
+        CopyLoss::FieldTtls {
+            count,
+            all_checked: false,
+        } => rust_i18n::t!("copy.loss_field_ttls_more", count = count, locale = locale),
+        CopyLoss::Uncopyable { key_type } => {
+            rust_i18n::t!("copy.loss_whole_key", key_type = key_type, locale = locale)
+        }
+    }
+    .to_string()
 }
 
 #[cfg(test)]

@@ -189,7 +189,9 @@ pub use latency::{
     LatencyEvent, LatencySample, latency_history, latency_latest, latency_monitor_threshold, latency_reset,
 };
 pub use list_ops::{list_len, list_push, list_range, list_set_if_unchanged, remove_list_indexes};
-pub use logical_copy::{copy_key_logically, is_foreign_payload, restore_or_recreate_chunk};
+pub use logical_copy::{
+    CopyLoss, CopyPreflight, copy_key_logically, copy_preflight, is_foreign_payload, restore_or_recreate_chunk,
+};
 pub use lua_script::{
     ScriptRunOutcome, max_keys_index, run_script, script_exists, script_flush, script_load, script_sha1, script_show,
 };
