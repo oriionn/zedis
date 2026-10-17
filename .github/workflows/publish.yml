@@ -154,9 +154,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     # The GPUI Fast images are a second form of the same app, and a new
     # one: a leg that fails to build, sign or notarize must not take the
-    # release with it. `checksums` then has no `dmg-fast` row for that
-    # arch, and a Fast install is shown the release page for that version
-    # instead of an in-app install (helpers/updater.rs).
+    # release with it (the windows and linux jobs do the same). `checksums`
+    # then has no `dmg-fast` row for that arch, and a Fast install is shown
+    # the release page for that version instead of an in-app install
+    # (helpers/updater.rs).
     continue-on-error: ${{ matrix.variant == 'fast' }}
     strategy:
       fail-fast: false
@@ -374,7 +375,12 @@ jobs:
   windows:
     needs: prepare_vars
     if: needs.prepare_vars.outputs.should_build == 'true' && github.event.inputs.targets != 'docker'
+    name: windows-${{ matrix.suffix }}
     runs-on: windows-latest
+    # The GPUI Fast build, as on macOS: a leg that fails must not take the
+    # release with it, and `checksums` then has no `msi-fast` row for that
+    # arch, so a Fast install is shown the release page instead.
+    continue-on-error: ${{ matrix.variant == 'fast' }}
     # A `permissions:` block REPLACES the default token's permissions, it does
     # not add to them — so every scope this job needs must be listed here.
     # `contents: write` is not optional: softprops/action-gh-release takes its
@@ -393,9 +399,31 @@ jobs:
       matrix:
         include:
           - target: x86_64-pc-windows-msvc
+            arch: x86_64
+            variant: standard
             suffix: x86_64
+            features: mimalloc
           - target: aarch64-pc-windows-msvc
+            arch: aarch64
+            variant: standard
             suffix: aarch64
+            features: mimalloc
+          # The same app on GPUI Fast, as `zedis-windows-<arch>-fast.{msi,zip}`.
+          # The MSI is the same product (wix/main.wxs: one UpgradeCode, and
+          # same-version upgrades allowed), so it installs over the standard
+          # one and back. Its manifest kinds are `msi-fast` / `zip-fast`, kinds
+          # of their own: a release before them installs the first `msi` row
+          # for its arch. No `.msi.zip` beside it — nothing reads one.
+          - target: x86_64-pc-windows-msvc
+            arch: x86_64
+            variant: fast
+            suffix: x86_64-fast
+            features: mimalloc,gpui-fast
+          - target: aarch64-pc-windows-msvc
+            arch: aarch64
+            variant: fast
+            suffix: aarch64-fast
+            features: mimalloc,gpui-fast
     steps:
       - uses: actions/checkout@v7
       - name: setup node
@@ -408,14 +436,16 @@ jobs:
       - name: rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ runner.os }}-${{ matrix.target }}-build
+          key: ${{ runner.os }}-${{ matrix.target }}-build${{ matrix.variant == 'fast' && '-fast' || '' }}
       - name: release
         env:
           RUSTFLAGS: "-C target-feature=+crt-static"
         run: |
           # --locked + pin: see the cargo-bundle note in the macos job.
           cargo install --locked cargo-wix@0.3.9
-          cargo build --release --target ${{ matrix.target }} --features mimalloc
+          # Quoted: unquoted, pwsh reads `mimalloc,gpui-fast` as an array and
+          # hands cargo two arguments.
+          cargo build --release --target ${{ matrix.target }} --features "${{ matrix.features }}"
           cp target/${{ matrix.target }}/release/zedis.exe ./zedis.exe
 
           cargo wix --nocapture --no-build -p zedis-gui --target ${{ matrix.target }}
@@ -490,8 +520,10 @@ jobs:
           retention-days: 3
       - name: submit SignPath signing request
         # release-signing parks here until an approver clicks Approve on
-        # app.signpath.io — one request per architecture, 30 minutes each
-        # before the step times out (re-run the job to resubmit).
+        # app.signpath.io — one request per leg (two architectures, standard
+        # and Fast: four a release), 30 minutes each before the step times
+        # out (re-run the job to resubmit). A Fast request left unapproved
+        # fails only its own leg.
         # test-signing needs no approval and returns within a minute.
         if: steps.signpath.outputs.policy != ''
         id: signpath_request
@@ -560,13 +592,14 @@ jobs:
           Write-Host "test-signing: $failed verification failure(s) expected (test certificate is not trusted)"
           exit 0
       - name: smoke test (first frame must paint)
-        # x86_64 only: the aarch64 build is cross-compiled and cannot run on
-        # this runner. GUI-subsystem exes detach from the shell, so
-        # Start-Process -Wait is required to observe the exit code. This is
-        # the platform where 0.4.5/0.4.6 shipped an invisible main window —
-        # a hidden window gets no WM_PAINT, no frame ever paints, and the
-        # binary exits 2 via its watchdog.
-        if: matrix.suffix == 'x86_64'
+        # x86_64 only (the standard build and the Fast one): the aarch64
+        # build is cross-compiled and cannot run on this runner.
+        # GUI-subsystem exes detach from the shell, so Start-Process -Wait
+        # is required to observe the exit code. This is the platform where
+        # 0.4.5/0.4.6 shipped an invisible main window — a hidden window
+        # gets no WM_PAINT, no frame ever paints, and the binary exits 2 via
+        # its watchdog.
+        if: matrix.arch == 'x86_64'
         timeout-minutes: 3
         shell: pwsh
         env:
@@ -594,40 +627,51 @@ jobs:
           Copy-Item zedis.msi $msiName
           echo "MSI_NAME=$msiName" >> $env:GITHUB_ENV
 
-          $msiZipName = "zedis-windows-${{ matrix.suffix }}.msi.zip"
-          Compress-Archive -Path zedis.msi -Destination $msiZipName
-          echo "MSI_ZIP_NAME=$msiZipName" >> $env:GITHUB_ENV
+          if ("${{ matrix.variant }}" -eq "standard") {
+            $msiZipName = "zedis-windows-${{ matrix.suffix }}.msi.zip"
+            Compress-Archive -Path zedis.msi -Destination $msiZipName
+            echo "MSI_ZIP_NAME=$msiZipName" >> $env:GITHUB_ENV
+          }
       - name: checksum (windows)
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path meta | Out-Null
           # kind "msi" must stay on the bare installer: the in-app updater
-          # picks kind == "msi" on Windows and runs the file directly.
+          # picks kind == "msi" on Windows and runs the file directly — and
+          # the Fast build `msi-fast`, which no release before it asks for.
+          $tail = if ("${{ matrix.variant }}" -eq "fast") { "-fast" } else { "" }
           $rows = @(
-            @{ name = "$env:ZIP_NAME";     kind = "zip" },
-            @{ name = "$env:MSI_NAME";     kind = "msi" },
-            @{ name = "$env:MSI_ZIP_NAME"; kind = "msizip" }
+            @{ name = "$env:ZIP_NAME"; kind = "zip$tail" },
+            @{ name = "$env:MSI_NAME"; kind = "msi$tail" }
           )
+          if ($env:MSI_ZIP_NAME) {
+            $rows += @{ name = "$env:MSI_ZIP_NAME"; kind = "msizip" }
+          }
           $lines = foreach ($r in $rows) {
             $sha  = (Get-FileHash $r.name -Algorithm SHA256).Hash.ToLower()
             $size = (Get-Item $r.name).Length
-            "windows ${{ matrix.suffix }} $($r.kind) $($r.name) $sha $size"
+            "windows ${{ matrix.arch }} $($r.kind) $($r.name) $sha $size"
           }
           Set-Content -Encoding ascii -Path "meta/windows-${{ matrix.suffix }}.txt" -Value $lines
-      - name: upload checksum meta (windows)
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: actions/upload-artifact@v7
-        with:
-          name: meta-windows-${{ matrix.suffix }}
-          path: meta/windows-${{ matrix.suffix }}.txt
       - name: upload asset
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         run: |
           ./.github/workflows/upload_asset.sh "./${{ env.ZIP_NAME }}" "$GITHUB_TOKEN"
           ./.github/workflows/upload_asset.sh "./${{ env.MSI_NAME }}" "$GITHUB_TOKEN"
-          ./.github/workflows/upload_asset.sh "./${{ env.MSI_ZIP_NAME }}" "$GITHUB_TOKEN"
+          if [ -n "${{ env.MSI_ZIP_NAME }}" ]; then
+            ./.github/workflows/upload_asset.sh "./${{ env.MSI_ZIP_NAME }}" "$GITHUB_TOKEN"
+          fi
+      - name: upload checksum meta (windows)
+        # After the files, not before — see the macos job: a Fast leg may
+        # fail without failing the release, and must not leave rows for
+        # files the release does not carry.
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v7
+        with:
+          name: meta-windows-${{ matrix.suffix }}
+          path: meta/windows-${{ matrix.suffix }}.txt
       - name: Release Nightly Assets
         # main pushes only — a tag push must not overwrite the nightly
         # release with stable-build artifacts.
@@ -649,18 +693,50 @@ jobs:
     if: needs.prepare_vars.outputs.should_build == 'true' && github.event.inputs.targets != 'docker'
     name: linux-${{ matrix.suffix }}
     runs-on: ${{ matrix.os }}
+    # The GPUI Fast build, as on macOS: a leg that fails must not take the
+    # release with it, and `checksums` then has no `appimage-fast` row for
+    # that arch, so a Fast install is shown the release page instead.
+    continue-on-error: ${{ matrix.variant == 'fast' }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            variant: standard
             suffix: x86_64
+            features: mimalloc
             appimagetool: appimagetool-x86_64.AppImage
 
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
+            arch: aarch64
+            variant: standard
             suffix: aarch64
+            features: mimalloc
+            appimagetool: appimagetool-aarch64.AppImage
+
+          # The same app on GPUI Fast: the AppImage and the tarball only, as
+          # `zedis-<arch>-fast.AppImage.tar.gz` / `zedis-linux-<arch>-fast.tar.gz`
+          # (kinds `appimage-fast` / `tarball-fast`). No `.deb` / `.rpm`: a
+          # second package called `zedis` at the same version is one the
+          # package managers decline to install over the first, and one
+          # under another name would sit beside it.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            variant: fast
+            suffix: x86_64-fast
+            features: mimalloc,gpui-fast
+            appimagetool: appimagetool-x86_64.AppImage
+
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            arch: aarch64
+            variant: fast
+            suffix: aarch64-fast
+            features: mimalloc,gpui-fast
             appimagetool: appimagetool-aarch64.AppImage
     steps:
       - uses: actions/checkout@v7
@@ -680,7 +756,7 @@ jobs:
       - name: rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ runner.os }}-${{ matrix.target }}-build
+          key: ${{ runner.os }}-${{ matrix.target }}-build${{ matrix.variant == 'fast' && '-fast' || '' }}
       - name: install appimagetool
         run: |
           wget https://github.com/AppImage/appimagetool/releases/download/continuous/${{ matrix.appimagetool }} -O appimagetool
@@ -698,19 +774,21 @@ jobs:
           # --locked + pin: see the cargo-bundle note in the macos job.
           cargo install --locked cargo-appimage@2.4.0
           cargo install --locked cargo-deb@3.7.0 cargo-generate-rpm@0.21.0
-          cargo build --release --features mimalloc
+          cargo build --release --features ${{ matrix.features }}
           ls -lh target/release
           # Native packages from the just-built binary — must run before the
           # `mv` below empties target/release. Metadata (name, desktop entry,
           # icons, dependency resolution) lives in [package.metadata.deb] /
           # [package.metadata.generate-rpm] in Cargo.toml.
-          cargo deb -p zedis-gui --no-build -o ./zedis-linux-${{ matrix.suffix }}.deb
-          cargo generate-rpm -o ./zedis-linux-${{ matrix.suffix }}.rpm
+          if [ "${{ matrix.variant }}" = "standard" ]; then
+            cargo deb -p zedis-gui --no-build -o ./zedis-linux-${{ matrix.suffix }}.deb
+            cargo generate-rpm -o ./zedis-linux-${{ matrix.suffix }}.rpm
+          fi
           mv target/release/zedis ./zedis
           chmod +x zedis
           objdump -p ./zedis | grep GLIBC
           tar -czvf zedis-linux-${{ matrix.suffix }}.tar.gz zedis
-          cargo appimage --features mimalloc
+          cargo appimage --features ${{ matrix.features }}
           mv target/appimage/zedis.AppImage ./zedis.AppImage
           tar -czvf zedis-${{ matrix.suffix }}.AppImage.tar.gz zedis.AppImage
       - name: smoke test (first frame must paint)
@@ -737,30 +815,44 @@ jobs:
         run: |
           mkdir -p meta
           : > "meta/linux-${{ matrix.suffix }}.txt"
-          for entry in \
-            "zedis-linux-${{ matrix.suffix }}.tar.gz tarball" \
-            "zedis-${{ matrix.suffix }}.AppImage.tar.gz appimage" \
-            "zedis-linux-${{ matrix.suffix }}.deb deb" \
-            "zedis-linux-${{ matrix.suffix }}.rpm rpm"; do
+          # The Fast build's kinds are the standard ones plus `-fast`, which
+          # no release before it asks for (the updater takes `appimage`).
+          tail=""
+          entries=(
+            "zedis-linux-${{ matrix.suffix }}.tar.gz tarball"
+            "zedis-${{ matrix.suffix }}.AppImage.tar.gz appimage"
+          )
+          if [ "${{ matrix.variant }}" = "fast" ]; then
+            tail="-fast"
+          else
+            entries+=(
+              "zedis-linux-${{ matrix.suffix }}.deb deb"
+              "zedis-linux-${{ matrix.suffix }}.rpm rpm"
+            )
+          fi
+          for entry in "${entries[@]}"; do
             set -- $entry
-            f="$1"; kind="$2"
+            f="$1"; kind="$2$tail"
             sha="$(sha256sum "$f" | awk '{print $1}')"
             size="$(stat -c%s "$f")"
-            echo "linux ${{ matrix.suffix }} $kind $f $sha $size" >> "meta/linux-${{ matrix.suffix }}.txt"
+            echo "linux ${{ matrix.arch }} $kind $f $sha $size" >> "meta/linux-${{ matrix.suffix }}.txt"
           done
-      - name: upload checksum meta (linux)
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: actions/upload-artifact@v7
-        with:
-          name: meta-linux-${{ matrix.suffix }}
-          path: meta/linux-${{ matrix.suffix }}.txt
       - name: upload asset
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           ./.github/workflows/upload_asset.sh "./zedis-linux-${{ matrix.suffix }}.tar.gz" "$GITHUB_TOKEN"
           ./.github/workflows/upload_asset.sh "./zedis-${{ matrix.suffix }}.AppImage.tar.gz" "$GITHUB_TOKEN"
-          ./.github/workflows/upload_asset.sh "./zedis-linux-${{ matrix.suffix }}.deb" "$GITHUB_TOKEN"
-          ./.github/workflows/upload_asset.sh "./zedis-linux-${{ matrix.suffix }}.rpm" "$GITHUB_TOKEN"
+          if [ "${{ matrix.variant }}" = "standard" ]; then
+            ./.github/workflows/upload_asset.sh "./zedis-linux-${{ matrix.suffix }}.deb" "$GITHUB_TOKEN"
+            ./.github/workflows/upload_asset.sh "./zedis-linux-${{ matrix.suffix }}.rpm" "$GITHUB_TOKEN"
+          fi
+      - name: upload checksum meta (linux)
+        # After the files, not before — see the macos job.
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v7
+        with:
+          name: meta-linux-${{ matrix.suffix }}
+          path: meta/linux-${{ matrix.suffix }}.txt
       - name: Release Nightly Assets
         # main pushes only — a tag push must not overwrite the nightly
         # release with stable-build artifacts.

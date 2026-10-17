@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   SignPath artifact configuration for the Windows build. One configuration
-  serves both architectures: the x86_64 and aarch64 jobs each submit a
-  GitHub Actions artifact with the same two file names.
+  serves every leg: the x86_64 and aarch64 jobs, standard and GPUI Fast,
+  each submit a GitHub Actions artifact with the same two file names.
 
   The artifact is what publish.yml uploads right before it submits the
   signing request. actions/upload-artifact zips zedis.exe and zedis.msi at

@@ -94,10 +94,11 @@ jobs:
       - name: test
         run: make test
       - name: lint + test the GPUI Fast build
-        # The `-fast` images publish.yml ships are the `gpui-fast` feature,
+        # The `-fast` builds publish.yml ships are the `gpui-fast` feature,
         # which nothing above compiles: without this, what sits behind it
         # is first built by a release. One arch is enough — the feature
-        # swaps the engine, not anything per-architecture.
+        # swaps the engine, not anything per-architecture; the linux and
+        # windows jobs below do the same for their platform layers.
         if: matrix.target == 'aarch64-apple-darwin'
         run: make lint-fast
 
@@ -131,6 +132,13 @@ jobs:
         run: cargo clippy --all-targets --all -- --deny=warnings
       - name: test
         run: cargo test --workspace
+      - name: clippy + test the GPUI Fast build
+        # `make lint-fast` for Linux: the Fast engine's platform layer here
+        # is its own crate (gpui-fast-linux), which the macOS leg never
+        # compiles, and publish.yml ships a Fast AppImage built on it.
+        run: |
+          cargo clippy --all-targets --features gpui-fast -- --deny=warnings
+          cargo test --features gpui-fast
 
   # The browser build (ADR 9). `make lint` and `make test` are native-only
   # and see nothing of wasm, so until this job existed a desktop refactor
@@ -228,3 +236,11 @@ jobs:
         run: cargo clippy --all-targets --all -- --deny=warnings
       - name: test
         run: cargo test --workspace
+      - name: clippy the GPUI Fast build
+        # As on linux: gpui-fast-windows is compiled nowhere else before a
+        # release builds the Fast MSI on it. Two steps, not one `run` of two
+        # lines: pwsh reports only the last command's exit code, so a failed
+        # clippy followed by passing tests would have been green.
+        run: cargo clippy --all-targets --features gpui-fast -- --deny=warnings
+      - name: test the GPUI Fast build
+        run: cargo test --features gpui-fast

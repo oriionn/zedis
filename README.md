@@ -49,10 +49,6 @@ Already on Redis Insight, ARDM or Tiny RDM? **Paste the export and every connect
 brew install --cask zedis
 ```
 
-**GPUI Fast build — a trial, macOS only for now.** Every [release](https://github.com/vicanso/zedis/releases/latest) also carries `Zedis-<arch>-fast.dmg` (Apple Silicon and Intel): the same app drawn by GPUI Fast, gpui-kit's optional rendering engine. It is offered so the engine can be tried in real use before anything is decided about it; Windows and Linux have no Fast build yet, and Homebrew installs the standard one. In our measurements it uses less CPU in most cases — about 20% less while scrolling pages such as Config and Metrics, a few percent less in the tables and the editor, the same in the key tree — for about 20% more memory.
-
-It installs over the standard app and keeps your settings, and it updates itself to the Fast image of each new release. *About → Copy System Info* says which one is running (`Renderer: GPUI Fast`) — please include it when you report a problem. To go back, install the standard `.dmg` from the same page.
-
 ### Windows
 
 ```bash
@@ -69,6 +65,20 @@ yay -S zedis-bin
 ```
 
 Other distributions: `.deb`, `.rpm`, an AppImage and a plain tarball (x86_64 and aarch64) are attached to every [release](https://github.com/vicanso/zedis/releases/latest).
+
+### GPUI Fast build (trial)
+
+Every [release](https://github.com/vicanso/zedis/releases/latest) also carries the same app drawn by GPUI Fast, gpui-kit's optional rendering engine, for x86_64 and aarch64:
+
+| Platform | File |
+| --- | --- |
+| macOS | `Zedis-<arch>-fast.dmg` |
+| Windows | `zedis-windows-<arch>-fast.msi`, or the portable `zedis-windows-<arch>-fast.zip` |
+| Linux | `zedis-<arch>-fast.AppImage.tar.gz`, or the plain `zedis-linux-<arch>-fast.tar.gz` |
+
+It is offered so the engine can be tried in real use before anything is decided about it; Homebrew, Scoop, winget, the AUR and the `.deb` / `.rpm` packages install the standard one. In our measurements on macOS it uses less CPU in most cases — about 20% less while scrolling pages such as Config and Metrics, a few percent less in the tables and the editor, the same in the key tree — for about 20% more memory.
+
+On macOS and Windows it installs over the standard app; on Linux it is a file of its own. Either way it keeps your settings, and it updates itself to the Fast build of each new release. *About → Copy System Info* says which one is running (`Renderer: GPUI Fast`) — please include it when you report a problem. To go back, install the standard file from the same page.
 
 <details>
 <summary><strong>Build from source with Cargo</strong></summary>

@@ -61,9 +61,14 @@ with a warning, as it always has.
 | `zedis-windows-<arch>.zip` | `zedis.exe` | Authenticode on the exe |
 | `zedis-windows-<arch>.msi` | installer, `PFiles\zedis\zedis.exe` inside | Authenticode on the embedded exe **and** on the MSI |
 | `zedis-windows-<arch>.msi.zip` | the signed MSI | the MSI's own signature |
+| `zedis-windows-<arch>-fast.{zip,msi}` | the same two files, from the GPUI Fast build | as above |
 
-Both architectures (x86_64, aarch64) go through the same steps as two
-independent signing requests. Nightly builds are not signed.
+Both architectures (x86_64, aarch64), each as the standard build and the
+GPUI Fast one, go through the same steps as four independent signing
+requests — four approvals per release under `release-signing`. A Fast
+request left to time out fails only its own leg (`continue-on-error`): the
+release ships without that Fast build, and the Fast install of that arch is
+shown the release page instead of an update. Nightly builds are not signed.
 
 The signer shown by Windows is **SignPath Foundation**, the certificate
 holder. The description inside the signature — what a UAC prompt shows as

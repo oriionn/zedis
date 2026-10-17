@@ -14,10 +14,12 @@
 
 //! Which GPUI this binary is built on.
 //!
-//! macOS ships the app as two images: the default one on GPUI, and a `-fast`
-//! one on GPUI Fast (the `gpui-fast` cargo feature). They are the same app
-//! under the same name and bundle identifier, so nothing on disk says which
-//! is installed — the binary has to know, and it does at compile time. Two
+//! Every desktop platform ships the app twice: the default build on GPUI,
+//! and a `-fast` one on GPUI Fast (the `gpui-fast` cargo feature). They are
+//! the same app under the same name — the same bundle identifier on macOS,
+//! the same MSI upgrade code on Windows, the same file names inside a Linux
+//! tarball or AppImage — so nothing on disk says which is installed: the
+//! binary has to know, and it does at compile time. Two
 //! things ask it: a report (System Info, the crash context, the diagnostics
 //! bundle), so a bug can be told by the engine it was seen on, and the
 //! updater, which keeps an install on the image it came from.
@@ -25,9 +27,10 @@
 /// The engine a build draws with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BuildVariant {
-    /// GPUI: every platform's build, and the only one outside macOS.
+    /// GPUI: every platform's build, and the only one Homebrew, Scoop,
+    /// winget, the AUR, Flathub and the `.deb` / `.rpm` packages carry.
     Standard,
-    /// GPUI Fast: the `-fast` image.
+    /// GPUI Fast: the `-fast` files of a release.
     Fast,
 }
 

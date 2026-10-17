@@ -14,7 +14,7 @@ lint:
 	cargo clippy --all-targets --all -- --deny=warnings
 	python3 scripts/asset-rev.py check
 
-# The GPUI Fast build (the `gpui-fast` feature — the macOS `-fast` images):
+# The GPUI Fast build (the `gpui-fast` feature — every platform's `-fast` files):
 # clippy for what sits behind the feature, which `make lint` never compiles,
 # then the app crate's tests on that engine. Run it after touching anything
 # gated on the feature, or the engine wiring in `lib.rs`.

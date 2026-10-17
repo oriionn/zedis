@@ -244,14 +244,17 @@ gpui = { workspace = true, features = ["test-support"] }
 gpui-kit = { workspace = true, features = ["test-support"] }
 
 [features]
-# The macOS `Zedis-<arch>-fast.dmg`: the same app on GPUI Fast, gpui-kit's
-# optional engine (0.7.2+), in place of the default `gpui-pre`. gpui-kit then
+# The `-fast` builds of a release (`Zedis-<arch>-fast.dmg`,
+# `zedis-windows-<arch>-fast.msi`, `zedis-<arch>-fast.AppImage.tar.gz`…):
+# the same app on GPUI Fast, gpui-kit's optional engine (0.7.2+), in place
+# of the default `gpui-pre`. gpui-kit then
 # re-exports Fast as `gpui_kit::*`, and each crate that writes `gpui::…`
 # aliases the kit under that name (`extern crate gpui_kit as gpui;` in its
 # `lib.rs`), so its paths — and what GPUI's macros expand to — name the
 # engine the components are built on. Desktop only: `zedis-web` constructs
-# gpui-pre's web platform by name. publish.yml's macOS job builds it and
-# `make lint-fast` checks it; nothing else turns it on.
+# gpui-pre's web platform by name. publish.yml's macos / windows / linux
+# jobs build it, `make lint-fast` and lint.yml's linux and windows jobs
+# check it; nothing else turns it on.
 gpui-fast = ["gpui-kit/gpui-fast", "zedis-ui/gpui-fast"]
 
 [workspace.dependencies]
