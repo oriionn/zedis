@@ -4,7 +4,7 @@ How the Windows release binaries get their Authenticode signature, what lives
 where, and what to do on release day. The user-facing side is the *Code
 signing policy* section of the README; this file is the maintainer's side.
 
-## Where onboarding stands (2026-10-09)
+## Where onboarding stands (2026-10-17)
 
 Delete this section once release signing is live. Nothing in it blocks an
 ordinary release: until step 5 below a tag ships an unsigned Windows build
@@ -23,30 +23,34 @@ with a warning, as it always has.
   by hand on `test-signing`, with the released v0.12.4 `zedis.exe` and
   `zedis.msi` zipped at the root, was processed successfully.
 - `test-signing` lists `CI builds` (and the maintainer) as Submitters.
+- The predefined *GitHub.com* trusted build system is in the organization
+  (*Trusted Build Systems*, ACTIVE, 2026-10-17). It could not be added from
+  the organization itself — the page had no button for it and *Link* on the
+  project offered only AppVeyor — so SignPath support added it. It is
+  linked to the project `zedis` (2026-10-17).
+- Dry run on the test certificate (2026-10-17, Actions run 38977578760):
+  both architectures were signed on `test-signing` without approval — the
+  exe, the MSI and the exe inside the MSI (`PFiles\zedis\zedis.exe`, the
+  path the configuration names), each timestamped by DigiCert. `signtool`
+  failed only on the untrusted test root, as expected. Signing requests:
+  [x86_64](https://app.signpath.io/Web/13ddfa06-ef0d-452c-8cf0-431207116a25/SigningRequests/5d906c29-cef1-4403-88ea-71f571305513),
+  [aarch64](https://app.signpath.io/Web/13ddfa06-ef0d-452c-8cf0-431207116a25/SigningRequests/f0621a8a-47f6-4135-9fe0-a900ffb0ca61).
 
 **Waiting on SignPath** (support e-mailed on 2026-10-09)
 
-- The predefined *GitHub.com* trusted build system cannot be added from this
-  organization: its *Trusted Build Systems* page has no button to add one,
-  and *Link* on the project's *Trusted Build Systems* tab offers only
-  AppVeyor. Until GitHub.com is linked to the project, do not start the dry
-  run — a rejected request fails the Windows job of that nightly.
 - `release-signing` is shown as INVALID. Asked whether that is only the
   production certificate that is not there yet.
 
 **Then, in this order**
 
-1. Link GitHub.com to the project (project → *Trusted Build Systems* →
-   *Link*) once SignPath has made it available.
-2. Dry run on the test certificate (*4. Dry run*).
-3. Send SignPath the two signing request links. They review the setup, then
+1. Send SignPath the two signing request links. They review the setup, then
    order and import the production certificate.
-4. Check `release-signing`: valid, the production certificate assigned,
+2. Check `release-signing`: valid, the production certificate assigned,
    `CI builds` as Submitter, the maintainer as Approver, origin restricted
    to this repository's `v*` tags.
-5. Set the repository variable `SIGNPATH_RELEASE_SIGNING` to `true`
+3. Set the repository variable `SIGNPATH_RELEASE_SIGNING` to `true`
    (*5. Switch release signing on*).
-6. First signed release: approve both requests within 30 minutes
+4. First signed release: approve both requests within 30 minutes
    (*Release day*), then file the winget manifest that was waiting for a
    signed installer.
 
