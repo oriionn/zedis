@@ -899,7 +899,7 @@ fn ttl_filter_label_key(filter: TtlFilter) -> Option<&'static str> {
 }
 
 /// i18n key per tag colour — the `[key_tag]` section's.
-fn tag_color_label_key(color: TagColor) -> &'static str {
+pub(super) fn tag_color_label_key(color: TagColor) -> &'static str {
     match color {
         TagColor::Red => "color_red",
         TagColor::Orange => "color_orange",

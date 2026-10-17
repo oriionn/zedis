@@ -40,6 +40,7 @@ use crate::states::{
     KeyType, MultiSearchScope, ZedisGlobalStore, i18n_common, i18n_multi_search, update_app_state_and_save_quiet,
 };
 use crate::views::export_to_file_global;
+use crate::views::placeholders::Placeholders;
 use gpui::{
     ClipboardItem, Context, Entity, FocusHandle, Hsla, KeyDownEvent, SharedString, Subscription, Task, Window, div,
     prelude::*, px, uniform_list,
@@ -114,12 +115,16 @@ pub struct ZedisMultiSearch {
     /// without a `Window` (⌘⇧F again), or a jump, whose page has to be
     /// the one on screen by then.
     pending_restore: bool,
+    /// The query's placeholder, worded again after a language change.
+    placeholders: Placeholders,
     _subscriptions: Vec<Subscription>,
 }
 
 impl ZedisMultiSearch {
     pub fn new(page_focus: FocusHandle, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let query = cx.new(|cx| InputState::new(window, cx).placeholder(i18n_multi_search(cx, "placeholder")));
+        let query = cx.new(|cx| InputState::new(window, cx));
+        let mut placeholders = Placeholders::new(cx);
+        placeholders.add(&query, |cx| i18n_multi_search(cx, "placeholder"), window, cx);
         let scan_count_input = cx.new(|cx| InputState::new(window, cx));
         let mut subscriptions = Vec::new();
         // Enter in the query starts (or restarts) the search.
@@ -160,6 +165,7 @@ impl ZedisMultiSearch {
             prev_focus: None,
             page_focus,
             pending_restore: false,
+            placeholders,
             _subscriptions: subscriptions,
         }
     }
@@ -792,6 +798,10 @@ impl Render for ZedisMultiSearch {
             }
             return div().into_any_element();
         }
+
+        // Long-lived (the root keeps it), so the placeholder follows a
+        // language change made since it was built (#222).
+        self.placeholders.follow(window, cx);
 
         if self.pending_focus {
             self.pending_focus = false;

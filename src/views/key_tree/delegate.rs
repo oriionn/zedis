@@ -15,6 +15,7 @@
 //! `ListDelegate` for the virtualized key tree: row rendering (icon,
 //! tag bar, TTL chip, inline delete) and the right-click context menu.
 
+use super::render::tag_color_label_key;
 use super::*;
 
 /// The selection checkbox of a key row, with the row's index.
@@ -321,9 +322,23 @@ impl ListDelegate for KeyTreeDelegate {
         let row_border = tag_color.unwrap_or(gpui::transparent_black());
         let note = entry.note.clone();
         let has_note = !note.is_empty();
-        let folder_tag_summary = entry.folder_tag_summary.clone();
-        let has_folder_tags = is_folder && !folder_tag_summary.is_empty();
-        let tag_mixed = entry.tag_mixed;
+        // A folder's tags as the tooltip lists them ("Red 3 · Blue 1"),
+        // worded in the language chosen now.
+        let folder_tags = (is_folder && !entry.folder_tag_counts.is_empty()).then(|| {
+            let tags = entry
+                .folder_tag_counts
+                .iter()
+                .map(|&(color, count)| format!("{} {count}", i18n_key_tag(cx, tag_color_label_key(color))))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let locale = cx.global::<ZedisGlobalStore>().read(cx).locale();
+            let line = if entry.tag_mixed {
+                t!("key_tree.folder_tags_mixed", tags = tags, locale = locale)
+            } else {
+                t!("key_tree.folder_tags", tags = tags, locale = locale)
+            };
+            line.to_string()
+        });
         let edit_tag_id = entry.id.clone();
         let del_id = entry.id.clone();
         // Inline delete only on leaf keys (folders use their context-menu
@@ -604,9 +619,8 @@ impl ListDelegate for KeyTreeDelegate {
                                         .tooltip({
                                             let text: SharedString = if has_note {
                                                 format!("{}\n{}", entry.id, note).into()
-                                            } else if has_folder_tags {
-                                                let mix = if tag_mixed { " (mixed)" } else { "" };
-                                                format!("{}\nTags{mix}: {}", entry.id, folder_tag_summary).into()
+                                            } else if let Some(tags) = &folder_tags {
+                                                format!("{}\n{tags}", entry.id).into()
                                             } else {
                                                 entry.id.clone()
                                             };

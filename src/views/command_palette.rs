@@ -26,6 +26,7 @@ use crate::states::{
 };
 #[cfg(not(target_family = "wasm"))]
 use crate::states::{i18n_status_bar, i18n_trash};
+use crate::views::placeholders::Placeholders;
 use gpui::{Context, FocusHandle, Focusable, KeyDownEvent, ScrollHandle, Window, div, prelude::*, px};
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::{ActiveTheme, label::Label, v_flex};
@@ -151,6 +152,8 @@ pub struct ZedisCommandPalette {
     /// forces a rebuild (set on every open so favorites/server edits
     /// from the previous session are re-read).
     items_signature: Option<(Scope, String, String)>,
+    /// The search field's placeholder, worded again after a language change.
+    placeholders: Placeholders,
 }
 
 impl ZedisCommandPalette {
@@ -160,10 +163,9 @@ impl ZedisCommandPalette {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let query = cx.new(|cx| {
-            gpui_kit::component::input::InputState::new(window, cx)
-                .placeholder(i18n_command_palette(cx, "search_placeholder"))
-        });
+        let query = cx.new(|cx| gpui_kit::component::input::InputState::new(window, cx));
+        let mut placeholders = Placeholders::new(cx);
+        placeholders.add(&query, |cx| i18n_command_palette(cx, "search_placeholder"), window, cx);
         Self {
             server_state,
             favorites: Vec::new(),
@@ -179,6 +181,7 @@ impl ZedisCommandPalette {
             cached_items: Vec::new(),
             cached_order: Vec::new(),
             items_signature: None,
+            placeholders,
         }
     }
 
@@ -655,6 +658,10 @@ impl Render for ZedisCommandPalette {
             return div().into_any_element();
         }
 
+        // Long-lived (the root keeps it), so the placeholder follows a
+        // language change made since it was built (#222).
+        self.placeholders.follow(window, cx);
+
         // Deferred from `toggle` (global action handler has no Window):
         // reset and focus the search input on the first render after open.
         if self.pending_focus {
@@ -922,6 +929,7 @@ mod tests {
     use crate::test_support::init_ui;
     use gpui::{AppContext, TestAppContext, size};
     use gpui_kit::component::Root;
+    use gpui_kit::test::TestWindowExt;
 
     /// The Tools menu's dialogs are commands too, and the recycle bin is
     /// found by the names the issue looked for it by — "trash" and
@@ -978,5 +986,47 @@ mod tests {
                 );
             }
         });
+    }
+
+    /// The palette lives as long as the window, so its search field is
+    /// worded again when the language changes after it was built — it kept
+    /// the English it was built in (#222).
+    #[gpui::test]
+    fn the_search_placeholder_follows_a_language_change(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let set_locale = |locale: &str, cx: &mut TestAppContext| {
+            let locale = locale.to_string();
+            cx.update(|cx| {
+                let store = cx.global::<ZedisGlobalStore>().clone();
+                store.update(cx, |state, _| state.set_locale(locale));
+            });
+        };
+        set_locale("en", cx);
+        let server_state = cx.new(|_| ZedisServerState::default());
+        let mut palette = None;
+        let handle = cx.open_window(size(px(600.), px(400.)), |window, cx| {
+            let page_focus = cx.focus_handle();
+            let view = cx.new(|cx| ZedisCommandPalette::new(server_state.clone(), page_focus, window, cx));
+            palette = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let palette = palette.expect("the window built the palette");
+        let placeholder = |cx: &mut TestAppContext| {
+            palette.read_with(cx, |palette, cx| {
+                palette.query.read(cx).presentation().placeholder().to_string()
+            })
+        };
+        assert_eq!(placeholder(cx), "Search servers and keys");
+
+        set_locale("zh", cx);
+        // Opened as `toggle` opens it, without the favorites it reads from
+        // the local database.
+        palette.update(cx, |palette, cx| {
+            palette.open = true;
+            cx.notify();
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .expect("the window is open");
+        assert_eq!(placeholder(cx), "搜索服务器与 key");
     }
 }

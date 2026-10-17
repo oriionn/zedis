@@ -103,9 +103,12 @@ pub(super) fn tag_color_index(color: TagColor) -> usize {
     TagColor::ALL.iter().position(|&c| c == color).unwrap_or(0)
 }
 
-/// Resolve a per-colour histogram into (mode colour, is_mixed, tooltip).
+/// How many keys carry each tag colour present, in `TagColor::ALL` order.
+pub(super) type TagCounts = Vec<(TagColor, u32)>;
+
+/// Resolve a per-colour histogram into (mode colour, is_mixed, the counts).
 /// `None` when no tagged descendants.
-pub(super) fn resolve_folder_tag_histogram(counts: &[u32; 6]) -> Option<(TagColor, bool, SharedString)> {
+pub(super) fn resolve_folder_tag_histogram(counts: &[u32; 6]) -> Option<(TagColor, bool, TagCounts)> {
     let total: u32 = counts.iter().sum();
     if total == 0 {
         return None;
@@ -125,14 +128,13 @@ pub(super) fn resolve_folder_tag_histogram(counts: &[u32; 6]) -> Option<(TagColo
     let mode = TagColor::ALL[best_ix];
     let mixed = distinct > 1;
     // Stable display order follows TagColor::ALL.
-    let mut parts: Vec<String> = Vec::new();
-    for (i, &c) in counts.iter().enumerate() {
-        if c > 0 {
-            parts.push(format!("{} {c}", TagColor::ALL[i].as_str()));
-        }
-    }
-    let summary: SharedString = parts.join(" · ").into();
-    Some((mode, mixed, summary))
+    let present = counts
+        .iter()
+        .enumerate()
+        .filter(|&(_, &c)| c > 0)
+        .map(|(i, &c)| (TagColor::ALL[i], c))
+        .collect();
+    Some((mode, mixed, present))
 }
 
 /// Stamp folder rows with aggregated tag colours derived from **local**
@@ -167,7 +169,7 @@ pub(super) fn stamp_folder_tag_aggregates(
         }
     }
     for (folder_id, hist) in counts {
-        let Some((mode, mixed, summary)) = resolve_folder_tag_histogram(&hist) else {
+        let Some((mode, mixed, present)) = resolve_folder_tag_histogram(&hist) else {
             continue;
         };
         if let Some(item) = items.get_mut(folder_id.as_str())
@@ -175,7 +177,7 @@ pub(super) fn stamp_folder_tag_aggregates(
         {
             item.tag = Some(mode);
             item.tag_mixed = mixed;
-            item.folder_tag_summary = summary;
+            item.folder_tag_counts = present;
         }
     }
 }
@@ -836,11 +838,10 @@ mod folder_tag_aggregate_tests {
         let mut counts = [0u32; 6];
         counts[tag_color_index(TagColor::Red)] = 3;
         counts[tag_color_index(TagColor::Blue)] = 1;
-        let (mode, mixed, summary) = resolve_folder_tag_histogram(&counts).expect("some");
+        let (mode, mixed, present) = resolve_folder_tag_histogram(&counts).expect("some");
         assert_eq!(mode, TagColor::Red);
         assert!(mixed);
-        assert!(summary.as_ref().contains("red 3"));
-        assert!(summary.as_ref().contains("blue 1"));
+        assert_eq!(present, vec![(TagColor::Red, 3), (TagColor::Blue, 1)]);
     }
 
     #[test]
@@ -886,7 +887,7 @@ mod folder_tag_aggregate_tests {
         let folder = items.get("user").expect("folder");
         assert_eq!(folder.tag, Some(TagColor::Red));
         assert!(!folder.tag_mixed);
-        assert!(folder.folder_tag_summary.as_ref().contains("red 2"));
+        assert_eq!(folder.folder_tag_counts, vec![(TagColor::Red, 2)]);
     }
 }
 

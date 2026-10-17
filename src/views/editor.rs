@@ -31,8 +31,8 @@ use crate::{
     },
     states::{
         ConnectionErrorKind, DataFormat, HINT_EDITOR_GUIDE, KeyType, LinkProblem, MAX_INLINE_VALUE_SIZE, ServerEvent,
-        VALUE_PREVIEW_BYTES, ViewerKind, ZedisGlobalStore, ZedisServerState, dialog_button_props, i18n_bitmap,
-        i18n_common, i18n_copy, i18n_editor, i18n_expire_at, i18n_geo_map, i18n_key_ops, i18n_shortcuts,
+        VALUE_PREVIEW_BYTES, ViewMode, ViewerKind, ZedisGlobalStore, ZedisServerState, dialog_button_props,
+        i18n_bitmap, i18n_common, i18n_copy, i18n_editor, i18n_expire_at, i18n_geo_map, i18n_key_ops, i18n_shortcuts,
         i18n_status_bar, update_app_state_and_save_quiet,
     },
     views::{
@@ -256,6 +256,16 @@ fn ttl_field_text(ttl: Option<chrono::Duration>) -> SharedString {
     }
 }
 
+/// The bitmap override a viewer picked on the status bar leaves: Plain or
+/// Hex shows the bytes rather than the grid (`Some(false)`, what the grid's
+/// ≡ button sets), Auto lets the small-binary heuristic decide again.
+fn bitmap_override_for(mode: Option<&ViewMode>) -> Option<bool> {
+    match mode {
+        Some(ViewMode::Plain | ViewMode::Hex) => Some(false),
+        Some(ViewMode::Auto) | None => None,
+    }
+}
+
 /// File extension suggested when exporting a value, from its detected format.
 fn value_export_extension(format: DataFormat) -> &'static str {
     match format {
@@ -395,6 +405,21 @@ impl ZedisEditor {
                     // A fresh value load (reload, type change, server
                     // switch) invalidates the diff snapshot.
                     this.close_diff_session(cx);
+                }
+                ServerEvent::ValueModeViewUpdated => {
+                    // A viewer picked on the status bar is a request to see
+                    // the bytes that way, so Plain or Hex leaves the bitmap
+                    // grid the small-binary heuristic opened — as the grid's
+                    // own ≡ button does — where it used to change nothing
+                    // until that button was found (#224). Auto hands the
+                    // choice back to the heuristic.
+                    let mode = server_state
+                        .read(cx)
+                        .value()
+                        .and_then(|value| value.bytes_value())
+                        .map(|bytes| bytes.view_mode.clone());
+                    this.bitmap_override = bitmap_override_for(mode.as_ref());
+                    cx.notify();
                 }
                 ServerEvent::ValueUpdated => {
                     // After a successful Save the right-pane snapshot
@@ -997,10 +1022,23 @@ impl ZedisEditor {
 #[cfg(test)]
 mod tests {
     use super::render::{ACT_HINTS, FIND_HINTS};
-    use super::{format_ttl_string, suggested_value_filename, ttl_field_text, value_export_extension};
+    use super::{
+        bitmap_override_for, format_ttl_string, suggested_value_filename, ttl_field_text, value_export_extension,
+    };
     use crate::helpers::hot_key_table;
-    use crate::states::DataFormat;
+    use crate::states::{DataFormat, ViewMode};
     use zedis_core::validate::ttl_secs;
+
+    /// A viewer chosen on the status bar decides between the bitmap grid
+    /// and the bytes: Plain and Hex leave the grid, Auto gives the choice
+    /// back to the heuristic (#224).
+    #[test]
+    fn a_viewer_picked_on_the_status_bar_leaves_the_bitmap_grid() {
+        assert_eq!(bitmap_override_for(Some(&ViewMode::Hex)), Some(false));
+        assert_eq!(bitmap_override_for(Some(&ViewMode::Plain)), Some(false));
+        assert_eq!(bitmap_override_for(Some(&ViewMode::Auto)), None);
+        assert_eq!(bitmap_override_for(None), None);
+    }
 
     /// The no-key screen draws each id's shortcut and, as its description,
     /// the `shortcuts.` entry of the same name — the one the ⌘/ overlay uses.

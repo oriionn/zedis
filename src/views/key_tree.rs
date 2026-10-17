@@ -196,9 +196,11 @@ struct KeyTreeItem {
     /// Leaves always `false`. Drives tooltip wording; left bar still
     /// shows the mode colour.
     tag_mixed: bool,
-    /// Folder only: preformatted "Red 3 · Blue 1" summary for tooltips.
-    /// Empty on leaves / untagged folders.
-    folder_tag_summary: SharedString,
+    /// Folder only: how many keys under it carry each tag colour, in
+    /// `TagColor::ALL` order, for the tooltip — worded when it is drawn,
+    /// in the language then chosen (the build runs off the UI thread and
+    /// knows none). Empty on leaves / untagged folders.
+    folder_tag_counts: TagCounts,
     /// Free-form note. Empty when there's no annotation. Rendered as a
     /// hover tooltip on the row label so it doesn't steal layout
     /// space from the type badge / TTL chip. Folders never carry notes.

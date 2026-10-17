@@ -20,6 +20,7 @@
 use crate::db::{get_recent_keys_manager, recent_keys_scope};
 use crate::helpers::fuzzy_score;
 use crate::states::{Route, ServerView, ZedisGlobalStore, ZedisServerState, i18n_recent_keys_palette};
+use crate::views::placeholders::Placeholders;
 use gpui::{Context, FocusHandle, Focusable, KeyDownEvent, ScrollHandle, Window, div, prelude::*, px};
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::{ActiveTheme, label::Label, v_flex};
@@ -46,6 +47,8 @@ pub struct ZedisRecentKeysPalette {
     /// Deferred because `toggle` has no `Window`.
     pending_restore: bool,
     scroll_handle: ScrollHandle,
+    /// The search field's placeholder, worded again after a language change.
+    placeholders: Placeholders,
 }
 
 impl ZedisRecentKeysPalette {
@@ -55,10 +58,14 @@ impl ZedisRecentKeysPalette {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let query = cx.new(|cx| {
-            gpui_kit::component::input::InputState::new(window, cx)
-                .placeholder(i18n_recent_keys_palette(cx, "search_placeholder"))
-        });
+        let query = cx.new(|cx| gpui_kit::component::input::InputState::new(window, cx));
+        let mut placeholders = Placeholders::new(cx);
+        placeholders.add(
+            &query,
+            |cx| i18n_recent_keys_palette(cx, "search_placeholder"),
+            window,
+            cx,
+        );
         Self {
             server_state,
             recent: Vec::new(),
@@ -72,6 +79,7 @@ impl ZedisRecentKeysPalette {
             page_focus,
             pending_restore: false,
             scroll_handle: ScrollHandle::new(),
+            placeholders,
         }
     }
 
@@ -183,6 +191,10 @@ impl Render for ZedisRecentKeysPalette {
             }
             return div().into_any_element();
         }
+
+        // Long-lived (the root keeps it), so the placeholder follows a
+        // language change made since it was built (#222).
+        self.placeholders.follow(window, cx);
 
         if self.pending_focus {
             self.pending_focus = false;
