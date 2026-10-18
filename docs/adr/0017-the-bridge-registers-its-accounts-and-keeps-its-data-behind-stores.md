@@ -145,10 +145,13 @@ one, chosen at start-up by a connection URL and written when a deployment
 needs it; one implementation over PostgreSQL, MySQL and SQLite is the
 target, and its crate is chosen (and its current version checked) then.
 
-The server list's trait goes in `zedis-connection`, because `save_servers`
-is the desktop's too: the desktop keeps its file arm unchanged and the
-bridge installs its store at start-up, the shape the page already uses with
-`bridge_server_store`. Everything else lives in `zedis-bridge`.
+All of the traits live in `zedis-bridge` (`store.rs`), the server list's
+too. Its local-directory store goes through `zedis-connection`'s own
+`get_servers` / `save_servers` — the desktop's functions, called as they
+are — so `zedis-connection` keeps the desktop's arm untouched and learns
+nothing of stores. A SQL store will need one door into that crate's cache
+(`get_server`, which the pool dials from), added beside the browser's
+`set_servers_cache` when that store is written.
 
 **Never in a store:**
 
@@ -163,11 +166,14 @@ bridge installs its store at start-up, the shape the page already uses with
 
 **Rules every store keeps:**
 
-- **Change by entry, never by rewriting the set.** The lost update is fixed
-  now, before any trait: every change to the bridge's server list goes
-  through `edit_servers`, which holds one lock from the read to the end of
-  the write, and a failed dial takes back only the entry its request wrote.
-  A record store changes one entry per call. Two edits of the *same* entry
+- **Change by entry, never by rewriting the set.** The lost update was
+  fixed before any trait, by one lock from the read to the end of the
+  write; it now lives in the local server store, whose file is still read
+  and written whole, while the routes call `ServerStore::put` and
+  `ServerStore::swap` — a swap changes an entry only while it is the one
+  the caller saw, which is how a failed dial takes back only its own entry
+  and a delete removes only what it checked. A record store changes one
+  entry per call. Two edits of the *same* entry
   are last-writer-wins today; a record carries a version so a SQL store can
   refuse the stale one.
 - **What holds a Redis value or a secret is encrypted with the master key
@@ -177,8 +183,12 @@ bridge installs its store at start-up, the shape the page already uses with
 - **The audit stays fail-open for requests** (ADR 11): a line that cannot be
   written is an error in the process log, never a refused request.
 - **A change to shared authored data is audited**: a script saved or
-  deleted; a key put in the bin, removed from it or restored. Tags and notes
-  carry their author and time on the record instead.
+  deleted; a key taken out of the bin (`trash_removed`) — restored or let
+  go, a restore's `RESTORE` being a write line of its own, since the page's
+  one call for both is shared with the desktop and is not split for this.
+  A key put in the bin (`trash_put`) follows `--audit-writes`, as the delete
+  it comes from is a plain data write. Tags and notes carry their author
+  and time on the record instead.
 - **A cache answers for its store.** The server list is cached in memory
   (`SERVER_CONFIG_MAP`); a store another process can change must tell this
   one — a version to poll, or the database's own notification. The
@@ -195,7 +205,7 @@ cannot reach them, rather than gated inside code it shares:
 | `zedis-web/www` | the setup, sign-up, sign-in, account and administration pages, as HTML beside today's sign-in form | outside the GUI crate and outside the wasm |
 | GUI crate | one entry in the title-bar menu — *Account…* when signed in, *Administration…* for an administrator — drawn by an ungated seam like `signed_in_to_bridge()`, which sends the page to the HTML | no bridge transport on the desktop, so nothing is drawn; a native test holds that |
 | `zedis-db` | the page's scripts, tags, notes and favorites persist through `mem_store` backed by `BridgeStorage` | `mem_store` is compiled for wasm only; the desktop's redb is untouched |
-| `zedis-connection` | the server list's store trait | the desktop's file arm is unchanged |
+| `zedis-connection` | `encrypt_bytes` / `decrypt_bytes` for the bin's payloads, beside the string forms | additions only, native only; the desktop's code is not touched |
 
 The account and administration screens are pages rather than GPUI views for
 the same reason: as views they would be browser-only screens inside the
@@ -213,10 +223,12 @@ give the desktop the same results before and after each step, and
 
 1. The lost update — done with this ADR.
 2. The store traits, with the local-directory implementation, for the data
-   the bridge already keeps: servers, logins, audit, bin, metrics — no
-   change in behaviour — plus the bin's audit lines and payload encryption.
-3. Accounts: the account, invite and token records; the setup token;
-   registration; sign-in on hashed passwords; the account and
+   the bridge already keeps — servers, audit, bin, metrics — no change in
+   behaviour, plus the bin's audit lines and payload encryption. Done.
+3. Accounts and logins: the account, invite and token records; logins as
+   leases, carrying the credential version instead of the users file's
+   tag (which is why they wait for this step rather than move twice); the
+   setup token; registration; sign-in on hashed passwords; the account and
    administration pages; the import from the users file; the audit lines.
 4. The page's data: scripts (private or shared, audited), key tags and
    notes, per-account favorites, recent keys and preferences.

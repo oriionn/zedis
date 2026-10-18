@@ -51,6 +51,7 @@
 //! an outage, and a bridge that stops is a bridge someone goes around.
 
 use crate::policy::{Verdict, words};
+use crate::store::AuditLog;
 use crate::webhook::Webhook;
 use axum::http::HeaderMap;
 use serde::Serialize;
@@ -77,19 +78,48 @@ const MAX_ARG_CHARS: usize = 128;
 /// count: a `DEL` of a folder names hundreds of keys.
 const MAX_ARGS: usize = 24;
 
-/// Where the lines go: the file, the webhook (`crate::webhook`), both or
-/// neither. Cloned into the router state; `off()` is a deployment with
-/// neither, where every `record` is a no-op.
+/// Where the lines go: the log (`store::AuditLog` — the file, today), the
+/// webhook (`crate::webhook`), both or neither. Cloned into the router
+/// state; `off()` is a deployment with neither, where every `record` is a
+/// no-op.
 #[derive(Clone, Default)]
 pub struct Audit {
-    file: Option<Arc<Sink>>,
+    log: Option<Arc<dyn AuditLog>>,
+    /// `--audit-writes`: plain data writes get a line too.
+    writes: bool,
     webhook: Option<Webhook>,
 }
 
-struct Sink {
+/// The audit log in the file `--audit-log` names, a JSON object a line,
+/// appended: the local directory's `store::AuditLog` (ADR 17).
+pub struct LocalAuditLog {
     path: PathBuf,
     file: Mutex<File>,
-    writes: bool,
+}
+
+impl LocalAuditLog {
+    /// Open `path` for appending — created owner-only if it is new — and
+    /// keep it.
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        restrict(path);
+        Ok(Self {
+            path: path.to_path_buf(),
+            file: Mutex::new(file),
+        })
+    }
+}
+
+impl AuditLog for LocalAuditLog {
+    fn append(&self, mut line: Vec<u8>) {
+        line.push(b'\n');
+        // A poisoned lock means another writer panicked mid-line; the file
+        // is still the file, and losing every later line over it is worse.
+        let mut file = self.file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Err(e) = file.write_all(&line) {
+            tracing::error!(error = %e, path = %self.path.display(), "audit line lost");
+        }
+    }
 }
 
 impl Audit {
@@ -100,14 +130,9 @@ impl Audit {
     /// Open `path` for appending — created owner-only if it is new — and
     /// keep it. `writes` is `--audit-writes`.
     pub fn open(path: &Path, writes: bool) -> std::io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
-        restrict(path);
         Ok(Self {
-            file: Some(Arc::new(Sink {
-                path: path.to_path_buf(),
-                file: Mutex::new(file),
-                writes,
-            })),
+            log: Some(Arc::new(LocalAuditLog::open(path)?)),
+            writes,
             webhook: None,
         })
     }
@@ -120,14 +145,14 @@ impl Audit {
 
     /// Whether plain data writes get a line too.
     pub fn logs_writes(&self) -> bool {
-        self.file.as_ref().is_some_and(|sink| sink.writes)
+        self.log.is_some() && self.writes
     }
 
     /// Append one line, and push it where the webhook wants it. Never fails
     /// the caller: a line that could not be written is an error in the
     /// process log instead.
     pub fn record(&self, account: &str, origin: &Origin, event: Event) {
-        if self.file.is_none() && self.webhook.is_none() {
+        if self.log.is_none() && self.webhook.is_none() {
             return;
         }
         let line = Line {
@@ -149,22 +174,12 @@ impl Audit {
                 Err(e) => tracing::error!(error = %e, "audit line could not be serialised for the webhook"),
             }
         }
-        let Some(sink) = &self.file else {
+        let Some(log) = &self.log else {
             return;
         };
-        let mut bytes = match serde_json::to_vec(&line) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                tracing::error!(error = %e, "audit line could not be serialised");
-                return;
-            }
-        };
-        bytes.push(b'\n');
-        // A poisoned lock means another writer panicked mid-line; the file
-        // is still the file, and losing every later line over it is worse.
-        let mut file = sink.file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Err(e) = file.write_all(&bytes) {
-            tracing::error!(error = %e, path = %sink.path.display(), "audit line lost");
+        match serde_json::to_vec(&line) {
+            Ok(bytes) => log.append(bytes),
+            Err(e) => tracing::error!(error = %e, "audit line could not be serialised"),
         }
     }
 }
@@ -294,6 +309,20 @@ pub enum Event {
     Locked {
         server: ServerRef,
     },
+    /// A deleted key's value kept in the recycle bin — under
+    /// `--audit-writes`, like the delete it follows (ADR 17).
+    TrashPut {
+        server: ServerRef,
+        key: String,
+        db: usize,
+    },
+    /// A key taken out of the recycle bin for good: restored — the
+    /// `RESTORE` that did it is a write line of its own — or let go.
+    TrashRemoved {
+        server: ServerRef,
+        key: String,
+        db: usize,
+    },
     /// A tool call at the MCP entry point (ADR 15) — every one, whatever it
     /// read. The other lines keep what a person did that mattered; this
     /// door admits a program acting for someone, and reads are the whole
@@ -327,6 +356,8 @@ impl Event {
             Event::ServerDeleted { .. } => "server_deleted",
             Event::Unlocked { .. } => "unlocked",
             Event::Locked { .. } => "locked",
+            Event::TrashPut { .. } => "trash_put",
+            Event::TrashRemoved { .. } => "trash_removed",
             Event::Tool { .. } => "tool",
         }
     }
@@ -340,6 +371,8 @@ impl Event {
             Event::Command(line) => {
                 line.outcome != Outcome::Allowed || is_administration_command(&line.command, &line.args)
             }
+            // A by-product of a plain delete, which is not pushed either.
+            Event::TrashPut { .. } => false,
             _ => true,
         }
     }
@@ -676,6 +709,16 @@ mod tests {
                 seconds: 900,
             },
             Event::Locked { server: at() },
+            Event::TrashPut {
+                server: at(),
+                key: "user:1".to_string(),
+                db: 0,
+            },
+            Event::TrashRemoved {
+                server: at(),
+                key: "user:1".to_string(),
+                db: 0,
+            },
             Event::Tool {
                 tool: "scan_keys".to_string(),
                 server: None,

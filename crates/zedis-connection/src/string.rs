@@ -138,6 +138,14 @@ pub fn decrypt(cipher_text: &str) -> Result<String> {
 
 /// Decrypt `data` (`[nonce (12 bytes)][ciphertext]`) under a specific key.
 fn decrypt_with_key(key: &[u8; 32], data: &[u8]) -> Result<String> {
+    let plaintext_bytes = open_with_key(key, data)?;
+
+    // Convert decrypted bytes to UTF-8 string
+    String::from_utf8(plaintext_bytes).map_err(|e| Error::Invalid { message: e.to_string() })
+}
+
+/// The bytes inside `data` (`[nonce (12 bytes)][ciphertext]`) under `key`.
+fn open_with_key(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>> {
     let cipher = Aes256Gcm::new(key.into());
 
     // Extract nonce from first 12 bytes (guarded: never index a short slice).
@@ -152,12 +160,35 @@ fn decrypt_with_key(key: &[u8; 32], data: &[u8]) -> Result<String> {
     let ciphertext = &data[12..];
 
     // Decrypt and verify authenticity
-    let plaintext_bytes = cipher
+    cipher
         .decrypt(&nonce, ciphertext)
-        .map_err(|e| Error::Invalid { message: e.to_string() })?;
+        .map_err(|e| Error::Invalid { message: e.to_string() })
+}
 
-    // Convert decrypted bytes to UTF-8 string
-    String::from_utf8(plaintext_bytes).map_err(|e| Error::Invalid { message: e.to_string() })
+/// How much longer [`encrypt_bytes`]'s answer is than what it was given: the
+/// 12-byte nonce in front and the 16-byte tag behind.
+pub const ENCRYPTED_BYTES_OVERHEAD: usize = 28;
+
+/// [`encrypt`] for bytes that are not text — a `DUMP` payload — answered as
+/// bytes (`[nonce (12 bytes)][ciphertext]`), not Base64: what keeps them is
+/// a file or a column, not a string in TOML.
+#[cfg(not(target_family = "wasm"))]
+pub fn encrypt_bytes(plain: &[u8]) -> Result<Vec<u8>> {
+    let cipher = Aes256Gcm::new(master_key().into());
+    let nonce = Nonce::generate();
+    let ciphertext = cipher
+        .encrypt(&nonce, plain)
+        .map_err(|e| Error::Invalid { message: e.to_string() })?;
+    let mut sealed = nonce.to_vec();
+    sealed.extend_from_slice(&ciphertext);
+    Ok(sealed)
+}
+
+/// The bytes [`encrypt_bytes`] sealed, under the current machine-local key
+/// only: nothing was ever written this way under the legacy one.
+#[cfg(not(target_family = "wasm"))]
+pub fn decrypt_bytes(sealed: &[u8]) -> Result<Vec<u8>> {
+    open_with_key(master_key(), sealed)
 }
 
 pub fn redis_value_to_string(v: &Value) -> String {
@@ -278,7 +309,10 @@ pub fn decrypt_share(token: &str, passphrase: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decrypt, decrypt_share, encrypt, encrypt_share, encrypt_with_key, is_share_token};
+    use super::{
+        ENCRYPTED_BYTES_OVERHEAD, decrypt, decrypt_bytes, decrypt_share, encrypt, encrypt_bytes, encrypt_share,
+        encrypt_with_key, is_share_token,
+    };
     use crate::master_key::LEGACY_MASTER_KEY;
 
     #[test]
@@ -287,6 +321,22 @@ mod tests {
         let cipher = encrypt(secret).expect("encrypt");
         assert_ne!(cipher, secret, "ciphertext must not equal plaintext");
         assert_eq!(decrypt(&cipher).expect("decrypt"), secret);
+    }
+
+    /// Bytes that are not text go in and come out whole, the length grows by
+    /// exactly the overhead the bridge's bin budgets for, and a sealed payload
+    /// that was tampered with is refused rather than handed back.
+    #[test]
+    fn bytes_round_trip_and_tampering_is_refused() {
+        let plain: Vec<u8> = (0..=255u8).chain([0, 0xff, 0x80]).collect();
+        let sealed = encrypt_bytes(&plain).expect("encrypt");
+        assert_eq!(sealed.len(), plain.len() + ENCRYPTED_BYTES_OVERHEAD);
+        assert_ne!(&sealed[12..12 + plain.len()], plain.as_slice());
+        assert_eq!(decrypt_bytes(&sealed).expect("decrypt"), plain);
+        let mut tampered = sealed;
+        tampered[20] ^= 1;
+        assert!(decrypt_bytes(&tampered).is_err());
+        assert!(decrypt_bytes(&[0; 8]).is_err(), "shorter than a nonce");
     }
 
     #[test]

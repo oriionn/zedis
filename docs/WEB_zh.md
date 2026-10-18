@@ -132,7 +132,7 @@ read_only = true
 
 ## 审计日志
 
-`--audit-log /data/audit.log`（`ZEDIS_BRIDGE_AUDIT_LOG`）会为每个事件追加一行 JSON：每次登录、登录失败与退出登录，只读账号被拒绝的每次请求、服务器条目的新增、编辑（改了哪些设置、改前改后的值；改了哪些密码之类的敏感字段，只记字段名不记值；私有条目被改为共享）和删除、每条管理服务器的命令 —— `CONFIG SET`、`ACL SETUSER`、`REPLICAOF`、`MODULE LOAD`、`CLIENT KILL`、`FLUSHDB` 之类 —— 以及每条需要人确认才放行的命令，所以开了“写入确认”的条目，在终端里输入的每一次写都会留痕。`--audit-writes`（`ZEDIS_BRIDGE_AUDIT_WRITES=1`）再加上普通的数据写命令；读命令永远不记。参数里的密码会被抹掉，过长的值会截断，同一批里的同名命令合并成一行并记数量，文件创建时的权限是仅属主可访问。
+`--audit-log /data/audit.log`（`ZEDIS_BRIDGE_AUDIT_LOG`）会为每个事件追加一行 JSON：每次登录、登录失败与退出登录，只读账号被拒绝的每次请求、服务器条目的新增、编辑（改了哪些设置、改前改后的值；改了哪些密码之类的敏感字段，只记字段名不记值；私有条目被改为共享）和删除、每条管理服务器的命令 —— `CONFIG SET`、`ACL SETUSER`、`REPLICAOF`、`MODULE LOAD`、`CLIENT KILL`、`FLUSHDB` 之类 —— 每条需要人确认才放行的命令（所以开了“写入确认”的条目，在终端里输入的每一次写都会留痕），以及每个从回收站移出的 key（恢复或丢弃；恢复时的 `RESTORE` 另有一行写命令记录）。`--audit-writes`（`ZEDIS_BRIDGE_AUDIT_WRITES=1`）再加上普通的数据写命令，以及随之放进回收站的每个被删除的 key；读命令永远不记。参数里的密码会被抹掉，过长的值会截断，同一批里的同名命令合并成一行并记数量，文件创建时的权限是仅属主可访问。
 
 ```json
 {"ts":"2026-09-25T08:12:03.417Z","account":"alice","peer":"10.0.0.7:51234","event":"command","server":{"id":"0199…","name":"prod"},"db":0,"command":"CONFIG","args":["SET","maxmemory","2gb"],"outcome":"confirmed","kind":"config_set","confirm":"type_name"}
@@ -162,7 +162,7 @@ docker run -d --name zedis-web -p 127.0.0.1:7379:7379 \
 08:13:00 mallory failed to sign in from 203.0.113.9
 ```
 
-推送的是审计日志所记内容的一个子集。默认推送除登录、退出登录和 MCP 工具调用之外的所有事件——这三种整天都在发生；`--audit-webhook-events`（`ZEDIS_BRIDGE_AUDIT_WEBHOOK_EVENTS`）可以改成一个列表——`login`、`login_failed`、`no_account`、`logout`、`refused`、`command`、`server_added`、`server_updated`、`server_deleted`、`unlocked`、`locked`、`tool`——或 `all`。命令里只推送管理服务器的命令，以及需要人确认或被拒绝的命令：普通的数据写永远不推，开了 `--audit-writes` 也一样，否则忙一个上午群就被刷屏了。
+推送的是审计日志所记内容的一个子集。默认推送除登录、退出登录和 MCP 工具调用之外的所有事件——这三种整天都在发生；`--audit-webhook-events`（`ZEDIS_BRIDGE_AUDIT_WEBHOOK_EVENTS`）可以改成一个列表——`login`、`login_failed`、`no_account`、`logout`、`refused`、`command`、`server_added`、`server_updated`、`server_deleted`、`unlocked`、`locked`、`trash_put`、`trash_removed`、`tool`——或 `all`。命令里只推送管理服务器的命令，以及需要人确认或被拒绝的命令：普通的数据写永远不推，开了 `--audit-writes` 也一样，否则忙一个上午群就被刷屏了；被删除的 key 放进回收站也不推，道理相同。
 
 推送从不拖慢请求：审计行先进队列，第一行到达 3 秒后发出，一条消息最多 20 行，这样也不会超过机器人的频率限制（企业微信每分钟 20 条）。发送失败会在 5 秒后重试一次，仍失败就在进程日志里记一条警告；机器人返回错误码（签名不对、机器人已停用）也算失败。URL 里带着机器人的密钥，所以进程日志只记它的域名——启动时的 `audit webhook on` 一行列出域名、格式、推送的事件以及是否签名。URL、格式或事件名写错时，bridge 在启动时就会报错退出；给不签名的机器人（企业微信、Slack、JSON）配了密钥也一样，免得你以为消息是签过名的。
 
@@ -238,7 +238,7 @@ claude mcp add --transport http zedis https://bridge.example.com/v1/mcp \
 
 这两项都由 bridge 保存在它的数据目录里（镜像中是 `/data`），因为网页刷新后什么都留不住：
 
-- `bridge-trash/`——回收站：被删除的 key 的值保留 24 小时（值不超过 1 MB；每台服务器最多 1000 个 key / 128 MB，超出时淘汰最旧的）。回收站属于服务器：能看到这个条目的人都能看到从中删了什么、是谁删的，恢复需要对它有写权限。可在每个浏览器的“设置 → 键行为”里关闭。
+- `bridge-trash/`——回收站：被删除的 key 的值保留 24 小时（值不超过 1 MB；每台服务器最多 1000 个 key / 128 MB，超出时淘汰最旧的），和服务器密码一样用 bridge 的 `master.key` 加密保存。回收站属于服务器：能看到这个条目的人都能看到从中删了什么、是谁删的，恢复需要对它有写权限。可在每个浏览器的“设置 → 键行为”里关闭。
 - `bridge-metrics/`——每台服务器每分钟一个指标样本，保留一周，由当时打开着这台服务器的页面上报。和桌面版一样，历史只覆盖有人打开着它的时段；bridge 自己从不去轮询服务器。
 
 删除服务器条目时两者一并删除。这些文件和 bridge 的其他文件一样，只有属主可访问。

@@ -29,7 +29,13 @@
 //! Bounded three ways: a payload over [`MAX_PAYLOAD`] is not kept (the
 //! desktop's rule), entries go after [`RETENTION`], and a server keeps at
 //! most [`MAX_ENTRIES`] and [`MAX_BYTES`], the oldest going to make room.
+//!
+//! [`LocalTrash`] is the bin in the local directory, behind
+//! `store::TrashStore` (ADR 17). A payload reaches it already encrypted with
+//! the master key (`sealed`): the bin keeps bytes and never knows which.
 
+use crate::store::{self, StoreFuture, blocking};
+use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
@@ -42,6 +48,8 @@ use std::time::Duration;
 pub const RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 /// The largest `DUMP` kept — the desktop's `TRASH_MAX_PAYLOAD`.
 pub const MAX_PAYLOAD: usize = 1024 * 1024;
+/// The largest payload a bin takes: [`MAX_PAYLOAD`] once encrypted.
+pub const MAX_STORED: usize = MAX_PAYLOAD + zedis_connection::string::ENCRYPTED_BYTES_OVERHEAD;
 /// The most deleted keys one server's bin holds.
 pub const MAX_ENTRIES: usize = 1_000;
 /// The most bytes of payload one server's bin holds.
@@ -58,17 +66,25 @@ pub struct Meta {
     pub deleted_at_ms: i64,
     /// The account that deleted it.
     pub deleted_by: String,
-    /// The payload's size.
+    /// The value's size, as the page shows it.
     pub size: u64,
+    /// The payload is encrypted with the master key. Entries kept before
+    /// the bin encrypted are plain, and age out within its day.
+    #[serde(default)]
+    pub sealed: bool,
 }
 
 /// A deleted key to keep.
-pub struct NewEntry<'a> {
-    pub key: &'a str,
+pub struct NewEntry {
+    pub key: String,
     pub db: usize,
     pub pttl_ms: i64,
-    pub deleted_by: &'a str,
-    pub payload: &'a [u8],
+    pub deleted_by: String,
+    /// What the bin keeps: the `DUMP`, encrypted if `sealed`.
+    pub payload: Vec<u8>,
+    /// The value's size, before any encryption.
+    pub size: u64,
+    pub sealed: bool,
 }
 
 /// Why a key was not kept.
@@ -86,7 +102,7 @@ impl From<io::Error> for PutError {
 
 /// The bins, under one directory.
 #[derive(Clone)]
-pub struct TrashStore {
+pub struct LocalTrash {
     root: Arc<PathBuf>,
     max_entries: usize,
     max_bytes: u64,
@@ -129,7 +145,7 @@ fn write_whole(path: &Path, bytes: &[u8]) -> io::Result<()> {
     fs::rename(&tmp, path)
 }
 
-impl TrashStore {
+impl LocalTrash {
     pub fn new(root: PathBuf) -> Self {
         Self {
             root: Arc::new(root),
@@ -143,8 +159,8 @@ impl TrashStore {
     }
 
     /// Keep a deleted key, making room by dropping the oldest.
-    pub fn put(&self, server_id: &str, entry: NewEntry<'_>) -> Result<Meta, PutError> {
-        if entry.payload.len() > MAX_PAYLOAD {
+    pub fn put(&self, server_id: &str, entry: NewEntry) -> Result<Meta, PutError> {
+        if entry.payload.len() > MAX_STORED {
             return Err(PutError::TooLarge);
         }
         let dir = self
@@ -152,7 +168,7 @@ impl TrashStore {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a server id"))?;
         private_dir(&self.root)?;
         private_dir(&dir)?;
-        let size = entry.payload.len() as u64;
+        let size = entry.size;
         let mut kept = self.list_in(&dir, now_ms());
         // Newest first: make room from the end.
         let mut bytes: u64 = kept.iter().map(|m| m.size).sum();
@@ -169,15 +185,16 @@ impl TrashStore {
             // room" dropped one of those at random. `now_v7` is ordered
             // within the process, and its hex sorts as its bytes do.
             id: uuid::Uuid::now_v7().simple().to_string(),
-            key: entry.key.to_string(),
+            key: entry.key,
             db: entry.db,
             pttl_ms: entry.pttl_ms,
             deleted_at_ms: now_ms(),
-            deleted_by: entry.deleted_by.to_string(),
+            deleted_by: entry.deleted_by,
             size,
+            sealed: entry.sealed,
         };
         // The payload first: a listing only shows what has both halves.
-        write_whole(&dir.join(format!("{}.dump", meta.id)), entry.payload)?;
+        write_whole(&dir.join(format!("{}.dump", meta.id)), &entry.payload)?;
         let json = serde_json::to_vec(&meta).map_err(io::Error::other)?;
         write_whole(&dir.join(format!("{}.json", meta.id)), &json)?;
         Ok(meta)
@@ -220,13 +237,18 @@ impl TrashStore {
         Some((meta, payload))
     }
 
-    /// Forget one deleted key — restored, or not wanted.
-    pub fn remove(&self, server_id: &str, id: &str) {
-        if plain(id)
-            && let Some(dir) = self.server_dir(server_id)
-        {
-            remove_files(&dir, id);
+    /// Forget one deleted key — restored, or not wanted — answering what it
+    /// was.
+    pub fn remove(&self, server_id: &str, id: &str) -> Option<Meta> {
+        if !plain(id) {
+            return None;
         }
+        let dir = self.server_dir(server_id)?;
+        let meta = fs::read(dir.join(format!("{id}.json")))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Meta>(&bytes).ok());
+        remove_files(&dir, id);
+        meta
     }
 
     /// Forget a server's whole bin: the entry itself is gone.
@@ -291,21 +313,58 @@ fn remove_files(dir: &Path, id: &str) {
     let _ = fs::remove_file(dir.join(format!("{id}.dump")));
 }
 
+/// Each method runs the one above, which touches the disk, on the blocking
+/// pool.
+impl store::TrashStore for LocalTrash {
+    fn put(&self, server_id: String, entry: NewEntry) -> BoxFuture<'static, Result<Meta, PutError>> {
+        let bins = self.clone();
+        let kept = blocking(move || LocalTrash::put(&bins, &server_id, entry));
+        Box::pin(async move { kept.await? })
+    }
+
+    fn list(&self, server_id: String) -> StoreFuture<Vec<Meta>> {
+        let bins = self.clone();
+        blocking(move || LocalTrash::list(&bins, &server_id))
+    }
+
+    fn get(&self, server_id: String, id: String) -> StoreFuture<Option<(Meta, Vec<u8>)>> {
+        let bins = self.clone();
+        blocking(move || LocalTrash::get(&bins, &server_id, &id))
+    }
+
+    fn remove(&self, server_id: String, id: String) -> StoreFuture<Option<Meta>> {
+        let bins = self.clone();
+        blocking(move || LocalTrash::remove(&bins, &server_id, &id))
+    }
+
+    fn remove_server(&self, server_id: String) -> StoreFuture<()> {
+        let bins = self.clone();
+        blocking(move || LocalTrash::remove_server(&bins, &server_id))
+    }
+
+    fn purge_expired(&self) -> StoreFuture<usize> {
+        let bins = self.clone();
+        blocking(move || LocalTrash::purge_expired(&bins))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn store() -> TrashStore {
-        TrashStore::new(std::env::temp_dir().join(format!("zedis-trash-test-{}", uuid::Uuid::new_v4().simple())))
+    fn store() -> LocalTrash {
+        LocalTrash::new(std::env::temp_dir().join(format!("zedis-trash-test-{}", uuid::Uuid::new_v4().simple())))
     }
 
-    fn entry<'a>(key: &'a str, payload: &'a [u8]) -> NewEntry<'a> {
+    fn entry(key: &str, payload: &[u8]) -> NewEntry {
         NewEntry {
-            key,
+            key: key.to_string(),
             db: 2,
             pttl_ms: 5_000,
-            deleted_by: "alice",
-            payload,
+            deleted_by: "alice".to_string(),
+            payload: payload.to_vec(),
+            size: payload.len() as u64,
+            sealed: false,
         }
     }
 
@@ -324,7 +383,12 @@ mod tests {
         assert!(store.list("srv-2").is_empty(), "a bin is the server's");
         assert_eq!(store.get("srv-1", "../srv-2/x"), None);
         assert!(store.put("../x", entry("k", b"v")).is_err(), "not a server id");
-        store.remove("srv-1", &meta.id);
+        assert_eq!(
+            store.remove("srv-1", &meta.id),
+            Some(meta.clone()),
+            "says what it removed"
+        );
+        assert_eq!(store.remove("srv-1", &meta.id), None, "and nothing the second time");
         assert!(store.list("srv-1").is_empty());
         let _ = fs::remove_dir_all(store.root.as_path());
     }
@@ -335,10 +399,10 @@ mod tests {
     fn the_bin_is_bounded() {
         let store = store();
         assert!(matches!(
-            store.put("srv", entry("big", &vec![0; MAX_PAYLOAD + 1])),
+            store.put("srv", entry("big", &vec![0; MAX_STORED + 1])),
             Err(PutError::TooLarge)
         ));
-        let store = TrashStore {
+        let store = LocalTrash {
             max_entries: 3,
             max_bytes: 10,
             ..store

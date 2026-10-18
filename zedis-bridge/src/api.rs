@@ -19,10 +19,10 @@
 //! never sees a host, a password or a key (ADR 9).
 
 use crate::audit::{self, Audit, Event, Origin, ServerRef};
-use crate::metrics::MetricsStore;
 use crate::presence::{Client, ClientKey, ONLINE_WINDOW, Presence};
 use crate::static_files::{Representation, WebBuild};
-use crate::trash::{NewEntry, PutError, TrashStore};
+use crate::store::{MetricsStore, ServerStore, TrashStore};
+use crate::trash::{NewEntry, PutError};
 use crate::watch::{Batch, WatchError, WatchKind, Watches};
 use crate::{auth, mcp, policy, resp, session::Sessions, static_files};
 use axum::{
@@ -42,9 +42,10 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path as FsPath;
-use std::sync::{LazyLock, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use uuid::Uuid;
-use zedis_connection::{PipelineSpec, RedisServer, get_connection_manager, get_server, get_servers, save_servers};
+use zedis_connection::string::{decrypt_bytes, encrypt_bytes};
+use zedis_connection::{PipelineSpec, RedisServer, get_connection_manager, get_server, get_servers};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -72,10 +73,13 @@ pub struct AppState {
     pub presence: Presence,
     /// What the server pushes, held for the pages that asked (`/v1/watch`).
     pub watches: Watches,
+    /// The server list (`/v1/servers`) — where a change is kept; reads go
+    /// through `zedis_connection`'s cache, which the store keeps in step.
+    pub servers: Arc<dyn ServerStore>,
     /// The browser build's recycle bin (`/v1/servers/{id}/trash`).
-    pub trash: TrashStore,
+    pub trash: Arc<dyn TrashStore>,
     /// The browser build's Metrics history (`/v1/servers/{id}/metrics`).
-    pub metrics: MetricsStore,
+    pub metrics: Arc<dyn MetricsStore>,
 }
 
 /// The page and the API, under `state.base_path` when there is one.
@@ -205,6 +209,8 @@ pub enum ApiError {
         kind: String,
         strictness: &'static str,
     },
+    /// What the request would change changed under it first.
+    Conflict(String),
     Upstream(String),
 }
 
@@ -239,6 +245,7 @@ impl ApiError {
                 Some(kind.clone()),
                 Some(*strictness),
             ),
+            ApiError::Conflict(m) => (StatusCode::CONFLICT, "conflict", m.clone(), None, None),
             ApiError::Upstream(m) => (StatusCode::BAD_GATEWAY, "upstream", m.clone(), None, None),
         }
     }
@@ -855,7 +862,7 @@ async fn add_server(
         audit::is_shared(&server),
         audit::settings(&server),
     );
-    let result = save_and_dial(server, None).await;
+    let result = save_and_dial(&state.servers, server, None).await;
     state.audit.record(
         &account,
         &origin,
@@ -876,29 +883,6 @@ fn is_plain_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// One change to the server list at a time.
-///
-/// The list is read, changed and saved whole — and saving it updates the
-/// in-memory copy first and writes the file afterwards, off the request — so
-/// two changes that overlapped kept only one of them: an entry added while
-/// another was edited could vanish from the list, from the file, or from
-/// one of the two. Every change goes through [`edit_servers`], which holds
-/// this from the read to the end of the write.
-static LIST_EDIT: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(Default::default);
-
-/// Read the server list, let `change` edit it, and save it, under
-/// [`LIST_EDIT`]. Never hold it across anything slow — a dial is not part of
-/// an edit (see [`save_and_dial`]).
-async fn edit_servers<T>(change: impl FnOnce(&mut Vec<RedisServer>) -> T) -> ApiResult<T> {
-    let _edit = LIST_EDIT.lock().await;
-    let mut servers = get_servers().map_err(|e| ApiError::Upstream(e.to_string()))?;
-    let answer = change(&mut servers);
-    save_servers(servers)
-        .await
-        .map_err(|e| ApiError::Upstream(e.to_string()))?;
-    Ok(answer)
-}
-
 /// Put `server` into the shared list and prove it reachable, or put the list
 /// back the way it was: `previous` is the entry it replaces (an edit), `None`
 /// when it is new.
@@ -907,7 +891,11 @@ async fn edit_servers<T>(change: impl FnOnce(&mut Vec<RedisServer>) -> T) -> Api
 /// healthy, and for an edit it would do worse — break an entry that worked.
 /// So the dial is part of the request either way, and a failure leaves no
 /// trace in a list everyone shares.
-async fn save_and_dial(server: RedisServer, previous: Option<RedisServer>) -> ApiResult<AddServerResponse> {
+async fn save_and_dial(
+    servers: &Arc<dyn ServerStore>,
+    server: RedisServer,
+    previous: Option<RedisServer>,
+) -> ApiResult<AddServerResponse> {
     let id = server.id.clone();
     let name = server.name.clone();
     // The pool is keyed by the entry's whole content, so the edited entry
@@ -917,36 +905,18 @@ async fn save_and_dial(server: RedisServer, previous: Option<RedisServer>) -> Ap
     }
 
     let saved = server.clone();
-    edit_servers(|servers| {
-        // In place, so an edit does not move the entry to the end of the list.
-        match servers.iter_mut().find(|s| s.id == id) {
-            Some(slot) => *slot = server,
-            None => servers.push(server),
-        }
-    })
-    .await?;
+    servers
+        .put(server)
+        .await
+        .map_err(|e| ApiError::Upstream(e.to_string()))?;
 
     let client = match get_connection_manager().get_client(&id, 0).await {
         Ok(client) => client,
         Err(e) => {
             // Take back this request's entry and nothing else: the dial took
-            // seconds, the lock was not held through it, and an edit someone
-            // made to the same entry meanwhile is theirs to keep.
-            let _ = edit_servers(|list| {
-                let Some(at) = list.iter().position(|s| s.id == id) else {
-                    return;
-                };
-                if list[at] != saved {
-                    return;
-                }
-                match previous {
-                    Some(previous) => list[at] = previous,
-                    None => {
-                        list.remove(at);
-                    }
-                }
-            })
-            .await;
+            // seconds, and an edit someone made to the same entry meanwhile
+            // is theirs to keep.
+            let _ = servers.swap(saved, previous).await;
             return Err(ApiError::Upstream(e.to_string()));
         }
     };
@@ -1038,7 +1008,7 @@ async fn update_server(
     let changed = audit::changed(&stored, &server);
     let secrets_changed = audit::secrets_changed(&stored, &server);
     let (was_shared, is_shared) = (audit::is_shared(&stored), audit::is_shared(&server));
-    let result = save_and_dial(server, Some(stored)).await;
+    let result = save_and_dial(&state.servers, server, Some(stored)).await;
     state.audit.record(
         &account,
         &origin,
@@ -1075,15 +1045,22 @@ async fn delete_server(
     if let Some(server) = &found {
         refuse_read_only_on(&state, &account, server, &origin, "server_delete")?;
     }
+    // Removed only as it was checked: an entry changed since — made someone
+    // else's, say — is left for the next try to judge again.
     let removed = match found {
-        Some(_) => {
-            edit_servers(|list| {
-                let at = list
-                    .iter()
-                    .position(|s| s.id == id && visible_to(&state.accounts, s, &account))?;
-                Some(ServerRef::from(&list.remove(at)))
-            })
-            .await?
+        Some(server) => {
+            let reference = ServerRef::from(&server);
+            let gone = state
+                .servers
+                .swap(server, None)
+                .await
+                .map_err(|e| ApiError::Upstream(e.to_string()))?;
+            if !gone {
+                return Err(ApiError::Conflict(
+                    "the entry changed while it was being deleted; try again".to_string(),
+                ));
+            }
+            Some(reference)
         }
         None => None,
     };
@@ -1092,13 +1069,8 @@ async fn delete_server(
     if let Some(server) = removed {
         // What was deleted from it goes with it: nobody can restore into an
         // entry that is not there, and the values were someone's.
-        let (trash, metrics) = (state.trash.clone(), state.metrics.clone());
-        let id = server.id.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            trash.remove_server(&id);
-            metrics.remove_server(&id);
-        })
-        .await;
+        let _ = state.trash.remove_server(server.id.clone()).await;
+        let _ = state.metrics.remove_server(server.id.clone()).await;
         state.audit.record(&account, &origin, Event::ServerDeleted { server });
     }
     Ok(StatusCode::NO_CONTENT)
@@ -1139,10 +1111,10 @@ async fn put_metrics(
 ) -> ApiResult<StatusCode> {
     let account = authorize(&state, &headers, &mut Origin::new(peer, &headers))?;
     let server = visible_server(&state.accounts, &id, &account)?;
-    let metrics = state.metrics.clone();
-    let kept = tokio::task::spawn_blocking(move || metrics.put(&server.id, req.ts_ms, req.sample.get()))
-        .await
-        .map_err(|e| ApiError::Upstream(e.to_string()))?;
+    let kept = state
+        .metrics
+        .put(server.id, req.ts_ms, req.sample.get().to_string())
+        .await;
     match kept {
         // Kept, or this minute already was: both are what the page wanted.
         Ok(_) => Ok(StatusCode::NO_CONTENT),
@@ -1166,8 +1138,9 @@ async fn metrics_since(
 ) -> ApiResult<Json<MetricsResponse>> {
     let account = authorize(&state, &headers, &mut Origin::new(peer, &headers))?;
     let server = visible_server(&state.accounts, &id, &account)?;
-    let metrics = state.metrics.clone();
-    let samples = tokio::task::spawn_blocking(move || metrics.since(&server.id, query.from_ms, query.max_points))
+    let samples = state
+        .metrics
+        .since(server.id, query.from_ms, query.max_points)
         .await
         .map_err(|e| ApiError::Upstream(e.to_string()))?;
     Ok(Json(MetricsResponse { samples }))
@@ -1193,6 +1166,12 @@ struct TrashEntryBody {
     payload: Option<String>,
 }
 
+/// A key as an audit line names it: cut like a command's argument, since a
+/// key name can be as long as a value.
+fn audit_key(key: &str) -> String {
+    audit::cut(vec![key.to_string()]).pop().unwrap_or_default()
+}
+
 /// What `id`'s recycle bin holds, newest first (`trash.rs`). Whoever may
 /// see the entry may see what was deleted from it, and by whom.
 async fn list_trash(
@@ -1203,8 +1182,9 @@ async fn list_trash(
 ) -> ApiResult<Json<Vec<TrashEntryBody>>> {
     let account = authorize(&state, &headers, &mut Origin::new(peer, &headers))?;
     let server = visible_server(&state.accounts, &id, &account)?;
-    let trash = state.trash.clone();
-    let metas = tokio::task::spawn_blocking(move || trash.list(&server.id))
+    let metas = state
+        .trash
+        .list(server.id)
         .await
         .map_err(|e| ApiError::Upstream(e.to_string()))?;
     Ok(Json(
@@ -1232,27 +1212,45 @@ async fn put_trash(
     let payload = B64
         .decode(req.payload)
         .map_err(|e| ApiError::BadRequest(format!("the payload is not base64: {e}")))?;
-    let trash = state.trash.clone();
-    let meta = tokio::task::spawn_blocking(move || {
-        trash.put(
-            &server.id,
+    let too_large = || ApiError::BadRequest(format!("a value over {} bytes is not kept", crate::trash::MAX_PAYLOAD));
+    if payload.len() > crate::trash::MAX_PAYLOAD {
+        return Err(too_large());
+    }
+    // A value, so encrypted before it reaches a store (ADR 17).
+    let size = payload.len() as u64;
+    let payload =
+        encrypt_bytes(&payload).map_err(|e| ApiError::Upstream(format!("the value could not be sealed: {e}")))?;
+    let reference = ServerRef::from(&server);
+    let meta = state
+        .trash
+        .put(
+            server.id,
             NewEntry {
-                key: &req.key,
+                key: req.key,
                 db: req.db,
                 pttl_ms: req.pttl_ms,
-                deleted_by: &account,
-                payload: &payload,
+                deleted_by: account.clone(),
+                payload,
+                size,
+                sealed: true,
             },
         )
-    })
-    .await
-    .map_err(|e| ApiError::Upstream(e.to_string()))?
-    .map_err(|e| match e {
-        PutError::TooLarge => {
-            ApiError::BadRequest(format!("a value over {} bytes is not kept", crate::trash::MAX_PAYLOAD))
-        }
-        PutError::Io(e) => ApiError::Upstream(format!("the bin could not be written: {e}")),
-    })?;
+        .await
+        .map_err(|e| match e {
+            PutError::TooLarge => too_large(),
+            PutError::Io(e) => ApiError::Upstream(format!("the bin could not be written: {e}")),
+        })?;
+    if state.audit.logs_writes() {
+        state.audit.record(
+            &account,
+            &origin,
+            Event::TrashPut {
+                server: reference,
+                key: audit_key(&meta.key),
+                db: meta.db,
+            },
+        );
+    }
     Ok(Json(TrashEntryBody { meta, payload: None }))
 }
 
@@ -1267,11 +1265,20 @@ async fn get_trash(
 ) -> ApiResult<Json<Option<TrashEntryBody>>> {
     let account = authorize(&state, &headers, &mut Origin::new(peer, &headers))?;
     let server = visible_server(&state.accounts, &id, &account)?;
-    let trash = state.trash.clone();
-    let found = tokio::task::spawn_blocking(move || trash.get(&server.id, &entry))
+    let found = state
+        .trash
+        .get(server.id, entry)
         .await
         .map_err(|e| ApiError::Upstream(e.to_string()))?;
-    Ok(Json(found.map(|(meta, payload)| TrashEntryBody {
+    let Some((meta, payload)) = found else {
+        return Ok(Json(None));
+    };
+    let payload = if meta.sealed {
+        decrypt_bytes(&payload).map_err(|e| ApiError::Upstream(format!("the value could not be opened: {e}")))?
+    } else {
+        payload
+    };
+    Ok(Json(Some(TrashEntryBody {
         meta,
         payload: Some(B64.encode(payload)),
     })))
@@ -1288,8 +1295,23 @@ async fn remove_trash(
     let account = authorize_write(&state, &headers, &mut origin, "trash")?;
     let server = visible_server(&state.accounts, &id, &account)?;
     refuse_read_only_on(&state, &account, &server, &origin, "trash")?;
-    let trash = state.trash.clone();
-    let _ = tokio::task::spawn_blocking(move || trash.remove(&server.id, &entry)).await;
+    let reference = ServerRef::from(&server);
+    let removed = state
+        .trash
+        .remove(server.id, entry)
+        .await
+        .map_err(|e| ApiError::Upstream(e.to_string()))?;
+    if let Some(meta) = removed {
+        state.audit.record(
+            &account,
+            &origin,
+            Event::TrashRemoved {
+                server: reference,
+                key: audit_key(&meta.key),
+                db: meta.db,
+            },
+        );
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2301,8 +2323,13 @@ mod mcp_auth_tests {
             mcp_calls: mcp::Limiter::new(),
             presence: Presence::new(),
             watches: Watches::new(),
-            trash: TrashStore::new(std::env::temp_dir().join("zedis-bridge-test-trash")),
-            metrics: MetricsStore::new(std::env::temp_dir().join("zedis-bridge-test-metrics")),
+            servers: Arc::new(crate::store::LocalServers),
+            trash: Arc::new(crate::trash::LocalTrash::new(
+                std::env::temp_dir().join("zedis-bridge-test-trash"),
+            )),
+            metrics: Arc::new(crate::metrics::LocalMetrics::new(
+                std::env::temp_dir().join("zedis-bridge-test-metrics"),
+            )),
         }
     }
 
@@ -2397,48 +2424,154 @@ mod mcp_auth_tests {
 }
 
 #[cfg(test)]
-mod list_edits {
+mod bin_tests {
     use super::*;
-    use zedis_core::fs::{get_or_create_config_dir, override_config_dir};
+    use zedis_core::fs::override_config_dir;
 
-    /// Overlapping changes to the server list all land — in the list the
-    /// bridge serves and in the file it starts from next time. Without
-    /// [`LIST_EDIT`], two of them read the same list and the one saved last
-    /// dropped the other's entry, and the file writes, done off the request,
-    /// could land in either order.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    async fn overlapping_edits_all_land_in_the_list_and_the_file() {
-        override_config_dir(std::env::temp_dir().join(format!("zedis-bridge-list-{}", std::process::id())));
-        let ids: Vec<String> = (0..64).map(|n| format!("list-edit-{n}")).collect();
-        let edits = ids.iter().cloned().map(|id| {
-            tokio::spawn(async move {
-                edit_servers(|list| {
-                    list.push(RedisServer {
-                        id: id.clone(),
-                        name: id,
-                        host: "127.0.0.1".to_string(),
-                        port: 6379,
-                        ..Default::default()
-                    })
-                })
-                .await
-            })
-        });
-        for edit in edits.collect::<Vec<_>>() {
-            if let Err(e) = edit.await.expect("task") {
-                panic!("edit failed: {}", e.describe());
-            }
-        }
+    /// A value the page hands the bin is encrypted before it reaches the
+    /// store and comes back whole; an entry kept before encryption is still
+    /// read as it is; and taking one out is an audit line, while keeping
+    /// one is only with `--audit-writes`, like the delete it follows.
+    #[tokio::test]
+    async fn the_bin_keeps_values_sealed_and_audits_what_leaves_it() {
+        override_config_dir(std::env::temp_dir().join(format!("zedis-bridge-store-{}", std::process::id())));
+        let dir = std::env::temp_dir().join(format!("zedis-bridge-bin-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let server = RedisServer {
+            id: "bin-srv".to_string(),
+            name: "bin".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 6379,
+            ..Default::default()
+        };
+        crate::store::LocalServers.put(server).await.expect("server");
 
-        let listed = get_servers().expect("list");
-        let file = std::fs::read_to_string(get_or_create_config_dir().expect("dir").join("redis-servers.toml"))
-            .expect("server file");
-        for id in &ids {
-            assert!(listed.iter().any(|s| &s.id == id), "{id} is missing from the list");
-            assert!(
-                file.contains(&format!("id = \"{id}\"")),
-                "{id} is missing from the file"
-            );
-        }
+        let trash = crate::trash::LocalTrash::new(dir.join("bridge-trash"));
+        let audit_path = dir.join("audit.log");
+        let state = |writes: bool| AppState {
+            accounts: auth::Accounts::from_toml("[[users]]\nname = \"ops\"\npassword = \"secret\"").expect("accounts"),
+            sessions: Sessions::new(),
+            logins: auth::Logins::new(),
+            audit: Audit::open(&audit_path, writes).expect("audit"),
+            trusted: None,
+            unlocks: policy::Unlocks::new(),
+            cookie: auth::CookiePolicy::new(false, ""),
+            base_path: String::new(),
+            web_root: None,
+            mcp_calls: mcp::Limiter::new(),
+            presence: Presence::new(),
+            watches: Watches::new(),
+            servers: Arc::new(crate::store::LocalServers),
+            trash: Arc::new(trash.clone()),
+            metrics: Arc::new(crate::metrics::LocalMetrics::new(dir.join("bridge-metrics"))),
+        };
+        let peer: SocketAddr = "10.0.0.7:5000".parse().expect("address");
+        let mut headers = HeaderMap::new();
+        let basic = format!("Basic {}", B64.encode("ops:secret"));
+        headers.insert("authorization", basic.parse().expect("header"));
+        let value = b"\x00\x0bDUMP payload\xff".to_vec();
+        let put = |state: AppState, key: &str| {
+            put_trash(
+                State(state),
+                ConnectInfo(peer),
+                headers.clone(),
+                Path("bin-srv".to_string()),
+                Json(PutTrashRequest {
+                    key: key.to_string(),
+                    db: 3,
+                    pttl_ms: 0,
+                    payload: B64.encode(&value),
+                }),
+            )
+        };
+        let audit_lines = || std::fs::read_to_string(&audit_path).unwrap_or_default();
+
+        let Ok(Json(kept)) = put(state(false), "plain:off").await else {
+            panic!("kept");
+        };
+        assert!(kept.meta.sealed);
+        assert_eq!(
+            kept.meta.size,
+            value.len() as u64,
+            "the value's size, not the sealed one"
+        );
+        let on_disk = std::fs::read(dir.join("bridge-trash/bin-srv").join(format!("{}.dump", kept.meta.id)))
+            .expect("payload file");
+        assert!(
+            !on_disk.windows(7).any(|w| w == b"payload"),
+            "the value is not on disk in the clear"
+        );
+        assert!(!audit_lines().contains("trash_put"), "not without --audit-writes");
+
+        let Ok(Json(Some(read))) = get_trash(
+            State(state(false)),
+            ConnectInfo(peer),
+            headers.clone(),
+            Path(("bin-srv".to_string(), kept.meta.id.clone())),
+        )
+        .await
+        else {
+            panic!("read back");
+        };
+        assert_eq!(
+            read.payload.map(|p| B64.decode(p).expect("base64")),
+            Some(value.clone())
+        );
+
+        let Ok(Json(audited)) = put(state(true), "with:writes").await else {
+            panic!("kept");
+        };
+        assert!(audit_lines().contains("\"event\":\"trash_put\""), "{}", audit_lines());
+
+        // Kept before the bin encrypted: read as it is.
+        let legacy = TrashStore::put(
+            &trash,
+            "bin-srv".to_string(),
+            NewEntry {
+                key: "legacy".to_string(),
+                db: 0,
+                pttl_ms: 0,
+                deleted_by: "ops".to_string(),
+                payload: value.clone(),
+                size: value.len() as u64,
+                sealed: false,
+            },
+        )
+        .await
+        .expect("legacy");
+        let Ok(Json(Some(read))) = get_trash(
+            State(state(false)),
+            ConnectInfo(peer),
+            headers.clone(),
+            Path(("bin-srv".to_string(), legacy.id)),
+        )
+        .await
+        else {
+            panic!("legacy read back");
+        };
+        assert_eq!(
+            read.payload.map(|p| B64.decode(p).expect("base64")),
+            Some(value.clone())
+        );
+
+        let removed = remove_trash(
+            State(state(false)),
+            ConnectInfo(peer),
+            headers.clone(),
+            Path(("bin-srv".to_string(), audited.meta.id)),
+        )
+        .await;
+        assert!(matches!(removed, Ok(StatusCode::NO_CONTENT)));
+        let lines = audit_lines();
+        let line = lines
+            .lines()
+            .find(|l| l.contains("\"event\":\"trash_removed\""))
+            .expect("a removal is a line without --audit-writes");
+        assert!(
+            line.contains("\"key\":\"with:writes\"") && line.contains("\"db\":3"),
+            "{line}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -39,6 +39,7 @@ mod presence;
 mod resp;
 mod session;
 mod static_files;
+mod store;
 mod trash;
 mod watch;
 mod webhook;
@@ -378,10 +379,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let presence_sweeper = presence.clone();
     let watches = watch::Watches::new();
     let watch_sweeper = watches.clone();
-    let trash = trash::TrashStore::new(get_or_create_config_dir()?.join("bridge-trash"));
-    let trash_sweeper = trash.clone();
-    let metrics = metrics::MetricsStore::new(get_or_create_config_dir()?.join("bridge-metrics"));
-    let metrics_pruner = metrics.clone();
+    // What the bridge keeps, in the local directory (ADR 17). The list is
+    // read now rather than by the first request that asks: a file that
+    // cannot be read says so at start.
+    let stores = store::Stores::local(&get_or_create_config_dir()?);
+    let entries = stores.servers.list().await?.len();
+    tracing::info!(entries, "server list loaded");
+    let trash_sweeper = stores.trash.clone();
+    let metrics_pruner = stores.metrics.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         loop {
@@ -405,14 +410,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if ended > 0 {
                 tracing::info!(ended, "swept ended write windows");
             }
-            let purger = trash_sweeper.clone();
-            match tokio::task::spawn_blocking(move || purger.purge_expired()).await {
+            match trash_sweeper.purge_expired().await {
                 Ok(0) => {}
                 Ok(purged) => tracing::info!(purged, "purged day-old recycle bin entries"),
                 Err(e) => tracing::warn!(error = %e, "the recycle bin purge did not finish"),
             }
-            let pruner = metrics_pruner.clone();
-            if let Ok(pruned) = tokio::task::spawn_blocking(move || pruner.prune()).await
+            if let Ok(pruned) = metrics_pruner.prune().await
                 && pruned > 0
             {
                 tracing::info!(pruned, "pruned week-old metrics days");
@@ -474,8 +477,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mcp_calls: mcp::Limiter::new(),
         presence,
         watches,
-        trash,
-        metrics,
+        servers: stores.servers,
+        trash: stores.trash,
+        metrics: stores.metrics,
     });
     // With the peer's address, which the audit log records beside whatever
     // a proxy wrote in `X-Forwarded-For`.

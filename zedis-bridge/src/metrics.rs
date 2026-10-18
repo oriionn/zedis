@@ -23,8 +23,11 @@
 //! asks Redis anything for it.
 //!
 //! On disk, `bridge-metrics/<server>/<day>.jsonl`, a line a minute, a file
-//! per UTC day so a week's retention is deleting files.
+//! per UTC day so a week's retention is deleting files — [`LocalMetrics`],
+//! the local directory's `store::MetricsStore` (ADR 17).
 
+use crate::store::{self, StoreFuture, blocking};
+use futures::future::BoxFuture;
 use serde::Serialize;
 use serde_json::value::RawValue;
 use std::collections::HashMap;
@@ -69,7 +72,7 @@ struct StoredLine {
 
 /// The histories, under one directory.
 #[derive(Clone)]
-pub struct MetricsStore {
+pub struct LocalMetrics {
     root: Arc<PathBuf>,
     /// The minute each server last kept, so a second page's sample for the
     /// same minute is not a second line.
@@ -103,7 +106,7 @@ fn private_dir(dir: &std::path::Path) -> io::Result<()> {
     fs::create_dir_all(dir)
 }
 
-impl MetricsStore {
+impl LocalMetrics {
     pub fn new(root: PathBuf) -> Self {
         Self {
             root: Arc::new(root),
@@ -229,6 +232,31 @@ impl MetricsStore {
     }
 }
 
+/// Each method runs the one above, which touches the disk, on the blocking
+/// pool.
+impl store::MetricsStore for LocalMetrics {
+    fn put(&self, server_id: String, ts_ms: i64, sample: String) -> BoxFuture<'static, Result<bool, PutError>> {
+        let histories = self.clone();
+        let kept = blocking(move || LocalMetrics::put(&histories, &server_id, ts_ms, &sample));
+        Box::pin(async move { kept.await.map_err(|e| PutError::Io(e.to_string()))? })
+    }
+
+    fn since(&self, server_id: String, from_ms: i64, max_points: usize) -> StoreFuture<Vec<Box<RawValue>>> {
+        let histories = self.clone();
+        blocking(move || LocalMetrics::since(&histories, &server_id, from_ms, max_points))
+    }
+
+    fn remove_server(&self, server_id: String) -> StoreFuture<()> {
+        let histories = self.clone();
+        blocking(move || LocalMetrics::remove_server(&histories, &server_id))
+    }
+
+    fn prune(&self) -> StoreFuture<usize> {
+        let histories = self.clone();
+        blocking(move || LocalMetrics::prune(&histories))
+    }
+}
+
 /// Every `n`th of `samples`, and the last, so a week reads as a week in a
 /// few hundred points.
 fn thin<T>(samples: Vec<T>, max_points: usize) -> Vec<T> {
@@ -249,8 +277,8 @@ fn thin<T>(samples: Vec<T>, max_points: usize) -> Vec<T> {
 mod tests {
     use super::*;
 
-    fn store() -> MetricsStore {
-        MetricsStore::new(std::env::temp_dir().join(format!("zedis-metrics-test-{}", uuid::Uuid::new_v4().simple())))
+    fn store() -> LocalMetrics {
+        LocalMetrics::new(std::env::temp_dir().join(format!("zedis-metrics-test-{}", uuid::Uuid::new_v4().simple())))
     }
 
     const NOW: i64 = 1_790_000_000_000;

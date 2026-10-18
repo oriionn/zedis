@@ -11879,6 +11879,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "flate2",
+ "futures",
  "redis",
  "rust-embed",
  "serde",

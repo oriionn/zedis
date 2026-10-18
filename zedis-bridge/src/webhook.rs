@@ -53,7 +53,7 @@ pub const SECRET_ENV: &str = "ZEDIS_BRIDGE_AUDIT_WEBHOOK_SECRET";
 pub const EVENTS_ENV: &str = "ZEDIS_BRIDGE_AUDIT_WEBHOOK_EVENTS";
 
 /// Every `event` a line can carry, as the log spells it.
-pub const EVENTS: [&str; 12] = [
+pub const EVENTS: [&str; 14] = [
     "login",
     "login_failed",
     "no_account",
@@ -65,6 +65,8 @@ pub const EVENTS: [&str; 12] = [
     "server_deleted",
     "unlocked",
     "locked",
+    "trash_put",
+    "trash_removed",
     "tool",
 ];
 
@@ -459,6 +461,16 @@ fn summary(line: &Value) -> String {
             line.get("seconds").and_then(Value::as_u64).unwrap_or(0)
         ),
         "locked" => format!("locked writes on {server} again"),
+        "trash_put" => format!(
+            "kept {} (db{}) of {server} in the recycle bin",
+            get("key"),
+            line.get("db").and_then(Value::as_u64).unwrap_or(0)
+        ),
+        "trash_removed" => format!(
+            "took {} (db{}) of {server} out of the recycle bin",
+            get("key"),
+            line.get("db").and_then(Value::as_u64).unwrap_or(0)
+        ),
         "tool" => format!("ran the MCP tool {} on {server}", get("tool")),
         other => other.to_string(),
     };

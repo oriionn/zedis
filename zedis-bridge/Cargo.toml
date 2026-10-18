@@ -27,6 +27,10 @@ zedis-connection = { workspace = true }
 zedis-core = { workspace = true }
 axum = "0.8.9"
 base64 = { workspace = true }
+# `BoxFuture`, for the store traits (`store.rs`, ADR 17): boxed so a store is
+# an `Arc<dyn …>` chosen at start-up, the shape zedis-connection's page-side
+# traits already have.
+futures = { workspace = true }
 # The web build, compiled into the binary (`static_files::WebBuild`) so a
 # deployment is one file. Declared here rather than inherited because the
 # feature set is deliberately not the desktop's: no `compression` — the
