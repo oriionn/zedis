@@ -461,11 +461,6 @@ pub trait BridgeTransport: Send + Sync + 'static {
     /// dropped on one side alone would still be good until it lapsed.
     fn sign_out(&self) -> BoxFuture<'static, Result<(), BridgeError>>;
 
-    /// The address of `page`, one of the bridge's own pages beside the one
-    /// the application runs in (`account.html`) — from where the page was
-    /// served, so it follows a base path (ADR 17).
-    fn page_url(&self, page: &str) -> String;
-
     /// Have the bridge subscribe, or start `MONITOR`, for this caller.
     /// `confirm` answers the question the bridge asks before `MONITOR` on
     /// an entry whose writes are locked (`ServerDb::confirmed`).
@@ -515,13 +510,6 @@ pub fn bridge_transport() -> Option<Arc<dyn BridgeTransport>> {
 /// and has no login to end, so "Sign out" is drawn where this says so.
 pub fn signed_in_to_bridge() -> bool {
     TRANSPORT.get().is_some()
-}
-
-/// The address of the bridge's own `page` ([`BridgeTransport::page_url`]),
-/// or `None` where there is no bridge — the desktop, which has no accounts
-/// to manage.
-pub fn bridge_page_url(page: &str) -> Option<String> {
-    TRANSPORT.get().map(|transport| transport.page_url(page))
 }
 
 /// End the bridge login ([`BridgeTransport::sign_out`]).
@@ -622,6 +610,206 @@ pub fn set_bridge_server_store(store: Arc<dyn BridgeServerStore>) {
 /// The installed sink, or `None` before [`set_bridge_server_store`].
 pub fn bridge_server_store() -> Option<Arc<dyn BridgeServerStore>> {
     SERVER_STORE.get().cloned()
+}
+
+/// A role on the bridge (ADR 17), as its account routes spell it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BridgeRole {
+    /// A full account that also manages the accounts and the invitations.
+    Admin,
+    Full,
+    #[default]
+    ReadOnly,
+}
+
+impl BridgeRole {
+    /// Every role, in the order a picker offers them.
+    pub const ALL: [BridgeRole; 3] = [Self::Admin, Self::Full, Self::ReadOnly];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Admin => "admin",
+            Self::Full => "full",
+            Self::ReadOnly => "read_only",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|role| role.as_str() == name)
+    }
+}
+
+/// An MCP token of an account's (ADR 15) — its name, never the token.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BridgeToken {
+    pub name: String,
+    /// Unix seconds; `None` for one that does not expire.
+    pub expires_at: Option<u64>,
+    pub created_at: u64,
+}
+
+/// An account as the bridge describes it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BridgeAccount {
+    pub name: String,
+    pub role: BridgeRole,
+    pub disabled: bool,
+    /// `false` for an account that signs in through the trusted proxy.
+    pub has_password: bool,
+    /// Which shared entries it sees (ADR 13); `None` is every one.
+    pub servers: Option<Vec<String>>,
+    pub tokens: Vec<BridgeToken>,
+    pub created_at: u64,
+}
+
+/// The signed-in account, and whether the bridge believes a sign-in proxy —
+/// which is when an invitation may be marked for it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BridgeOwnAccount {
+    pub account: BridgeAccount,
+    pub proxy: bool,
+}
+
+/// What an invitation does when its link is opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BridgeInviteKind {
+    /// Registers an account with this role and these rules; `proxy`: as the
+    /// name the sign-in proxy asserts, with no password.
+    Register {
+        role: BridgeRole,
+        servers: Option<Vec<String>>,
+        proxy: bool,
+    },
+    /// Sets a new password on `account`.
+    Reset { account: String },
+}
+
+/// An open invitation — never its code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeInvite {
+    pub id: String,
+    pub kind: BridgeInviteKind,
+    pub expires_at: u64,
+    pub created_by: String,
+    pub created_at: u64,
+}
+
+/// An invitation just made, with the code its link carries: shown once,
+/// because the bridge keeps only its hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeNewInvite {
+    pub invite: BridgeInvite,
+    pub code: String,
+}
+
+/// What an administrator changes on an account; `None` leaves a setting as
+/// it is, and `servers: Some(None)` clears the rules (every shared entry).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BridgeAccountChange {
+    pub role: Option<BridgeRole>,
+    pub servers: Option<Option<Vec<String>>>,
+    pub disabled: Option<bool>,
+}
+
+/// Why an account request was refused, in the terms its page words it in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeAccountErrorKind {
+    /// Not allowed (`403`): a wrong current password, or not an administrator.
+    Refused,
+    /// In the way of something (`409`): the last administrator, a token name
+    /// already taken.
+    Conflict,
+    /// Not acceptable as asked (`400`): a short password, a bad rule.
+    Invalid,
+    /// Not there (`404`): an account or invitation someone else removed.
+    NotFound,
+    /// Too many failed attempts from this address (`429`).
+    TooManyAttempts,
+    /// Anything else, the bridge unreachable included.
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeAccountError {
+    pub kind: BridgeAccountErrorKind,
+    /// The bridge's own words, for a refusal the page has no wording of.
+    pub message: String,
+}
+
+impl BridgeAccountError {
+    pub fn new(kind: BridgeAccountErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for BridgeAccountError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for BridgeAccountError {}
+
+pub type BridgeAccountResult<T> = BoxFuture<'static, Result<T, BridgeAccountError>>;
+
+/// The account page's requests (ADR 17, amended 2026-10-18): one's own
+/// account, and for an administrator everyone's and the invitations. The
+/// page draws them; the browser entry point carries them, and the desktop,
+/// which has no accounts, never installs one.
+pub trait BridgeAccounts: Send + Sync + 'static {
+    /// `GET /v1/account`.
+    fn account(&self) -> BridgeAccountResult<BridgeOwnAccount>;
+    /// A new password, given the current one. Every other login of the
+    /// account ends; this one carries on with a new cookie.
+    fn change_password(&self, current: String, new: String) -> BridgeAccountResult<()>;
+    /// A new MCP token, answered once: on the signed-in account (`None`, a
+    /// read-only account's own) or, by an administrator, on `account`.
+    /// `expires` is a day, `2027-01-01`.
+    fn issue_token(
+        &self,
+        account: Option<String>,
+        name: String,
+        expires: Option<String>,
+    ) -> BridgeAccountResult<String>;
+    fn revoke_token(&self, account: Option<String>, name: String) -> BridgeAccountResult<()>;
+    /// Every account, for an administrator.
+    fn accounts(&self) -> BridgeAccountResult<Vec<BridgeAccount>>;
+    /// The account as it is after `change`.
+    fn update_account(&self, name: String, change: BridgeAccountChange) -> BridgeAccountResult<BridgeAccount>;
+    fn delete_account(&self, name: String) -> BridgeAccountResult<()>;
+    /// A link that sets a new password on `name`, once.
+    fn reset_link(&self, name: String) -> BridgeAccountResult<BridgeNewInvite>;
+    /// The open invitations.
+    fn invites(&self) -> BridgeAccountResult<Vec<BridgeInvite>>;
+    /// An invitation to register one account, valid for `days`.
+    fn create_invite(
+        &self,
+        role: BridgeRole,
+        servers: Option<Vec<String>>,
+        proxy: bool,
+        days: u64,
+    ) -> BridgeAccountResult<BridgeNewInvite>;
+    fn revoke_invite(&self, id: String) -> BridgeAccountResult<()>;
+    /// The address an invitation's `code` is sent as: the sign-in page,
+    /// with the code in the part after `#` that no request carries.
+    fn invite_link(&self, code: &str) -> String;
+}
+
+static ACCOUNTS: OnceLock<Arc<dyn BridgeAccounts>> = OnceLock::new();
+
+/// Install the account requests. The first call wins, as with the transport.
+pub fn set_bridge_accounts(accounts: Arc<dyn BridgeAccounts>) {
+    if ACCOUNTS.set(accounts).is_err() {
+        tracing::warn!("the bridge accounts were already installed; keeping the first");
+    }
+}
+
+/// The installed account requests, or `None` — on the desktop, always.
+pub fn bridge_accounts() -> Option<Arc<dyn BridgeAccounts>> {
+    ACCOUNTS.get().cloned()
 }
 
 /// A Redis connection whose transport is the bridge.
@@ -898,11 +1086,20 @@ mod tests {
 
     /// The account page is the web version's (ADR 17): a process that never
     /// installed a transport — the desktop, and every native test — has no
-    /// address for it, and draws no menu item that would open it.
+    /// accounts to manage, and draws no menu item that would open them.
     #[test]
-    fn the_desktop_has_no_bridge_page_to_open() {
+    fn the_desktop_has_no_accounts_to_manage() {
         assert!(!signed_in_to_bridge());
-        assert_eq!(bridge_page_url("account.html"), None);
+        assert!(bridge_accounts().is_none());
+    }
+
+    #[test]
+    fn a_role_is_spelled_as_the_bridge_spells_it() {
+        for role in BridgeRole::ALL {
+            assert_eq!(BridgeRole::from_name(role.as_str()), Some(role));
+        }
+        assert_eq!(BridgeRole::ReadOnly.as_str(), "read_only");
+        assert_eq!(BridgeRole::from_name("owner"), None);
     }
     use std::sync::Mutex;
 
@@ -1030,10 +1227,6 @@ mod tests {
 
         fn sign_out(&self) -> BoxFuture<'static, Result<(), BridgeError>> {
             Box::pin(async { Ok(()) })
-        }
-
-        fn page_url(&self, page: &str) -> String {
-            format!("https://bridge.test/{page}")
         }
 
         fn open_watch(

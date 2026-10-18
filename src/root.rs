@@ -55,7 +55,7 @@ use crate::views::{
 };
 use crate::views::{
     ZedisCommandPalette, ZedisContent, ZedisMultiSearch, ZedisRecentKeysPalette, ZedisShortcutsOverlay, ZedisSidebar,
-    ZedisTitleBar, confirm_dangerous_command, confirm_remove_server, open_compare, open_features_dialog,
+    ZedisTitleBar, confirm_dangerous_command, confirm_remove_server, open_account, open_compare, open_features_dialog,
     open_new_group_dialog, open_settings, open_trash_dialog,
 };
 use crate::window_setup::*;
@@ -1387,12 +1387,15 @@ impl Render for Zedis {
                 WindowAction::Zoom => window.zoom_window(),
                 WindowAction::ToggleFullscreen => window.toggle_fullscreen(),
             }))
-            .on_action(cx.listener(|this, e: &MemuAction, _window, cx| {
-                if matches!(e, MemuAction::Close) && this.tabs.len() > 1 {
-                    this.close_tab(this.active_tab, cx);
-                } else {
-                    cx.propagate();
+            .on_action(cx.listener(|this, e: &MemuAction, window, cx| match e {
+                MemuAction::Close if this.tabs.len() > 1 => this.close_tab(this.active_tab, cx),
+                // The bridge's account page, as a dialog over the page; on
+                // the desktop nothing draws the item, and nothing opens.
+                MemuAction::Account => {
+                    this.keep_focus_in_page(window, cx);
+                    open_account(window, cx);
                 }
+                _ => cx.propagate(),
             }))
             // ⌘F / secondary-f: focus the active page's filter box.
             // Must live on the window root — after a tab switch focus often

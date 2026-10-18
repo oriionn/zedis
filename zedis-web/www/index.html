@@ -125,16 +125,11 @@
   const api = (path, init) => fetch(root + path, { credentials: "same-origin", ...init });
   // Filled by `web-bundle.sh` between the ASSET_REV markers on the next
   // line. Leave `{}` in git: an unbundled page just fetches unversioned URLs.
-  const ASSET_REV = /*ASSET_REV*/{"assets/commands.json":"a1f58c0b4949","assets/config_docs/en.json":"90b5e6e1426a","assets/config_docs/zh.json":"32d145cb21ce","assets/icon.png":"9121a3cab487","fonts/IBMPlexSans.ttf":"335a2b2a3a64","fonts/JetBrainsMono-Bold.ttf":"8658ffe39dbf","fonts/JetBrainsMono-Regular.ttf":"d09f65145228","fonts/OFL.txt":"4d4949dda4b2","locales/de.toml":"a525b5f6ba79","locales/en.toml":"0139c58cba4b","locales/es.toml":"ee3175fa9b9c","locales/fr.toml":"518acda9ca3a","locales/ja.toml":"a463f0c15bf8","locales/pt.toml":"336a284f7e60","locales/ru.toml":"df12f43f32f2","locales/zh.toml":"5f7e9039e95f","wasm/zedis_web.d.ts":"7ce84307d97f","wasm/zedis_web.js":"d0882bec19e8","wasm/zedis_web_bg.wasm":"1f9e07fe061f","wasm/zedis_web_bg.wasm.d.ts":"c8a12d2a60aa"}/*/ASSET_REV*/;
+  const ASSET_REV = /*ASSET_REV*/{"assets/commands.json":"a1f58c0b4949","assets/config_docs/en.json":"90b5e6e1426a","assets/config_docs/zh.json":"32d145cb21ce","assets/icon.png":"9121a3cab487","fonts/IBMPlexSans.ttf":"335a2b2a3a64","fonts/JetBrainsMono-Bold.ttf":"8658ffe39dbf","fonts/JetBrainsMono-Regular.ttf":"d09f65145228","fonts/OFL.txt":"4d4949dda4b2","locales/de.toml":"2d1924e36cbe","locales/en.toml":"3e314d5ce821","locales/es.toml":"c700fdae4460","locales/fr.toml":"42b7a87cf9b3","locales/ja.toml":"7dc28cbc61eb","locales/pt.toml":"0b184d074fbd","locales/ru.toml":"a380af991abf","locales/zh.toml":"5efcb2f5cb51","wasm/zedis_web.d.ts":"563ee520015c","wasm/zedis_web.js":"de130d2ba5e8","wasm/zedis_web_bg.wasm":"def4f0c5eee5","wasm/zedis_web_bg.wasm.d.ts":"444a5c717a54"}/*/ASSET_REV*/;
   const url = (path) => {
     const v = ASSET_REV[path];
     return v ? `${root}/${path}?v=${v}` : `${root}/${path}`;
   };
-  // The forms' strings and helpers, shared with the account page.
-  const pages = await import(url("pages.js"));
-  const { t } = await pages.loadStrings(url);
-  pages.localize(t);
-
   // An input method's keystrokes are not the application's. gpui-pre-web
   // (through 0.3.5) decides that from `isComposing` alone, but the *first*
   // key of a composition arrives before `compositionstart`: `isComposing` is
@@ -170,6 +165,80 @@
     const lang = (navigator.language || "en").split("-")[0].toLowerCase();
     return SUPPORTED_LOCALES.includes(lang) ? lang : "en";
   }
+
+  // The `key = "value"` lines of one `[section]` of a TOML file. The forms'
+  // section holds single-line basic strings only, whose escapes are JSON's.
+  function tomlSection(text, name) {
+    const out = {};
+    let inside = false;
+    for (const line of text.split("\n")) {
+      const header = line.match(/^\s*\[([^\]]+)\]\s*$/);
+      if (header) {
+        inside = header[1].trim() === name;
+        continue;
+      }
+      if (!inside) continue;
+      const m = line.match(/^\s*([A-Za-z0-9_]+)\s*=\s*("(?:[^"\\]|\\.)*")\s*$/);
+      if (m) {
+        try {
+          out[m[1]] = JSON.parse(m[2]);
+        } catch {
+          // a line it cannot read falls back to English
+        }
+      }
+    }
+    return out;
+  }
+
+  // The forms' strings — the `[web_account]` section of the application's
+  // own locale files, English underneath the chosen language — and a `t`
+  // that fills in `%{name}`. Fetched before the wasm, which is not loaded
+  // until someone has signed in.
+  async function loadStrings() {
+    const locale = preferredLocale();
+    const names = locale === "en" ? ["en"] : ["en", locale];
+    const texts = await Promise.all(
+      names.map(async (name) => {
+        try {
+          const res = await fetch(url(`locales/${name}.toml`));
+          return res.ok ? await res.text() : "";
+        } catch {
+          return "";
+        }
+      }),
+    );
+    const strings = {};
+    for (const text of texts) Object.assign(strings, tomlSection(text, "web_account"));
+    document.documentElement.lang = locale;
+    return (key, vars = {}) =>
+      (strings[key] ?? key).replace(/%\{(\w+)\}/g, (_, name) => (vars[name] ?? "").toString());
+  }
+  const t = await loadStrings();
+  for (const el of document.querySelectorAll("[data-i18n]")) el.textContent = t(el.dataset.i18n);
+  for (const el of document.querySelectorAll("[data-i18n-placeholder]")) {
+    el.placeholder = t(el.dataset.i18nPlaceholder);
+  }
+
+  /** `api` with a JSON body. */
+  const send = (method, path, body) =>
+    api(path, {
+      method,
+      headers: { "content-type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+
+  /** What the bridge said about a refused request: its message, else the status. */
+  async function failure(res) {
+    try {
+      const body = await res.json();
+      return body.message || body.error || `HTTP ${res.status}`;
+    } catch {
+      return `HTTP ${res.status}`;
+    }
+  }
+
+  /** The string key of a role as the bridge spells it. */
+  const roleKey = (role) => ({ admin: "role_admin", full: "role_full", read_only: "role_read_only" })[role] || role;
 
   async function start() {
     // The whole application, as the desktop builds it, compiled to wasm.
@@ -285,7 +354,7 @@
 
   async function setupOpen() {
     try {
-      const res = await pages.api("/v1/setup");
+      const res = await api("/v1/setup");
       return res.ok && (await res.json()).open === true;
     } catch {
       return false;
@@ -321,7 +390,7 @@
     }
     $("setup-go").disabled = true;
     try {
-      const res = await pages.send("POST", "/v1/setup", {
+      const res = await send("POST", "/v1/setup", {
         token: $("setup-token").value.trim(),
         name: $("setup-name").value.trim(),
         password: $("setup-password").value,
@@ -329,7 +398,7 @@
       });
       if (!res.ok) {
         const known = { 403: "setup_refused", 404: "setup_closed", 429: "too_many_attempts" }[res.status];
-        $("setup-msg").textContent = known ? t(known) : t("error_generic", { error: await pages.failure(res) });
+        $("setup-msg").textContent = known ? t(known) : t("error_generic", { error: await failure(res) });
         return;
       }
       $("setup-password").value = "";
@@ -347,7 +416,7 @@
   // stays out of every access log on the way; it goes in a request body.
   async function showInvitation(code) {
     show("register");
-    const res = await pages.send("POST", "/v1/invitation", { code });
+    const res = await send("POST", "/v1/invitation", { code });
     if (!res.ok) {
       $("register-title").textContent = t("invite_title");
       $("register-intro").textContent = t(res.status === 429 ? "too_many_attempts" : "invite_invalid");
@@ -355,7 +424,7 @@
       return;
     }
     const invite = await res.json();
-    const role = t(pages.roleKey(invite.role));
+    const role = t(roleKey(invite.role));
     let ask = { name: true, password: true };
     if (invite.kind === "reset") {
       $("register-title").textContent = t("reset_title");
@@ -391,7 +460,7 @@
       }
       $("register-go").disabled = true;
       try {
-        const res = await pages.send("POST", "/v1/register", {
+        const res = await send("POST", "/v1/register", {
           code,
           name: $("register-name").value.trim(),
           password: $("register-password").value,
@@ -399,7 +468,7 @@
         });
         if (!res.ok) {
           const known = { 409: "name_taken", 429: "too_many_attempts" }[res.status];
-          $("register-msg").textContent = known ? t(known) : t("error_generic", { error: await pages.failure(res) });
+          $("register-msg").textContent = known ? t(known) : t("error_generic", { error: await failure(res) });
           return;
         }
         // Used up: a reload must not offer it again.

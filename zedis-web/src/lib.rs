@@ -52,7 +52,8 @@ use tracing_subscriber::prelude::*;
 use transport::HttpBridgeTransport;
 #[cfg(target_family = "wasm")]
 use zedis_connection::{
-    RedisServer, get_servers, set_bridge_server_store, set_bridge_storage, set_bridge_transport, set_servers_cache,
+    RedisServer, get_servers, set_bridge_accounts, set_bridge_server_store, set_bridge_storage, set_bridge_transport,
+    set_servers_cache,
 };
 #[cfg(target_family = "wasm")]
 use zedis_gui::helpers::pacing::{SERVER_LIST_REFRESH, set_unattended, unattended};
@@ -157,14 +158,16 @@ pub fn run(origin: String, ui_font: Vec<u8>, apple_keyboard: bool) -> Result<(),
             assets::repaint_when_icons_land(icon_watch, cx);
         }
 
-        // The bridge is where commands go, where the server list lives, and
-        // where the recycle bin and the Metrics history are kept. One
+        // The bridge is where commands go, where the server list lives,
+        // where the recycle bin and the Metrics history are kept, and what
+        // the account page asks. One
         // transport serves every role; no credential, because the page
         // logged in for a cookie and the fetch carries it.
         let transport = Arc::new(HttpBridgeTransport::new(cx.http_client(), origin));
         set_bridge_transport(transport.clone());
         set_bridge_server_store(transport.clone());
         set_bridge_storage(transport.clone());
+        set_bridge_accounts(transport.clone());
 
         // Before `launch`, which binds the keys and draws their labels.
         set_web_command_key(apple_keyboard);

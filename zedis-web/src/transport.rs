@@ -25,10 +25,14 @@ use futures::AsyncReadExt as _;
 use futures::future::BoxFuture;
 use gpui::http_client::{AsyncBody, HttpClient, http::Request};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::Arc;
 use zedis_connection::{
-    BridgeError, BridgeErrorKind, BridgeReply, BridgeRequest, BridgeServerStore, BridgeStorage, BridgeTransport,
+    BridgeAccount, BridgeAccountChange, BridgeAccountError, BridgeAccountErrorKind, BridgeAccountResult,
+    BridgeAccounts, BridgeError, BridgeErrorKind, BridgeInvite, BridgeInviteKind, BridgeNewInvite, BridgeOwnAccount,
+    BridgeReply, BridgeRequest, BridgeRole, BridgeServerStore, BridgeStorage, BridgeToken, BridgeTransport,
     BridgeTrashEntry, RedisServer, WatchBatch, WatchItem, WatchKind, WatchOpened, describe_commands, get_servers,
     set_account_read_only_on,
 };
@@ -340,10 +344,6 @@ impl BridgeTransport for HttpBridgeTransport {
             }
             Ok(())
         })
-    }
-
-    fn page_url(&self, page: &str) -> String {
-        format!("{}/{page}", self.base_url)
     }
 
     /// `POST /v1/logout`, then the page's own way back to the sign-in form.
@@ -724,10 +724,433 @@ impl BridgeServerStore for HttpBridgeTransport {
     }
 }
 
+/// A path segment as the URL carries it: everything but the unreserved
+/// characters escaped. An account's name may hold `#`, `?` or `%`, which
+/// would otherwise end the path or be read as an escape of its own.
+fn segment(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
+/// What a refused account request stands for. The bridge's message travels
+/// with it, for the refusals the page has no words of its own for.
+fn account_failure(status: u16, bytes: &[u8]) -> BridgeAccountError {
+    let kind = match status {
+        400 => BridgeAccountErrorKind::Invalid,
+        403 => BridgeAccountErrorKind::Refused,
+        404 => BridgeAccountErrorKind::NotFound,
+        409 => BridgeAccountErrorKind::Conflict,
+        429 => BridgeAccountErrorKind::TooManyAttempts,
+        _ => BridgeAccountErrorKind::Failed,
+    };
+    BridgeAccountError::new(kind, failure(status, bytes).message)
+}
+
+fn json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
+    serde_json::from_slice(bytes).map_err(|e| e.to_string())
+}
+
+fn nothing(_: &[u8]) -> Result<(), String> {
+    Ok(())
+}
+
+/// The bridge's `TokenView`.
+#[derive(Deserialize)]
+struct TokenBody {
+    name: String,
+    #[serde(default)]
+    expires_at: Option<u64>,
+    #[serde(default)]
+    created_at: u64,
+}
+
+/// The bridge's `AccountView`.
+#[derive(Deserialize)]
+struct AccountBody {
+    name: String,
+    role: String,
+    #[serde(default)]
+    disabled: bool,
+    #[serde(default)]
+    has_password: bool,
+    #[serde(default)]
+    servers: Option<Vec<String>>,
+    #[serde(default)]
+    tokens: Vec<TokenBody>,
+    #[serde(default)]
+    created_at: u64,
+}
+
+impl AccountBody {
+    fn into_account(self) -> BridgeAccount {
+        BridgeAccount {
+            name: self.name,
+            // A role this side does not know reads as the least of them.
+            role: BridgeRole::from_name(&self.role).unwrap_or_default(),
+            disabled: self.disabled,
+            has_password: self.has_password,
+            servers: self.servers,
+            tokens: self
+                .tokens
+                .into_iter()
+                .map(|token| BridgeToken {
+                    name: token.name,
+                    expires_at: token.expires_at,
+                    created_at: token.created_at,
+                })
+                .collect(),
+            created_at: self.created_at,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct OwnBody {
+    #[serde(flatten)]
+    account: AccountBody,
+    #[serde(default)]
+    proxy: bool,
+}
+
+/// The bridge's `InviteView`: its kind flattened, as `kind` plus the fields
+/// of that kind.
+#[derive(Deserialize)]
+struct InviteBody {
+    id: String,
+    kind: String,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    servers: Option<Vec<String>>,
+    #[serde(default)]
+    proxy: bool,
+    #[serde(default)]
+    account: Option<String>,
+    expires_at: u64,
+    #[serde(default)]
+    created_by: String,
+    #[serde(default)]
+    created_at: u64,
+}
+
+impl InviteBody {
+    fn into_invite(self) -> BridgeInvite {
+        let kind = match (self.kind.as_str(), self.account) {
+            ("reset", Some(account)) => BridgeInviteKind::Reset { account },
+            _ => BridgeInviteKind::Register {
+                role: self.role.as_deref().and_then(BridgeRole::from_name).unwrap_or_default(),
+                servers: self.servers,
+                proxy: self.proxy,
+            },
+        };
+        BridgeInvite {
+            id: self.id,
+            kind,
+            expires_at: self.expires_at,
+            created_by: self.created_by,
+            created_at: self.created_at,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct NewInviteBody {
+    #[serde(flatten)]
+    invite: InviteBody,
+    code: String,
+}
+
+impl NewInviteBody {
+    fn into_new_invite(self) -> BridgeNewInvite {
+        BridgeNewInvite {
+            invite: self.invite.into_invite(),
+            code: self.code,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct NewTokenBody {
+    token: String,
+}
+
+impl HttpBridgeTransport {
+    /// One account request: `method` on `path`, with `body` as JSON, its
+    /// answer read by `read`. Any 2xx is an answer (`204` for a removal).
+    fn account_call<T: Send + 'static>(
+        &self,
+        method: &'static str,
+        path: String,
+        body: Option<serde_json::Value>,
+        read: fn(&[u8]) -> Result<T, String>,
+    ) -> BridgeAccountResult<T> {
+        let client = self.client.clone();
+        let url = format!("{}{path}", self.base_url);
+        Box::pin(async move {
+            let body = body.map(|body| body.to_string()).unwrap_or_default();
+            let (status, bytes) = Self::call(client, method, url, body)
+                .await
+                .map_err(|e| BridgeAccountError::new(BridgeAccountErrorKind::Failed, e.message))?;
+            if !(200..300).contains(&status) {
+                return Err(account_failure(status, &bytes));
+            }
+            read(&bytes).map_err(|e| {
+                BridgeAccountError::new(
+                    BridgeAccountErrorKind::Failed,
+                    format!("the bridge's answer could not be read: {e}"),
+                )
+            })
+        })
+    }
+}
+
+impl BridgeAccounts for HttpBridgeTransport {
+    fn account(&self) -> BridgeAccountResult<BridgeOwnAccount> {
+        self.account_call("GET", "/v1/account".to_string(), None, |bytes| {
+            json::<OwnBody>(bytes).map(|own| BridgeOwnAccount {
+                account: own.account.into_account(),
+                proxy: own.proxy,
+            })
+        })
+    }
+
+    fn change_password(&self, current: String, new: String) -> BridgeAccountResult<()> {
+        let body = serde_json::json!({ "current": current, "new": new });
+        self.account_call("POST", "/v1/account/password".to_string(), Some(body), nothing)
+    }
+
+    fn issue_token(
+        &self,
+        account: Option<String>,
+        name: String,
+        expires: Option<String>,
+    ) -> BridgeAccountResult<String> {
+        let path = match &account {
+            None => "/v1/account/tokens".to_string(),
+            Some(account) => format!("/v1/admin/accounts/{}/tokens", segment(account)),
+        };
+        let body = serde_json::json!({ "name": name, "expires": expires });
+        self.account_call("POST", path, Some(body), |bytes| {
+            json::<NewTokenBody>(bytes).map(|made| made.token)
+        })
+    }
+
+    fn revoke_token(&self, account: Option<String>, name: String) -> BridgeAccountResult<()> {
+        let path = match &account {
+            None => format!("/v1/account/tokens/{}", segment(&name)),
+            Some(account) => format!("/v1/admin/accounts/{}/tokens/{}", segment(account), segment(&name)),
+        };
+        self.account_call("DELETE", path, None, nothing)
+    }
+
+    fn accounts(&self) -> BridgeAccountResult<Vec<BridgeAccount>> {
+        self.account_call("GET", "/v1/admin/accounts".to_string(), None, |bytes| {
+            json::<Vec<AccountBody>>(bytes).map(|list| list.into_iter().map(AccountBody::into_account).collect())
+        })
+    }
+
+    fn update_account(&self, name: String, change: BridgeAccountChange) -> BridgeAccountResult<BridgeAccount> {
+        // Only what changes: an absent field is left as it is, and a `null`
+        // `servers` clears the rules — two answers the bridge tells apart.
+        let mut body = serde_json::Map::new();
+        if let Some(role) = change.role {
+            body.insert("role".to_string(), role.as_str().into());
+        }
+        if let Some(servers) = change.servers {
+            body.insert("servers".to_string(), serde_json::json!(servers));
+        }
+        if let Some(disabled) = change.disabled {
+            body.insert("disabled".to_string(), disabled.into());
+        }
+        let path = format!("/v1/admin/accounts/{}", segment(&name));
+        self.account_call("PATCH", path, Some(body.into()), |bytes| {
+            json::<AccountBody>(bytes).map(AccountBody::into_account)
+        })
+    }
+
+    fn delete_account(&self, name: String) -> BridgeAccountResult<()> {
+        let path = format!("/v1/admin/accounts/{}", segment(&name));
+        self.account_call("DELETE", path, None, nothing)
+    }
+
+    fn reset_link(&self, name: String) -> BridgeAccountResult<BridgeNewInvite> {
+        let path = format!("/v1/admin/accounts/{}/reset", segment(&name));
+        self.account_call("POST", path, Some(serde_json::json!({})), |bytes| {
+            json::<NewInviteBody>(bytes).map(NewInviteBody::into_new_invite)
+        })
+    }
+
+    fn invites(&self) -> BridgeAccountResult<Vec<BridgeInvite>> {
+        self.account_call("GET", "/v1/admin/invites".to_string(), None, |bytes| {
+            json::<Vec<InviteBody>>(bytes).map(|list| list.into_iter().map(InviteBody::into_invite).collect())
+        })
+    }
+
+    fn create_invite(
+        &self,
+        role: BridgeRole,
+        servers: Option<Vec<String>>,
+        proxy: bool,
+        days: u64,
+    ) -> BridgeAccountResult<BridgeNewInvite> {
+        let body = serde_json::json!({
+            "role": role.as_str(),
+            "servers": servers,
+            "proxy": proxy,
+            "days": days,
+        });
+        self.account_call("POST", "/v1/admin/invites".to_string(), Some(body), |bytes| {
+            json::<NewInviteBody>(bytes).map(NewInviteBody::into_new_invite)
+        })
+    }
+
+    fn revoke_invite(&self, id: String) -> BridgeAccountResult<()> {
+        let path = format!("/v1/admin/invites/{}", segment(&id));
+        self.account_call("DELETE", path, None, nothing)
+    }
+
+    fn invite_link(&self, code: &str) -> String {
+        format!("{}/#invite={code}", self.base_url)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use gpui::http_client::FakeHttpClient;
+
+    /// One request a fake bridge was sent: method, address, body.
+    type Sent = (String, String, String);
+
+    /// Every request a fake bridge was sent, and the transport that sends
+    /// them to it.
+    fn transport_recording(status: u16, body: &'static str) -> (HttpBridgeTransport, Arc<Mutex<Vec<Sent>>>) {
+        let seen: Arc<Mutex<Vec<Sent>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = seen.clone();
+        let client = FakeHttpClient::create(move |mut req| {
+            let captured = captured.clone();
+            async move {
+                let mut sent = Vec::new();
+                req.body_mut().read_to_end(&mut sent).await?;
+                captured.lock().expect("lock").push((
+                    req.method().to_string(),
+                    req.uri().to_string(),
+                    String::from_utf8_lossy(&sent).into_owned(),
+                ));
+                Ok(gpui::http_client::http::Response::builder()
+                    .status(status)
+                    .body(AsyncBody::from(body.to_string()))?)
+            }
+        });
+        (HttpBridgeTransport::new(client, "http://bridge:7379/zedis/"), seen)
+    }
+
+    #[test]
+    fn the_signed_in_account_is_read_with_its_tokens_and_the_proxy() {
+        let (transport, seen) = transport_recording(
+            200,
+            r#"{"name":"ai","role":"read_only","disabled":false,"has_password":true,"servers":["prod-*:ro"],
+                "tokens":[{"name":"laptop","expires_at":1800000000,"created_at":1700000000}],
+                "created_at":1690000000,"proxy":true}"#,
+        );
+        let own = futures::executor::block_on(transport.account()).expect("account");
+        assert_eq!(own.account.name, "ai");
+        assert_eq!(own.account.role, BridgeRole::ReadOnly);
+        assert_eq!(own.account.servers, Some(vec!["prod-*:ro".to_string()]));
+        assert_eq!(own.account.tokens[0].expires_at, Some(1_800_000_000));
+        assert!(own.proxy);
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen[0].0, "GET");
+        assert_eq!(seen[0].1, "http://bridge:7379/zedis/v1/account");
+    }
+
+    /// A name is what someone typed: `#` or `?` in it must not end the path,
+    /// and a token is revoked on the account it belongs to.
+    #[test]
+    fn a_name_in_a_path_is_escaped() {
+        let (transport, seen) = transport_recording(204, "");
+        futures::executor::block_on(transport.revoke_token(Some("ops#1".to_string()), "a b?".to_string()))
+            .expect("revoked");
+        futures::executor::block_on(transport.revoke_token(None, "laptop".to_string())).expect("revoked");
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen[0].0, "DELETE");
+        assert_eq!(
+            seen[0].1,
+            "http://bridge:7379/zedis/v1/admin/accounts/ops%231/tokens/a%20b%3F"
+        );
+        assert_eq!(seen[1].1, "http://bridge:7379/zedis/v1/account/tokens/laptop");
+    }
+
+    /// Absent leaves a setting alone and `null` clears the rules; the bridge
+    /// reads the two differently, so the body has to keep them apart.
+    #[test]
+    fn an_account_change_sends_only_what_changes() {
+        let account = r#"{"name":"bob","role":"full","disabled":true,"has_password":true,"servers":null,"tokens":[],"created_at":1}"#;
+        let (transport, seen) = transport_recording(200, account);
+        let change = BridgeAccountChange {
+            role: None,
+            servers: Some(None),
+            disabled: Some(true),
+        };
+        let updated =
+            futures::executor::block_on(transport.update_account("bob".to_string(), change)).expect("updated");
+        assert!(updated.disabled);
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen[0].0, "PATCH");
+        let sent: serde_json::Value = serde_json::from_str(&seen[0].2).expect("json");
+        assert_eq!(sent, serde_json::json!({ "servers": null, "disabled": true }));
+    }
+
+    #[test]
+    fn invitations_are_read_by_their_kind() {
+        let (transport, _) = transport_recording(
+            200,
+            r#"[{"id":"i1","kind":"register","role":"full","servers":null,"proxy":true,"expires_at":9,"created_by":"alice","created_at":1},
+                {"id":"i2","kind":"reset","account":"bob","expires_at":9,"created_by":"alice","created_at":1}]"#,
+        );
+        let invites = futures::executor::block_on(transport.invites()).expect("invites");
+        assert_eq!(
+            invites[0].kind,
+            BridgeInviteKind::Register {
+                role: BridgeRole::Full,
+                servers: None,
+                proxy: true,
+            }
+        );
+        assert_eq!(
+            invites[1].kind,
+            BridgeInviteKind::Reset {
+                account: "bob".to_string()
+            }
+        );
+        assert_eq!(transport.invite_link("abc"), "http://bridge:7379/zedis/#invite=abc");
+    }
+
+    #[test]
+    fn a_refused_account_request_says_why_by_its_status() {
+        for (status, kind) in [
+            (400, BridgeAccountErrorKind::Invalid),
+            (403, BridgeAccountErrorKind::Refused),
+            (404, BridgeAccountErrorKind::NotFound),
+            (409, BridgeAccountErrorKind::Conflict),
+            (429, BridgeAccountErrorKind::TooManyAttempts),
+            (502, BridgeAccountErrorKind::Failed),
+        ] {
+            let error = account_failure(
+                status,
+                br#"{"message":"the bridge would be left without an administrator"}"#,
+            );
+            assert_eq!(error.kind, kind);
+            assert_eq!(error.message, "the bridge would be left without an administrator");
+        }
+    }
 
     #[test]
     fn a_stored_secret_is_shown_as_a_placeholder_and_sent_back_as_a_name() {
