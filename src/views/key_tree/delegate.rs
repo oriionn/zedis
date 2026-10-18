@@ -558,10 +558,18 @@ impl ListDelegate for KeyTreeDelegate {
                             // Import keys lives under Tools (status bar) —
                             // it targets the current server/db, not a tree
                             // prefix, so the context menu no longer offers it.
-                            // Tag & note — local redb only.
+                            // Tag & note — local redb only, or in the browser
+                            // the bridge's, seen by everyone who sees the
+                            // server and so left only by an account that may
+                            // write there (ADR 17).
                             // Multi-select → batch colour only (notes preserved).
                             // Single leaf → full tag + note dialog.
-                            if Capability::EditLocalMetadata.allowed(readonly) {
+                            let notes_writable = cx
+                                .global::<ZedisGlobalStore>()
+                                .read(cx)
+                                .selected_server()
+                                .is_none_or(|(server_id, _)| !account_is_read_only_on(server_id.as_ref()));
+                            if Capability::EditLocalMetadata.allowed(readonly) && notes_writable {
                                 if multi_selection_count > 1 {
                                     let locale = cx.global::<ZedisGlobalStore>().read(cx).locale();
                                     let text = t!(

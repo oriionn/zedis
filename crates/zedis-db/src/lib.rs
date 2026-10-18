@@ -48,6 +48,10 @@ mod lua_scripts;
 #[cfg(any(target_family = "wasm", test))]
 mod mem_store;
 mod metrics_history;
+/// The browser's page data on the bridge (ADR 17). Compiled for `cargo test`
+/// too, for what it makes of a commit.
+#[cfg(any(target_family = "wasm", test))]
+mod page_data;
 #[cfg(not(target_family = "wasm"))]
 mod protos;
 #[cfg(not(target_family = "wasm"))]
@@ -63,6 +67,8 @@ pub use history_manager::{
 pub use key_metadata_manager::*;
 pub use lua_scripts::*;
 pub use metrics_history::*;
+#[cfg(target_family = "wasm")]
+pub use page_data::{PageChange, PageSeed, observe_page_data, seed_page_data};
 #[cfg(not(target_family = "wasm"))]
 pub use protos::*;
 #[cfg(not(target_family = "wasm"))]

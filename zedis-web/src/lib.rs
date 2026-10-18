@@ -52,8 +52,8 @@ use tracing_subscriber::prelude::*;
 use transport::HttpBridgeTransport;
 #[cfg(target_family = "wasm")]
 use zedis_connection::{
-    RedisServer, get_servers, set_bridge_accounts, set_bridge_server_store, set_bridge_storage, set_bridge_transport,
-    set_servers_cache,
+    RedisServer, get_servers, set_bridge_accounts, set_bridge_page_data, set_bridge_server_store, set_bridge_storage,
+    set_bridge_transport, set_servers_cache,
 };
 #[cfg(target_family = "wasm")]
 use zedis_gui::helpers::pacing::{SERVER_LIST_REFRESH, set_unattended, unattended};
@@ -91,10 +91,19 @@ pub fn set_asset_revs(json: String) {
 /// between "started" and "has a font". `apple_keyboard` is the page's reading
 /// of `navigator`: one wasm module serves a Mac and a Windows laptop alike,
 /// so which key the shortcuts are *drawn* with is a run-time fact here, not
-/// the compile-time one it is on the desktop.
+/// the compile-time one it is on the desktop. `page_data` is the bridge's
+/// answer to `GET /v1/page-data` (ADR 17): what this account keeps — its
+/// favorites, recent keys and search history, the key tags and notes, the
+/// saved scripts — loaded before anything reads it; empty when the page
+/// could not get it, and then nothing is sent back either.
 #[cfg(target_family = "wasm")]
 #[wasm_bindgen::prelude::wasm_bindgen]
-pub fn run(origin: String, ui_font: Vec<u8>, apple_keyboard: bool) -> Result<(), wasm_bindgen::JsValue> {
+pub fn run(
+    origin: String,
+    ui_font: Vec<u8>,
+    apple_keyboard: bool,
+    page_data: String,
+) -> Result<(), wasm_bindgen::JsValue> {
     // A panic in wasm is otherwise an unexplained `unreachable`.
     console_error_panic_hook::set_once();
     // Straight to `set_global_default`, not `init()`: `init` first installs
@@ -130,6 +139,15 @@ pub fn run(origin: String, ui_font: Vec<u8>, apple_keyboard: bool) -> Result<(),
         WebBackendPreference::Auto,
         CanvasFontFallback::EmojiAndCjk,
     ));
+    let page_seed = match page_data.as_str() {
+        "" => {
+            error!("no page data from the bridge; this page keeps its changes to itself");
+            None
+        }
+        json => transport::page_seed(json)
+            .map_err(|e| error!(error = %e, "the bridge's page data could not be read"))
+            .ok(),
+    };
     let http_client = Arc::new(platform.fetch_http_client());
     let app = Application::with_platform(platform).with_http_client(http_client);
     // Locales, JetBrains Mono, commands.json and CONFIG help are fetched
@@ -168,12 +186,20 @@ pub fn run(origin: String, ui_font: Vec<u8>, apple_keyboard: bool) -> Result<(),
         set_bridge_server_store(transport.clone());
         set_bridge_storage(transport.clone());
         set_bridge_accounts(transport.clone());
+        // Only with what the bridge holds loaded: a change made on top of
+        // nothing would replace the account's lists with this page's.
+        if page_seed.is_some() {
+            set_bridge_page_data(transport.clone());
+        }
 
         // Before `launch`, which binds the keys and draws their labels.
         set_web_command_key(apple_keyboard);
         zedis_gui::init_embedded_commands();
         if let Err(e) = zedis_gui::db::init_database() {
             error!(error = %e, "the in-memory local store could not be created");
+        }
+        if let Some(seed) = page_seed {
+            zedis_gui::states::seed_page_data(seed);
         }
         zedis_gui::init_caches();
 

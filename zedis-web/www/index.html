@@ -125,7 +125,7 @@
   const api = (path, init) => fetch(root + path, { credentials: "same-origin", ...init });
   // Filled by `web-bundle.sh` between the ASSET_REV markers on the next
   // line. Leave `{}` in git: an unbundled page just fetches unversioned URLs.
-  const ASSET_REV = /*ASSET_REV*/{"assets/commands.json":"a1f58c0b4949","assets/config_docs/en.json":"90b5e6e1426a","assets/config_docs/zh.json":"32d145cb21ce","assets/icon.png":"9121a3cab487","fonts/IBMPlexSans.ttf":"335a2b2a3a64","fonts/JetBrainsMono-Bold.ttf":"8658ffe39dbf","fonts/JetBrainsMono-Regular.ttf":"d09f65145228","fonts/OFL.txt":"4d4949dda4b2","locales/de.toml":"2d1924e36cbe","locales/en.toml":"3e314d5ce821","locales/es.toml":"c700fdae4460","locales/fr.toml":"42b7a87cf9b3","locales/ja.toml":"7dc28cbc61eb","locales/pt.toml":"0b184d074fbd","locales/ru.toml":"a380af991abf","locales/zh.toml":"5efcb2f5cb51","wasm/zedis_web.d.ts":"563ee520015c","wasm/zedis_web.js":"de130d2ba5e8","wasm/zedis_web_bg.wasm":"def4f0c5eee5","wasm/zedis_web_bg.wasm.d.ts":"444a5c717a54"}/*/ASSET_REV*/;
+  const ASSET_REV = /*ASSET_REV*/{"assets/commands.json":"a1f58c0b4949","assets/config_docs/en.json":"90b5e6e1426a","assets/config_docs/zh.json":"32d145cb21ce","assets/icon.png":"9121a3cab487","fonts/IBMPlexSans.ttf":"335a2b2a3a64","fonts/JetBrainsMono-Bold.ttf":"8658ffe39dbf","fonts/JetBrainsMono-Regular.ttf":"d09f65145228","fonts/OFL.txt":"4d4949dda4b2","locales/de.toml":"9148a0d97852","locales/en.toml":"92a76a2c5381","locales/es.toml":"5531f189c92e","locales/fr.toml":"3c16b5b2df65","locales/ja.toml":"03337dd7355d","locales/pt.toml":"f9af1fef7ad1","locales/ru.toml":"444cff3c974f","locales/zh.toml":"c65fea3fb893","wasm/zedis_web.d.ts":"2764f832465b","wasm/zedis_web.js":"20fb3ed01d7c","wasm/zedis_web_bg.wasm":"688dcfd4bb4a","wasm/zedis_web_bg.wasm.d.ts":"c50a1b79f7fd"}/*/ASSET_REV*/;
   const url = (path) => {
     const v = ASSET_REV[path];
     return v ? `${root}/${path}?v=${v}` : `${root}/${path}`;
@@ -240,6 +240,29 @@
   /** The string key of a role as the bridge spells it. */
   const roleKey = (role) => ({ admin: "role_admin", full: "role_full", read_only: "role_read_only" })[role] || role;
 
+  // The account's page data, as the bridge answers it, or "" when it could
+  // not: the module then keeps this page's changes to itself rather than
+  // replace the account's with them. The preferences among it are put where
+  // the application reads its settings — the account's, on any browser.
+  async function pageDataOfAccount() {
+    try {
+      const res = await api("/v1/page-data");
+      if (!res.ok) return "";
+      const text = await res.text();
+      const prefs = JSON.parse(text).rows?.find((row) => row.table === "preferences" && row.key === "zedis.toml");
+      if (prefs) {
+        try {
+          localStorage.setItem("zedis:zedis.toml", prefs.value);
+        } catch {
+          // denied storage: the application starts on its defaults
+        }
+      }
+      return text;
+    } catch {
+      return "";
+    }
+  }
+
   async function start() {
     // The whole application, as the desktop builds it, compiled to wasm.
     show("loading");
@@ -248,6 +271,9 @@
       // fonts of its own, and the first frame measures text. Locales are
       // the same kind of thing — `t!` is synchronous — so they land before
       // `run`, not on a later frame.
+      // What this account keeps on the bridge (ADR 17) — asked first, because
+      // its preferences decide the language the locales below are fetched in.
+      const pageData = await pageDataOfAccount();
       const locale = preferredLocale();
       const localeNames = locale === "en" ? ["en"] : ["en", locale];
       const [mod, font, localeFiles] = await Promise.all([
@@ -277,7 +303,7 @@
       const appleKeyboard = /mac|iphone|ipad/i.test(navigator.userAgentData?.platform || navigator.platform || "");
       // `root`, not the origin: the module builds `/v1/…` and the icon URLs
       // on it, so they follow the page under a base path.
-      mod.run(root, new Uint8Array(font), appleKeyboard);
+      mod.run(root, new Uint8Array(font), appleKeyboard, pageData);
       // A page nobody is looking at polls the bridge far less often. Browsers
       // throttle a hidden tab's timers but never stop them, and a tab left
       // open for the weekend would otherwise keep its heartbeat going.

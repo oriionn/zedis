@@ -16,6 +16,7 @@ mod app;
 mod i18n;
 #[cfg(not(target_family = "wasm"))]
 mod migration;
+mod page_data;
 mod server;
 mod session;
 pub mod trash_store;
@@ -87,6 +88,11 @@ pub use i18n::save_ui_locale;
 pub use i18n::{command_status_label, command_unavailable_message, server_view_title};
 #[cfg(not(target_family = "wasm"))]
 pub use migration::{ExportFormat, LogStatus, MigrationEvent, MigrationJob, MigrationPhase, MigrationState};
+pub use page_data::account_is_read_only;
+/// The browser entry point loads the page data from the bridge here, before
+/// `init_caches` (ADR 17).
+#[cfg(target_family = "wasm")]
+pub use page_data::{save_preferences, seed_page_data};
 pub use server::ConnectionHealth;
 pub use server::ErrorMessage;
 pub use server::InfoSnapshot;

@@ -33,12 +33,14 @@ use crate::{
     error::Error,
     helpers::{get_mono_font_family, parse_lines, unix_ts},
     states::{
-        ServerEvent, ServerView, ZedisGlobalStore, ZedisServerState, back_to_editor_tooltip, dialog_button_props,
-        escalate_dangerous_body, i18n_common, i18n_lua_scripts,
+        ServerEvent, ServerView, ZedisGlobalStore, ZedisServerState, account_is_read_only, back_to_editor_tooltip,
+        dialog_button_props, escalate_dangerous_body, i18n_common, i18n_lua_scripts,
     },
 };
 use ahash::AHashMap;
 use gpui::{ClipboardItem, Entity, SharedString, Subscription, Task, Window, div, prelude::*, px};
+#[cfg(target_family = "wasm")]
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, IconName, Sizable, WindowExt,
     button::{Button, ButtonVariants},
@@ -107,6 +109,9 @@ const TEMPLATES: &[CodeTemplate] = &[
 /// existing entry; `None` for a brand-new script.
 struct EditForm {
     target_id: Option<String>,
+    /// The page's *Shared* box (ADR 17); always `false` on the desktop,
+    /// which has no accounts to share with.
+    shared: bool,
     name: Entity<InputState>,
     code: Entity<EditorState>,
     default_keys: Entity<TextareaState>,
@@ -252,6 +257,7 @@ impl ZedisLuaScriptLibrary {
     }
 
     fn open_form(&mut self, existing: Option<&(String, LuaScript)>, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        let shared = existing.is_some_and(|(_, s)| s.shared);
         let (target_id, name_val, code_val, keys_val, args_val) = match existing {
             Some((id, s)) => (
                 Some(id.clone()),
@@ -300,6 +306,7 @@ impl ZedisLuaScriptLibrary {
         });
         self.edit_form = Some(EditForm {
             target_id,
+            shared,
             name,
             code,
             default_keys,
@@ -355,6 +362,7 @@ impl ZedisLuaScriptLibrary {
             return;
         }
         let id = form.target_id.clone().unwrap_or_else(|| Uuid::now_v7().to_string());
+        let shared = form.shared;
         let default_keys = parse_lines(&form.default_keys.read(cx).value());
         let default_args = parse_lines(&form.default_args.read(cx).value());
         // Default KEYS are optional pre-fills for the Run panel — do not
@@ -377,6 +385,7 @@ impl ZedisLuaScriptLibrary {
             evalsha_hits,
             created_at,
             updated_at: now,
+            shared,
         };
         if let Err(e) = LuaScriptManager::upsert(&id, script) {
             self.error = Some(e.to_string().into());
@@ -445,6 +454,8 @@ impl ZedisLuaScriptLibrary {
             evalsha_hits: 0,
             created_at: now,
             updated_at: now,
+            // A copy is the copier's own until they share it.
+            shared: false,
         };
         if let Err(e) = LuaScriptManager::upsert(&new_id, copy) {
             self.error = Some(e.to_string().into());
@@ -766,6 +777,7 @@ impl ZedisLuaScriptLibrary {
                             evalsha_hits: 0,
                             created_at: now,
                             updated_at: now,
+                            shared: false,
                         };
                         if LuaScriptManager::upsert(&id, script).is_ok() {
                             ok += 1;
@@ -840,14 +852,16 @@ impl gpui::Render for ZedisLuaScriptLibrary {
                 .size_full()
                 .gap_3()
                 .child(Label::new(i18n_lua_scripts(cx, "empty")).text_color(muted))
-                .child(
-                    Button::new("lua-empty-new")
-                        .outline()
-                        .small()
-                        .icon(IconName::Plus)
-                        .label(i18n_lua_scripts(cx, "new_script"))
-                        .on_click(cx.listener(|this, _, w, cx| this.open_form(None, w, cx))),
-                )
+                .when(!account_is_read_only(), |this| {
+                    this.child(
+                        Button::new("lua-empty-new")
+                            .outline()
+                            .small()
+                            .icon(IconName::Plus)
+                            .label(i18n_lua_scripts(cx, "new_script"))
+                            .on_click(cx.listener(|this, _, w, cx| this.open_form(None, w, cx))),
+                    )
+                })
                 .into_any_element()
         } else if filtered.is_empty() {
             div()
@@ -891,6 +905,8 @@ impl ZedisLuaScriptLibrary {
     fn render_header(&self, cx: &mut gpui::Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let can_run = self.server_state.read(cx).can(Capability::EvalScript);
+        // A read-only bridge account uses the library and changes none of it.
+        let may_edit = !account_is_read_only();
         let count = self.scripts.len();
         let count_label = if count == 0 {
             SharedString::default()
@@ -944,7 +960,7 @@ impl ZedisLuaScriptLibrary {
                     )
                     // Import reads the clipboard at the press, which a page
                     // may not (`reads_clipboard_on_demand`).
-                    .when(reads_clipboard_on_demand(), |this| {
+                    .when(may_edit && reads_clipboard_on_demand(), |this| {
                         this.child(
                             Button::new("lua-import")
                                 .ghost()
@@ -977,14 +993,16 @@ impl ZedisLuaScriptLibrary {
                                 })),
                         )
                     })
-                    .child(
-                        Button::new("lua-new")
-                            .outline()
-                            .small()
-                            .icon(IconName::Plus)
-                            .label(i18n_lua_scripts(cx, "new_script"))
-                            .on_click(cx.listener(|this, _, w, cx| this.open_form(None, w, cx))),
-                    )
+                    .when(may_edit, |this| {
+                        this.child(
+                            Button::new("lua-new")
+                                .outline()
+                                .small()
+                                .icon(IconName::Plus)
+                                .label(i18n_lua_scripts(cx, "new_script"))
+                                .on_click(cx.listener(|this, _, w, cx| this.open_form(None, w, cx))),
+                        )
+                    })
                     .child(
                         Button::new("lua-refresh")
                             .outline()
@@ -1022,6 +1040,8 @@ impl ZedisLuaScriptLibrary {
         cx: &mut gpui::Context<Self>,
     ) -> impl IntoElement {
         let can_run = self.server_state.read(cx).can(Capability::EvalScript);
+        // A read-only bridge account runs scripts and changes none of them.
+        let may_edit = !account_is_read_only();
         let muted = cx.theme().muted_foreground;
         let foreground = cx.theme().foreground;
         let code_expanded = *self.code_expanded.get(&id).unwrap_or(&false);
@@ -1200,16 +1220,18 @@ impl ZedisLuaScriptLibrary {
                                                 cx.listener(move |this, _, _w, cx| this.run(id_run_btn.clone(), cx)),
                                             ),
                                     )
-                                    .child(
-                                        Button::new(("lua-save-defaults", card_hash))
-                                            .outline()
-                                            .small()
-                                            .label(i18n_lua_scripts(cx, "save_defaults"))
-                                            .tooltip(i18n_lua_scripts(cx, "save_defaults_tooltip"))
-                                            .on_click(cx.listener(move |this, _, _w, cx| {
-                                                this.save_run_as_defaults(id_save_defaults.clone(), cx)
-                                            })),
-                                    ),
+                                    .when(may_edit, |this| {
+                                        this.child(
+                                            Button::new(("lua-save-defaults", card_hash))
+                                                .outline()
+                                                .small()
+                                                .label(i18n_lua_scripts(cx, "save_defaults"))
+                                                .tooltip(i18n_lua_scripts(cx, "save_defaults_tooltip"))
+                                                .on_click(cx.listener(move |this, _, _w, cx| {
+                                                    this.save_run_as_defaults(id_save_defaults.clone(), cx)
+                                                })),
+                                        )
+                                    }),
                             ),
                     )
                     .when_some(result_block, |this, block| this.child(block))
@@ -1249,6 +1271,15 @@ impl ZedisLuaScriptLibrary {
                             .text_sm()
                             .text_color(foreground),
                     )
+                    // Only ever set in the browser, for a script every
+                    // account sees (ADR 17).
+                    .when(script.shared, |this| {
+                        this.child(
+                            Label::new(i18n_lua_scripts(cx, "shared_badge"))
+                                .text_xs()
+                                .text_color(muted),
+                        )
+                    })
                     .child(
                         Button::new(("lua-copy-sha", card_hash))
                             .ghost()
@@ -1309,39 +1340,65 @@ impl ZedisLuaScriptLibrary {
                                 ),
                         )
                     })
-                    .child(
-                        Button::new(("lua-dup", card_hash))
-                            .ghost()
-                            .small()
-                            .label(i18n_lua_scripts(cx, "duplicate"))
-                            .tooltip(i18n_lua_scripts(cx, "duplicate_tooltip"))
-                            .on_click(cx.listener(move |this, _, _w, cx| this.duplicate(id_dup.clone(), cx))),
-                    )
-                    .child(
-                        Button::new(("lua-edit", card_hash))
-                            .outline()
-                            .small()
-                            .icon(CustomIconName::FilePenLine)
-                            .label(i18n_lua_scripts(cx, "edit"))
-                            .on_click(cx.listener(move |this, _, w, cx| {
-                                let pair = (id_for_edit.clone(), LuaScript::clone(&script_for_edit));
-                                this.open_form(Some(&pair), w, cx);
-                                let _ = id_edit;
-                            })),
-                    )
-                    .child(
-                        Button::new(("lua-delete", card_hash))
-                            .ghost()
-                            .small()
-                            .icon(IconName::CircleX)
-                            .tooltip(i18n_lua_scripts(cx, "delete_tooltip"))
-                            .on_click(cx.listener(move |this, _, w, cx| {
-                                this.confirm_delete(id_delete.clone(), name_for_delete.clone(), w, cx)
-                            })),
-                    ),
+                    .when(may_edit, |this| {
+                        this.child(
+                            Button::new(("lua-dup", card_hash))
+                                .ghost()
+                                .small()
+                                .label(i18n_lua_scripts(cx, "duplicate"))
+                                .tooltip(i18n_lua_scripts(cx, "duplicate_tooltip"))
+                                .on_click(cx.listener(move |this, _, _w, cx| this.duplicate(id_dup.clone(), cx))),
+                        )
+                        .child(
+                            Button::new(("lua-edit", card_hash))
+                                .outline()
+                                .small()
+                                .icon(CustomIconName::FilePenLine)
+                                .label(i18n_lua_scripts(cx, "edit"))
+                                .on_click(cx.listener(move |this, _, w, cx| {
+                                    let pair = (id_for_edit.clone(), LuaScript::clone(&script_for_edit));
+                                    this.open_form(Some(&pair), w, cx);
+                                    let _ = id_edit;
+                                })),
+                        )
+                        .child(
+                            Button::new(("lua-delete", card_hash))
+                                .ghost()
+                                .small()
+                                .icon(IconName::CircleX)
+                                .tooltip(i18n_lua_scripts(cx, "delete_tooltip"))
+                                .on_click(cx.listener(move |this, _, w, cx| {
+                                    this.confirm_delete(id_delete.clone(), name_for_delete.clone(), w, cx)
+                                })),
+                        )
+                    }),
             )
             .when_some(run_block, |this, block| this.child(block))
             .when_some(code_block, |this, block| this.child(block))
+    }
+
+    /// The page's *Shared* box: on the bridge a script is the saver's unless
+    /// it is shared with every account (ADR 17). The desktop has no accounts.
+    #[cfg(not(target_family = "wasm"))]
+    fn shared_box(&self, _cx: &mut gpui::Context<Self>) -> Option<gpui::AnyElement> {
+        None
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn shared_box(&self, cx: &mut gpui::Context<Self>) -> Option<gpui::AnyElement> {
+        let form = self.edit_form.as_ref()?;
+        Some(
+            Checkbox::new("lua-shared")
+                .checked(form.shared)
+                .label(i18n_lua_scripts(cx, "shared"))
+                .on_click(cx.listener(|this, checked: &bool, _w, cx| {
+                    if let Some(form) = this.edit_form.as_mut() {
+                        form.shared = *checked;
+                        cx.notify();
+                    }
+                }))
+                .into_any_element(),
+        )
     }
 
     fn render_form_panel(&self, cx: &mut gpui::Context<Self>) -> impl IntoElement {
@@ -1531,6 +1588,7 @@ impl ZedisLuaScriptLibrary {
                     .border_t_1()
                     .border_color(cx.theme().border)
                     .bg(cx.theme().background)
+                    .children(self.shared_box(cx))
                     .child(
                         Button::new("lua-cancel")
                             .small()

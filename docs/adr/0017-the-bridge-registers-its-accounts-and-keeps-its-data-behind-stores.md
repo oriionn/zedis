@@ -244,7 +244,21 @@ give the desktop the same results before and after each step, and
    over is left for later. The account page then moves into the app (the
    amendment below), before step 4.
 4. The page's data: scripts (private or shared, audited), key tags and
-   notes, per-account favorites, recent keys and preferences.
+   notes, per-account favorites, recent keys and preferences. Done, as
+   decided on 2026-10-18: the preferences are the account's whole (the
+   page writes them into `localStorage` before the module starts); a
+   shared script is changed or deleted by any account that may write, as a
+   shared server entry is; a key's tag and note are left only by an
+   account that may write on that server. Search history joined the
+   account's own lists; the terminal's command history did not. The
+   managers are untouched: `mem_store` tells a commit observer what each
+   commit changed, and `zedis_db::page_data` turns that into one change
+   per thing the bridge keeps — a whole row of an account's list, one key's
+   note (a server's whole document would let two people's tags undo each
+   other), one script, and nothing when a script only counted a run. The
+   page sends them one after another so a later one never lands first,
+   and sends nothing when the page data could not be loaded. What other
+   accounts change appears on the next page load.
 5. A SQL implementation when a deployment asks for more than one process
    or for audit queries, with migrations, and the audit viewer for
    administrators.

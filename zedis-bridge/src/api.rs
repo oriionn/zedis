@@ -22,10 +22,10 @@ use crate::accounts::{Accounts, Basic, Setup};
 use crate::audit::{self, Audit, Event, Origin, ServerRef};
 use crate::presence::{Client, ClientKey, ONLINE_WINDOW, Presence};
 use crate::static_files::{Representation, WebBuild};
-use crate::store::{MetricsStore, ServerStore, TrashStore};
+use crate::store::{KeyNoteStore, MetricsStore, PageRowStore, ScriptStore, ServerStore, TrashStore};
 use crate::trash::{NewEntry, PutError};
 use crate::watch::{Batch, WatchError, WatchKind, Watches};
-use crate::{account_api, auth, mcp, policy, resp, session::Sessions, static_files};
+use crate::{account_api, auth, mcp, page_data, policy, resp, session::Sessions, static_files};
 use axum::{
     Json, Router,
     body::{Body, Bytes},
@@ -82,6 +82,11 @@ pub struct AppState {
     pub trash: Arc<dyn TrashStore>,
     /// The browser build's Metrics history (`/v1/servers/{id}/metrics`).
     pub metrics: Arc<dyn MetricsStore>,
+    /// The page's own data (`/v1/page-data`, ADR 17): each account's rows,
+    /// the key tags and notes, the saved scripts.
+    pub page_rows: Arc<dyn PageRowStore>,
+    pub key_notes: Arc<dyn KeyNoteStore>,
+    pub scripts: Arc<dyn ScriptStore>,
     /// Failed sign-ins, setup tokens and invitation codes, per address.
     pub throttle: auth::Throttle,
     /// The token that seats an administrator (ADR 17).
@@ -129,8 +134,9 @@ pub fn router(state: AppState) -> Router {
             &at("/v1/mcp"),
             post(mcp::post).get(mcp::not_allowed).delete(mcp::not_allowed),
         );
-    // Registration and administration (ADR 17).
-    account_api::routes(router, &at)
+    // Registration and administration, and the page's own data (ADR 17).
+    let router = account_api::routes(router, &at);
+    page_data::routes(router, &at)
         // On the API routes only — the page's files need no login.
         .route_layer(middleware::from_fn_with_state(state.clone(), renew_login_cookie))
         .fallback(web_asset)
@@ -414,7 +420,7 @@ pub(crate) const MAX_TRIED_NAME: usize = 64;
 /// forgetting the test is a compile error's worth of obvious: the route
 /// either asks this function or it does not change anything. `action` is
 /// what the audit log says was refused.
-fn authorize_write(
+pub(crate) fn authorize_write(
     state: &AppState,
     headers: &HeaderMap,
     origin: &mut Origin,
@@ -443,7 +449,7 @@ pub(crate) fn visible_to(accounts: &Accounts, server: &RedisServer, account: &st
 /// The entry `id` names, if `account` may see it. An entry that exists but
 /// is someone else's answers exactly like one that does not exist, so the
 /// routes never confirm what another account has.
-fn visible_server(accounts: &Accounts, id: &str, account: &str) -> ApiResult<RedisServer> {
+pub(crate) fn visible_server(accounts: &Accounts, id: &str, account: &str) -> ApiResult<RedisServer> {
     get_server(id)
         .ok()
         .filter(|server| visible_to(accounts, server, account))
@@ -453,7 +459,7 @@ fn visible_server(accounts: &Accounts, id: &str, account: &str) -> ApiResult<Red
 /// Refuse a change to `server` by an account that may not write there —
 /// read-only outright, or read-only on this entry by its rules — the way
 /// `authorize_write` refuses one that may write nowhere.
-fn refuse_read_only_on(
+pub(crate) fn refuse_read_only_on(
     state: &AppState,
     account: &str,
     server: &RedisServer,
@@ -1125,6 +1131,7 @@ async fn delete_server(
         // entry that is not there, and the values were someone's.
         let _ = state.trash.remove_server(server.id.clone()).await;
         let _ = state.metrics.remove_server(server.id.clone()).await;
+        let _ = state.key_notes.remove_server(server.id.clone()).await;
         state.audit.record(&account, &origin, Event::ServerDeleted { server });
     }
     Ok(StatusCode::NO_CONTENT)
@@ -2384,6 +2391,15 @@ mod mcp_auth_tests {
             metrics: Arc::new(crate::metrics::LocalMetrics::new(
                 std::env::temp_dir().join("zedis-bridge-test-metrics"),
             )),
+            page_rows: Arc::new(crate::page_data::LocalPageRows::new(
+                std::env::temp_dir().join("zedis-bridge-test-rows"),
+            )),
+            key_notes: Arc::new(crate::page_data::LocalKeyNotes::new(
+                std::env::temp_dir().join("zedis-bridge-test-notes"),
+            )),
+            scripts: Arc::new(crate::page_data::LocalScripts::new(
+                std::env::temp_dir().join("zedis-bridge-test-scripts.json"),
+            )),
             throttle: auth::Throttle::new(),
             setup: Setup::in_dir(&std::env::temp_dir().join("zedis-bridge-test-setup")),
         }
@@ -2520,6 +2536,9 @@ mod bin_tests {
             servers: Arc::new(crate::store::LocalServers),
             trash: Arc::new(trash.clone()),
             metrics: Arc::new(crate::metrics::LocalMetrics::new(dir.join("bridge-metrics"))),
+            page_rows: Arc::new(crate::page_data::LocalPageRows::new(dir.join("rows"))),
+            key_notes: Arc::new(crate::page_data::LocalKeyNotes::new(dir.join("notes"))),
+            scripts: Arc::new(crate::page_data::LocalScripts::new(dir.join("scripts.json"))),
             throttle: auth::Throttle::new(),
             setup: Setup::in_dir(&dir),
         };

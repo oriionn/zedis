@@ -379,6 +379,18 @@ pub enum Event {
         target: String,
         role: &'static str,
     },
+    /// A saved Lua script added or changed (ADR 17): a shared one is run by
+    /// others, on production too.
+    ScriptSaved {
+        id: String,
+        name: String,
+        shared: bool,
+        created: bool,
+    },
+    ScriptDeleted {
+        id: String,
+        name: String,
+    },
     /// A tool call at the MCP entry point (ADR 15) — every one, whatever it
     /// read. The other lines keep what a person did that mattered; this
     /// door admits a program acting for someone, and reads are the whole
@@ -424,6 +436,8 @@ impl Event {
             Event::TokenIssued { .. } => "token_issued",
             Event::TokenRevoked { .. } => "token_revoked",
             Event::AccountImported { .. } => "account_imported",
+            Event::ScriptSaved { .. } => "script_saved",
+            Event::ScriptDeleted { .. } => "script_deleted",
             Event::Tool { .. } => "tool",
         }
     }
@@ -824,6 +838,16 @@ mod tests {
             Event::AccountImported {
                 target: "bob".to_string(),
                 role: "full",
+            },
+            Event::ScriptSaved {
+                id: "s".to_string(),
+                name: "top keys".to_string(),
+                shared: true,
+                created: true,
+            },
+            Event::ScriptDeleted {
+                id: "s".to_string(),
+                name: "top keys".to_string(),
             },
             Event::Tool {
                 tool: "scan_keys".to_string(),

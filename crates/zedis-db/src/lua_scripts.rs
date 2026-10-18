@@ -41,7 +41,7 @@ static LUA_SCRIPT_CACHE: LazyLock<DashMap<String, LuaScript>> = LazyLock::new(Da
 /// body so it doesn't get serialized twice.
 /// `#[serde(default)]` is the upgrade contract (see [`crate::ProtoConfig`]): a
 /// script saved by an earlier build must still load after a field is added.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LuaScript {
     pub name: String,
@@ -70,6 +70,11 @@ pub struct LuaScript {
     pub created_at: i64,
     #[serde(default)]
     pub updated_at: i64,
+    /// In the browser: whether the bridge shares it with every account, or
+    /// keeps it the saver's (ADR 17). The desktop never sets it, and a
+    /// `false` is not written, so its rows are what they always were.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub shared: bool,
 }
 
 pub struct LuaScriptManager;

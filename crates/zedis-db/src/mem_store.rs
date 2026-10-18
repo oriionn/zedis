@@ -22,14 +22,13 @@
 //! way `bridge::BridgeQuery` substitutes for redis-rs's `query_async` without
 //! a single call site changing.
 //!
-//! What that buys, and what it costs: the desktop path stays byte-identical
-//! (this module is not compiled there at all), and the browser gets tags,
-//! favourites, history and the recycle bin working for the life of the tab.
-//! They do not survive a reload — there is no persistence behind this, only a
-//! `BTreeMap`. That is a deliberate first step, not the destination: the
-//! deployment shares one server list held by the bridge, so the shared local
-//! data belongs there too, and this module is the seam a bridge-backed store
-//! slots into later without touching a manager again.
+//! What that buys: the desktop path stays byte-identical (this module is not
+//! compiled there at all), and the browser gets tags, favourites, history
+//! and the script library with the managers' own code. What keeps them past
+//! a reload is the bridge (ADR 17): the rows it holds are written in before
+//! a manager first reads them, and a commit tells an observer what it
+//! changed ([`Database::observe`]), which `page_data` turns into what the
+//! bridge keeps — without a manager knowing.
 //!
 //! Keys are encoded so that byte order *is* key order, because `range` is
 //! load-bearing: `metrics_history` prunes by `(server, timestamp)` and the
@@ -319,6 +318,34 @@ impl std::error::Error for DatabaseError {}
 type Rows = BTreeMap<Vec<u8>, Vec<u8>>;
 type Tables = BTreeMap<String, Rows>;
 
+/// What a commit tells whoever watches the database, one call per row it
+/// changed: the table, the key, and the value before and after (`None` for
+/// a row that was not there, or is gone). Encoded, as stored.
+pub type CommitObserver = Arc<dyn Fn(&str, &[u8], Option<&[u8]>, Option<&[u8]>) + Send + Sync>;
+
+/// One row a commit changed: table, key, value before, value after.
+type ChangedRow = (String, Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// Every row `staged` changes in `live`.
+fn changed_rows(live: &Tables, staged: &Tables) -> Vec<ChangedRow> {
+    let empty = Rows::new();
+    let mut changes = Vec::new();
+    for (name, after) in staged {
+        let before = live.get(name).unwrap_or(&empty);
+        for (key, value) in after {
+            if before.get(key) != Some(value) {
+                changes.push((name.clone(), key.clone(), before.get(key).cloned(), Some(value.clone())));
+            }
+        }
+        for (key, value) in before {
+            if !after.contains_key(key) {
+                changes.push((name.clone(), key.clone(), Some(value.clone()), None));
+            }
+        }
+    }
+    changes
+}
+
 /// The database: every table, behind one lock.
 ///
 /// One lock rather than one per table because a write transaction here is the
@@ -327,6 +354,7 @@ type Tables = BTreeMap<String, Rows>;
 /// have.
 pub struct Database {
     tables: Arc<Mutex<Tables>>,
+    observer: Arc<Mutex<Option<CommitObserver>>>,
 }
 
 impl Database {
@@ -335,7 +363,15 @@ impl Database {
     pub fn create(_path: impl AsRef<std::path::Path>) -> Result<Self, DatabaseError> {
         Ok(Self {
             tables: Arc::new(Mutex::new(Tables::new())),
+            observer: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Be told what every later commit changes — how the page's data reaches
+    /// the bridge (ADR 17) without a manager knowing. Replaces an earlier
+    /// observer.
+    pub fn observe(&self, observer: CommitObserver) {
+        *self.observer.lock().unwrap_or_else(|e| e.into_inner()) = Some(observer);
     }
 }
 
@@ -358,6 +394,7 @@ impl Database {
         Ok(WriteTransaction {
             tables: Arc::clone(&self.tables),
             staged: Mutex::new(Tables::new()),
+            observer: Arc::clone(&self.observer),
         })
     }
 }
@@ -396,6 +433,7 @@ impl ReadTransaction {
 pub struct WriteTransaction {
     tables: Arc<Mutex<Tables>>,
     staged: Mutex<Tables>,
+    observer: Arc<Mutex<Option<CommitObserver>>>,
 }
 
 impl WriteTransaction {
@@ -428,9 +466,20 @@ impl WriteTransaction {
 
     pub fn commit(self) -> Result<(), CommitError> {
         let staged = self.staged.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let mut live = self.tables.lock().unwrap_or_else(|e| e.into_inner());
-        for (name, rows) in staged {
-            live.insert(name, rows);
+        let observer = self.observer.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let changes = {
+            let mut live = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+            let changes = observer.as_ref().map(|_| changed_rows(&live, &staged));
+            for (name, rows) in staged {
+                live.insert(name, rows);
+            }
+            changes
+        };
+        // Told after the lock is let go: an observer may read the database.
+        if let (Some(observer), Some(changes)) = (observer, changes) {
+            for (table, key, before, after) in &changes {
+                observer(table, key, before.as_deref(), after.as_deref());
+            }
         }
         Ok(())
     }
@@ -650,6 +699,61 @@ mod tests {
         assert!(
             db.begin_read().expect("read").open_table(STRINGS).is_err(),
             "rolling back is what makes a half-migrated schema impossible"
+        );
+    }
+
+    /// A commit names each row it changed, with the value before and after,
+    /// and nothing it left as it was.
+    #[test]
+    fn a_commit_tells_its_observer_what_changed() {
+        type Seen = Vec<(String, String, Option<String>, Option<String>)>;
+        let db = db();
+        let seen: Arc<Mutex<Seen>> = Arc::default();
+        let write = db.begin_write().expect("write");
+        {
+            let mut table = write.open_table(STRINGS).expect("open");
+            table.insert("kept", "1").expect("insert");
+            table.insert("changed", "1").expect("insert");
+            table.insert("removed", "1").expect("insert");
+        }
+        write.commit().expect("commit");
+
+        let record = Arc::clone(&seen);
+        db.observe(Arc::new(move |table, key, before, after| {
+            let text = |bytes: Option<&[u8]>| bytes.map(|b| String::from_utf8_lossy(b).into_owned());
+            record.lock().expect("lock").push((
+                table.to_string(),
+                String::from_utf8_lossy(key).into_owned(),
+                text(before),
+                text(after),
+            ));
+        }));
+        let write = db.begin_write().expect("write");
+        {
+            let mut table = write.open_table(STRINGS).expect("open");
+            table.insert("kept", "1").expect("insert");
+            table.insert("changed", "2").expect("insert");
+            table.remove("removed").expect("remove");
+            table.insert("added", "3").expect("insert");
+        }
+        write.commit().expect("commit");
+        let mut seen = seen.lock().expect("lock").clone();
+        seen.sort();
+        let row = |key: &str, before: Option<&str>, after: Option<&str>| {
+            (
+                "strings".to_string(),
+                key.to_string(),
+                before.map(str::to_string),
+                after.map(str::to_string),
+            )
+        };
+        assert_eq!(
+            seen,
+            vec![
+                row("added", None, Some("3")),
+                row("changed", Some("1"), Some("2")),
+                row("removed", Some("1"), None),
+            ]
         );
     }
 

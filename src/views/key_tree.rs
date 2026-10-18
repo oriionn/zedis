@@ -20,7 +20,7 @@ use crate::views::{ExportSource, open_migration_export_window};
 use crate::{
     assets::CustomIconName,
     components::KeyTypeBadge,
-    connection::{Capability, ServerCommand},
+    connection::{Capability, ServerCommand, account_is_read_only_on},
     constants::EDITOR_KEY_BAR_HEIGHT,
     db::{
         KeyMetadata, TagColor, get_favorites_manager, get_key_metadata_manager, get_recent_keys_manager,

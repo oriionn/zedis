@@ -114,7 +114,7 @@ tools.example.com {
 
 ## 审计日志
 
-`--audit-log /data/audit.log`（`ZEDIS_BRIDGE_AUDIT_LOG`）会为每个事件追加一行 JSON：每次登录、登录失败与退出登录，只读账号被拒绝的每次请求，账号的每一次变动 —— 用初始化令牌创建管理员、邀请的创建与撤销、账号的注册、修改（角色、服务器规则、是否停用，改前改后）、删除与导入、密码的修改与重置、MCP token 的签发与吊销，从不记密码、邀请码或 token 本身 —— 服务器条目的新增、编辑（改了哪些设置、改前改后的值；改了哪些密码之类的敏感字段，只记字段名不记值；私有条目被改为共享）和删除、每条管理服务器的命令 —— `CONFIG SET`、`ACL SETUSER`、`REPLICAOF`、`MODULE LOAD`、`CLIENT KILL`、`FLUSHDB` 之类 —— 每条需要人确认才放行的命令（所以开了“写入确认”的条目，在终端里输入的每一次写都会留痕），以及每个从回收站移出的 key（恢复或丢弃；恢复时的 `RESTORE` 另有一行写命令记录）。`--audit-writes`（`ZEDIS_BRIDGE_AUDIT_WRITES=1`）再加上普通的数据写命令，以及随之放进回收站的每个被删除的 key；读命令永远不记。参数里的密码会被抹掉，过长的值会截断，同一批里的同名命令合并成一行并记数量，文件创建时的权限是仅属主可访问。
+`--audit-log /data/audit.log`（`ZEDIS_BRIDGE_AUDIT_LOG`）会为每个事件追加一行 JSON：每次登录、登录失败与退出登录，只读账号被拒绝的每次请求，账号的每一次变动 —— 用初始化令牌创建管理员、邀请的创建与撤销、账号的注册、修改（角色、服务器规则、是否停用，改前改后）、删除与导入、密码的修改与重置、MCP token 的签发与吊销，从不记密码、邀请码或 token 本身 —— Lua 脚本的保存与删除，服务器条目的新增、编辑（改了哪些设置、改前改后的值；改了哪些密码之类的敏感字段，只记字段名不记值；私有条目被改为共享）和删除、每条管理服务器的命令 —— `CONFIG SET`、`ACL SETUSER`、`REPLICAOF`、`MODULE LOAD`、`CLIENT KILL`、`FLUSHDB` 之类 —— 每条需要人确认才放行的命令（所以开了“写入确认”的条目，在终端里输入的每一次写都会留痕），以及每个从回收站移出的 key（恢复或丢弃；恢复时的 `RESTORE` 另有一行写命令记录）。`--audit-writes`（`ZEDIS_BRIDGE_AUDIT_WRITES=1`）再加上普通的数据写命令，以及随之放进回收站的每个被删除的 key；读命令永远不记。参数里的密码会被抹掉，过长的值会截断，同一批里的同名命令合并成一行并记数量，文件创建时的权限是仅属主可访问。
 
 ```json
 {"ts":"2026-09-25T08:12:03.417Z","account":"alice","peer":"10.0.0.7:51234","event":"command","server":{"id":"0199…","name":"prod"},"db":0,"command":"CONFIG","args":["SET","maxmemory","2gb"],"outcome":"confirmed","kind":"config_set","confirm":"type_name"}
@@ -143,7 +143,7 @@ docker run -d --name zedis-web -p 127.0.0.1:7379:7379 \
 08:13:00 mallory failed to sign in from 203.0.113.9
 ```
 
-推送的是审计日志所记内容的一个子集。默认推送除登录、退出登录和 MCP 工具调用之外的所有事件——这三种整天都在发生；`--audit-webhook-events`（`ZEDIS_BRIDGE_AUDIT_WEBHOOK_EVENTS`）可以改成一个列表——`login`、`login_failed`、`no_account`、`logout`、`refused`、`command`、`server_added`、`server_updated`、`server_deleted`、`unlocked`、`locked`、`trash_put`、`trash_removed`、`setup_completed`、`invite_created`、`invite_revoked`、`account_registered`、`account_updated`、`account_deleted`、`password_changed`、`token_issued`、`token_revoked`、`account_imported`、`tool`——或 `all`。命令里只推送管理服务器的命令，以及需要人确认或被拒绝的命令：普通的数据写永远不推，开了 `--audit-writes` 也一样，否则忙一个上午群就被刷屏了；被删除的 key 放进回收站也不推，道理相同。
+推送的是审计日志所记内容的一个子集。默认推送除登录、退出登录和 MCP 工具调用之外的所有事件——这三种整天都在发生；`--audit-webhook-events`（`ZEDIS_BRIDGE_AUDIT_WEBHOOK_EVENTS`）可以改成一个列表——`login`、`login_failed`、`no_account`、`logout`、`refused`、`command`、`server_added`、`server_updated`、`server_deleted`、`unlocked`、`locked`、`trash_put`、`trash_removed`、`setup_completed`、`invite_created`、`invite_revoked`、`account_registered`、`account_updated`、`account_deleted`、`password_changed`、`token_issued`、`token_revoked`、`account_imported`、`script_saved`、`script_deleted`、`tool`——或 `all`。命令里只推送管理服务器的命令，以及需要人确认或被拒绝的命令：普通的数据写永远不推，开了 `--audit-writes` 也一样，否则忙一个上午群就被刷屏了；被删除的 key 放进回收站也不推，道理相同。
 
 推送从不拖慢请求：审计行先进队列，第一行到达 3 秒后发出，一条消息最多 20 行，这样也不会超过机器人的频率限制（企业微信每分钟 20 条）。发送失败会在 5 秒后重试一次，仍失败就在进程日志里记一条警告；机器人返回错误码（签名不对、机器人已停用）也算失败。URL 里带着机器人的密钥，所以进程日志只记它的域名——启动时的 `audit webhook on` 一行列出域名、格式、推送的事件以及是否签名。URL、格式或事件名写错时，bridge 在启动时就会报错退出；给不签名的机器人（企业微信、Slack、JSON）配了密钥也一样，免得你以为消息是签过名的。
 
@@ -209,8 +209,18 @@ claude mcp add --transport http zedis https://bridge.example.com/v1/mcp \
 
 删除服务器条目时两者一并删除。这些文件和 bridge 的其他文件一样，只有属主可访问。
 
+## 保存在 bridge 上的数据
+
+桌面版存在本地数据库里的东西，bridge 替页面保存：在应用启动前载入，有改动就随时保存。
+
+- **每个账号自己的**——收藏、最近打开的 key、搜索历史和设置（`bridge-page-data/accounts/`）。它们跟着账号走，换哪个浏览器都一样，别人看不到；只读账号也有自己的一份。删除账号时一并删除。
+- **key 的标签和备注**（`bridge-page-data/key-notes/`）——属于服务器：能看到这台服务器的人都能看到，每条都记着是谁、在什么时候留下的。按 key 逐条保存，所以两个人给两个 key 打标签不会互相覆盖。在这台服务器上不能写的账号——只读账号，或规则在这里写了 `:ro` 的账号——只能看，不能加。删除服务器条目时一并删除。
+- **保存的 Lua 脚本**（`bridge-scripts.json`）——默认归保存它的人；在脚本库里勾选*共享*后对所有账号可见。和共享的服务器条目一样，有写权限的账号都能修改或删除共享脚本；只读账号可以运行脚本，但改不了。每次保存、删除都记一行审计（`script_saved`、`script_deleted`），因为共享脚本会被别人运行，也包括在生产环境上。脚本的运行次数只留在当前页面。
+
+不保存的：终端的命令历史——里面是输入过的原文，可能包含密码，而且命令本身已经记在审计日志里。其他账号的改动在下次打开页面时出现。
+
 ## Web 版不包含的功能
 
-所有“一问一答”式的功能都可用——键树、各类型的值编辑器、终端、指标（含 1 小时 / 24 小时 / 7 天历史）、慢日志、配置、客户端、内存分析、按值搜索、多数据库键搜索（⌘⇧F）、跨服务器对比（这里是对话框，没有“复制到目标”）、回收站、Lua 脚本库——流式面板也可用：实时监控（MONITOR）、Pub/Sub、键空间通知（见下文“流式面板”）。浏览器中不可用的有：拓扑与 Sentinel 管理、脚本查看器与 Protobuf 描述编辑器、迁移（文件导入 / 导出）、连接诊断，以及被浏览器自己占用的快捷键（⌘N / ⌘T / ⌘W / ⌘Q）。凡是需要文件或第二个窗口的也不可用：把导出内容保存为文件、从文件导入（连接导出改为复制到剪贴板）、关于窗口，以及安装版自己的维护功能：更新、日志目录、诊断包。设置以对话框的形式打开，只包含适用于网页的部分——外观、日期时间、键行为、工作区标签——不包含安装版程序相关的部分（连接超时在浏览器里由 bridge 决定；AI 助手；托盘、更新器与代理；备份文件）。在那里的设置保存在当前浏览器中。值编辑器里的代码不着色、也不能折叠：UI 库 `gpui-component` 把语法高亮做成可选的 `tree-sitter` 编译特性，而任何 wasm 构建都无法启用它——格式化、JSONPath 与编辑不受影响。标签、备注、收藏和保存的脚本可以用，但只保存在当前页面——刷新后就没了。放在后台标签页里的页面会自行降低轮询频率。不提供的功能就不出现：浏览器里没有对应的菜单项、按钮和快捷键，而不是点了没反应。桌面应用仍是功能完整的客户端。
+所有“一问一答”式的功能都可用——键树、各类型的值编辑器、终端、指标（含 1 小时 / 24 小时 / 7 天历史）、慢日志、配置、客户端、内存分析、按值搜索、多数据库键搜索（⌘⇧F）、跨服务器对比（这里是对话框，没有“复制到目标”）、回收站、Lua 脚本库——流式面板也可用：实时监控（MONITOR）、Pub/Sub、键空间通知（见下文“流式面板”）。浏览器中不可用的有：拓扑与 Sentinel 管理、脚本查看器与 Protobuf 描述编辑器、迁移（文件导入 / 导出）、连接诊断，以及被浏览器自己占用的快捷键（⌘N / ⌘T / ⌘W / ⌘Q）。凡是需要文件或第二个窗口的也不可用：把导出内容保存为文件、从文件导入（连接导出改为复制到剪贴板）、关于窗口，以及安装版自己的维护功能：更新、日志目录、诊断包。设置以对话框的形式打开，只包含适用于网页的部分——外观、日期时间、键行为、工作区标签——不包含安装版程序相关的部分（连接超时在浏览器里由 bridge 决定；AI 助手；托盘、更新器与代理；备份文件）。在那里的设置保存在当前浏览器中。值编辑器里的代码不着色、也不能折叠：UI 库 `gpui-component` 把语法高亮做成可选的 `tree-sitter` 编译特性，而任何 wasm 构建都无法启用它——格式化、JSONPath 与编辑不受影响。标签、备注、收藏、最近打开的 key、搜索历史、保存的脚本和设置都由 bridge 保存（见*保存在 bridge 上的数据*）；终端的命令历史只在当前页面里。放在后台标签页里的页面会自行降低轮询频率。不提供的功能就不出现：浏览器里没有对应的菜单项、按钮和快捷键，而不是点了没反应。桌面应用仍是功能完整的客户端。
 
 不使用 Docker 的话，`make web-dist` 可以把同样的内容构建成一个自包含的单文件二进制。

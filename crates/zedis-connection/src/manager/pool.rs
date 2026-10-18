@@ -164,7 +164,9 @@ fn cluster_enabled(reply: Value) -> Result<bool> {
 static ACCOUNT_READ_ONLY_ON: std::sync::LazyLock<std::sync::RwLock<std::collections::HashSet<String>>> =
     std::sync::LazyLock::new(Default::default);
 
-fn account_is_read_only_on(server_id: &str) -> bool {
+/// Whether the signed-in bridge account may not write on `server_id` —
+/// never, on the desktop, which has no account.
+pub fn account_is_read_only_on(server_id: &str) -> bool {
     ACCOUNT_READ_ONLY_ON
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

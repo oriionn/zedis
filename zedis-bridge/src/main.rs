@@ -36,6 +36,7 @@ mod audit;
 mod auth;
 mod mcp;
 mod metrics;
+mod page_data;
 mod policy;
 mod presence;
 mod resp;
@@ -489,6 +490,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         servers: stores.servers,
         trash: stores.trash,
         metrics: stores.metrics,
+        page_rows: stores.page_rows,
+        key_notes: stores.key_notes,
+        scripts: stores.scripts,
         throttle,
         setup,
     });

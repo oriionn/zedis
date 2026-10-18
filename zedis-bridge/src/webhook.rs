@@ -53,7 +53,7 @@ pub const SECRET_ENV: &str = "ZEDIS_BRIDGE_AUDIT_WEBHOOK_SECRET";
 pub const EVENTS_ENV: &str = "ZEDIS_BRIDGE_AUDIT_WEBHOOK_EVENTS";
 
 /// Every `event` a line can carry, as the log spells it.
-pub const EVENTS: [&str; 24] = [
+pub const EVENTS: [&str; 26] = [
     "login",
     "login_failed",
     "no_account",
@@ -77,6 +77,8 @@ pub const EVENTS: [&str; 24] = [
     "token_issued",
     "token_revoked",
     "account_imported",
+    "script_saved",
+    "script_deleted",
     "tool",
 ];
 
@@ -513,6 +515,20 @@ fn summary(line: &Value) -> String {
         "token_issued" => format!("issued the MCP token {} for {}", get("token"), get("target")),
         "token_revoked" => format!("revoked the MCP token {} of {}", get("token"), get("target")),
         "account_imported" => format!("was imported from the users file as {}", get("role")),
+        "script_saved" => {
+            let verb = if line.get("created").and_then(Value::as_bool).unwrap_or(false) {
+                "saved the new"
+            } else {
+                "changed the"
+            };
+            let shared = if line.get("shared").and_then(Value::as_bool).unwrap_or(false) {
+                "shared"
+            } else {
+                "private"
+            };
+            format!("{verb} {shared} Lua script {}", get("name"))
+        }
+        "script_deleted" => format!("deleted the Lua script {}", get("name")),
         "tool" => format!("ran the MCP tool {} on {server}", get("tool")),
         other => other.to_string(),
     };

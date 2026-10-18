@@ -50,6 +50,14 @@ use rust_i18n::t;
 use tracing::error;
 use zedis_ui::ZedisDialog;
 
+/// What the note box says about where a note goes: nowhere but this machine
+/// on the desktop; to the bridge in the browser, where everyone who sees the
+/// server sees it (ADR 17).
+#[cfg(not(target_family = "wasm"))]
+const NOTE_PLACEHOLDER: &str = "note_placeholder";
+#[cfg(target_family = "wasm")]
+const NOTE_PLACEHOLDER: &str = "note_placeholder_web";
+
 pub struct ZedisKeyTagDialog {
     server_id: SharedString,
     key: SharedString,
@@ -73,7 +81,7 @@ impl ZedisKeyTagDialog {
         let note_input_state = cx.new(|cx| {
             let mut input = TextareaState::new(window, cx)
                 .auto_grow(2, 6)
-                .placeholder(i18n_key_tag(cx, "note_placeholder"));
+                .placeholder(i18n_key_tag(cx, NOTE_PLACEHOLDER));
             if !initial_note.is_empty() {
                 input = input.default_value(initial_note);
             }

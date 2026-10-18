@@ -812,6 +812,77 @@ pub fn bridge_accounts() -> Option<Arc<dyn BridgeAccounts>> {
     ACCOUNTS.get().cloned()
 }
 
+/// One of an account's own rows of the page's data (ADR 17): a list of key
+/// names under a server and database, or the preferences file.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BridgePageRow {
+    /// `favorites`, `recent_keys`, `search_history` or `preferences`.
+    pub table: String,
+    pub key: String,
+    pub value: String,
+}
+
+/// A key's tag and note on one server, and who left them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BridgeKeyNote {
+    pub server_id: String,
+    pub key: String,
+    pub tag: Option<String>,
+    pub note: String,
+    pub by: String,
+    pub at: u64,
+}
+
+/// A saved Lua script: the page's own JSON for it, and whether it is shared.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BridgeScript {
+    pub id: String,
+    pub json: String,
+    pub shared: bool,
+}
+
+/// What the page keeps on the bridge, as it is when the page starts.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BridgePageSeed {
+    /// Who is signed in.
+    pub account: String,
+    /// Whether that account may change nothing anybody else sees — the
+    /// script library's saves, a key's tag and note.
+    pub read_only: bool,
+    pub rows: Vec<BridgePageRow>,
+    pub key_notes: Vec<BridgeKeyNote>,
+    pub scripts: Vec<BridgeScript>,
+}
+
+/// The page's own data, sent to the bridge as it changes (ADR 17): what the
+/// browser used to keep in the tab until a reload emptied it. Sent and not
+/// waited for — the callers are a store's commit and a preferences save,
+/// which have nothing to wait with — and in the order they were made, so a
+/// later change never lands before an earlier one.
+pub trait BridgePageData: Send + Sync + 'static {
+    /// One of the account's rows, or `None` to forget it.
+    fn put_row(&self, table: String, key: String, value: Option<String>);
+    /// A key's tag and note on a server; neither forgets them.
+    fn put_key_note(&self, server_id: String, key: String, tag: Option<String>, note: String);
+    fn put_script(&self, script: BridgeScript);
+    fn delete_script(&self, id: String);
+}
+
+static PAGE_DATA: OnceLock<Arc<dyn BridgePageData>> = OnceLock::new();
+
+/// Install where the page's data goes. The first call wins, as with the
+/// transport.
+pub fn set_bridge_page_data(page_data: Arc<dyn BridgePageData>) {
+    if PAGE_DATA.set(page_data).is_err() {
+        tracing::warn!("the bridge page data was already installed; keeping the first");
+    }
+}
+
+/// Where the page's data goes, or `None` — on the desktop, always.
+pub fn bridge_page_data() -> Option<Arc<dyn BridgePageData>> {
+    PAGE_DATA.get().cloned()
+}
+
 /// A Redis connection whose transport is the bridge.
 #[derive(Clone)]
 pub struct BridgeConn {
@@ -1091,6 +1162,7 @@ mod tests {
     fn the_desktop_has_no_accounts_to_manage() {
         assert!(!signed_in_to_bridge());
         assert!(bridge_accounts().is_none());
+        assert!(bridge_page_data().is_none());
     }
 
     #[test]

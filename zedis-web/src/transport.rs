@@ -22,19 +22,21 @@
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use futures::AsyncReadExt as _;
+use futures::StreamExt as _;
+use futures::channel::mpsc::{UnboundedSender, unbounded};
 use futures::future::BoxFuture;
 use gpui::http_client::{AsyncBody, HttpClient, http::Request};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use zedis_connection::{
     BridgeAccount, BridgeAccountChange, BridgeAccountError, BridgeAccountErrorKind, BridgeAccountResult,
-    BridgeAccounts, BridgeError, BridgeErrorKind, BridgeInvite, BridgeInviteKind, BridgeNewInvite, BridgeOwnAccount,
-    BridgeReply, BridgeRequest, BridgeRole, BridgeServerStore, BridgeStorage, BridgeToken, BridgeTransport,
-    BridgeTrashEntry, RedisServer, WatchBatch, WatchItem, WatchKind, WatchOpened, describe_commands, get_servers,
-    set_account_read_only_on,
+    BridgeAccounts, BridgeError, BridgeErrorKind, BridgeInvite, BridgeInviteKind, BridgeKeyNote, BridgeNewInvite,
+    BridgeOwnAccount, BridgePageData, BridgePageRow, BridgePageSeed, BridgeReply, BridgeRequest, BridgeRole,
+    BridgeScript, BridgeServerStore, BridgeStorage, BridgeToken, BridgeTransport, BridgeTrashEntry, RedisServer,
+    WatchBatch, WatchItem, WatchKind, WatchOpened, describe_commands, get_servers, set_account_read_only_on,
 };
 
 /// Talks to one `zedis-bridge`.
@@ -42,6 +44,16 @@ pub struct HttpBridgeTransport {
     client: Arc<dyn HttpClient>,
     /// No trailing slash.
     base_url: String,
+    /// The page's data changes, sent one after another in the order they
+    /// were made ([`BridgePageData`]). Started with the first one.
+    page_writes: OnceLock<UnboundedSender<PageWrite>>,
+}
+
+/// One change of the page's data, as the request that carries it.
+struct PageWrite {
+    method: &'static str,
+    path: String,
+    body: String,
 }
 
 impl HttpBridgeTransport {
@@ -53,6 +65,7 @@ impl HttpBridgeTransport {
         Self {
             client,
             base_url: base_url.into().trim_end_matches('/').to_string(),
+            page_writes: OnceLock::new(),
         }
     }
 
@@ -1021,6 +1034,156 @@ impl BridgeAccounts for HttpBridgeTransport {
     }
 }
 
+/// The bridge's `GET /v1/page-data`.
+#[derive(Deserialize)]
+struct PageDataBody {
+    account: String,
+    #[serde(default)]
+    read_only: bool,
+    #[serde(default)]
+    rows: Vec<PageRowBody>,
+    #[serde(default)]
+    key_notes: Vec<KeyNoteBody>,
+    #[serde(default)]
+    scripts: Vec<ScriptBody>,
+}
+
+#[derive(Deserialize)]
+struct PageRowBody {
+    table: String,
+    key: String,
+    value: String,
+}
+
+#[derive(Deserialize)]
+struct KeyNoteBody {
+    server: String,
+    key: String,
+    #[serde(default)]
+    tag: Option<String>,
+    #[serde(default)]
+    note: String,
+    #[serde(default)]
+    by: String,
+    #[serde(default)]
+    at: u64,
+}
+
+#[derive(Deserialize)]
+struct ScriptBody {
+    id: String,
+    #[serde(default)]
+    shared: bool,
+    script: serde_json::Value,
+}
+
+/// What the page keeps on the bridge, from the `GET /v1/page-data` the page
+/// made before it started the application (`index.html`).
+pub fn page_seed(json: &str) -> Result<BridgePageSeed, String> {
+    let body: PageDataBody = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    Ok(BridgePageSeed {
+        account: body.account,
+        read_only: body.read_only,
+        rows: body
+            .rows
+            .into_iter()
+            .map(|row| BridgePageRow {
+                table: row.table,
+                key: row.key,
+                value: row.value,
+            })
+            .collect(),
+        key_notes: body
+            .key_notes
+            .into_iter()
+            .map(|note| BridgeKeyNote {
+                server_id: note.server,
+                key: note.key,
+                tag: note.tag,
+                note: note.note,
+                by: note.by,
+                at: note.at,
+            })
+            .collect(),
+        scripts: body
+            .scripts
+            .into_iter()
+            .map(|script| BridgeScript {
+                id: script.id,
+                json: script.script.to_string(),
+                shared: script.shared,
+            })
+            .collect(),
+    })
+}
+
+impl HttpBridgeTransport {
+    /// Queue a change of the page's data. The queue is drained by one task,
+    /// one request at a time, so two quick changes to one row land in the
+    /// order they were made — two requests in flight at once could arrive
+    /// the other way round, and the older list would be the one kept.
+    fn send_page_write(&self, method: &'static str, path: String, body: String) {
+        let queue = self.page_writes.get_or_init(|| {
+            let (queue, mut writes) = unbounded::<PageWrite>();
+            let (client, base_url) = (self.client.clone(), self.base_url.clone());
+            start_detached(async move {
+                while let Some(write) = writes.next().await {
+                    let url = format!("{base_url}{}", write.path);
+                    match Self::call(client.clone(), write.method, url, write.body).await {
+                        Ok((status, _)) if (200..300).contains(&status) => {}
+                        Ok((status, bytes)) => tracing::warn!(
+                            status,
+                            path = write.path,
+                            error = failure(status, &bytes).message,
+                            "the bridge did not keep a change of the page's data"
+                        ),
+                        Err(e) => tracing::warn!(
+                            path = write.path,
+                            error = e.message,
+                            "a change of the page's data did not reach the bridge"
+                        ),
+                    }
+                }
+            });
+            queue
+        });
+        if queue.unbounded_send(PageWrite { method, path, body }).is_err() {
+            tracing::warn!("the page's data queue is closed; a change was not sent");
+        }
+    }
+}
+
+impl BridgePageData for HttpBridgeTransport {
+    fn put_row(&self, table: String, key: String, value: Option<String>) {
+        let body = serde_json::json!({ "table": table, "key": key, "value": value });
+        self.send_page_write("PUT", "/v1/page-data/rows".to_string(), body.to_string());
+    }
+
+    fn put_key_note(&self, server_id: String, key: String, tag: Option<String>, note: String) {
+        let body = serde_json::json!({ "key": key, "tag": tag, "note": note });
+        let path = format!("/v1/servers/{}/key-notes", segment(&server_id));
+        self.send_page_write("PUT", path, body.to_string());
+    }
+
+    fn put_script(&self, script: BridgeScript) {
+        let parsed = match serde_json::from_str::<serde_json::Value>(&script.json) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                tracing::warn!(id = script.id, error = %e, "a script that is not JSON was not sent");
+                return;
+            }
+        };
+        let body = serde_json::json!({ "script": parsed, "shared": script.shared });
+        let path = format!("/v1/scripts/{}", segment(&script.id));
+        self.send_page_write("PUT", path, body.to_string());
+    }
+
+    fn delete_script(&self, id: String) {
+        let path = format!("/v1/scripts/{}", segment(&id));
+        self.send_page_write("DELETE", path, String::new());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1131,6 +1294,77 @@ mod tests {
             }
         );
         assert_eq!(transport.invite_link("abc"), "http://bridge:7379/zedis/#invite=abc");
+    }
+
+    #[test]
+    fn the_page_data_is_read_whole() {
+        let seed = page_seed(
+            r#"{"account":"ai","read_only":true,
+                "rows":[{"table":"favorites","key":"srv:0","value":"[\"k\"]"}],
+                "key_notes":[{"server":"srv","key":"user:1","tag":"red","note":"","by":"alice","at":5}],
+                "scripts":[{"id":"s1","shared":true,"owner":null,"updated_by":"alice","updated_at":5,
+                            "script":{"name":"top","code":"return 1"}}]}"#,
+        )
+        .expect("seed");
+        assert_eq!(seed.account, "ai");
+        assert!(seed.read_only);
+        assert_eq!(seed.rows[0].value, "[\"k\"]");
+        assert_eq!(seed.key_notes[0].tag.as_deref(), Some("red"));
+        assert_eq!(seed.key_notes[0].by, "alice");
+        assert!(seed.scripts[0].shared);
+        let script: serde_json::Value = serde_json::from_str(&seed.scripts[0].json).expect("script json");
+        assert_eq!(script["name"], "top");
+        assert!(page_seed("not json").is_err());
+    }
+
+    /// Changes go out one after another, in the order they were made, each
+    /// to its route — a key's name in the body, never in the path.
+    #[test]
+    fn page_data_changes_are_sent_in_order() {
+        let (transport, seen) = transport_recording(204, "");
+        transport.put_row(
+            "favorites".to_string(),
+            "srv:0".to_string(),
+            Some("[\"a\"]".to_string()),
+        );
+        transport.put_row("favorites".to_string(), "srv:0".to_string(), None);
+        transport.put_key_note(
+            "srv".to_string(),
+            "user:1/x?y".to_string(),
+            Some("red".to_string()),
+            String::new(),
+        );
+        transport.put_script(BridgeScript {
+            id: "s 1".to_string(),
+            json: r#"{"name":"top"}"#.to_string(),
+            shared: true,
+        });
+        transport.delete_script("s 1".to_string());
+        for _ in 0..200 {
+            if seen.lock().expect("lock").len() == 5 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let seen = seen.lock().expect("lock");
+        let asked: Vec<(&str, &str)> = seen.iter().map(|(m, u, _)| (m.as_str(), u.as_str())).collect();
+        assert_eq!(
+            asked,
+            vec![
+                ("PUT", "http://bridge:7379/zedis/v1/page-data/rows"),
+                ("PUT", "http://bridge:7379/zedis/v1/page-data/rows"),
+                ("PUT", "http://bridge:7379/zedis/v1/servers/srv/key-notes"),
+                ("PUT", "http://bridge:7379/zedis/v1/scripts/s%201"),
+                ("DELETE", "http://bridge:7379/zedis/v1/scripts/s%201"),
+            ]
+        );
+        let row: serde_json::Value = serde_json::from_str(&seen[1].2).expect("json");
+        assert_eq!(row["value"], serde_json::Value::Null, "null forgets the row");
+        let note: serde_json::Value = serde_json::from_str(&seen[2].2).expect("json");
+        assert_eq!(note["key"], "user:1/x?y");
+        let script: serde_json::Value = serde_json::from_str(&seen[3].2).expect("json");
+        assert_eq!(script["script"]["name"], "top");
+        assert_eq!(script["shared"], true);
     }
 
     #[test]

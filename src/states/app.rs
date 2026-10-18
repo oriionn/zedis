@@ -36,6 +36,8 @@ use crate::helpers::{DEFAULT_DATE_FORMAT, TimeZonePref};
 use crate::helpers::{decrypt, encrypt, set_configured_proxy};
 use crate::startup::is_nightly_build;
 use crate::states::i18n_common;
+#[cfg(target_family = "wasm")]
+use crate::states::save_preferences;
 use chrono::Local;
 use gpui::{Action, App, AppContext, Bounds, Context, Entity, EventEmitter, Global, Pixels, SharedString, Window};
 use gpui_kit::component::{ThemeMode, dialog::DialogButtonProps};
@@ -554,6 +556,9 @@ pub fn save_app_state(state: &ZedisAppState) -> Result<()> {
     };
     let value = toml::to_string(state)?;
     write_file_atomic_with_backup(&path, value.as_bytes())?;
+    // The account's, on the bridge, as well as this browser's (ADR 17).
+    #[cfg(target_family = "wasm")]
+    save_preferences(&value);
     Ok(())
 }
 

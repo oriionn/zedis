@@ -18,11 +18,14 @@
 //! `Arc<dyn …>` of it: the accounts and their invites ([`AccountStore`],
 //! records), the server list ([`ServerStore`], records), browser logins
 //! ([`LoginStore`], leases), the recycle bin ([`TrashStore`], blobs beside
-//! their metadata), the Metrics history ([`MetricsStore`], a log) and the
-//! audit log ([`AuditLog`]). The implementations are the local directory's
-//! — [`LocalServers`] below, `accounts::LocalAccounts`, `auth::LocalLogins`,
-//! `trash::LocalTrash`, `metrics::LocalMetrics`, `audit::LocalAuditLog` —
-//! files beside the server list. A SQL store
+//! their metadata), the Metrics history ([`MetricsStore`], a log), the
+//! page's own data — an account's rows ([`PageRowStore`]), key tags and
+//! notes ([`KeyNoteStore`]) and saved scripts ([`ScriptStore`]), records —
+//! and the audit log ([`AuditLog`]). The implementations are the local
+//! directory's — [`LocalServers`] below, `accounts::LocalAccounts`,
+//! `auth::LocalLogins`, `trash::LocalTrash`, `metrics::LocalMetrics`,
+//! `page_data::{LocalPageRows, LocalKeyNotes, LocalScripts}`,
+//! `audit::LocalAuditLog` — files beside the server list. A SQL store
 //! is another `impl` of the same traits, chosen at start-up; nothing that
 //! calls them changes.
 //!
@@ -34,10 +37,11 @@
 use crate::accounts::{AccountRecord, InviteRecord, LocalAccounts};
 use crate::auth::{LocalLogins, Login};
 use crate::metrics::{self, LocalMetrics};
+use crate::page_data::{AccountRows, KeyNote, LocalKeyNotes, LocalPageRows, LocalScripts, RowError, ScriptRecord};
 use crate::trash::{self, LocalTrash, Meta, NewEntry};
 use futures::future::BoxFuture;
 use serde_json::value::RawValue;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
@@ -124,6 +128,43 @@ pub trait MetricsStore: Send + Sync {
     fn prune(&self) -> StoreFuture<usize>;
 }
 
+/// An account's own rows of the page's data (ADR 17): favorites, recent
+/// keys, search history, preferences — private, keyed by table and key.
+pub trait PageRowStore: Send + Sync {
+    /// Every row `account` keeps.
+    fn rows(&self, account: String) -> StoreFuture<AccountRows>;
+    /// Keep `value` under `table` / `key`, or forget it for `None`.
+    fn put(
+        &self,
+        account: String,
+        table: String,
+        key: String,
+        value: Option<String>,
+    ) -> BoxFuture<'static, Result<(), RowError>>;
+    /// Forget every row of `account`: it is gone.
+    fn forget(&self, account: String) -> StoreFuture<()>;
+}
+
+/// Key tags and notes (ADR 17): per server, one key at a time, with who left
+/// each and when.
+pub trait KeyNoteStore: Send + Sync {
+    /// `server_id`'s notes, by key.
+    fn list(&self, server_id: String) -> StoreFuture<BTreeMap<String, KeyNote>>;
+    /// Keep `note` on `key`, or forget the key's for `None`.
+    fn put(&self, server_id: String, key: String, note: Option<KeyNote>) -> StoreFuture<()>;
+    /// Forget a server's notes: the entry itself is gone.
+    fn remove_server(&self, server_id: String) -> StoreFuture<()>;
+}
+
+/// Saved Lua scripts (ADR 17): records, private or shared, one at a time.
+pub trait ScriptStore: Send + Sync {
+    fn list(&self) -> StoreFuture<Vec<ScriptRecord>>;
+    /// Add `record`, or put it in place of the one with its id.
+    fn put(&self, record: ScriptRecord) -> StoreFuture<()>;
+    /// Forget the script `id`, answering what it was.
+    fn remove(&self, id: String) -> StoreFuture<Option<ScriptRecord>>;
+}
+
 /// The audit log (ADR 11): appended to, one JSON line at a time.
 pub trait AuditLog: Send + Sync {
     /// Keep `line`, a JSON object without its newline. Never fails the
@@ -139,6 +180,9 @@ pub struct Stores {
     pub servers: Arc<dyn ServerStore>,
     pub trash: Arc<dyn TrashStore>,
     pub metrics: Arc<dyn MetricsStore>,
+    pub page_rows: Arc<dyn PageRowStore>,
+    pub key_notes: Arc<dyn KeyNoteStore>,
+    pub scripts: Arc<dyn ScriptStore>,
 }
 
 impl Stores {
@@ -151,6 +195,9 @@ impl Stores {
             servers: Arc::new(LocalServers),
             trash: Arc::new(LocalTrash::new(dir.join("bridge-trash"))),
             metrics: Arc::new(LocalMetrics::new(dir.join("bridge-metrics"))),
+            page_rows: Arc::new(LocalPageRows::new(dir.join("bridge-page-data").join("accounts"))),
+            key_notes: Arc::new(LocalKeyNotes::new(dir.join("bridge-page-data").join("key-notes"))),
+            scripts: Arc::new(LocalScripts::new(dir.join("bridge-scripts.json"))),
         }
     }
 }

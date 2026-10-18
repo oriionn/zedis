@@ -131,6 +131,23 @@ fn envelope_default_version() -> u32 {
     1
 }
 
+/// A server's document as stored, read back into its entries; `None` for
+/// one this build cannot read.
+#[cfg(any(target_family = "wasm", test))]
+pub(crate) fn document_entries(json: &str) -> Option<HashMap<String, KeyMetadata>> {
+    let envelope: StoredEnvelope = serde_json::from_str(json).ok()?;
+    (envelope.v == ENVELOPE_VERSION).then_some(envelope.entries)
+}
+
+/// `entries` as a server's document is stored.
+#[cfg(any(target_family = "wasm", test))]
+pub(crate) fn entries_document(entries: HashMap<String, KeyMetadata>) -> Result<String> {
+    Ok(serde_json::to_string(&StoredEnvelope {
+        v: ENVELOPE_VERSION,
+        entries,
+    })?)
+}
+
 const ENVELOPE_VERSION: u32 = 1;
 
 pub struct KeyMetadataManager {

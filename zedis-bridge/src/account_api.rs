@@ -555,6 +555,11 @@ async fn delete_account(
     let mut origin = Origin::new(peer, &headers);
     let admin = authorize_admin(&state, &headers, &mut origin, "account_delete")?;
     state.accounts.delete(&name).await?;
+    // What it kept for itself goes with it; what it wrote for others — its
+    // shared scripts, its notes on shared keys — stays theirs.
+    if let Err(e) = state.page_rows.forget(name.clone()).await {
+        tracing::error!(error = %e, account = name, "the deleted account's own rows could not be removed");
+    }
     state
         .audit
         .record(&admin, &origin, Event::AccountDeleted { target: name.clone() });
@@ -727,6 +732,9 @@ mod tests {
             servers: Arc::new(crate::store::LocalServers),
             trash: Arc::new(crate::trash::LocalTrash::new(dir.join("bridge-trash"))),
             metrics: Arc::new(crate::metrics::LocalMetrics::new(dir.join("bridge-metrics"))),
+            page_rows: Arc::new(crate::page_data::LocalPageRows::new(dir.join("rows"))),
+            key_notes: Arc::new(crate::page_data::LocalKeyNotes::new(dir.join("notes"))),
+            scripts: Arc::new(crate::page_data::LocalScripts::new(dir.join("scripts.json"))),
             throttle: auth::Throttle::new(),
             setup: crate::accounts::Setup::in_dir(dir),
         }
