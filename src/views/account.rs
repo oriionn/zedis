@@ -13,9 +13,10 @@
 // limitations under the License.
 
 //! The account page of the web version (ADR 17, amended 2026-10-18): one's
-//! own password and MCP tokens, and for an administrator the accounts and
-//! the invitations — a dialog over the page, like the browser's Settings,
-//! with its sections down the left.
+//! own password and MCP tokens, and for an administrator the accounts, the
+//! invitations, the requests for an account where the bridge takes them and
+//! the audit — a dialog over the page, like the browser's Settings, with its
+//! sections down the left.
 //!
 //! Not `cfg`-gated: it compiles on the desktop as well, where nothing opens
 //! it — *Account…* is drawn only while `signed_in_to_bridge()`, and
@@ -28,6 +29,7 @@ mod audit;
 mod handover;
 mod invites;
 mod password;
+mod signups;
 mod tokens;
 
 use crate::connection::{
@@ -52,6 +54,7 @@ use gpui_kit::component::{
 use invites::InvitesForm;
 use password::PasswordForm;
 use rust_i18n::t;
+use signups::SignupsForm;
 use std::sync::Arc;
 use tokens::TokenForm;
 use zedis_ui::ZedisDialog;
@@ -70,6 +73,7 @@ enum AccountSection {
     Tokens,
     Accounts,
     Invites,
+    Signups,
     Audit,
 }
 
@@ -80,17 +84,25 @@ impl AccountSection {
             Self::Tokens => "section_tokens",
             Self::Accounts => "section_accounts",
             Self::Invites => "section_invites",
+            Self::Signups => "section_signups",
             Self::Audit => "section_audit",
         }
     }
 
-    /// What `account` has: tokens are a read-only account's (ADR 15), the
-    /// accounts, the invitations and the audit an administrator's.
-    fn of(account: &BridgeAccount) -> Vec<Self> {
+    /// What `me` has: tokens are a read-only account's (ADR 15), the
+    /// accounts, the invitations and the audit an administrator's — and the
+    /// requests for an account too, on a bridge that takes them.
+    fn of(me: &BridgeOwnAccount) -> Vec<Self> {
         let mut sections = vec![Self::Password];
-        match account.role {
+        match me.account.role {
             BridgeRole::ReadOnly => sections.push(Self::Tokens),
-            BridgeRole::Admin => sections.extend([Self::Accounts, Self::Invites, Self::Audit]),
+            BridgeRole::Admin => {
+                sections.extend([Self::Accounts, Self::Invites]);
+                if me.signup {
+                    sections.push(Self::Signups);
+                }
+                sections.push(Self::Audit);
+            }
             BridgeRole::Full => {}
         }
         sections
@@ -144,6 +156,7 @@ pub struct ZedisAccount {
     tokens: TokenForm,
     admin: AdminForm,
     invites: InvitesForm,
+    signups: SignupsForm,
     audit: AuditForm,
 }
 
@@ -160,6 +173,7 @@ impl ZedisAccount {
             tokens: TokenForm::new(window, cx),
             admin: AdminForm::new(window, cx),
             invites: InvitesForm::new(window, cx),
+            signups: SignupsForm::new(window, cx),
             audit: AuditForm::new(window, cx),
         };
         this.load_me(cx);
@@ -176,11 +190,15 @@ impl ZedisAccount {
                 match result {
                     Ok(me) => {
                         let admin = me.account.role == BridgeRole::Admin && this.me.is_none();
+                        let signup = me.signup;
                         this.me = Some(me);
                         this.load_error = None;
                         if admin {
                             this.load_accounts(cx);
                             this.load_invites(cx);
+                            if signup {
+                                this.load_signups(cx);
+                            }
                         }
                     }
                     Err(e) => {
@@ -196,9 +214,13 @@ impl ZedisAccount {
 
     fn select_section(&mut self, section: AccountSection, window: &mut Window, cx: &mut Context<Self>) {
         self.section = section;
-        // The audit is read when it is first looked at, not with the page.
+        // The audit is read when it is first looked at, not with the page;
+        // the requests every time, since they come in while it is open.
         if section == AccountSection::Audit && !self.audit.loaded {
             self.load_audit(false, cx);
+        }
+        if section == AccountSection::Signups {
+            self.load_signups(cx);
         }
         self.focus_handle.focus(window, cx);
         cx.notify();
@@ -345,7 +367,7 @@ impl ZedisAccount {
                     .px_2()
                     .pb_2(),
             )
-            .children(AccountSection::of(&me.account).into_iter().map(|section| {
+            .children(AccountSection::of(me).into_iter().map(|section| {
                 ListItem::new(section.title_key())
                     .selected(section == active)
                     .child(Label::new(i18n_account(cx, section.title_key())).text_sm())
@@ -469,7 +491,7 @@ impl Render for ZedisAccount {
         };
         // A section this account does not have (its role changed while the
         // page was open) is not drawn; the first one is.
-        if !AccountSection::of(&me.account).contains(&self.section) {
+        if !AccountSection::of(&me).contains(&self.section) {
             self.section = AccountSection::Password;
         }
         let body = match self.section {
@@ -477,6 +499,7 @@ impl Render for ZedisAccount {
             AccountSection::Tokens => self.render_tokens(&me, window, cx),
             AccountSection::Accounts => self.render_accounts(window, cx),
             AccountSection::Invites => self.render_invites(&me, window, cx),
+            AccountSection::Signups => self.render_signups(window, cx),
             AccountSection::Audit => self.render_audit(window, cx),
         };
         h_flex()

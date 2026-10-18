@@ -540,6 +540,22 @@ pub enum Event {
         invite: String,
         role: &'static str,
     },
+    /// Someone asked for an account (ADR 17, amended 2026-10-18); `account`
+    /// is the name asked for, which is no account yet — or someone else's.
+    SignupRequested {
+        request: String,
+    },
+    /// An administrator made the account `target` a request asked for.
+    SignupApproved {
+        request: String,
+        target: String,
+        role: &'static str,
+    },
+    /// An administrator turned down `target`'s request.
+    SignupRejected {
+        request: String,
+        target: String,
+    },
     /// An administrator changed `target`: setting → from, to.
     AccountUpdated {
         target: String,
@@ -630,6 +646,9 @@ impl Event {
             Event::InviteCreated { .. } => "invite_created",
             Event::InviteRevoked { .. } => "invite_revoked",
             Event::AccountRegistered { .. } => "account_registered",
+            Event::SignupRequested { .. } => "signup_requested",
+            Event::SignupApproved { .. } => "signup_approved",
+            Event::SignupRejected { .. } => "signup_rejected",
             Event::AccountUpdated { .. } => "account_updated",
             Event::AccountDeleted { .. } => "account_deleted",
             Event::OrphansSettled { .. } => "orphans_settled",
@@ -1124,6 +1143,18 @@ mod tests {
             Event::AccountRegistered {
                 invite: "i".to_string(),
                 role: "full",
+            },
+            Event::SignupRequested {
+                request: "r".to_string(),
+            },
+            Event::SignupApproved {
+                request: "r".to_string(),
+                target: "dana".to_string(),
+                role: "read_only",
+            },
+            Event::SignupRejected {
+                request: "r".to_string(),
+                target: "dana".to_string(),
             },
             Event::AccountUpdated {
                 target: "bob".to_string(),

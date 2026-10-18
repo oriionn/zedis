@@ -663,11 +663,31 @@ pub struct BridgeAccount {
 }
 
 /// The signed-in account, and whether the bridge believes a sign-in proxy —
-/// which is when an invitation may be marked for it.
+/// which is when an invitation may be marked for it — and takes requests
+/// for an account, which an administrator then answers.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BridgeOwnAccount {
     pub account: BridgeAccount,
     pub proxy: bool,
+    pub signup: bool,
+}
+
+/// A request for an account, waiting for an administrator (ADR 17, amended
+/// 2026-10-18) — never its password.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BridgeSignup {
+    pub id: String,
+    /// The name it asks for.
+    pub name: String,
+    /// What the person wrote for the administrator.
+    pub note: String,
+    /// The address it came from.
+    pub peer: Option<String>,
+    /// Unix seconds.
+    pub requested_at: u64,
+    pub expires_at: u64,
+    /// An account has this name already: it cannot be approved.
+    pub name_taken: bool,
 }
 
 /// What an invitation does when its link is opened.
@@ -817,7 +837,8 @@ impl std::error::Error for BridgeAccountError {}
 pub type BridgeAccountResult<T> = BoxFuture<'static, Result<T, BridgeAccountError>>;
 
 /// The account page's requests (ADR 17, amended 2026-10-18): one's own
-/// account, and for an administrator everyone's and the invitations. The
+/// account, and for an administrator everyone's, the invitations and the
+/// requests for an account. The
 /// page draws them; the browser entry point carries them, and the desktop,
 /// which has no accounts, never installs one.
 pub trait BridgeAccounts: Send + Sync + 'static {
@@ -863,6 +884,17 @@ pub trait BridgeAccounts: Send + Sync + 'static {
         days: u64,
     ) -> BridgeAccountResult<BridgeNewInvite>;
     fn revoke_invite(&self, id: String) -> BridgeAccountResult<()>;
+    /// The requests for an account waiting for an answer, oldest first.
+    fn signups(&self) -> BridgeAccountResult<Vec<BridgeSignup>>;
+    /// Make the account the request `id` asks for, with `role` and
+    /// `servers`; answers it.
+    fn approve_signup(
+        &self,
+        id: String,
+        role: BridgeRole,
+        servers: Option<Vec<String>>,
+    ) -> BridgeAccountResult<BridgeAccount>;
+    fn reject_signup(&self, id: String) -> BridgeAccountResult<()>;
     /// The address an invitation's `code` is sent as: the sign-in page,
     /// with the code in the part after `#` that no request carries.
     fn invite_link(&self, code: &str) -> String;

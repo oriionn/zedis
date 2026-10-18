@@ -19,11 +19,12 @@ use super::admin::{ADMIN_ISSUE_TOKEN_ID, ADMIN_TOKEN_NAME_ID, DELETE_ACCOUNT_ID,
 use super::audit::{AUDIT_ACCOUNT_ID, AUDIT_MORE_ID, AUDIT_SEARCH_ID};
 use super::handover::SHARE_ID;
 use super::password::{CHANGE_PASSWORD_ID, CURRENT_PASSWORD_ID, NEW_PASSWORD_ID, REPEAT_PASSWORD_ID};
+use super::signups::{SIGNUP_APPROVE_ID, SIGNUP_REJECT_ID, signup_row_id};
 use super::tokens::{ADMIN_TOKEN_DAYS, ISSUE_TOKEN_ID, TOKEN_NAME_ID};
 use super::*;
 use crate::connection::{
     BridgeAccountChange, BridgeAccountResult, BridgeAuditPage, BridgeAuditQuery, BridgeDisposition, BridgeInvite,
-    BridgeNewInvite, BridgeOrphans, BridgeOwned, BridgeOwnedItem,
+    BridgeNewInvite, BridgeOrphans, BridgeOwned, BridgeOwnedItem, BridgeSignup,
 };
 use crate::test_support::init_ui;
 use chrono::{Duration, Utc};
@@ -32,6 +33,7 @@ use gpui_kit::component::Root;
 use gpui_kit::component::dialog::ANIMATION_DURATION;
 use gpui_kit::test::TestWindowExt;
 use std::sync::Mutex;
+use zedis_ui::ZedisSelectEvent;
 
 /// A bridge that answers at once, and writes down what it was asked.
 #[derive(Default)]
@@ -51,6 +53,8 @@ struct FakeBridge {
     /// The page every audit question gets, and the questions.
     audit_page: Mutex<BridgeAuditPage>,
     audits: Mutex<Vec<BridgeAuditQuery>>,
+    /// The requests waiting; an approval or a rejection takes one out.
+    signups: Mutex<Vec<BridgeSignup>>,
 }
 
 impl FakeBridge {
@@ -59,6 +63,7 @@ impl FakeBridge {
         *bridge.me.lock().expect("lock") = BridgeOwnAccount {
             account: account(name, role),
             proxy: false,
+            signup: false,
         };
         Arc::new(bridge)
     }
@@ -171,6 +176,31 @@ impl BridgeAccounts for FakeBridge {
 
     fn revoke_invite(&self, id: String) -> BridgeAccountResult<()> {
         self.asked(format!("revoke invite {id}"));
+        answer(Ok(()))
+    }
+
+    fn signups(&self) -> BridgeAccountResult<Vec<BridgeSignup>> {
+        answer(Ok(self.signups.lock().expect("lock").clone()))
+    }
+
+    fn approve_signup(
+        &self,
+        id: String,
+        role: BridgeRole,
+        servers: Option<Vec<String>>,
+    ) -> BridgeAccountResult<BridgeAccount> {
+        self.asked(format!("approve {id} {} {servers:?}", role.as_str()));
+        let mut waiting = self.signups.lock().expect("lock");
+        let Some(at) = waiting.iter().position(|request| request.id == id) else {
+            return answer(Err(BridgeAccountError::new(BridgeAccountErrorKind::NotFound, "gone")));
+        };
+        let request = waiting.remove(at);
+        answer(Ok(account(&request.name, role)))
+    }
+
+    fn reject_signup(&self, id: String) -> BridgeAccountResult<()> {
+        self.asked(format!("reject {id}"));
+        self.signups.lock().expect("lock").retain(|request| request.id != id);
         answer(Ok(()))
     }
 
@@ -578,6 +608,94 @@ fn a_new_search_leaves_no_line_picked(cx: &mut TestAppContext) {
     view.read_with(cx, |view, cx| {
         assert_eq!(view.audit.table.read(cx).selected_row(), None, "nothing is marked");
     });
+}
+
+/// The requests for an account are an administrator's section only on a
+/// bridge that takes them; a request picked is approved with the role chosen
+/// and the rules typed, one for a taken name cannot be, and a rejection
+/// takes one away.
+#[gpui::test]
+fn requests_are_approved_with_a_role_and_rejected(cx: &mut TestAppContext) {
+    let shut = FakeBridge::signed_in_as("alice", BridgeRole::Admin);
+    let (view, _) = open(cx, shut);
+    view.read_with(cx, |view, _| {
+        let me = view.me.as_ref().expect("signed in");
+        assert!(
+            !AccountSection::of(me).contains(&AccountSection::Signups),
+            "a shut door has no section"
+        );
+    });
+
+    let bridge = FakeBridge::signed_in_as("alice", BridgeRole::Admin);
+    bridge.me.lock().expect("lock").signup = true;
+    *bridge.signups.lock().expect("lock") = vec![
+        BridgeSignup {
+            id: "r1".to_string(),
+            name: "dana".to_string(),
+            note: "on call next week".to_string(),
+            requested_at: 1_700_000_000,
+            expires_at: 1_800_000_000,
+            ..Default::default()
+        },
+        BridgeSignup {
+            id: "r2".to_string(),
+            name: "alice".to_string(),
+            requested_at: 1_700_000_100,
+            expires_at: 1_800_000_000,
+            name_taken: true,
+            ..Default::default()
+        },
+    ];
+    let (view, window) = open(cx, bridge.clone());
+    view.read_with(cx, |view, _| {
+        let me = view.me.as_ref().expect("signed in");
+        assert!(AccountSection::of(me).contains(&AccountSection::Signups));
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.select_section(AccountSection::Signups, window, cx));
+    })
+    .expect("the window is open");
+    cx.run_until_parked();
+
+    // The one for a taken name cannot be approved.
+    click(cx, window, signup_row_id("r2"));
+    click(cx, window, SIGNUP_APPROVE_ID);
+    assert!(
+        !bridge.requests().iter().any(|line| line.starts_with("approve")),
+        "{:?}",
+        bridge.requests()
+    );
+
+    click(cx, window, signup_row_id("r1"));
+    // The role picker's answer and the rules typed, as the form hears them.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.signups
+                .role
+                .update(cx, |_, cx| cx.emit(ZedisSelectEvent::Change(1)));
+            view.signups
+                .servers
+                .update(cx, |state, cx| state.set_value("staging", window, cx));
+        });
+    })
+    .expect("the window is open");
+    cx.run_until_parked();
+    click(cx, window, SIGNUP_APPROVE_ID);
+    assert!(
+        bridge
+            .requests()
+            .contains(&r#"approve r1 full Some(["staging"])"#.to_string()),
+        "{:?}",
+        bridge.requests()
+    );
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.signups.signups.len(), 1, "read again once answered");
+    });
+
+    click(cx, window, signup_row_id("r2"));
+    click(cx, window, SIGNUP_REJECT_ID);
+    assert!(bridge.requests().contains(&"reject r2".to_string()));
+    view.read_with(cx, |view, _| assert!(view.signups.signups.is_empty()));
 }
 
 /// The desktop has no bridge to ask, so *Account…* — were anything to send

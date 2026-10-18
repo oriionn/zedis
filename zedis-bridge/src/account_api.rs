@@ -13,7 +13,8 @@
 // limitations under the License.
 
 //! The routes of registration and administration (ADR 17): the setup token,
-//! invitations, an account's own page and the administrators' one. The
+//! invitations, requests for an account where the bridge takes them, an
+//! account's own page and the administrators' one. The
 //! pages are HTML beside the sign-in form (`zedis-web/www`); these are what
 //! they call.
 //!
@@ -25,7 +26,8 @@
 //! same whatever was wrong about it.
 
 use crate::accounts::{
-    AccountError, AccountView, INVITE_DAYS, InviteKind, InviteView, Role, check_password, hash_password,
+    AccountError, AccountView, INVITE_DAYS, InviteKind, InviteView, Role, SignupView, check_new_name, check_password,
+    hash_password,
 };
 use crate::api::{ApiError, ApiResult, AppState, MAX_TRIED_NAME, authorize};
 use crate::audit::{Change, Event, Origin};
@@ -49,6 +51,7 @@ pub(crate) fn routes(router: Router<AppState>, at: &impl Fn(&str) -> String) -> 
         .route(&at("/v1/setup"), get(setup_state).post(setup))
         .route(&at("/v1/invitation"), post(invitation))
         .route(&at("/v1/register"), post(register))
+        .route(&at("/v1/signup"), post(signup))
         .route(&at("/v1/account"), get(own_account))
         .route(&at("/v1/account/password"), post(change_password))
         .route(&at("/v1/account/tokens"), post(issue_own_token))
@@ -66,6 +69,9 @@ pub(crate) fn routes(router: Router<AppState>, at: &impl Fn(&str) -> String) -> 
         .route(&at("/v1/admin/accounts/{name}/tokens/{token}"), delete(revoke_token_of))
         .route(&at("/v1/admin/invites"), get(list_invites).post(create_invite))
         .route(&at("/v1/admin/invites/{id}"), delete(revoke_invite))
+        .route(&at("/v1/admin/signups"), get(list_signups))
+        .route(&at("/v1/admin/signups/{id}"), delete(reject_signup))
+        .route(&at("/v1/admin/signups/{id}/approve"), post(approve_signup))
         .route(&at("/v1/admin/audit"), get(audit_lines))
 }
 
@@ -73,9 +79,10 @@ impl From<AccountError> for ApiError {
     fn from(e: AccountError) -> Self {
         match e {
             AccountError::NotFound => ApiError::NotFound(e.to_string()),
-            AccountError::NameTaken | AccountError::LastAdmin | AccountError::TokenNameTaken => {
-                ApiError::Conflict(e.to_string())
-            }
+            AccountError::NameTaken
+            | AccountError::LastAdmin
+            | AccountError::TokenNameTaken
+            | AccountError::TooManySignups => ApiError::Conflict(e.to_string()),
             AccountError::BadName(_)
             | AccountError::BadPassword(_)
             | AccountError::BadRule(_)
@@ -157,15 +164,19 @@ fn expiry(text: Option<&str>) -> ApiResult<Option<u64>> {
 
 // ---- setup -------------------------------------------------------------
 
+/// What the sign-in page offers besides signing in.
 #[derive(Serialize)]
 struct SetupState {
     /// Whether the page offers *Create the administrator*.
     open: bool,
+    /// Whether it offers *Request an account* (`--signup approval`).
+    signup: bool,
 }
 
 async fn setup_state(State(state): State<AppState>) -> Json<SetupState> {
     Json(SetupState {
         open: state.setup.open(&state.accounts).await,
+        signup: state.signup.is_open(),
     })
 }
 
@@ -333,6 +344,53 @@ async fn register(
     signed_in(&state, &name, req.remember, &origin).await
 }
 
+// ---- asking for an account ---------------------------------------------------
+
+#[derive(Deserialize)]
+struct SignupRequest {
+    name: String,
+    password: String,
+    /// What the person tells the administrator.
+    #[serde(default)]
+    note: String,
+}
+
+/// Ask for an account (ADR 17, amended 2026-10-18), where the bridge takes
+/// requests. The answer is the same whatever the name: whether one is taken
+/// is for the administrator to see at approval, not for whoever asks.
+async fn signup(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<SignupRequest>,
+) -> ApiResult<Response> {
+    if !state.signup.is_open() {
+        return Err(ApiError::NotFound(
+            "this bridge takes no requests for an account: ask an administrator for an invitation".to_string(),
+        ));
+    }
+    let origin = Origin::new(peer, &headers);
+    let attempt = attempt_key(origin.peer_ip, "signup");
+    not_throttled(&state, &attempt)?;
+    // Every request counts, not only a refused one: that is what keeps one
+    // address from filling the list, and the hash below is paid only
+    // within it.
+    state.throttle.failed(&attempt);
+    let name = req.name.trim().to_string();
+    check_new_name(&name)?;
+    check_password(&req.password)?;
+    let hash = hashed(req.password).await?;
+    let peer_ip = origin.peer_ip.map(|ip| ip.to_string());
+    let request = state.accounts.request_signup(&name, hash, &req.note, peer_ip).await?;
+    state.audit.record(&name, &origin, Event::SignupRequested { request });
+    tracing::info!(account = name, "an account was asked for");
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "status": "requested" })),
+    )
+        .into_response())
+}
+
 // ---- one's own account -----------------------------------------------------
 
 #[derive(Serialize)]
@@ -342,6 +400,9 @@ struct OwnAccount {
     /// Whether this bridge believes a reverse proxy: the page then does not
     /// offer a password to an account that has none.
     proxy: bool,
+    /// Whether it takes requests for an account: an administrator's page
+    /// then has them to answer.
+    signup: bool,
 }
 
 async fn own_account(
@@ -357,6 +418,7 @@ async fn own_account(
     Ok(Json(OwnAccount {
         account: view,
         proxy: state.trusted.is_some(),
+        signup: state.signup.is_open(),
     }))
 }
 
@@ -829,10 +891,76 @@ async fn revoke_invite(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+async fn list_signups(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Vec<SignupView>>> {
+    authorize_admin(&state, &headers, &mut Origin::new(peer, &headers), "signups")?;
+    Ok(Json(state.accounts.signups()))
+}
+
+#[derive(Deserialize)]
+struct ApproveRequest {
+    role: Role,
+    #[serde(default)]
+    servers: Option<Vec<String>>,
+}
+
+/// Make the account a request asked for, with the role and rules the
+/// administrator gives it and the password it was asked with.
+async fn approve_signup(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<ApproveRequest>,
+) -> ApiResult<Json<AccountView>> {
+    let mut origin = Origin::new(peer, &headers);
+    let admin = authorize_admin(&state, &headers, &mut origin, "signup_approve")?;
+    let account = state.accounts.approve_signup(&id, req.role, req.servers).await?;
+    state.audit.record(
+        &admin,
+        &origin,
+        Event::SignupApproved {
+            request: id,
+            target: account.name.clone(),
+            role: req.role.name(),
+        },
+    );
+    tracing::info!(
+        account = account.name,
+        role = req.role.name(),
+        by = admin,
+        "a request for an account was approved"
+    );
+    Ok(Json(account))
+}
+
+async fn reject_signup(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<axum::http::StatusCode> {
+    let mut origin = Origin::new(peer, &headers);
+    let admin = authorize_admin(&state, &headers, &mut origin, "signup_reject")?;
+    let name = state.accounts.reject_signup(&id).await?;
+    state.audit.record(
+        &admin,
+        &origin,
+        Event::SignupRejected {
+            request: id,
+            target: name,
+        },
+    );
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accounts::Accounts;
+    use crate::accounts::{Accounts, Signup};
     use crate::api::authorize_mcp;
     use crate::audit::Audit;
     use axum::http::StatusCode;
@@ -861,6 +989,7 @@ mod tests {
             scripts: Arc::new(crate::page_data::LocalScripts::new(dir.join("scripts.json"))),
             throttle: auth::Throttle::new(),
             setup: crate::accounts::Setup::in_dir(dir),
+            signup: Signup::Off,
         }
     }
 
@@ -1357,6 +1486,124 @@ mod tests {
         assert_eq!(owner_of(&left.id), Some(Some(names.carol.clone())));
         let log = std::fs::read_to_string(dir.join("audit.log")).expect("audit");
         assert!(log.contains(r#""event":"orphans_settled""#));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The second door (ADR 17, amended 2026-10-18), through the routes: shut
+    /// unless opened; a request answered the same whatever the name; listed
+    /// and answered by an administrator only; approved into an account that
+    /// signs in with what it asked; and every step an audit line.
+    #[tokio::test]
+    async fn a_request_for_an_account_waits_for_an_administrator() {
+        let dir = scratch_dir();
+        let mut state = AppState {
+            audit: Audit::open(&dir.join("audit.log"), false).expect("audit"),
+            ..state(&dir)
+        };
+        seat_alice(&state).await;
+        let ask = |state: &AppState, name: &str| {
+            signup(
+                State(state.clone()),
+                peer(),
+                HeaderMap::new(),
+                Json(SignupRequest {
+                    name: name.to_string(),
+                    password: format!("{name}-password"),
+                    note: "for the release".to_string(),
+                }),
+            )
+        };
+        assert_eq!(
+            status(ask(&state, "dana").await),
+            StatusCode::NOT_FOUND,
+            "shut by default"
+        );
+        assert!(!setup_state(State(state.clone())).await.signup);
+
+        state.signup = Signup::Approval;
+        assert!(setup_state(State(state.clone())).await.signup);
+        assert_eq!(status(ask(&state, "dana").await), StatusCode::ACCEPTED);
+        assert_eq!(
+            status(ask(&state, "alice").await),
+            StatusCode::ACCEPTED,
+            "a taken name is not told to whoever asks"
+        );
+        assert_eq!(status(ask(&state, "a/b").await), StatusCode::BAD_REQUEST);
+        assert!(!state.accounts.has("dana"));
+        assert_eq!(
+            status(own_account(State(state.clone()), peer(), basic("dana:dana-password")).await),
+            StatusCode::UNAUTHORIZED,
+            "a request signs nobody in"
+        );
+
+        let admin = || basic("alice:alice-password");
+        let Ok(Json(me)) = own_account(State(state.clone()), peer(), admin()).await else {
+            panic!("alice");
+        };
+        assert!(me.signup, "the page has requests to answer");
+        let Ok(Json(waiting)) = list_signups(State(state.clone()), peer(), admin()).await else {
+            panic!("listed");
+        };
+        assert_eq!(waiting.len(), 2);
+        let dana = waiting.iter().find(|r| r.name == "dana").expect("dana's");
+        let alices = waiting.iter().find(|r| r.name == "alice").expect("the one for alice");
+        assert!(alices.name_taken && !dana.name_taken);
+        assert_eq!(dana.note, "for the release");
+
+        let approve = |id: &str, role: Role| {
+            approve_signup(
+                State(state.clone()),
+                peer(),
+                admin(),
+                Path(id.to_string()),
+                Json(ApproveRequest {
+                    role,
+                    servers: Some(vec!["staging".to_string()]),
+                }),
+            )
+        };
+        assert_eq!(
+            status(approve(&alices.id, Role::Full).await),
+            StatusCode::CONFLICT,
+            "an account has that name"
+        );
+        let Ok(Json(made)) = approve(&dana.id, Role::ReadOnly).await else {
+            panic!("approved");
+        };
+        assert_eq!((made.name.as_str(), made.role), ("dana", Role::ReadOnly));
+        let Ok(Json(own)) = own_account(State(state.clone()), peer(), basic("dana:dana-password")).await else {
+            panic!("dana signs in with the password she asked with");
+        };
+        assert_eq!(own.account.servers, Some(vec!["staging".to_string()]));
+        assert_eq!(
+            status(list_signups(State(state.clone()), peer(), basic("dana:dana-password")).await),
+            StatusCode::FORBIDDEN,
+            "administrators only"
+        );
+        assert_eq!(
+            status(reject_signup(State(state.clone()), peer(), admin(), Path(alices.id.clone())).await),
+            StatusCode::NO_CONTENT
+        );
+        let Ok(Json(waiting)) = list_signups(State(state.clone()), peer(), admin()).await else {
+            panic!("listed");
+        };
+        assert!(waiting.is_empty());
+
+        // Each request counts against its address: the throttle's ten.
+        let mut refused = None;
+        for n in 0..auth::THROTTLE_LIMIT {
+            let answer = status(ask(&state, &format!("user{n}")).await);
+            if answer == StatusCode::TOO_MANY_REQUESTS {
+                refused = Some(n);
+                break;
+            }
+        }
+        assert!(refused.is_some(), "an address cannot fill the list");
+
+        let log = std::fs::read_to_string(dir.join("audit.log")).expect("audit");
+        for event in ["signup_requested", "signup_approved", "signup_rejected"] {
+            assert!(log.contains(&format!(r#""event":"{event}""#)), "{event}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

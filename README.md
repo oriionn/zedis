@@ -152,7 +152,7 @@ docker logs zedis-web 2>&1 | grep "setup token"
 
 Open <http://localhost:7379> and create the administrator with the setup token from the log. That command is a plain-http trial: drop `--insecure-cookie` and put HTTPS in front.
 
-- **Accounts, roles, SSO** — the first account is the administrator, everyone else registers by invitation; an entry is private until it is shared; an account can be read-only or limited to some servers; identity can come from a reverse-proxy header.
+- **Accounts, roles, SSO** — the first account is the administrator, everyone else registers by invitation or by a request an administrator approves; an entry is private until it is shared; an account can be read-only or limited to some servers; identity can come from a reverse-proxy header.
 - **Production stays locked** — Prod entries open for 15 minutes at a time; the audit log records logins, entry changes and every confirmed command.
 - **MCP** — Claude Code, Cursor or any MCP client reads Redis as a read-only account, every call audited.
 

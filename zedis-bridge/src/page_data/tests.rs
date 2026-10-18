@@ -54,6 +54,7 @@ fn state(dir: &StdPath) -> AppState {
         scripts: Arc::new(LocalScripts::new(dir.join("scripts.json"))),
         throttle: auth::Throttle::new(),
         setup: crate::accounts::Setup::in_dir(dir),
+        signup: crate::accounts::Signup::Off,
     }
 }
 

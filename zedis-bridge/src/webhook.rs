@@ -53,7 +53,7 @@ pub const SECRET_ENV: &str = "ZEDIS_BRIDGE_AUDIT_WEBHOOK_SECRET";
 pub const EVENTS_ENV: &str = "ZEDIS_BRIDGE_AUDIT_WEBHOOK_EVENTS";
 
 /// Every `event` a line can carry, as the log spells it.
-pub const EVENTS: [&str; 27] = [
+pub const EVENTS: [&str; 30] = [
     "login",
     "login_failed",
     "no_account",
@@ -71,6 +71,9 @@ pub const EVENTS: [&str; 27] = [
     "invite_created",
     "invite_revoked",
     "account_registered",
+    "signup_requested",
+    "signup_approved",
+    "signup_rejected",
     "account_updated",
     "account_deleted",
     "orphans_settled",
@@ -512,6 +515,9 @@ fn summary(line: &Value) -> String {
         },
         "invite_revoked" => "revoked an invitation".to_string(),
         "account_registered" => format!("registered as a {} account", get("role")),
+        "signup_requested" => "asked for an account".to_string(),
+        "signup_approved" => format!("approved {}'s request: a {} account", get("target"), get("role")),
+        "signup_rejected" => format!("turned down {}'s request for an account", get("target")),
         "account_updated" => {
             let changed: Vec<&str> = line
                 .get("changed")
@@ -667,6 +673,10 @@ mod tests {
         let default = events(None).expect("default");
         assert!(default.iter().any(|e| e == "command") && default.iter().any(|e| e == "login_failed"));
         assert!(!default.iter().any(|e| e == "login" || e == "logout" || e == "tool"));
+        assert!(
+            default.iter().any(|e| e == "signup_requested"),
+            "a request waits for an administrator, who learns of it here"
+        );
         assert_eq!(events(Some("all")).expect("all").len(), EVENTS.len());
         assert_eq!(
             events(Some("command, refused")).expect("a list"),
@@ -714,6 +724,8 @@ mod tests {
         assert_eq!(summary(&failed), "08:13:00 mallory failed to sign in from 203.0.113.9");
         let unlocked = json!({ "ts": "2026-10-17T08:14:00.000Z", "account": "ops", "event": "unlocked", "server": { "id": "1", "name": "prod" }, "seconds": 900 });
         assert_eq!(summary(&unlocked), "08:14:00 ops unlocked writes on prod for 900s");
+        let asked = json!({ "ts": "2026-10-17T08:15:00.000Z", "account": "dana", "peer": "198.51.100.4:5000", "event": "signup_requested", "request": "r" });
+        assert_eq!(summary(&asked), "08:15:00 dana asked for an account from 198.51.100.4");
     }
 
     /// Each bot gets its own shape; the JSON one gets the lines themselves.

@@ -13,12 +13,13 @@
 // limitations under the License.
 
 //! `zedis-bridge import-local` (ADR 18): what a local directory keeps,
-//! copied once into an empty database — the accounts and invitations, the
-//! logins, the server list, the saved scripts, each account's rows, the key
-//! notes, the recycle bin and the metrics history, and a waiting setup
-//! token. Each thing keeps what it was: a deleted key its id and its time, a
-//! sample the minute it was taken, a login its last use, so nobody signs in
-//! again and nothing in the bin ages out early or late.
+//! copied once into an empty database — the accounts, the invitations, the
+//! requests waiting for an administrator, the logins, the server list, the
+//! saved scripts, each account's rows, the key notes, the recycle bin and
+//! the metrics history, and a waiting setup token. Each thing keeps what it
+//! was: a deleted key its id and its time, a sample the minute it was taken,
+//! a login its last use, so nobody signs in again and nothing in the bin
+//! ages out early or late.
 //!
 //! It runs with the directory's master key, which the database's check then
 //! names: every bridge on the database uses that `master.key` afterwards.
@@ -43,6 +44,7 @@ use zedis_connection::read_servers_file;
 pub struct Imported {
     pub accounts: usize,
     pub invites: usize,
+    pub signups: usize,
     pub logins: usize,
     pub servers: usize,
     pub scripts: usize,
@@ -58,6 +60,7 @@ impl fmt::Display for Imported {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "  accounts         {}", self.accounts)?;
         writeln!(f, "  invitations      {}", self.invites)?;
+        writeln!(f, "  requests         {}", self.signups)?;
         writeln!(f, "  logins           {}", self.logins)?;
         writeln!(f, "  server entries   {}", self.servers)?;
         writeln!(f, "  scripts          {}", self.scripts)?;
@@ -157,6 +160,7 @@ pub(crate) async fn copy(from: &Path, to: &SqlStore) -> io::Result<Imported> {
     let mut done = Imported {
         accounts: accounts.accounts.len(),
         invites: accounts.invites.len(),
+        signups: accounts.signups.len(),
         logins: logins.len(),
         servers: servers.len(),
         scripts: scripts.len(),
@@ -166,12 +170,13 @@ pub(crate) async fn copy(from: &Path, to: &SqlStore) -> io::Result<Imported> {
         ..Imported::default()
     };
 
-    // The accounts and invitations, as one change.
+    // The accounts, invitations and requests, as one change.
     let ops: Vec<AccountOp> = accounts
         .accounts
         .into_iter()
         .map(AccountOp::PutAccount)
         .chain(accounts.invites.into_iter().map(AccountOp::PutInvite))
+        .chain(accounts.signups.into_iter().map(AccountOp::PutSignup))
         .collect();
     if !ops.is_empty() {
         let version = target.accounts.version().await?;

@@ -18,7 +18,7 @@
 
 use super::statements::{self as st};
 use super::{SqlStore, counter, db, stored};
-use crate::accounts::{AccountOp, AccountRecord, InviteRecord};
+use crate::accounts::{AccountOp, AccountRecord, InviteRecord, SignupRecord};
 use crate::auth::{Login, LoginChange, hex};
 use crate::store::{AccountStore, AccountsAt, LoginStore, ServerStore, SetupStore, StoreFuture, ThrottleStore};
 use sha2::{Digest, Sha256};
@@ -76,10 +76,18 @@ impl AccountStore for SqlStore {
                 .iter()
                 .map(|row| record::<InviteRecord>(&row.try_get::<String, _>(0).map_err(db)?))
                 .collect::<io::Result<Vec<_>>>()?;
+            let signups = sqlx::query(store.sql(&st::SIGNUPS))
+                .fetch_all(&store.pool)
+                .await
+                .map_err(db)?
+                .iter()
+                .map(|row| record::<SignupRecord>(&row.try_get::<String, _>(0).map_err(db)?))
+                .collect::<io::Result<Vec<_>>>()?;
             Ok(AccountsAt {
                 version: counter(version),
                 accounts,
                 invites,
+                signups,
             })
         })
     }
@@ -127,6 +135,11 @@ impl AccountStore for SqlStore {
                         .bind(stored(invite.expires_at))
                         .bind(doc(invite)?),
                     AccountOp::RemoveInvite(id) => sqlx::query(store.sql(&st::INVITE_DELETE)).bind(id.clone()),
+                    AccountOp::PutSignup(request) => sqlx::query(store.sql(&st::SIGNUP_PUT))
+                        .bind(request.id.clone())
+                        .bind(stored(request.expires_at))
+                        .bind(doc(request)?),
+                    AccountOp::RemoveSignup(id) => sqlx::query(store.sql(&st::SIGNUP_DELETE)).bind(id.clone()),
                 };
                 query.execute(&mut *tx).await.map_err(db)?;
             }

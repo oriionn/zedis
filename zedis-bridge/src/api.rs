@@ -18,7 +18,7 @@
 //! The bridge holds the credentials. A caller names a server by its id and
 //! never sees a host, a password or a key (ADR 9).
 
-use crate::accounts::{Accounts, Basic, Setup};
+use crate::accounts::{Accounts, Basic, Setup, Signup};
 use crate::audit::{self, Audit, Event, Origin, ServerRef};
 use crate::presence::{Client, ClientKey, ONLINE_WINDOW, Presence};
 use crate::static_files::{Representation, WebBuild};
@@ -91,6 +91,9 @@ pub struct AppState {
     pub throttle: auth::Throttle,
     /// The token that seats an administrator (ADR 17).
     pub setup: Setup,
+    /// `--signup`: whether anyone may ask for an account, for an
+    /// administrator to approve (ADR 17, amended 2026-10-18).
+    pub signup: Signup,
 }
 
 /// The page and the API, under `state.base_path` when there is one.
@@ -2437,6 +2440,7 @@ mod mcp_auth_tests {
             )),
             throttle: auth::Throttle::new(),
             setup: Setup::in_dir(&std::env::temp_dir().join("zedis-bridge-test-setup")),
+            signup: Signup::Off,
         }
     }
 
@@ -2576,6 +2580,7 @@ mod bin_tests {
             scripts: Arc::new(crate::page_data::LocalScripts::new(dir.join("scripts.json"))),
             throttle: auth::Throttle::new(),
             setup: Setup::in_dir(&dir),
+            signup: Signup::Off,
         };
         let peer: SocketAddr = "10.0.0.7:5000".parse().expect("address");
         let mut headers = HeaderMap::new();

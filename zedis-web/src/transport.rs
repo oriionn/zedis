@@ -37,8 +37,8 @@ use zedis_connection::{
     BridgeAccounts, BridgeAuditPage, BridgeAuditQuery, BridgeDisposition, BridgeError, BridgeErrorKind, BridgeInvite,
     BridgeInviteKind, BridgeKeyNote, BridgeNewInvite, BridgeOrphans, BridgeOwnAccount, BridgeOwned, BridgeOwnedItem,
     BridgePageData, BridgePageRow, BridgePageSeed, BridgeReply, BridgeRequest, BridgeRole, BridgeScript,
-    BridgeServerStore, BridgeStorage, BridgeToken, BridgeTransport, BridgeTrashEntry, RedisServer, WatchBatch,
-    WatchItem, WatchKind, WatchOpened, describe_commands, get_servers, set_account_read_only_on,
+    BridgeServerStore, BridgeSignup, BridgeStorage, BridgeToken, BridgeTransport, BridgeTrashEntry, RedisServer,
+    WatchBatch, WatchItem, WatchKind, WatchOpened, describe_commands, get_servers, set_account_read_only_on,
 };
 
 /// Talks to one `zedis-bridge`.
@@ -935,6 +935,39 @@ struct OwnBody {
     account: AccountBody,
     #[serde(default)]
     proxy: bool,
+    #[serde(default)]
+    signup: bool,
+}
+
+/// The bridge's `SignupView`.
+#[derive(Deserialize)]
+struct SignupBody {
+    id: String,
+    name: String,
+    #[serde(default)]
+    note: String,
+    #[serde(default)]
+    peer: Option<String>,
+    #[serde(default)]
+    requested_at: u64,
+    #[serde(default)]
+    expires_at: u64,
+    #[serde(default)]
+    name_taken: bool,
+}
+
+impl SignupBody {
+    fn into_signup(self) -> BridgeSignup {
+        BridgeSignup {
+            id: self.id,
+            name: self.name,
+            note: self.note,
+            peer: self.peer,
+            requested_at: self.requested_at,
+            expires_at: self.expires_at,
+            name_taken: self.name_taken,
+        }
+    }
 }
 
 /// The bridge's `InviteView`: its kind flattened, as `kind` plus the fields
@@ -1117,6 +1150,7 @@ impl BridgeAccounts for HttpBridgeTransport {
             json::<OwnBody>(bytes).map(|own| BridgeOwnAccount {
                 account: own.account.into_account(),
                 proxy: own.proxy,
+                signup: own.signup,
             })
         })
     }
@@ -1250,6 +1284,30 @@ impl BridgeAccounts for HttpBridgeTransport {
 
     fn revoke_invite(&self, id: String) -> BridgeAccountResult<()> {
         let path = format!("/v1/admin/invites/{}", segment(&id));
+        self.account_call("DELETE", path, None, nothing)
+    }
+
+    fn signups(&self) -> BridgeAccountResult<Vec<BridgeSignup>> {
+        self.account_call("GET", "/v1/admin/signups".to_string(), None, |bytes| {
+            json::<Vec<SignupBody>>(bytes).map(|list| list.into_iter().map(SignupBody::into_signup).collect())
+        })
+    }
+
+    fn approve_signup(
+        &self,
+        id: String,
+        role: BridgeRole,
+        servers: Option<Vec<String>>,
+    ) -> BridgeAccountResult<BridgeAccount> {
+        let path = format!("/v1/admin/signups/{}/approve", segment(&id));
+        let body = serde_json::json!({ "role": role.as_str(), "servers": servers });
+        self.account_call("POST", path, Some(body), |bytes| {
+            json::<AccountBody>(bytes).map(AccountBody::into_account)
+        })
+    }
+
+    fn reject_signup(&self, id: String) -> BridgeAccountResult<()> {
+        let path = format!("/v1/admin/signups/{}", segment(&id));
         self.account_call("DELETE", path, None, nothing)
     }
 
@@ -1694,6 +1752,43 @@ mod tests {
                 "http://bridge:7379/zedis/v1/admin/audit?account=a%20b&event=logout&since_ms=1000&before=42"
             )
         );
+    }
+
+    #[test]
+    fn the_requests_are_read_and_answered() {
+        let (transport, _) = transport_recording(
+            200,
+            r#"[{"id":"r1","name":"dana","note":"on call","peer":"10.0.0.9","requested_at":5,"expires_at":9,"name_taken":true}]"#,
+        );
+        let waiting = futures::executor::block_on(transport.signups()).expect("requests");
+        assert_eq!(
+            waiting,
+            vec![BridgeSignup {
+                id: "r1".to_string(),
+                name: "dana".to_string(),
+                note: "on call".to_string(),
+                peer: Some("10.0.0.9".to_string()),
+                requested_at: 5,
+                expires_at: 9,
+                name_taken: true,
+            }]
+        );
+
+        let (transport, seen) = transport_recording(200, r#"{"name":"dana","role":"full"}"#);
+        let made = futures::executor::block_on(transport.approve_signup(
+            "r 1".to_string(),
+            BridgeRole::Full,
+            Some(vec!["staging".to_string()]),
+        ))
+        .expect("approved");
+        assert_eq!((made.name.as_str(), made.role), ("dana", BridgeRole::Full));
+        let seen = seen.lock().expect("lock");
+        assert_eq!(
+            (seen[0].0.as_str(), seen[0].1.as_str()),
+            ("POST", "http://bridge:7379/zedis/v1/admin/signups/r%201/approve")
+        );
+        let body: serde_json::Value = serde_json::from_str(&seen[0].2).expect("json");
+        assert_eq!(body, serde_json::json!({ "role": "full", "servers": ["staging"] }));
     }
 
     #[test]

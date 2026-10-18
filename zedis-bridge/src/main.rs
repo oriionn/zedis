@@ -50,7 +50,7 @@ mod trash;
 mod watch;
 mod webhook;
 
-use accounts::{Accounts, SETUP_TOKEN_ENV, Setup, USERS_ENV, USERS_FILE_ENV};
+use accounts::{Accounts, SETUP_TOKEN_ENV, SIGNUP_ENV, Setup, Signup, USERS_ENV, USERS_FILE_ENV};
 use session::Sessions;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -186,7 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "zedis-bridge [--listen {DEFAULT_LISTEN}] [--base-path /prefix] [--static <dir>] \
              [--insecure-cookie] [--store <url>] [--audit-log <file>] [--audit-writes] \
              [--audit-webhook <url> [--audit-webhook-format <name>] [--audit-webhook-events <list>]] \
-             [--trusted-header <name> --trusted-proxy <cidr,…>]"
+             [--trusted-header <name> --trusted-proxy <cidr,…>] [--signup approval]"
         );
         println!();
         println!("POST /v1/mcp is a Model Context Protocol server for an AI assistant (Claude");
@@ -214,6 +214,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("setup token when every administrator is lost. A deployment that still sets");
         println!("{USERS_ENV} or --users-file ({USERS_FILE_ENV}) has those accounts imported once,");
         println!("into an empty store, as full or read-only — never as administrator.");
+        println!("--signup approval ({SIGNUP_ENV}) also lets anyone ask for an account from the sign-in");
+        println!("page: a request signs nobody in until an administrator approves it, with a role and");
+        println!("server rules, on the account page — or rejects it. Off unless set; a request waits a");
+        println!(
+            "week, at most {} wait at once, and every request is an audit line.",
+            accounts::MAX_SIGNUPS
+        );
         println!("The page asks for the username and password, scripts send HTTP Basic. A server");
         println!("entry is private to the account that added it unless it is marked shared.");
         println!("Secrets are encrypted with the master.key file there, never the OS keychain.");
@@ -324,6 +331,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("--trusted-proxy needs --trusted-header: which header carries the identity?".into());
         }
     };
+    // Requests for an account (ADR 17, amended 2026-10-18): off unless a
+    // deployment opens that door, and a word it is not understood stops the
+    // bridge rather than leaving it shut or open by surprise.
+    let signup = Signup::from_setting(setting("--signup", SIGNUP_ENV).as_deref())?;
+    if signup.is_open() {
+        tracing::info!("anyone may ask for an account: administrators approve or reject each on the account page");
+    }
     // What the bridge keeps, in the local directory (ADR 17). The lists are
     // read now rather than by the first request that asks: a file that
     // cannot be read says so at start.
@@ -528,6 +542,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(purged) => tracing::info!(purged, "purged expired invitations"),
                 Err(e) => tracing::warn!(error = %e, "the expired invitations could not be purged"),
             }
+            match account_sweeper.purge_expired_signups().await {
+                Ok(0) => {}
+                Ok(purged) => tracing::info!(purged, "purged requests for an account nobody answered"),
+                Err(e) => tracing::warn!(error = %e, "the unanswered requests could not be purged"),
+            }
             // Five quiet minutes: each client that went is a line, with how
             // many are left.
             let (gone, online) = presence_sweeper.sweep();
@@ -623,6 +642,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scripts: stores.scripts,
         throttle,
         setup,
+        signup,
     });
     // With the peer's address, which the audit log records beside whatever
     // a proxy wrote in `X-Forwarded-For`.

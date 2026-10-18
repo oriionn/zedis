@@ -92,6 +92,17 @@ pub const INVITE_DELETE: Stmt = Stmt {
     pg: "DELETE FROM invites WHERE id = $1",
     my: "DELETE FROM invites WHERE id = ?",
 };
+pub const SIGNUPS: Stmt = both!("SELECT doc FROM signups ORDER BY id");
+pub const SIGNUP_PUT: Stmt = Stmt {
+    pg: "INSERT INTO signups (id, expires_at_secs, doc) VALUES ($1, $2, $3) \
+         ON CONFLICT (id) DO UPDATE SET expires_at_secs = EXCLUDED.expires_at_secs, doc = EXCLUDED.doc",
+    my: "INSERT INTO signups (id, expires_at_secs, doc) VALUES (?, ?, ?) AS new \
+         ON DUPLICATE KEY UPDATE expires_at_secs = new.expires_at_secs, doc = new.doc",
+};
+pub const SIGNUP_DELETE: Stmt = Stmt {
+    pg: "DELETE FROM signups WHERE id = $1",
+    my: "DELETE FROM signups WHERE id = ?",
+};
 
 // ---- logins, the setup token and the throttle (leases) ------------------------------
 

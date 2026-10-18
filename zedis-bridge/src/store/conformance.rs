@@ -20,7 +20,7 @@
 //! one writes the configuration directory every test in the process shares.
 
 use super::Stores;
-use crate::accounts::{AccountOp, AccountRecord, InviteKind, InviteRecord, Role};
+use crate::accounts::{AccountOp, AccountRecord, InviteKind, InviteRecord, Role, SignupRecord};
 use crate::auth::{Login, LoginChange};
 use crate::page_data::{KeyNote, MAX_ACCOUNT_BYTES, RowError, ScriptRecord};
 use crate::trash::{MAX_PAYLOAD, NewEntry};
@@ -64,6 +64,15 @@ async fn accounts(stores: &Stores) {
         created_by: "conformance".to_string(),
         created_at: 1,
     };
+    let request = SignupRecord {
+        id: unique("signup"),
+        name: lower.clone(),
+        password: "$argon2id$v=19$m=8,t=1,p=1$c2FsdA$aGFzaA".to_string(),
+        note: "for the on-call rota — ünïcode kept".to_string(),
+        peer: Some("10.0.0.7".to_string()),
+        requested_at: 1,
+        expires_at: 4_000_000_000,
+    };
     let applied = store
         .apply(
             at.version,
@@ -71,6 +80,7 @@ async fn accounts(stores: &Stores) {
                 AccountOp::PutAccount(record(&lower)),
                 AccountOp::PutAccount(record(&upper)),
                 AccountOp::PutInvite(invite.clone()),
+                AccountOp::PutSignup(request.clone()),
             ],
         )
         .await
@@ -96,6 +106,7 @@ async fn accounts(stores: &Stores) {
         "case is kept apart"
     );
     assert!(now.invites.contains(&invite));
+    assert!(now.signups.contains(&request), "a request is kept as it was asked");
 
     let removed = store
         .apply(
@@ -104,6 +115,7 @@ async fn accounts(stores: &Stores) {
                 AccountOp::RemoveAccount(lower.clone()),
                 AccountOp::RemoveAccount(upper.clone()),
                 AccountOp::RemoveInvite(invite.id.clone()),
+                AccountOp::RemoveSignup(request.id.clone()),
             ],
         )
         .await
@@ -112,6 +124,7 @@ async fn accounts(stores: &Stores) {
     let now = store.load().await.expect("load");
     assert!(!now.accounts.iter().any(|a| a.name == lower || a.name == upper));
     assert!(!now.invites.iter().any(|i| i.id == invite.id));
+    assert!(!now.signups.iter().any(|r| r.id == request.id));
 }
 
 async fn logins(stores: &Stores) {

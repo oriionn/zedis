@@ -15,7 +15,7 @@
 //! Where the bridge keeps what it keeps (ADR 17).
 //!
 //! Each kind of data is reached through a trait here, and the routes hold an
-//! `Arc<dyn …>` of it: the accounts and their invites ([`AccountStore`],
+//! `Arc<dyn …>` of it: the accounts, invites and requests ([`AccountStore`],
 //! records), the server list ([`ServerStore`], records), browser logins
 //! ([`LoginStore`], leases), the recycle bin ([`TrashStore`], blobs beside
 //! their metadata), the Metrics history ([`MetricsStore`], a log), the
@@ -42,7 +42,7 @@
 //! `zedis_connection::bridge` gives the page's side of the same data.
 
 use crate::accounts::Accounts;
-use crate::accounts::{AccountOp, AccountRecord, InviteRecord, LocalAccounts, LocalSetup};
+use crate::accounts::{AccountOp, AccountRecord, InviteRecord, LocalAccounts, LocalSetup, SignupRecord};
 use crate::auth::{LocalLogins, Login, LoginChange, Logins, Throttle};
 use crate::metrics::{self, LocalMetrics};
 use crate::page_data::{AccountRows, KeyNote, LocalKeyNotes, LocalPageRows, LocalScripts, RowError, ScriptRecord};
@@ -88,14 +88,17 @@ pub struct AccountsAt {
     pub version: u64,
     pub accounts: Vec<AccountRecord>,
     pub invites: Vec<InviteRecord>,
+    /// The requests for an account waiting for an administrator.
+    pub signups: Vec<SignupRecord>,
 }
 
 /// The accounts (ADR 17): registered, each with its role, server rules and
-/// MCP tokens, and the invitations that register the next ones. Records;
+/// MCP tokens, the invitations that register the next ones, and the requests
+/// for one an administrator has yet to answer. Records;
 /// the bridge keeps them in memory in front (`accounts::Accounts`), decides
 /// a change there and writes it through.
 pub trait AccountStore: Send + Sync {
-    /// Every account and every open invitation, and the version they are at.
+    /// Every account, invitation and request, and the version they are at.
     fn load(&self) -> StoreFuture<AccountsAt>;
     /// The version alone: whether what a process holds is still current.
     fn version(&self) -> StoreFuture<u64>;

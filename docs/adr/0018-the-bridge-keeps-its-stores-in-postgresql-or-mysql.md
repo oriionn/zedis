@@ -247,7 +247,8 @@ the process it reached, and says which.
 - MySQL does not run DDL in a transaction: every statement of a migration
   runs again safely (`IF NOT EXISTS`, `INSERT IGNORE`), so one that stopped
   halfway is finished by running it again. The first migration creates the
-  stores' tables, the second the audit's.
+  stores' tables, the second the audit's, the third the requests for an
+  account (ADR 17, amended 2026-10-18).
 
 ### The audit
 

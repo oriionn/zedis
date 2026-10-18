@@ -228,7 +228,7 @@ async fn a_sign_in_on_one_bridge_is_taken_in_by_another() {
 #[tokio::test]
 #[ignore]
 async fn a_local_directory_is_copied_into_the_database() {
-    use crate::accounts::{InviteKind, InviteRecord, LocalAccounts, LocalSetup};
+    use crate::accounts::{InviteKind, InviteRecord, LocalAccounts, LocalSetup, SignupRecord};
     use crate::auth::LocalLogins;
     use crate::import::{copy, import_local};
     use crate::metrics::LocalMetrics;
@@ -260,12 +260,22 @@ async fn a_local_directory_is_copied_into_the_database() {
         created_by: "root".to_string(),
         created_at: 1,
     };
+    let request = SignupRecord {
+        id: unique("signup"),
+        name: unique("frank"),
+        password: "hash".to_string(),
+        note: "waiting".to_string(),
+        peer: None,
+        requested_at: 1,
+        expires_at: 4_000_000_000,
+    };
     LocalAccounts::new(dir.join(at::ACCOUNTS))
         .apply(
             0,
             vec![
                 AccountOp::PutAccount(record.clone()),
                 AccountOp::PutInvite(invite.clone()),
+                AccountOp::PutSignup(request.clone()),
             ],
         )
         .await
@@ -348,8 +358,15 @@ async fn a_local_directory_is_copied_into_the_database() {
 
     let done = copy(&dir, &store).await.expect("copied");
     assert_eq!(
-        (done.accounts, done.invites, done.logins, done.servers, done.scripts),
-        (1, 1, 1, 1, 1)
+        (
+            done.accounts,
+            done.invites,
+            done.signups,
+            done.logins,
+            done.servers,
+            done.scripts
+        ),
+        (1, 1, 1, 1, 1, 1)
     );
     assert_eq!((done.page_rows, done.key_notes, done.trash, done.metrics), (1, 1, 1, 1));
     assert!(done.setup_token);
@@ -357,6 +374,7 @@ async fn a_local_directory_is_copied_into_the_database() {
     let target = store.clone().stores();
     let at_now = target.accounts.load().await.expect("accounts");
     assert!(at_now.accounts.contains(&record) && at_now.invites.contains(&invite));
+    assert!(at_now.signups.contains(&request), "a waiting request moves too");
     assert_eq!(target.logins.get(login_key).await.expect("login"), Some(login));
     assert!(
         target

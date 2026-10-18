@@ -74,7 +74,8 @@ invite — a role, the server rules, an expiry (seven days unless set), one
 use — and sends its link; registering with it creates the account as the
 invite describes. There is no open sign-up: a bridge holds production
 credentials. An approval queue (sign up, then wait for an administrator)
-can be added later as a second mode; it is not needed to start.
+can be added later as a second mode; it is not needed to start. (Added,
+off unless a deployment turns it on: the last amendment below.)
 
 **Roles.** `admin` is a full account that also manages accounts and
 invites (and, later, reads the audit log); `full` and `read-only` are what
@@ -263,7 +264,7 @@ give the desktop the same results before and after each step, and
    page now refreshes it.
 5. A SQL implementation when a deployment asks for more than one process
    or for audit queries, with migrations, and the audit viewer for
-   administrators. Designed in ADR 18.
+   administrators. Designed in ADR 18, and done there.
 
 ## Consequences
 
@@ -401,3 +402,49 @@ count of commits taken before it), when it is asked for again two seconds
 later. An open script form keeps what is typed into it; the last save wins.
 The preferences are not refreshed: they are a session's settings, read once
 at the start.
+
+## Amended 2026-10-18 — asking for an account, and an administrator's answer
+
+The approval queue the decision left for later is a second door beside the
+invitations, and it is shut unless a deployment opens it: `--signup
+approval` (`ZEDIS_BRIDGE_SIGNUP`), with `off` the default. A bridge holds
+production credentials; whoever finds its address is not invited to ask in
+unless its operator chose that.
+
+**A request is not an account.** `POST /v1/signup` keeps a name, the hash
+of a password, a note for the administrator (at most 500 characters) and
+the address it came from, for seven days (`SIGNUP_DAYS`). It signs in
+nobody, sees nothing, and is listed only to administrators. Requests are
+records of their own beside the accounts and the invitations
+(`AccountOp::PutSignup`, the `signups` list in `bridge-accounts.json`, the
+`signups` table in a database — its third migration), changed through
+`Accounts::change` like the rest.
+
+**An administrator answers it.** The account page's *Requests* section,
+drawn while the door is open, lists them, oldest first. *Approve* makes the
+account with the role and the server rules the administrator picks there —
+read-only unless changed, as an invitation is — and the password the
+request was made with; *Reject* deletes it. Both are audit lines
+(`signup_approved`, `signup_rejected`), and so is the request
+(`signup_requested`), which the webhook pushes by default: that is how an
+administrator learns that someone is waiting.
+
+**A request reserves nothing, and gives nothing away.** It is not checked
+against the accounts, so its answer is the same whether the name is taken
+or not, and the form cannot be used to find out who has an account; two
+requests may ask for the same name. The check is made at approval, which an
+existing account's name refuses (`409`), and the page marks such a request
+*name taken*.
+
+**It cannot be used to flood the bridge.** A request counts against its
+address in the sign-in throttle (`auth::Throttle`: ten in a quarter of an
+hour), the password is hashed only after that, and at most `MAX_SIGNUPS`
+(100) wait at once — the next is refused until one is answered or expires.
+The minute's sweeper forgets the expired ones.
+
+**Not through a sign-in proxy.** A name the proxy asserts that is no account
+is still a `403` and a `no_account` line, never a request: such accounts
+keep coming through invitations marked for the proxy.
+
+When the door is shut again, the requests already waiting are neither shown
+nor answerable, and expire.

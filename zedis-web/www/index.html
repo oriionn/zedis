@@ -19,13 +19,15 @@
   label.check { display: flex; align-items: center; gap: .5rem; }
   label.check input { width: auto; }
   label.check span { margin: 0; }
-  input { width: 100%; box-sizing: border-box; padding: .5rem; border: 1px solid var(--line);
+  input, textarea { width: 100%; box-sizing: border-box; padding: .5rem; border: 1px solid var(--line);
           border-radius: .375rem; background: transparent; color: inherit; font: inherit; }
+  textarea { resize: vertical; }
   button { margin-top: .75rem; padding: .5rem 1rem; border: 0; border-radius: .375rem; background: #1f6feb; color: #fff;
            font: inherit; cursor: pointer; }
   button:disabled { opacity: .5; cursor: default; }
   .msg { margin-top: .75rem; white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: .85rem; }
   .bad { color: var(--bad); }
+  .good { color: #3fb950; font-family: inherit; }
   .note { margin: 0 0 1rem; font-size: .85rem; opacity: .8; }
   .link { margin-top: 1rem; padding: 0; background: none; color: #58a6ff; font-size: .85rem; }
   [hidden] { display: none !important; }
@@ -54,6 +56,8 @@
   </form>
   <div class="msg bad" id="login-msg"></div>
   <button id="to-setup" class="link" type="button" data-i18n="setup_title" hidden>Create the administrator</button>
+  <!-- Only where the bridge takes requests (`--signup approval`). -->
+  <button id="to-signup" class="link" type="button" data-i18n="signup_link" hidden>Request an account</button>
 </main>
 <!-- The first account, or one more after every administrator was lost: the
      setup token from the bridge's log seats it (ADR 17). -->
@@ -82,6 +86,34 @@
   <p class="note" data-i18n="setup_existing_hint"></p>
   <div class="msg bad" id="setup-msg"></div>
   <button id="to-login" class="link" type="button" data-i18n="sign_in_instead">Sign in instead</button>
+</main>
+<!-- A request for an account, for an administrator to approve (ADR 17,
+     amended 2026-10-18). The answer is the same whatever the name: whether
+     one is taken is the administrator's to see. -->
+<main id="signup" hidden>
+  <h1 data-i18n="signup_title">Request an account</h1>
+  <p class="note" data-i18n="signup_intro"></p>
+  <form id="signup-form" autocomplete="on">
+    <label>
+      <span data-i18n="account_name">Account name</span>
+      <input id="signup-name" name="username" type="text" autocomplete="username" maxlength="64" required />
+    </label>
+    <label>
+      <span data-i18n="password">Password</span>
+      <input id="signup-password" name="password" type="password" autocomplete="new-password" required />
+    </label>
+    <label>
+      <span data-i18n="repeat_password">Repeat the password</span>
+      <input id="signup-confirm" type="password" autocomplete="new-password" required />
+    </label>
+    <label>
+      <span data-i18n="signup_note">Note for the administrator (optional)</span>
+      <textarea id="signup-note" rows="3" maxlength="500"></textarea>
+    </label>
+    <button id="signup-go" type="submit" data-i18n="signup_go">Send the request</button>
+  </form>
+  <div class="msg bad" id="signup-msg"></div>
+  <button id="signup-to-login" class="link" type="button" data-i18n="sign_in_instead">Sign in instead</button>
 </main>
 <!-- An invitation link (`#invite=…`): a new account, or a new password. -->
 <main id="register" hidden>
@@ -370,7 +402,7 @@
   }
 
   function show(id) {
-    for (const main of ["login", "setup", "register", "loading"]) $(main).hidden = main !== id;
+    for (const main of ["login", "setup", "signup", "register", "loading"]) $(main).hidden = main !== id;
   }
 
   // What a new password has to be, said before the bridge says it.
@@ -380,18 +412,23 @@
     return null;
   }
 
-  async function setupOpen() {
+  // What the page offers besides signing in: creating the administrator,
+  // and asking for an account where the bridge takes requests.
+  async function offers() {
     try {
       const res = await api("/v1/setup");
-      return res.ok && (await res.json()).open === true;
+      if (!res.ok) return { open: false, signup: false };
+      const body = await res.json();
+      return { open: body.open === true, signup: body.signup === true };
     } catch {
-      return false;
+      return { open: false, signup: false };
     }
   }
 
   async function showSignIn() {
-    const open = await setupOpen();
+    const { open, signup } = await offers();
     $("to-setup").hidden = !open;
+    $("to-signup").hidden = !signup;
     if (open) {
       show("setup");
       $("setup-token").focus();
@@ -407,6 +444,50 @@
   $("to-login").onclick = () => {
     show("login");
     $("username").focus();
+  };
+  $("to-signup").onclick = () => {
+    show("signup");
+    $("signup-name").focus();
+  };
+  $("signup-to-login").onclick = () => {
+    show("login");
+    $("username").focus();
+  };
+
+  $("signup-form").onsubmit = async (event) => {
+    event.preventDefault();
+    const problem = passwordProblem($("signup-password").value, $("signup-confirm").value);
+    if (problem) {
+      $("signup-msg").className = "msg bad";
+      $("signup-msg").textContent = problem;
+      return;
+    }
+    $("signup-go").disabled = true;
+    try {
+      const res = await send("POST", "/v1/signup", {
+        name: $("signup-name").value.trim(),
+        password: $("signup-password").value,
+        note: $("signup-note").value,
+      });
+      if (!res.ok) {
+        const known = { 404: "signup_closed", 409: "signup_full", 429: "too_many_attempts" }[res.status];
+        $("signup-msg").className = "msg bad";
+        $("signup-msg").textContent = known ? t(known) : t("error_generic", { error: await failure(res) });
+        return;
+      }
+      // Asked: nothing signs in until an administrator approves it, so the
+      // form goes and says so; the password is not kept on the page.
+      $("signup-password").value = "";
+      $("signup-confirm").value = "";
+      $("signup-form").hidden = true;
+      $("signup-msg").className = "msg good";
+      $("signup-msg").textContent = t("signup_sent");
+    } catch (e) {
+      $("signup-msg").className = "msg bad";
+      $("signup-msg").textContent = t("unreachable", { error: e });
+    } finally {
+      $("signup-go").disabled = false;
+    }
   };
 
   $("setup-form").onsubmit = async (event) => {
