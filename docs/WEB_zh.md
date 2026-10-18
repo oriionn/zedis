@@ -14,15 +14,15 @@ Zedis 也能在浏览器里运行：同一套代码编译成 WebAssembly，用 c
 
 ```bash
 docker run -d --name zedis-web -p 7379:7379 \
-  -e ZEDIS_BRIDGE_USERS="admin@change-me" \
   -v zedis-data:/data \
   vicanso/zedis-web:latest --listen 0.0.0.0:7379 --insecure-cookie
+docker logs zedis-web 2>&1 | grep "setup token"
 ```
 
-打开 <http://localhost:7379>，用 `admin` / `change-me` 登录。
+打开 <http://localhost:7379>。bridge 还没有管理员时，页面显示**创建管理员**：填入日志里的初始化令牌（setup token）、一个用户名和一个密码（至少 8 个字符），就以这个管理员身份登录了。其他人从标题栏菜单的**账号…**邀请（见[账号与共享](#账号与共享)）。
 
-- **必须配置账号** —— 要么 `ZEDIS_BRIDGE_USERS="用户名@密码,用户名2@密码2"`，要么 `--users-file`（见[账号与共享](#账号与共享)）。两者都不给，bridge 拒绝启动；两者都给，同样拒绝启动。行内写法按第一个 `@` 切分，因此用户名不能包含 `@` 或 `:`，密码不能包含逗号。脚本可以用 HTTP Basic（`curl -u admin:change-me …/v1/servers`）。
-- **`/data`** 保存服务器列表（其中的密码由同目录的 `master.key` 加密）和已保存的登录状态。请保留这个卷，否则每次重启都是空的。
+- **账号是注册出来的，不是配置出来的。** 第一个账号就是管理员，用一次性的初始化令牌创建：bridge 把它打印在日志里，并写入 `/data/setup-token`（仅属主可读，用过即删）；也可以用 `-e ZEDIS_BRIDGE_SETUP_TOKEN=…` 事先指定，方便安装脚本使用。其他人都通过邀请链接注册。脚本用某个账号的 HTTP Basic 登录（`curl -u admin:… …/v1/servers`）。
+- **`/data`** 保存服务器列表（其中的密码由同目录的 `master.key` 加密）、账号（密码以 Argon2id 哈希保存）和已保存的登录状态。请保留这个卷，否则每次重启都是空的，连管理员也没有。
 - **`--insecure-cookie` 仅用于纯 http 的试用。** 登录 cookie 默认带 `Secure`，而浏览器会静默丢弃通过纯 http 收到的 `Secure` cookie —— 只有 `localhost` 例外（部分浏览器连 `localhost` 也不例外）。不加这个参数时，现象是登录成功、紧接着的请求返回 `401`。
 - **Redis 跑在 Docker 宿主机上**时，容器内的 `127.0.0.1` 指的是容器自己。请使用 `host.docker.internal`（Linux 上需加 `--add-host=host.docker.internal:host-gateway`）或 `--network host`。
 
@@ -32,7 +32,6 @@ docker run -d --name zedis-web -p 7379:7379 \
 
 ```bash
 docker run -d --name zedis-web -p 127.0.0.1:7379:7379 \
-  -e ZEDIS_BRIDGE_USERS="alice@…,bob@…" \
   -v zedis-data:/data \
   vicanso/zedis-web:latest
 ```
@@ -43,7 +42,7 @@ zedis.example.com {
 }
 ```
 
-账号密码可能被暴力猜解：如果 bridge 能从内网之外访问，请在代理层加上限流。
+把地址告诉别人之前，先创建好管理员：在那之前，谁拿到初始化令牌，谁就成为管理员。同一地址在一刻钟内失败 10 次后，bridge 会拒绝它的后续尝试（`429`）—— 按账号名分别计数，初始化令牌和邀请码也一样。经反向代理时所有请求都来自代理的地址，这时的计数就变成了所有人按账号名共用一份；如果 bridge 能从内网之外访问，仍请在代理层加上限流。
 
 ## 与其它应用共用域名
 
@@ -51,7 +50,6 @@ zedis.example.com {
 
 ```bash
 docker run -d --name zedis-web -p 127.0.0.1:7379:7379 \
-  -e ZEDIS_BRIDGE_USERS="alice@…,bob@…" \
   -e ZEDIS_BRIDGE_BASE_PATH=/zedis \
   -v zedis-data:/data \
   vicanso/zedis-web:latest
@@ -71,41 +69,29 @@ tools.example.com {
 
 ## 账号与共享
 
-服务器条目属于添加它的账号，其他人看不到；勾选**共享**（Shared）后则对所有账号可见。能看到共享条目的账号都可以编辑或删除它。
+服务器条目属于添加它的账号，其他人看不到；勾选**共享**（Shared）后则对所有账号可见。能看到共享条目、且有写权限的账号都可以编辑或删除它。
 
-账号有两种配置方式，只能二选一：
+账号由 bridge 保存（`/data` 下的 `bridge-accounts.json`，仅属主可读），在它的页面上创建，从不写进配置。每个账号是三种角色之一：
 
-```bash
-# 行内：名字后加 ":ro" 即为只读账号
--e ZEDIS_BRIDGE_USERS="alice@secret,bob:ro@hunter2"
-```
+- **管理员** —— 完整权限账号能做的都能做，另外还管理账号页上的账号与邀请。
+- **完整权限** —— 在它看得到的条目上可读可写。
+- **只读** —— 只能读（见下文）。
 
-```toml
-# 或者用文件：--users-file /data/users.toml（ZEDIS_BRIDGE_USERS_FILE）
-[[users]]
-name = "alice"
-password = "secret"
+第一个账号是管理员，用初始化令牌创建（见[快速试用](#快速试用)）。之后的每个账号都来自一份**邀请**：管理员在账号页（标题栏菜单的**账号…**，或页面同目录下的 `account.html`）选好角色、它能看到哪些共享服务器、链接有效几天（默认 7 天，最长 90 天），然后把生成的链接发出去。一个链接只能注册一个账号，用户名和密码由对方自己定，用完即失效；bridge 只保存邀请码的哈希，未使用的邀请可以在同一页上撤销。邀请码放在链接的 `#` 之后，浏览器不会把这一段放进请求，所以也不会出现在沿途代理的访问日志里。
 
-[[users]]
-name = "bob"
-password = "hunter2"
-read_only = true
+在同一页的账号表里，管理员还可以修改账号的角色和服务器规则、停用或删除账号，或者给忘了密码的人生成一个**重置链接…**——它只能设置一次新密码。每个人都在账号页上修改自己的密码。最后一个管理员不能被降级、停用或删除。万一所有管理员都丢了，在宿主机上执行 `zedis-bridge setup-token`（`docker exec zedis-web /usr/local/bin/zedis-bridge setup-token`）：它会打印一个新的初始化令牌，页面重新提供*创建管理员*，可以新建账号，也可以用已有账号自己的密码把它设为管理员。这件事通过 HTTP 做不到 —— 能登录宿主机，就等于掌握了 bridge。
 
-[[users]]
-name = "carol"
-password = "s3cret"
-servers = ["prod-*:ro", "staging", "id:0199…"]   # 能看到哪些共享条目，在哪些上只读
-```
-
-用文件可以让密码不出现在每次 `docker inspect` 都会打印的环境变量里，也是唯一一种改动账号时不必重写整份列表的写法。行内写法把角色放在**名字**一侧，是因为密码里允许出现 `:`，而名字里不允许。
-
-`servers` 限定账号能看到哪些**共享**条目——按名字匹配（`*`、`?` 是通配符）或按 `id:` 精确指定——规则后加 `:ro` 表示在这些条目上只读，其它条目上仍是账号原本的权限。多条规则对同一条目意见不一时，**可写优先**：宽的规则做限制，例外单独点名，`["prod-*:ro", "prod-eu"]` 就是 `prod-*` 的条目都只读、其中 `prod-eu` 可写。不写这一项，看到全部共享条目；写成空列表，一个都看不到。账号自己添加的条目永远可见可写。只有文件写法支持这一项，行内写法放不下。条目名是所有者自己起的，能编辑条目的人改个名字，就能让它匹配上或不再匹配某条规则——在意这一点就用 `id:`。
+服务器规则限定账号能看到哪些**共享**条目，一行一条——按名字匹配（`*`、`?` 是通配符）或用 `id:` 加条目 id 精确指定——规则末尾加 `:ro` 表示在这些条目上只读，其它条目上仍是账号原本的权限。多条规则对同一条目意见不一时，**可写优先**：宽的规则做限制，例外单独点名，`prod-*:ro` 加 `prod-eu` 就是 `prod-*` 的条目都只读、其中 `prod-eu` 可写。没有规则时，看到全部共享条目。账号自己添加的条目永远可见可写。条目名是所有者自己起的，能编辑条目的人改个名字，就能让它匹配上或不再匹配某条规则——在意这一点就用 `id:`。
 
 **只读账号**可以查看它能看到的一切，但什么都改不了：不能写 Redis，也不能新增、编辑或删除服务器条目。拦截是 bridge 做的，不是页面 —— 任何不是读的请求都会收到 `403`，所以脚本直接请求 `/v1/exec` 和页面一样会被拒绝，带上确认参数也不会放行。判定用的是**读命令的白名单**，而不是"要避开的写命令"清单：`EVAL` 能执行任意脚本，`BITFIELD` 名字像读、实际会写，`GETDEL` 与 `GETEX` 名字是 get、实际是写，而模块命令根本不在 Redis 核心的命令表里 —— 因此不认识的一律拒绝；白名单万一漏了某个读命令，表现就是对应的面板提示不可用。
 
-修改账号的密码**或角色**都会让它已有的登录失效，所以把某个账号降为只读，对已经登录的浏览器同样立即生效。标题栏菜单的最后一项**退出登录**会立即结束当前这次登录 —— 是在 bridge 上作废，而不只是清掉这个浏览器的 cookie。不主动退出的话，登录在 30 天未使用后失效；登录时取消勾选 *Keep me signed in on this device* 则是 8 小时。重启 bridge 不会让任何人退出登录。
+修改账号的密码、角色或服务器规则，或者停用它，都会让它已有的登录失效，所以把某个账号降为只读，对已经登录的浏览器同样立即生效。标题栏菜单的最后一项**退出登录**会立即结束当前这次登录 —— 是在 bridge 上作废，而不只是清掉这个浏览器的 cookie。不主动退出的话，登录在 30 天未使用后失效；登录时取消勾选 *Keep me signed in on this device* 则是 8 小时。重启 bridge 不会让任何人退出登录。
 
 这是纵深防御，不能替代 Redis 自己的 ACL：Redis ACL 用户带上 `-@write` 后，限制由服务端在每条连接上执行，谁来连都一样；而这里的限制由 bridge 执行，浏览器能连到的也只有 bridge。两者一起用 —— ACL 是保证，账号角色是让按钮在请求发出之前就变灰的那一层。
+
+### 从配置账号升级
+
+有注册之前，账号是配置出来的：`ZEDIS_BRIDGE_USERS`（`alice@secret,bob:ro@hunter2`）或一份 `[[users]]` 表格式的 TOML 文件（`--users-file`、`ZEDIS_BRIDGE_USERS_FILE`）。仍然设置了其中之一的 bridge，在升级后第一次启动时会把这些账号导入一次（仅当账号存储为空时）：密码转为哈希，只读角色、`servers` 规则和 MCP token 一并带过来 —— 大家原来怎么登录，现在还怎么登录。它们都不会成为管理员，因为原来的配置从没做过这个决定，所以 bridge 同时会打印一个初始化令牌：打开页面，选*创建管理员*，填入令牌和某个已有账号自己的用户名与密码，这个账号就成为管理员。每导入一个账号，审计日志记一行 `account_imported`。此后这项设置会被忽略 —— 每次启动都会有一条警告提醒 —— 可以删掉了。
 
 ## 接入你自己的 SSO
 
@@ -116,13 +102,9 @@ servers = ["prod-*:ro", "staging", "id:0199…"]   # 能看到哪些共享条目
 -e ZEDIS_BRIDGE_TRUSTED_PROXY=10.0.0.0/8,172.17.0.5  # --trusted-proxy：代理的地址
 ```
 
-两个要么都配，要么都不配：任何人都能在请求里自己写一个 `Remote-User: alice`，所以只有**来自代理**的连接上这个头才算数——判断依据是 socket 对端地址，永远不看 `X-Forwarded-For`。头里的名字必须是 users 文件里的账号，该账号可以不写密码；不是账号的名字会被 `403` 拒绝（并记入审计日志），而不是当成新用户放进来。角色仍然在 users 文件里（`read_only = true`），因为代理只回答"你是谁"，不回答"你能做什么"。
+两个要么都配，要么都不配：任何人都能在请求里自己写一个 `Remote-User: alice`，所以只有**来自代理**的连接上这个头才算数——判断依据是 socket 对端地址，永远不看 `X-Forwarded-For`。头里的名字必须是 bridge 上的账号；不是账号的名字会被 `403` 拒绝（并记入审计日志），而不是当成新用户放进来。角色仍由 bridge 决定，因为代理只回答"你是谁"，不回答"你能做什么"。
 
-```toml
-[[users]]
-name = "alice@example.com"   # 和代理写进头里的值完全一致
-read_only = true
-```
+这样的账号用勾选了**通过代理登录**的邀请来注册（配置了上面两项时才提供这个选项）。经代理打开邀请链接，注册的就是代理写进头里的那个名字 —— 原样照搬，代理发的是 `alice@example.com` 就是 `alice@example.com` —— 角色取自邀请，没有密码，所以这个账号无法绕过代理登录。用初始化令牌创建的管理员有密码；角色选管理员并勾选代理的邀请，可以再建一个经代理登录的管理员。
 
 代理必须做到两件事：转发的每个请求都剥掉或覆盖这个头；并且是访问 bridge 的唯一入口——如果 bridge 还能被直连，地址检查就形同虚设。各家代理只有头名不同：Authelia 是 `Remote-User`，oauth2-proxy 是 `X-Auth-Request-User`（需开 `--set-xauthrequest`），Cloudflare Access 是 `Cf-Access-Authenticated-User-Email`，Tailscale 是 `Tailscale-User-Login`。不配这两项时，这个头根本不会被读取。
 
@@ -132,7 +114,7 @@ read_only = true
 
 ## 审计日志
 
-`--audit-log /data/audit.log`（`ZEDIS_BRIDGE_AUDIT_LOG`）会为每个事件追加一行 JSON：每次登录、登录失败与退出登录，只读账号被拒绝的每次请求、服务器条目的新增、编辑（改了哪些设置、改前改后的值；改了哪些密码之类的敏感字段，只记字段名不记值；私有条目被改为共享）和删除、每条管理服务器的命令 —— `CONFIG SET`、`ACL SETUSER`、`REPLICAOF`、`MODULE LOAD`、`CLIENT KILL`、`FLUSHDB` 之类 —— 每条需要人确认才放行的命令（所以开了“写入确认”的条目，在终端里输入的每一次写都会留痕），以及每个从回收站移出的 key（恢复或丢弃；恢复时的 `RESTORE` 另有一行写命令记录）。`--audit-writes`（`ZEDIS_BRIDGE_AUDIT_WRITES=1`）再加上普通的数据写命令，以及随之放进回收站的每个被删除的 key；读命令永远不记。参数里的密码会被抹掉，过长的值会截断，同一批里的同名命令合并成一行并记数量，文件创建时的权限是仅属主可访问。
+`--audit-log /data/audit.log`（`ZEDIS_BRIDGE_AUDIT_LOG`）会为每个事件追加一行 JSON：每次登录、登录失败与退出登录，只读账号被拒绝的每次请求，账号的每一次变动 —— 用初始化令牌创建管理员、邀请的创建与撤销、账号的注册、修改（角色、服务器规则、是否停用，改前改后）、删除与导入、密码的修改与重置、MCP token 的签发与吊销，从不记密码、邀请码或 token 本身 —— 服务器条目的新增、编辑（改了哪些设置、改前改后的值；改了哪些密码之类的敏感字段，只记字段名不记值；私有条目被改为共享）和删除、每条管理服务器的命令 —— `CONFIG SET`、`ACL SETUSER`、`REPLICAOF`、`MODULE LOAD`、`CLIENT KILL`、`FLUSHDB` 之类 —— 每条需要人确认才放行的命令（所以开了“写入确认”的条目，在终端里输入的每一次写都会留痕），以及每个从回收站移出的 key（恢复或丢弃；恢复时的 `RESTORE` 另有一行写命令记录）。`--audit-writes`（`ZEDIS_BRIDGE_AUDIT_WRITES=1`）再加上普通的数据写命令，以及随之放进回收站的每个被删除的 key；读命令永远不记。参数里的密码会被抹掉，过长的值会截断，同一批里的同名命令合并成一行并记数量，文件创建时的权限是仅属主可访问。
 
 ```json
 {"ts":"2026-09-25T08:12:03.417Z","account":"alice","peer":"10.0.0.7:51234","event":"command","server":{"id":"0199…","name":"prod"},"db":0,"command":"CONFIG","args":["SET","maxmemory","2gb"],"outcome":"confirmed","kind":"config_set","confirm":"type_name"}
@@ -146,7 +128,6 @@ read_only = true
 
 ```bash
 docker run -d --name zedis-web -p 127.0.0.1:7379:7379 \
-  -e ZEDIS_BRIDGE_USERS="alice@…,bob@…" \
   -e ZEDIS_BRIDGE_AUDIT_LOG=/data/audit.log \
   -e ZEDIS_BRIDGE_AUDIT_WEBHOOK="https://open.feishu.cn/open-apis/bot/v2/hook/…" \
   -e ZEDIS_BRIDGE_AUDIT_WEBHOOK_SECRET="…" \
@@ -162,7 +143,7 @@ docker run -d --name zedis-web -p 127.0.0.1:7379:7379 \
 08:13:00 mallory failed to sign in from 203.0.113.9
 ```
 
-推送的是审计日志所记内容的一个子集。默认推送除登录、退出登录和 MCP 工具调用之外的所有事件——这三种整天都在发生；`--audit-webhook-events`（`ZEDIS_BRIDGE_AUDIT_WEBHOOK_EVENTS`）可以改成一个列表——`login`、`login_failed`、`no_account`、`logout`、`refused`、`command`、`server_added`、`server_updated`、`server_deleted`、`unlocked`、`locked`、`trash_put`、`trash_removed`、`tool`——或 `all`。命令里只推送管理服务器的命令，以及需要人确认或被拒绝的命令：普通的数据写永远不推，开了 `--audit-writes` 也一样，否则忙一个上午群就被刷屏了；被删除的 key 放进回收站也不推，道理相同。
+推送的是审计日志所记内容的一个子集。默认推送除登录、退出登录和 MCP 工具调用之外的所有事件——这三种整天都在发生；`--audit-webhook-events`（`ZEDIS_BRIDGE_AUDIT_WEBHOOK_EVENTS`）可以改成一个列表——`login`、`login_failed`、`no_account`、`logout`、`refused`、`command`、`server_added`、`server_updated`、`server_deleted`、`unlocked`、`locked`、`trash_put`、`trash_removed`、`setup_completed`、`invite_created`、`invite_revoked`、`account_registered`、`account_updated`、`account_deleted`、`password_changed`、`token_issued`、`token_revoked`、`account_imported`、`tool`——或 `all`。命令里只推送管理服务器的命令，以及需要人确认或被拒绝的命令：普通的数据写永远不推，开了 `--audit-writes` 也一样，否则忙一个上午群就被刷屏了；被删除的 key 放进回收站也不推，道理相同。
 
 推送从不拖慢请求：审计行先进队列，第一行到达 3 秒后发出，一条消息最多 20 行，这样也不会超过机器人的频率限制（企业微信每分钟 20 条）。发送失败会在 5 秒后重试一次，仍失败就在进程日志里记一条警告；机器人返回错误码（签名不对、机器人已停用）也算失败。URL 里带着机器人的密钥，所以进程日志只记它的域名——启动时的 `audit webhook on` 一行列出域名、格式、推送的事件以及是否签名。URL、格式或事件名写错时，bridge 在启动时就会报错退出；给不签名的机器人（企业微信、Slack、JSON）配了密钥也一样，免得你以为消息是签过名的。
 
@@ -190,24 +171,9 @@ $ curl -s -u alice:secret https://zedis.example.com/v1/clients
 
 ## 让 AI 助手只读访问（MCP）
 
-`POST /v1/mcp` 是一个 [Model Context Protocol](https://modelcontextprotocol.io) 服务端，Claude Code、Cursor 或任何 MCP 客户端都可以经由 bridge 读取你的 Redis —— 只能读。助手登录的账号**必须是只读的**（`ai:ro@secret`，或 `read_only = true`）—— 用这个账号的 token（见下文），或像脚本一样用 HTTP Basic；完整权限的账号在这里无论请求什么都会被拒绝。工具是按模型而不是按终端的习惯设计的：`list_servers`、`scan_keys`（分页，集群的每个 master 都会扫到）、`inspect_key`（类型、TTL、内存、编码、长度和一小段预览）、`server_info` 与 `slowlog`（按 master 解析好）；三个做汇总而不是罗列的工具——`slowlog_summary`（慢日志按命令汇总，最重的在前，并列出最慢的几条）、`hotkeys`（读取已在运行的 `HOTKEYS` 采集报告，Redis 8.6+；启动采集会改变服务器状态，所以留给人来做）和 `memory_summary`（最多抽 5000 个 key，用 `MEMORY USAGE` 测量后按前缀汇总，并列出最大的 key）；以及兜底的 `read_command`，跑任意其它只读命令。工具发出的每条命令都要过页面用的那份只读白名单，此外还会拒绝会改动共享连接状态的命令（`SELECT`、`AUTH`、`CLIENT SETNAME`、`SUBSCRIBE` 等）；写入、`_RO` 形式以外的脚本、管理命令以及会返回凭据的读（读密码的 `CONFIG GET`、`ACL LIST`）都会被拒绝，并附上模型读得懂的原因。大值会截断到能放进模型上下文的大小，每个账号每分钟最多 120 次调用，而且**每次调用都是审计日志里的一行** —— 读也记，因为调用者是替人做事的程序。
+`POST /v1/mcp` 是一个 [Model Context Protocol](https://modelcontextprotocol.io) 服务端，Claude Code、Cursor 或任何 MCP 客户端都可以经由 bridge 读取你的 Redis —— 只能读。助手登录的账号**必须是只读的** —— 用这个账号的 token（见下文），或像脚本一样用 HTTP Basic；完整权限的账号在这里无论请求什么都会被拒绝。工具是按模型而不是按终端的习惯设计的：`list_servers`、`scan_keys`（分页，集群的每个 master 都会扫到）、`inspect_key`（类型、TTL、内存、编码、长度和一小段预览）、`server_info` 与 `slowlog`（按 master 解析好）；三个做汇总而不是罗列的工具——`slowlog_summary`（慢日志按命令汇总，最重的在前，并列出最慢的几条）、`hotkeys`（读取已在运行的 `HOTKEYS` 采集报告，Redis 8.6+；启动采集会改变服务器状态，所以留给人来做）和 `memory_summary`（最多抽 5000 个 key，用 `MEMORY USAGE` 测量后按前缀汇总，并列出最大的 key）；以及兜底的 `read_command`，跑任意其它只读命令。工具发出的每条命令都要过页面用的那份只读白名单，此外还会拒绝会改动共享连接状态的命令（`SELECT`、`AUTH`、`CLIENT SETNAME`、`SUBSCRIBE` 等）；写入、`_RO` 形式以外的脚本、管理命令以及会返回凭据的读（读密码的 `CONFIG GET`、`ACL LIST`）都会被拒绝，并附上模型读得懂的原因。大值会截断到能放进模型上下文的大小，每个账号每分钟最多 120 次调用，而且**每次调用都是审计日志里的一行** —— 读也记，因为调用者是替人做事的程序。
 
-给助手一个 **token**，而不是账号的密码。在 bridge 所在的机器上执行（或 `docker run --rm vicanso/zedis-web token new …`）：
-
-```sh
-zedis-bridge token new --user ai --name claude-laptop --expires 2027-01-01
-```
-
-它只显示一次 token，并给出要加到 users 文件里那个账号下的一行 —— 记的是 token 的 SHA-256，而不是 token 本身。加上之后重启 bridge：
-
-```toml
-[[users]]
-name = "ai"
-read_only = true
-tokens = [
-  { name = "claude-laptop", sha256 = "5e1f2416…", expires = "2027-01-01" },
-]
-```
+给助手一个 **token**，而不是账号的密码。为它邀请一个只读账号，以这个账号登录后打开**账号…**：在 *MCP 令牌*下，用机器或客户端给 token 起个名字（`claude-laptop`），需要的话填上到期日，然后签发。管理员也可以在账号表里给任意只读账号签发（*签发令牌…*）。token 只显示一次；bridge 只保存它的 SHA-256。
 
 客户端把它放在请求头里：
 
@@ -216,14 +182,14 @@ claude mcp add --transport http zedis https://bridge.example.com/v1/mcp \
   --header "Authorization: Bearer ${ZEDIS_MCP_TOKEN}"
 ```
 
-token 只能在 `/v1/mcp` 登录，别处都不行 —— 页面不行，API 也不行 —— 所以 MCP 客户端明文存在配置文件里的，不是一个能打开页面的密码。要停掉某一台机器，删掉它那一行再重启 bridge 即可；`expires`（可选）从那一天的第一秒（UTC）起拒绝它；每次调用的审计日志都会写明是哪个 token（`"auth":"token","token":"claude-laptop"`）。token 只能写在 users 文件里（`ZEDIS_BRIDGE_USERS` 简写形式没有 token），而且只能写在只读账号下 —— 否则 bridge 不会启动。为了兼容在有 token 之前配置的客户端，`/v1/mcp` 仍然接受 HTTP Basic：
+token 只能在 `/v1/mcp` 登录，别处都不行 —— 页面不行，API 也不行 —— 所以 MCP 客户端明文存在配置文件里的，不是一个能打开页面的密码。要停掉某一台机器，在同一页上吊销它的 token 即可，下一次调用就会被拒绝；到期日从那一天的第一秒（UTC）起拒绝它；每次调用的审计日志都会写明是哪个 token（`"auth":"token","token":"claude-laptop"`）。token 只属于只读账号：完整权限的账号签发不了，持有 token 的只读账号在 token 全部吊销之前也不能改成别的角色。为了兼容在有 token 之前配置的客户端，`/v1/mcp` 仍然接受 HTTP Basic：
 
 ```sh
 claude mcp add --transport http zedis https://bridge.example.com/v1/mcp \
   --header "Authorization: Basic $(printf 'ai:secret' | base64)"
 ```
 
-助手和页面走的是同一个入口，而不是另开一条通道：users 文件里的 `servers` 规则决定助手看得见哪些条目，审计日志记录它读了什么，数据不经过任何第三方。
+助手和页面走的是同一个入口，而不是另开一条通道：账号的服务器规则决定助手看得见哪些条目，审计日志记录它读了什么，数据不经过任何第三方。
 
 ## 流式面板
 

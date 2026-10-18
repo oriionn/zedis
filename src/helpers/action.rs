@@ -47,6 +47,10 @@ pub enum MemuAction {
     /// End the bridge login and return to its sign-in form — what the web
     /// version's menu offers in the place of Quit, which a tab cannot do.
     SignOut,
+    /// The bridge's account page — password, MCP tokens and, for an
+    /// administrator, the accounts and invitations (ADR 17) — in a tab of
+    /// its own. The web version's alone, beside Sign Out.
+    Account,
 }
 
 /// Navigation. `Back` (bound to `escape`) mirrors the "back to editor"

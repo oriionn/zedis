@@ -10,7 +10,7 @@
 // own entry in `zedis-web` and calls `launch` (ADR 9).
 #[cfg(not(target_family = "wasm"))]
 use crate::connection::install_crypto_provider;
-use crate::connection::sign_out_of_bridge;
+use crate::connection::{bridge_page_url, sign_out_of_bridge};
 // The GPUI Fast build (`gpui-fast`): gpui-kit re-exports the Fast engine,
 // and the kit under the name `gpui` is what makes every `gpui::…` path in
 // this crate, and what GPUI's macros expand to, name the engine the
@@ -436,6 +436,13 @@ pub fn launch(cx: &mut App, app_state: ZedisAppState) {
             #[cfg(not(target_os = "macos"))]
             if let Some(window) = cx.active_window() {
                 let _ = window.update(cx, |_, window, _cx| window.remove_window());
+            }
+        }
+        // A page of the bridge's, not of the application: the browser opens
+        // it in a tab of its own, and the application keeps running here.
+        MemuAction::Account => {
+            if let Some(url) = bridge_page_url("account.html") {
+                cx.open_url(&url);
             }
         }
         MemuAction::SignOut => {

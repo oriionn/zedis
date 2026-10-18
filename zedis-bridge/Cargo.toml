@@ -26,6 +26,9 @@ zedis-connection = { workspace = true }
 # zedis-connection does not re-export the fs helpers.
 zedis-core = { workspace = true }
 axum = "0.8.9"
+# Password hashes of the registered accounts (ADR 17): Argon2id, the
+# version zedis-connection already uses for share tokens.
+argon2 = { workspace = true }
 base64 = { workspace = true }
 # `BoxFuture`, for the store traits (`store.rs`, ADR 17): boxed so a store is
 # an `Arc<dyn …>` chosen at start-up, the shape zedis-connection's page-side

@@ -53,7 +53,7 @@ pub const SECRET_ENV: &str = "ZEDIS_BRIDGE_AUDIT_WEBHOOK_SECRET";
 pub const EVENTS_ENV: &str = "ZEDIS_BRIDGE_AUDIT_WEBHOOK_EVENTS";
 
 /// Every `event` a line can carry, as the log spells it.
-pub const EVENTS: [&str; 14] = [
+pub const EVENTS: [&str; 24] = [
     "login",
     "login_failed",
     "no_account",
@@ -67,6 +67,16 @@ pub const EVENTS: [&str; 14] = [
     "locked",
     "trash_put",
     "trash_removed",
+    "setup_completed",
+    "invite_created",
+    "invite_revoked",
+    "account_registered",
+    "account_updated",
+    "account_deleted",
+    "password_changed",
+    "token_issued",
+    "token_revoked",
+    "account_imported",
     "tool",
 ];
 
@@ -471,6 +481,38 @@ fn summary(line: &Value) -> String {
             get("key"),
             line.get("db").and_then(Value::as_u64).unwrap_or(0)
         ),
+        "setup_completed" => {
+            if line.get("promoted").and_then(Value::as_bool).unwrap_or(false) {
+                "became an administrator with the setup token".to_string()
+            } else {
+                "created the administrator with the setup token".to_string()
+            }
+        }
+        "invite_created" => match get("kind") {
+            "reset" => format!("made a password reset link for {}", get("target")),
+            _ => format!("invited a new {} account", get("role")),
+        },
+        "invite_revoked" => "revoked an invitation".to_string(),
+        "account_registered" => format!("registered as a {} account", get("role")),
+        "account_updated" => {
+            let changed: Vec<&str> = line
+                .get("changed")
+                .and_then(Value::as_object)
+                .map(|c| c.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            format!("changed account {}: {}", get("target"), changed.join(", "))
+        }
+        "account_deleted" => format!("deleted account {}", get("target")),
+        "password_changed" => {
+            if line.get("reset").and_then(Value::as_bool).unwrap_or(false) {
+                "set a new password with a reset link".to_string()
+            } else {
+                "changed their password".to_string()
+            }
+        }
+        "token_issued" => format!("issued the MCP token {} for {}", get("token"), get("target")),
+        "token_revoked" => format!("revoked the MCP token {} of {}", get("token"), get("target")),
+        "account_imported" => format!("was imported from the users file as {}", get("role")),
         "tool" => format!("ran the MCP tool {} on {server}", get("tool")),
         other => other.to_string(),
     };

@@ -2,6 +2,10 @@
 
 Date: 2026-09-26 · Status: accepted
 
+Amended by ADR 17 (2026-10-18): an account that signs in through the proxy
+is registered by an invitation marked for the proxy, with no password,
+instead of listed in the users file; its role is still the bridge's.
+
 ## Context
 
 A team that already has single sign-on asks the same first question of every

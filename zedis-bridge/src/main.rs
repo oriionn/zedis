@@ -29,6 +29,8 @@
 //! never the OS keychain (`disable_keychain`). A service has no session to
 //! answer a keychain prompt in.
 
+mod account_api;
+mod accounts;
 mod api;
 mod audit;
 mod auth;
@@ -44,7 +46,7 @@ mod trash;
 mod watch;
 mod webhook;
 
-use auth::{Accounts, USERS_ENV, USERS_FILE_ENV};
+use accounts::{Accounts, SETUP_TOKEN_ENV, Setup, USERS_ENV, USERS_FILE_ENV};
 use session::Sessions;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -72,71 +74,27 @@ fn flag(name: &str) -> Option<String> {
     None
 }
 
-const TOKEN_USAGE: &str = "zedis-bridge token new --user <account> --name <label> [--expires YYYY-MM-DD]";
-
-/// `zedis-bridge token new …`: a fresh MCP token (ADR 15), printed once with
-/// the line its account lists it by in the users file. Nothing is written:
-/// the users file is the operator's, and the token is the client's — the
-/// bridge keeps neither, only the hash the operator pastes.
-fn token_command() -> Result<(), Box<dyn std::error::Error>> {
-    let verb = std::env::args().nth(2);
+/// `zedis-bridge setup-token`: a fresh setup token, for when every
+/// administrator is lost (ADR 17). Written beside the bridge's data, where
+/// the running bridge reads it at the next attempt, and printed once. Host
+/// access is administrator access; nothing over HTTP can do this.
+fn setup_token_command() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().any(|a| a == "--help" || a == "-h") {
-        println!("{TOKEN_USAGE}");
+        println!("zedis-bridge setup-token");
         println!();
-        println!("Prints a token for an AI assistant at POST /v1/mcp and the line to add to that");
-        println!("account's tokens in the users file. The account must be read_only = true.");
-        println!("The client sends it as `Authorization: Bearer <token>`; it signs in there and");
-        println!("nowhere else. --expires 2027-01-01 refuses it from the start of that day (UTC).");
+        println!("Writes a one-time setup token to setup-token in the bridge's data directory");
+        println!("(ZEDIS_CONFIG_DIR) and prints it. On the bridge's page, Create the administrator");
+        println!("with it: a new account, or an existing one by its password, becomes an");
+        println!("administrator. The token is deleted once used.");
         return Ok(());
     }
-    if verb.as_deref() != Some("new") {
-        return Err(format!("usage: {TOKEN_USAGE}").into());
-    }
-    let user = flag("--user").filter(|user| !user.trim().is_empty());
-    let label = flag("--name").filter(|label| !label.trim().is_empty());
-    let (Some(user), Some(label)) = (user, label) else {
-        return Err(format!("usage: {TOKEN_USAGE}").into());
-    };
-    let (user, label) = (user.trim().to_string(), label.trim().to_string());
-    if user.contains(':') {
-        return Err("--user: an account name cannot contain ':'".into());
-    }
-    let expires = flag("--expires");
-    if let Some(expires) = &expires {
-        let at = auth::parse_expiry(expires).map_err(|e| format!("--expires: {e}"))?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if at <= now {
-            return Err(format!("--expires {expires} is already past").into());
-        }
-    }
-    let (token, sha256) = auth::new_mcp_token();
-    let expires = expires
-        .map(|date| format!(", expires = \"{}\"", date.trim()))
-        .unwrap_or_default();
-    let quoted = |text: &str| serde_json::to_string(text).unwrap_or_else(|_| format!("\"{text}\""));
-    println!(
-        "Token for account {} ({label}) — shown once, put it in the MCP client's config:",
-        quoted(&user)
-    );
+    let setup = Setup::in_dir(&get_or_create_config_dir()?);
+    let token = setup.mint()?;
+    println!("Setup token — shown once, also in {}:", setup.file().display());
     println!();
     println!("  {token}");
     println!();
-    println!("Add this to that account in the users file, then restart the bridge:");
-    println!();
-    println!("  [[users]]");
-    println!("  name = {}", quoted(&user));
-    println!("  read_only = true");
-    println!("  tokens = [");
-    println!("    {{ name = {}, sha256 = \"{sha256}\"{expires} }},", quoted(&label));
-    println!("  ]");
-    println!();
-    println!("The client sends it as a header, for example:");
-    println!();
-    println!("  claude mcp add --transport http zedis https://<bridge>/v1/mcp \\");
-    println!("    --header \"Authorization: Bearer {token}\"");
+    println!("Open the bridge's page and choose Create the administrator.");
     Ok(())
 }
 
@@ -146,20 +104,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
-    if std::env::args().nth(1).as_deref() == Some("token") {
-        return token_command();
+    if std::env::args().nth(1).as_deref() == Some("setup-token") {
+        return setup_token_command();
     }
 
     if std::env::args().any(|a| a == "--help" || a == "-h") {
         println!(
             "zedis-bridge [--listen {DEFAULT_LISTEN}] [--base-path /prefix] [--static <dir>] \
-             [--users-file <file>] [--insecure-cookie] [--audit-log <file>] [--audit-writes] \
+             [--insecure-cookie] [--audit-log <file>] [--audit-writes] \
              [--audit-webhook <url> [--audit-webhook-format <name>] [--audit-webhook-events <list>]] \
              [--trusted-header <name> --trusted-proxy <cidr,…>]"
         );
         println!();
         println!("POST /v1/mcp is a Model Context Protocol server for an AI assistant (Claude");
-        println!("Code, Cursor, …): a read-only account's token (`{TOKEN_USAGE}`,");
+        println!("Code, Cursor, …): a read-only account's token (issued on its account page,");
         println!("sent as `Authorization: Bearer …`) or HTTP Basic, and tools that list the");
         println!("servers, scan keys, describe one key, read INFO and SLOWLOG and run any other");
         println!("read-only command. A full account is refused there, every call is one audit");
@@ -174,11 +132,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("--base-path /zedis (or {BASE_PATH_ENV}) mounts the page and the API under that");
         println!("path, for a host name shared with other applications; the reverse proxy then");
         println!("forwards /zedis/ with the prefix kept.");
-        println!("Callers sign in by name. Either {USERS_ENV}=\"alice@secret,bob:ro@hunter2\" or");
-        println!("--users-file <file> ({USERS_FILE_ENV}), a TOML file of [[users]] tables with");
-        println!("name / password / read_only — one of the two, never both. `:ro` (short form) or");
-        println!("read_only = true makes an account read-only: it may look at everything it can");
-        println!("see and change none of it, refused by the bridge rather than by the page.");
+        println!("Accounts are registered, never configured. The first is the administrator: while");
+        println!("there is none, the bridge prints a setup token in its log and writes it to");
+        println!("setup-token in its data directory ({SETUP_TOKEN_ENV} chooses one in advance),");
+        println!("and the page offers Create the administrator. After that an administrator");
+        println!("invites each account — a role (administrator, full or read-only), the servers it");
+        println!("sees, an expiry — and sends the link. `zedis-bridge setup-token` writes a new");
+        println!("setup token when every administrator is lost. A deployment that still sets");
+        println!("{USERS_ENV} or --users-file ({USERS_FILE_ENV}) has those accounts imported once,");
+        println!("into an empty store, as full or read-only — never as administrator.");
         println!("The page asks for the username and password, scripts send HTTP Basic. A server");
         println!("entry is private to the account that added it unless it is marked shared.");
         println!("Secrets are encrypted with the master.key file there, never the OS keychain.");
@@ -224,11 +186,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--trusted-proxy 10.0.0.0/8,… ({}); both or neither. The name must be an",
             auth::TRUSTED_PROXY_ENV
         );
-        println!("account in the users file, which may then omit that account's password.");
-        println!("A [[users]] table may also list servers = [\"prod-*:ro\", \"staging\", \"id:…\"]:");
-        println!("the shared entries that account sees (by name glob or id), and where it is");
-        println!("read-only (\":ro\"; where rules disagree, write wins). Left out: every shared");
-        println!("entry. Its own entries an account always sees and writes.");
+        println!("account here; an invitation marked for the proxy registers that name, with no");
+        println!("password. An account's server rules — \"prod-*:ro\", \"staging\", \"id:…\" — are");
+        println!("the shared entries it sees (by name glob or id) and where it is read-only");
+        println!("(\":ro\"; where rules disagree, write wins); none is every shared entry. Its own");
+        println!("entries an account always sees and writes.");
         return Ok(());
     }
 
@@ -243,21 +205,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // rebuilt binary is asked for the login password on every restart. Before
     // anything reads the server list, because the key is resolved once.
     disable_keychain();
-
-    // The flag first, then the environment — the one a container sets, since
-    // arguments there replace the image's whole command line.
-    let users_file = flag("--users-file")
-        .or_else(|| std::env::var(USERS_FILE_ENV).ok())
-        .map(std::path::PathBuf::from);
-    let accounts = Accounts::load(users_file.as_deref())?;
-    tracing::info!(
-        accounts = accounts.len(),
-        read_only = accounts.read_only_count(),
-        with_server_rules = accounts.with_server_rules(),
-        mcp_tokens = accounts.mcp_token_count(),
-        source = users_file.as_ref().map_or(USERS_ENV, |_| USERS_FILE_ENV),
-        "accounts loaded"
-    );
 
     // A plain-http local run has to say so: the login cookie is `Secure` by
     // default, so a deployment that forgets TLS sees a login that visibly
@@ -296,6 +243,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("--trusted-proxy needs --trusted-header: which header carries the identity?".into());
         }
     };
+    // What the bridge keeps, in the local directory (ADR 17). The lists are
+    // read now rather than by the first request that asks: a file that
+    // cannot be read says so at start.
+    let data_dir = get_or_create_config_dir()?;
+    let stores = store::Stores::local(&data_dir);
+    let entries = stores.servers.list().await?.len();
+    tracing::info!(entries, "server list loaded");
+    let accounts = Accounts::load(stores.accounts.clone()).await?;
+    let setup = Setup::in_dir(&data_dir);
+
     let passwordless = accounts.passwordless();
     match &trusted {
         Some(proxy) => tracing::info!(
@@ -304,13 +261,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             proxy_only_accounts = passwordless.len(),
             "identities from the reverse proxy are trusted"
         ),
-        None if !passwordless.is_empty() => {
-            return Err(format!(
-                "accounts without a password ({}) need --trusted-header: nothing else could sign them in",
-                passwordless.join(", ")
-            )
-            .into());
-        }
+        // Registered behind a proxy that is no longer configured: they are
+        // still accounts, and an administrator can reset them a password.
+        None if !passwordless.is_empty() => tracing::warn!(
+            accounts = passwordless.join(", "),
+            "accounts without a password cannot sign in without --trusted-header"
+        ),
         None => {}
     }
 
@@ -364,41 +320,94 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => audit,
     };
 
+    // The accounts a deployment configured before registration, imported
+    // once into an empty store — after the audit is open, since each is a
+    // line — and never read again.
+    let users_file = flag("--users-file")
+        .or_else(|| std::env::var(USERS_FILE_ENV).ok())
+        .map(std::path::PathBuf::from);
+    if let Some(records) = accounts::import_records(users_file.as_deref())? {
+        let names: Vec<(String, &'static str)> = records.iter().map(|r| (r.name.clone(), r.role.name())).collect();
+        match accounts.import(records).await? {
+            0 => tracing::warn!(
+                accounts = accounts.len(),
+                "{USERS_ENV} / {USERS_FILE_ENV} are ignored: accounts are registered now, and the store has some"
+            ),
+            imported => {
+                for (name, role) in &names {
+                    audit.record(
+                        name,
+                        &audit::Origin::default(),
+                        audit::Event::AccountImported {
+                            target: name.clone(),
+                            role,
+                        },
+                    );
+                }
+                tracing::info!(
+                    imported,
+                    "accounts imported from the configured users; remove that setting now"
+                );
+            }
+        }
+    }
+    tracing::info!(
+        accounts = accounts.len(),
+        administrators = accounts.admin_count(),
+        read_only = accounts.read_only_count(),
+        with_server_rules = accounts.with_server_rules(),
+        mcp_tokens = accounts.mcp_token_count(),
+        "accounts loaded"
+    );
+    // No administrator: the setup token seats one (ADR 17).
+    if accounts.admin_count() == 0 {
+        if std::env::var(SETUP_TOKEN_ENV).is_ok_and(|t| !t.trim().is_empty()) {
+            tracing::warn!("no administrator yet: open the page and Create the administrator with {SETUP_TOKEN_ENV}");
+        } else {
+            let token = match std::fs::read_to_string(setup.file()) {
+                Ok(token) if !token.trim().is_empty() => token.trim().to_string(),
+                _ => setup.mint()?,
+            };
+            tracing::warn!(
+                file = %setup.file().display(),
+                "no administrator yet: open the page and Create the administrator with the setup token {token}"
+            );
+        }
+    }
+
     // Saved, so that restarting the bridge does not sign everybody out —
     // which, while they lived in memory, it did, every time.
-    let logins_path = get_or_create_config_dir()?.join("bridge-logins.json");
-    let logins = auth::Logins::load(logins_path, &accounts);
+    let logins = auth::Logins::load(stores.logins.clone(), &accounts).await;
     tracing::info!(live = logins.len(), "saved logins restored");
+    let throttle = auth::Throttle::new();
 
     let sessions = Sessions::new();
     let unlocks = policy::Unlocks::new();
     let sweeper = sessions.clone();
     let login_sweeper = logins.clone();
+    let account_sweeper = accounts.clone();
+    let throttle_sweeper = throttle.clone();
     let unlock_sweeper = unlocks.clone();
     let presence = presence::Presence::new();
     let presence_sweeper = presence.clone();
     let watches = watch::Watches::new();
     let watch_sweeper = watches.clone();
-    // What the bridge keeps, in the local directory (ADR 17). The list is
-    // read now rather than by the first request that asks: a file that
-    // cannot be read says so at start.
-    let stores = store::Stores::local(&get_or_create_config_dir()?);
-    let entries = stores.servers.list().await?.len();
-    tracing::info!(entries, "server list loaded");
     let trash_sweeper = stores.trash.clone();
     let metrics_pruner = stores.metrics.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         loop {
             tick.tick().await;
-            let expired = login_sweeper.sweep();
-            // File work, fsync included: off the async workers.
-            let flusher = login_sweeper.clone();
-            if let Err(e) = tokio::task::spawn_blocking(move || flusher.flush()).await {
-                tracing::warn!(error = %e, "the logins flush did not finish");
-            }
+            let expired = login_sweeper.sweep(&account_sweeper);
+            login_sweeper.flush().await;
             if expired > 0 {
                 tracing::info!(expired, "swept idle logins");
+            }
+            throttle_sweeper.sweep();
+            match account_sweeper.purge_expired_invites().await {
+                Ok(0) => {}
+                Ok(purged) => tracing::info!(purged, "purged expired invitations"),
+                Err(e) => tracing::warn!(error = %e, "the expired invitations could not be purged"),
             }
             // Five quiet minutes: each client that went is a line, with how
             // many are left.
@@ -480,6 +489,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         servers: stores.servers,
         trash: stores.trash,
         metrics: stores.metrics,
+        throttle,
+        setup,
     });
     // With the peer's address, which the audit log records beside whatever
     // a proxy wrote in `X-Forwarded-For`.

@@ -112,7 +112,7 @@ pub use bitmap::{BitOpKind, BitmapInfo, bit_field, bit_op, bitmap_info, set_bit}
 pub use bridge::{
     BridgeConn, BridgeError, BridgeErrorKind, BridgeReply, BridgeRequest, BridgeServerStore, BridgeStorage,
     BridgeTransport, BridgeTrashEntry, DESCRIBED_COMMANDS, PipelineSpec, WatchBatch, WatchItem, WatchKind, WatchOpened,
-    bridge_server_store, bridge_storage, bridge_transport, describe_commands, describe_packed_command,
+    bridge_page_url, bridge_server_store, bridge_storage, bridge_transport, describe_commands, describe_packed_command,
     set_bridge_server_store, set_bridge_storage, set_bridge_transport, sign_out_of_bridge, signed_in_to_bridge,
 };
 /// What stands in for redis-rs's `Cmd::query_async` / `Pipeline::query_async`

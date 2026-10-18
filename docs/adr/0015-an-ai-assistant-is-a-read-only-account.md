@@ -2,6 +2,10 @@
 
 Date: 2026-09-26 · Status: accepted
 
+Amended by ADR 17 (2026-10-18): tokens are issued and revoked on the
+account page and kept as their SHA-256 in the account store; the users
+file's `tokens` and `zedis-bridge token new` are gone.
+
 ## Context
 
 An AI coding assistant asked about a Redis server wants to look: scan a

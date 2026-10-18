@@ -58,19 +58,25 @@ Zedis web build $VERSION ($TARGET)
 
 Run:
 
-  ZEDIS_BRIDGE_USERS="alice@secret,bob@hunter2" ./zedis-bridge
+  ./zedis-bridge
 
-then open http://127.0.0.1:7379/ and sign in. The accounts are required:
-the bridge does not start without them. Entries are comma-separated and
-split at the first @, so a name cannot contain @ (or :), and a password
-cannot contain a comma. Scripts send HTTP Basic (curl -u alice:secret).
+then open http://127.0.0.1:7379/. Accounts are registered, not configured.
+Until there is an administrator the bridge prints a setup token in its log
+and writes it to setup-token in its data directory (ZEDIS_BRIDGE_SETUP_TOKEN
+chooses one in advance); the page asks for it to create the administrator,
+who then invites everyone else from the account page, each with a role
+(administrator, full or read-only) and the shared servers it sees. Scripts
+send HTTP Basic (curl -u alice:...). When every administrator is lost,
+./zedis-bridge setup-token makes a new setup token. Accounts set the old
+way, in ZEDIS_BRIDGE_USERS or --users-file, are imported once into an empty
+store, none of them as administrator.
 
 A server entry belongs to the account that added it and nobody else sees
 it, unless its "Shared" box is ticked, which makes it everyone's. Entries
 with no owner — a list written before there were owners — are shared.
-There are no roles: any account may edit or delete a shared entry.
-Passwords are guessable: put a rate limit in front if the bridge is
-reachable beyond your own network.
+Any account that may write and can see a shared entry may edit or delete
+it. Failed sign-ins are throttled per address; still, put a rate limit in
+front if the bridge is reachable beyond your own network.
 
 --listen 0.0.0.0:7379 binds beyond loopback; do that only behind TLS. The
 login cookie is Secure by default, so over plain http the login visibly

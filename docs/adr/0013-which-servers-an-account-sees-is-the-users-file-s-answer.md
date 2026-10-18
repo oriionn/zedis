@@ -2,6 +2,10 @@
 
 Date: 2026-09-26 · Status: accepted
 
+Amended by ADR 17 (2026-10-18): the rules are the account's, set by an
+administrator on the invitation and the account page, instead of the users
+file's; what they mean is unchanged.
+
 ## Context
 
 An entry on the bridge is private (its owner's) or shared (everyone's), and

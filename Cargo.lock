@@ -11876,6 +11876,7 @@ dependencies = [
 name = "zedis-bridge"
 version = "0.14.0"
 dependencies = [
+ "argon2",
  "axum",
  "base64 0.23.1",
  "flate2",

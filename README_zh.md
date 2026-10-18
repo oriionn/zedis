@@ -143,14 +143,14 @@ cargo install --git https://github.com/vicanso/zedis --locked zedis-gui
 
 ```bash
 docker run -d --name zedis-web -p 7379:7379 \
-  -e ZEDIS_BRIDGE_USERS="admin@change-me" \
   -v zedis-data:/data \
   vicanso/zedis-web:latest --listen 0.0.0.0:7379 --insecure-cookie
+docker logs zedis-web 2>&1 | grep "setup token"
 ```
 
-打开 <http://localhost:7379>，用 `admin` / `change-me` 登录。这条命令只适合纯 http 试用：正式使用请去掉 `--insecure-cookie`，并在前面加上 HTTPS。
+打开 <http://localhost:7379>，用日志里的初始化令牌创建管理员。这条命令只适合纯 http 试用：正式使用请去掉 `--insecure-cookie`，并在前面加上 HTTPS。
 
-- **账号、角色、SSO** —— 必须登录；条目默认私有；账号可以只读或只能看到部分服务器；身份可以来自反向代理写入的请求头。
+- **账号、角色、SSO** —— 第一个账号是管理员，其他人凭邀请注册；条目默认私有；账号可以只读或只能看到部分服务器；身份可以来自反向代理写入的请求头。
 - **生产环境默认锁写** —— Prod 每次解锁 15 分钟；审计日志记录登录、条目变更和每条经确认的命令。
 - **MCP** —— Claude Code、Cursor 或任何 MCP 客户端以只读账号读 Redis，每次调用都留审计。
 

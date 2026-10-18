@@ -323,6 +323,62 @@ pub enum Event {
         key: String,
         db: usize,
     },
+    /// The setup token seated an administrator (ADR 17): a new account, or
+    /// an existing one `promoted`.
+    SetupCompleted {
+        promoted: bool,
+    },
+    /// An invitation made: to register an account with `role`, or to set
+    /// `target`'s password anew.
+    InviteCreated {
+        invite: String,
+        kind: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        role: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        proxy: bool,
+        expires_at: u64,
+    },
+    InviteRevoked {
+        invite: String,
+    },
+    /// An account registered with an invitation; `account` is the new one.
+    AccountRegistered {
+        invite: String,
+        role: &'static str,
+    },
+    /// An administrator changed `target`: setting → from, to.
+    AccountUpdated {
+        target: String,
+        changed: BTreeMap<String, Change>,
+    },
+    AccountDeleted {
+        target: String,
+    },
+    /// `target`'s password changed: by its owner, or with a reset link.
+    PasswordChanged {
+        target: String,
+        reset: bool,
+    },
+    /// An MCP token issued for `target` (ADR 15), named — never itself.
+    TokenIssued {
+        target: String,
+        token: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        expires_at: Option<u64>,
+    },
+    TokenRevoked {
+        target: String,
+        token: String,
+    },
+    /// An account read from a users file, once, on the upgrade to
+    /// registration.
+    AccountImported {
+        target: String,
+        role: &'static str,
+    },
     /// A tool call at the MCP entry point (ADR 15) — every one, whatever it
     /// read. The other lines keep what a person did that mattered; this
     /// door admits a program acting for someone, and reads are the whole
@@ -358,6 +414,16 @@ impl Event {
             Event::Locked { .. } => "locked",
             Event::TrashPut { .. } => "trash_put",
             Event::TrashRemoved { .. } => "trash_removed",
+            Event::SetupCompleted { .. } => "setup_completed",
+            Event::InviteCreated { .. } => "invite_created",
+            Event::InviteRevoked { .. } => "invite_revoked",
+            Event::AccountRegistered { .. } => "account_registered",
+            Event::AccountUpdated { .. } => "account_updated",
+            Event::AccountDeleted { .. } => "account_deleted",
+            Event::PasswordChanged { .. } => "password_changed",
+            Event::TokenIssued { .. } => "token_issued",
+            Event::TokenRevoked { .. } => "token_revoked",
+            Event::AccountImported { .. } => "account_imported",
             Event::Tool { .. } => "tool",
         }
     }
@@ -718,6 +784,46 @@ mod tests {
                 server: at(),
                 key: "user:1".to_string(),
                 db: 0,
+            },
+            Event::SetupCompleted { promoted: false },
+            Event::InviteCreated {
+                invite: "i".to_string(),
+                kind: "register",
+                role: Some("full"),
+                target: None,
+                proxy: false,
+                expires_at: 0,
+            },
+            Event::InviteRevoked {
+                invite: "i".to_string(),
+            },
+            Event::AccountRegistered {
+                invite: "i".to_string(),
+                role: "full",
+            },
+            Event::AccountUpdated {
+                target: "bob".to_string(),
+                changed: BTreeMap::new(),
+            },
+            Event::AccountDeleted {
+                target: "bob".to_string(),
+            },
+            Event::PasswordChanged {
+                target: "bob".to_string(),
+                reset: false,
+            },
+            Event::TokenIssued {
+                target: "ai".to_string(),
+                token: "claude".to_string(),
+                expires_at: None,
+            },
+            Event::TokenRevoked {
+                target: "ai".to_string(),
+                token: "claude".to_string(),
+            },
+            Event::AccountImported {
+                target: "bob".to_string(),
+                role: "full",
             },
             Event::Tool {
                 tool: "scan_keys".to_string(),

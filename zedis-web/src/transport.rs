@@ -342,6 +342,10 @@ impl BridgeTransport for HttpBridgeTransport {
         })
     }
 
+    fn page_url(&self, page: &str) -> String {
+        format!("{}/{page}", self.base_url)
+    }
+
     /// `POST /v1/logout`, then the page's own way back to the sign-in form.
     ///
     /// The bridge answers `204` whether or not it knew the login, and clears

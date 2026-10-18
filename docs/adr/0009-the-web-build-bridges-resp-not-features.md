@@ -2,6 +2,10 @@
 
 Date: 2026-09-17 · Status: accepted
 
+Amended by ADR 17 (2026-10-18): accounts are registered on the bridge — the
+first with a setup token, the rest by invitation — instead of configured in
+`ZEDIS_BRIDGE_USERS` or a users file, which are now a one-time import.
+
 ## Context
 
 gpui-kit 0.6.1 ships a real browser backend (`gpui-pre-web`: WebGPU with a WebGL2

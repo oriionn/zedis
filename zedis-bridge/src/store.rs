@@ -15,12 +15,14 @@
 //! Where the bridge keeps what it keeps (ADR 17).
 //!
 //! Each kind of data is reached through a trait here, and the routes hold an
-//! `Arc<dyn …>` of it: the server list ([`ServerStore`], records), the
-//! recycle bin ([`TrashStore`], blobs beside their metadata), the Metrics
-//! history ([`MetricsStore`], a log) and the audit log ([`AuditLog`]). The
-//! implementations are the local directory's — [`LocalServers`] below,
+//! `Arc<dyn …>` of it: the accounts and their invites ([`AccountStore`],
+//! records), the server list ([`ServerStore`], records), browser logins
+//! ([`LoginStore`], leases), the recycle bin ([`TrashStore`], blobs beside
+//! their metadata), the Metrics history ([`MetricsStore`], a log) and the
+//! audit log ([`AuditLog`]). The implementations are the local directory's
+//! — [`LocalServers`] below, `accounts::LocalAccounts`, `auth::LocalLogins`,
 //! `trash::LocalTrash`, `metrics::LocalMetrics`, `audit::LocalAuditLog` —
-//! the files they always were, in the formats they always had. A SQL store
+//! files beside the server list. A SQL store
 //! is another `impl` of the same traits, chosen at start-up; nothing that
 //! calls them changes.
 //!
@@ -29,10 +31,13 @@
 //! themselves. Arguments are owned and the futures `'static`, the shape
 //! `zedis_connection::bridge` gives the page's side of the same data.
 
+use crate::accounts::{AccountRecord, InviteRecord, LocalAccounts};
+use crate::auth::{LocalLogins, Login};
 use crate::metrics::{self, LocalMetrics};
 use crate::trash::{self, LocalTrash, Meta, NewEntry};
 use futures::future::BoxFuture;
 use serde_json::value::RawValue;
+use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
@@ -59,6 +64,31 @@ pub trait ServerStore: Send + Sync {
     /// entry, for `None` — if that entry is still exactly `expected`. Answers
     /// whether it was: an entry someone changed in the meantime is theirs.
     fn swap(&self, expected: RedisServer, replacement: Option<RedisServer>) -> StoreFuture<bool>;
+}
+
+/// The accounts (ADR 17): registered, each with its role, server rules and
+/// MCP tokens, and the invitations that register the next ones. Records,
+/// changed one at a time; the bridge keeps them in memory in front
+/// (`accounts::Accounts`) and writes through.
+pub trait AccountStore: Send + Sync {
+    /// Every account and every open invitation.
+    fn load(&self) -> StoreFuture<(Vec<AccountRecord>, Vec<InviteRecord>)>;
+    /// Add `account`, or put it in place of the one with its name.
+    fn put_account(&self, account: AccountRecord) -> StoreFuture<()>;
+    fn remove_account(&self, name: String) -> StoreFuture<()>;
+    /// Add `invite`, or put it in place of the one with its id.
+    fn put_invite(&self, invite: InviteRecord) -> StoreFuture<()>;
+    fn remove_invite(&self, id: String) -> StoreFuture<()>;
+}
+
+/// Browser logins: leases, each keyed by the hash of its cookie id and
+/// carrying the credential version it was opened under. The bridge holds
+/// them in memory (`auth::Logins`) and hands the store what changed.
+pub trait LoginStore: Send + Sync {
+    /// Every saved login.
+    fn load(&self) -> StoreFuture<HashMap<String, Login>>;
+    /// Keep each `Some`, forget each `None`.
+    fn save(&self, changes: Vec<(String, Option<Login>)>) -> StoreFuture<()>;
 }
 
 /// The recycle bin of the browser build: per server, a deleted key's `DUMP`
@@ -104,6 +134,8 @@ pub trait AuditLog: Send + Sync {
 
 /// The stores a bridge starts with.
 pub struct Stores {
+    pub accounts: Arc<dyn AccountStore>,
+    pub logins: Arc<dyn LoginStore>,
     pub servers: Arc<dyn ServerStore>,
     pub trash: Arc<dyn TrashStore>,
     pub metrics: Arc<dyn MetricsStore>,
@@ -114,6 +146,8 @@ impl Stores {
     /// `/data` in the image.
     pub fn local(dir: &Path) -> Self {
         Self {
+            accounts: Arc::new(LocalAccounts::new(dir.join("bridge-accounts.json"))),
+            logins: Arc::new(LocalLogins::new(dir.join("bridge-logins.json"))),
             servers: Arc::new(LocalServers),
             trash: Arc::new(LocalTrash::new(dir.join("bridge-trash"))),
             metrics: Arc::new(LocalMetrics::new(dir.join("bridge-metrics"))),

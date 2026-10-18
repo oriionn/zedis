@@ -298,6 +298,11 @@ impl ZedisTitleBar {
         // until this was here it could not sign out either.
         if signed_in_to_bridge() {
             this.menu_with_icon(
+                format!("{}…", i18n_sidebar(cx, "account")),
+                Icon::new(gpui_kit::assets::IconName::CircleUser),
+                Box::new(MemuAction::Account),
+            )
+            .menu_with_icon(
                 i18n_sidebar(cx, "sign_out"),
                 Icon::new(CustomIconName::Power),
                 Box::new(MemuAction::SignOut),

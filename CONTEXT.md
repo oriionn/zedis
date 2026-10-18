@@ -88,11 +88,14 @@ Architecture and conventions live in `CLAUDE.md`; decisions in `docs/adr/`.
 - **Bridge** (`zedis-bridge`) — the HTTP server the browser build talks to: it
   serves the page and forwards RESP frames (ADR 9). Nothing in the browser
   speaks to Redis directly.
-- **Account** — a sign-in on the bridge (`ZEDIS_BRIDGE_USERS` or a users
-  file), required. A **read-only account** — or one whose `servers` rule says
-  `:ro` for an entry — is refused every write by the bridge, before any
-  confirmation (ADR 13); the **MCP** door admits read-only accounts only
-  (ADR 15).
+- **Account** — a sign-in on the bridge, *registered* there and kept by its
+  account store, never configured (ADR 17). Its **role** is administrator,
+  full or read-only. The first account is the **administrator**, made with
+  the one-time **setup token**; every later one comes through an
+  **invitation** (a role, server rules, an expiry, one use). A **read-only
+  account** — or one whose server rule says `:ro` for an entry — is refused
+  every write by the bridge, before any confirmation (ADR 13); the **MCP**
+  door admits read-only accounts only (ADR 15).
 - **Owner** — the account a server entry belongs to on the bridge. An entry
   without one is **shared**; someone else's private entry answers like a
   missing one (ADR 9).

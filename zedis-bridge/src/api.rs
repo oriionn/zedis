@@ -18,13 +18,14 @@
 //! The bridge holds the credentials. A caller names a server by its id and
 //! never sees a host, a password or a key (ADR 9).
 
+use crate::accounts::{Accounts, Basic, Setup};
 use crate::audit::{self, Audit, Event, Origin, ServerRef};
 use crate::presence::{Client, ClientKey, ONLINE_WINDOW, Presence};
 use crate::static_files::{Representation, WebBuild};
 use crate::store::{MetricsStore, ServerStore, TrashStore};
 use crate::trash::{NewEntry, PutError};
 use crate::watch::{Batch, WatchError, WatchKind, Watches};
-use crate::{auth, mcp, policy, resp, session::Sessions, static_files};
+use crate::{account_api, auth, mcp, policy, resp, session::Sessions, static_files};
 use axum::{
     Json, Router,
     body::{Body, Bytes},
@@ -49,7 +50,8 @@ use zedis_connection::{PipelineSpec, RedisServer, get_connection_manager, get_se
 
 #[derive(Clone)]
 pub struct AppState {
-    pub accounts: auth::Accounts,
+    /// The registered accounts (ADR 17), in memory in front of their store.
+    pub accounts: Accounts,
     pub sessions: Sessions,
     pub logins: auth::Logins,
     /// `--audit-log`: the record of what went through, or nothing.
@@ -80,6 +82,10 @@ pub struct AppState {
     pub trash: Arc<dyn TrashStore>,
     /// The browser build's Metrics history (`/v1/servers/{id}/metrics`).
     pub metrics: Arc<dyn MetricsStore>,
+    /// Failed sign-ins, setup tokens and invitation codes, per address.
+    pub throttle: auth::Throttle,
+    /// The token that seats an administrator (ADR 17).
+    pub setup: Setup,
 }
 
 /// The page and the API, under `state.base_path` when there is one.
@@ -96,7 +102,7 @@ pub struct AppState {
 /// not `/zedis/`, which is the one address the page lives at.
 pub fn router(state: AppState) -> Router {
     let at = |path: &str| format!("{}{path}", state.base_path);
-    Router::new()
+    let router = Router::new()
         .route(&at("/v1/health"), get(health))
         .route(&at("/v1/login"), post(login))
         .route(&at("/v1/logout"), post(logout))
@@ -122,7 +128,9 @@ pub fn router(state: AppState) -> Router {
         .route(
             &at("/v1/mcp"),
             post(mcp::post).get(mcp::not_allowed).delete(mcp::not_allowed),
-        )
+        );
+    // Registration and administration (ADR 17).
+    account_api::routes(router, &at)
         // On the API routes only — the page's files need no login.
         .route_layer(middleware::from_fn_with_state(state.clone(), renew_login_cookie))
         .fallback(web_asset)
@@ -211,6 +219,10 @@ pub enum ApiError {
     },
     /// What the request would change changed under it first.
     Conflict(String),
+    /// An account, an invitation or a token that is not there.
+    NotFound(String),
+    /// Too many failed attempts from this address; try later.
+    TooManyAttempts,
     Upstream(String),
 }
 
@@ -246,6 +258,14 @@ impl ApiError {
                 Some(*strictness),
             ),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, "conflict", m.clone(), None, None),
+            ApiError::NotFound(m) => (StatusCode::NOT_FOUND, "not_found", m.clone(), None, None),
+            ApiError::TooManyAttempts => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too_many_attempts",
+                "too many failed attempts from this address; try again in a quarter of an hour".to_string(),
+                None,
+                None,
+            ),
             ApiError::Upstream(m) => (StatusCode::BAD_GATEWAY, "upstream", m.clone(), None, None),
         }
     }
@@ -285,7 +305,7 @@ impl IntoResponse for ApiError {
     }
 }
 
-type ApiResult<T> = Result<T, ApiError>;
+pub(crate) type ApiResult<T> = Result<T, ApiError>;
 
 /// Who is calling: the identity the reverse proxy asserted (when there is
 /// one, and the request came from it), HTTP Basic from a script or the CLI,
@@ -312,17 +332,38 @@ pub(crate) fn authorize(state: &AppState, headers: &HeaderMap, origin: &mut Orig
         return Ok(name);
     }
     let authorization = headers.get("authorization").and_then(|v| v.to_str().ok());
-    if let Some(account) = state.accounts.account_for_header(authorization) {
-        let key = ClientKey::Basic {
-            account: account.clone(),
-            peer: origin.peer_ip,
-        };
-        note_client(state, key, &account, origin);
-        return Ok(account);
+    match state.accounts.check_basic(authorization) {
+        Basic::Accepted(account) => {
+            let attempt = auth::attempt_key(origin.peer_ip, &account);
+            if state.throttle.blocked(&attempt) {
+                return Err(ApiError::TooManyAttempts);
+            }
+            state.throttle.succeeded(&attempt);
+            let key = ClientKey::Basic {
+                account: account.clone(),
+                peer: origin.peer_ip,
+            };
+            note_client(state, key, &account, origin);
+            return Ok(account);
+        }
+        // A script's wrong password counts like the form's: Basic is the
+        // other way to guess one.
+        Basic::Refused(tried) => {
+            let attempt = auth::attempt_key(origin.peer_ip, &tried);
+            if state.throttle.blocked(&attempt) {
+                return Err(ApiError::TooManyAttempts);
+            }
+            state.throttle.failed(&attempt);
+            return Err(ApiError::Unauthorized);
+        }
+        Basic::Absent => {}
     }
     let cookie = headers.get("cookie").and_then(|v| v.to_str().ok());
     let id = auth::cookie_value(cookie).ok_or(ApiError::Unauthorized)?;
-    let account = state.logins.account(id).ok_or(ApiError::Unauthorized)?;
+    let account = state
+        .logins
+        .account(id, &state.accounts)
+        .ok_or(ApiError::Unauthorized)?;
     note_client(state, ClientKey::Browser(auth::login_key(id)), &account, origin);
     Ok(account)
 }
@@ -363,7 +404,7 @@ pub(crate) const READ_ONLY_REFUSAL: &str = "this account is read-only";
 /// The longest name a failed login, or an unknown proxy identity, is
 /// recorded under: it is whatever was typed into the box or written into
 /// the header, and the log is not the place for a pasted essay.
-const MAX_TRIED_NAME: usize = 64;
+pub(crate) const MAX_TRIED_NAME: usize = 64;
 
 /// Who is calling, for a route that *changes* something — the server list,
 /// or Redis itself. Same check as [`authorize`], plus the account's role.
@@ -392,7 +433,7 @@ fn authorize_write(
 /// ones (those with no owner; entries written before there were owners have
 /// none, so they stay everyone's) that the account's `servers` rules admit,
 /// which without rules is all of them.
-pub(crate) fn visible_to(accounts: &auth::Accounts, server: &RedisServer, account: &str) -> bool {
+pub(crate) fn visible_to(accounts: &Accounts, server: &RedisServer, account: &str) -> bool {
     match server.owner.as_deref() {
         None | Some("") => accounts.may_see_shared(account, server),
         Some(owner) => owner == account,
@@ -402,7 +443,7 @@ pub(crate) fn visible_to(accounts: &auth::Accounts, server: &RedisServer, accoun
 /// The entry `id` names, if `account` may see it. An entry that exists but
 /// is someone else's answers exactly like one that does not exist, so the
 /// routes never confirm what another account has.
-fn visible_server(accounts: &auth::Accounts, id: &str, account: &str) -> ApiResult<RedisServer> {
+fn visible_server(accounts: &Accounts, id: &str, account: &str) -> ApiResult<RedisServer> {
     get_server(id)
         .ok()
         .filter(|server| visible_to(accounts, server, account))
@@ -465,11 +506,24 @@ async fn login(
     Json(req): Json<LoginRequest>,
 ) -> ApiResult<Response> {
     let origin = Origin::new(peer, &headers);
-    if !state.accounts.accepts_password(&req.username, &req.password) {
-        let tried: String = req.username.trim().chars().take(MAX_TRIED_NAME).collect();
+    let tried: String = req.username.trim().chars().take(MAX_TRIED_NAME).collect();
+    let attempt = auth::attempt_key(origin.peer_ip, &tried);
+    if state.throttle.blocked(&attempt) {
+        state.audit.record(&tried, &origin, Event::LoginFailed);
+        return Err(ApiError::TooManyAttempts);
+    }
+    // Argon2 is slow on purpose: off the async workers.
+    let accounts = state.accounts.clone();
+    let (name, password) = (req.username.clone(), req.password.clone());
+    let accepted = tokio::task::spawn_blocking(move || accounts.accepts_password(&name, &password))
+        .await
+        .unwrap_or(false);
+    if !accepted {
+        state.throttle.failed(&attempt);
         state.audit.record(&tried, &origin, Event::LoginFailed);
         return Err(ApiError::Unauthorized);
     }
+    state.throttle.succeeded(&attempt);
     let account = req.username;
     let id = state
         .logins
@@ -2009,7 +2063,7 @@ mod base_path_tests {
 
 #[cfg(test)]
 mod server_tests {
-    use super::{RedisServer, ServerEntry, assign_owner, auth, merge_update, visible_to};
+    use super::{Accounts, RedisServer, ServerEntry, assign_owner, merge_update, visible_to};
 
     fn owned_by(owner: Option<&str>) -> RedisServer {
         RedisServer {
@@ -2019,8 +2073,8 @@ mod server_tests {
         }
     }
 
-    fn accounts(toml: &str) -> auth::Accounts {
-        auth::Accounts::from_toml(toml).expect("accounts")
+    fn accounts(toml: &str) -> Accounts {
+        Accounts::from_toml(toml).expect("accounts")
     }
 
     #[test]
@@ -2311,7 +2365,7 @@ mod mcp_auth_tests {
 
     fn state(accounts: &str) -> AppState {
         AppState {
-            accounts: auth::Accounts::from_toml(accounts).expect("accounts"),
+            accounts: Accounts::from_toml(accounts).expect("accounts"),
             sessions: Sessions::new(),
             logins: auth::Logins::new(),
             audit: Audit::off(),
@@ -2330,6 +2384,8 @@ mod mcp_auth_tests {
             metrics: Arc::new(crate::metrics::LocalMetrics::new(
                 std::env::temp_dir().join("zedis-bridge-test-metrics"),
             )),
+            throttle: auth::Throttle::new(),
+            setup: Setup::in_dir(&std::env::temp_dir().join("zedis-bridge-test-setup")),
         }
     }
 
@@ -2449,7 +2505,7 @@ mod bin_tests {
         let trash = crate::trash::LocalTrash::new(dir.join("bridge-trash"));
         let audit_path = dir.join("audit.log");
         let state = |writes: bool| AppState {
-            accounts: auth::Accounts::from_toml("[[users]]\nname = \"ops\"\npassword = \"secret\"").expect("accounts"),
+            accounts: Accounts::from_toml("[[users]]\nname = \"ops\"\npassword = \"secret\"").expect("accounts"),
             sessions: Sessions::new(),
             logins: auth::Logins::new(),
             audit: Audit::open(&audit_path, writes).expect("audit"),
@@ -2464,6 +2520,8 @@ mod bin_tests {
             servers: Arc::new(crate::store::LocalServers),
             trash: Arc::new(trash.clone()),
             metrics: Arc::new(crate::metrics::LocalMetrics::new(dir.join("bridge-metrics"))),
+            throttle: auth::Throttle::new(),
+            setup: Setup::in_dir(&dir),
         };
         let peer: SocketAddr = "10.0.0.7:5000".parse().expect("address");
         let mut headers = HeaderMap::new();

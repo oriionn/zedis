@@ -3,8 +3,9 @@
 # The web build of Zedis as one image (ADR 9): `zedis-bridge` with the browser
 # bundle compiled into it. Not the desktop app — that one needs a window.
 #
-#   docker run -p 7379:7379 -v zedis-data:/data \
-#     -e ZEDIS_BRIDGE_USERS="alice@secret,bob@hunter2" vicanso/zedis-web
+#   docker run -p 7379:7379 -v zedis-data:/data vicanso/zedis-web
+#
+# and create the administrator on the page with the setup token it logs.
 #
 # Self-contained on purpose: `docker build .` on a fresh clone produces the
 # image, with no bundle built beforehand. The price is that each architecture
@@ -90,7 +91,7 @@ RUN scripts/web-bundle.sh --release \
 FROM gcr.io/distroless/cc-debian12:nonroot
 
 COPY --from=builder /zedis-bridge /usr/local/bin/zedis-bridge
-# The server list, its key file and the saved logins. Owned by the image's
+# The server list, its key file, the accounts and the saved logins. Owned by the image's
 # user, because a fresh named volume takes its ownership from this directory.
 COPY --from=builder --chown=nonroot:nonroot /data /data
 
@@ -99,9 +100,11 @@ VOLUME ["/data"]
 EXPOSE 7379
 
 # Every interface, because inside a container loopback reaches nobody; what is
-# published, and to whom, is `docker run -p`'s decision. `ZEDIS_BRIDGE_USERS`
-# is required — the bridge does not start without accounts. Behind plain http
-# add `--insecure-cookie`, or the login cookie (Secure by default) is dropped.
+# published, and to whom, is `docker run -p`'s decision. Accounts are
+# registered on the page: until there is an administrator the bridge logs a
+# setup token and writes it to /data/setup-token (`ZEDIS_BRIDGE_SETUP_TOKEN`
+# chooses one in advance). Behind plain http add `--insecure-cookie`, or the
+# login cookie (Secure by default) is dropped.
 # `ZEDIS_BRIDGE_BASE_PATH=/zedis` mounts everything under that path, for a host
 # name shared with other applications — an environment variable because
 # arguments to `docker run` replace this whole CMD.

@@ -29,7 +29,9 @@
 //!   in the danger confirm dialog, `{base}_desc` in the settings page,
 //!   `{base}_hint` / `{base}_confirm` in the key-operation dialog).
 //!   The match is deliberately loose — a key is only flagged when
-//!   nothing in the source could possibly produce it.
+//!   nothing in the source could possibly produce it. The bridge's own
+//!   pages (`zedis-web/www/*.html` / `*.js`, the `[web_account]` section,
+//!   ADR 17) count as source too: their keys are quoted there.
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
@@ -172,9 +174,25 @@ fn push_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// The bridge's pages: the top of `zedis-web/www` only — `wasm/` below it
+/// is generated glue whose thousands of strings would make any key look
+/// used.
+fn push_page_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && matches!(path.extension().and_then(|e| e.to_str()), Some("html" | "js")) {
+            out.push(path);
+        }
+    }
+}
+
 /// All string literals in the app and sub-crate sources. `crates/*/src`
 /// is included because key names originate there too (`danger.rs`
-/// `i18n_key()`, `zedis-core` `CommandStatus::i18n_key`, …).
+/// `i18n_key()`, `zedis-core` `CommandStatus::i18n_key`, …), and so are
+/// the bridge's pages, which read the `[web_account]` keys.
 fn source_literals() -> HashSet<String> {
     let root = repo_root();
     let mut files = Vec::new();
@@ -185,6 +203,9 @@ fn source_literals() -> HashSet<String> {
         }
     }
     assert!(files.len() > 50, "source walk looks broken: {} files", files.len());
+    let pages_before = files.len();
+    push_page_files(&root.join("zedis-web/www"), &mut files);
+    assert!(files.len() > pages_before, "the bridge's pages were not found");
 
     let mut literals = HashSet::new();
     for file in files {

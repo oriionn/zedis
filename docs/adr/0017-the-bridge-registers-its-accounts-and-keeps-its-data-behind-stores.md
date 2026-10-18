@@ -59,7 +59,7 @@ No account is configured any more. Each one is **registered**, and kept in
 the account store with its role, its server rules and its MCP tokens.
 
 **The first account is the administrator, and taking that seat needs the
-setup token.** While the store holds no account, the bridge mints a
+setup token.** While the store holds no administrator, the bridge mints a
 one-time token, prints it in its log and writes it to `setup-token`
 (`0600`) beside its data — or takes `ZEDIS_BRIDGE_SETUP_TOKEN` from an
 unattended install that wants to know it in advance — and the page offers
@@ -202,8 +202,8 @@ cannot reach them, rather than gated inside code it shares:
 | Where | What | Why the desktop cannot see it |
 | --- | --- | --- |
 | `zedis-bridge` | accounts, setup, invites, registration, every store | a native server the desktop never links |
-| `zedis-web/www` | the setup, sign-up, sign-in, account and administration pages, as HTML beside today's sign-in form | outside the GUI crate and outside the wasm |
-| GUI crate | one entry in the title-bar menu — *Account…* when signed in, *Administration…* for an administrator — drawn by an ungated seam like `signed_in_to_bridge()`, which sends the page to the HTML | no bridge transport on the desktop, so nothing is drawn; a native test holds that |
+| `zedis-web/www` | the setup and sign-up forms beside the sign-in form (`index.html`), and the account page with its administration section (`account.html`) | outside the GUI crate and outside the wasm |
+| GUI crate | one entry in the title-bar menu, *Account…*, drawn while `signed_in_to_bridge()` and opened through the ungated `bridge_page_url` seam, which sends the page to the HTML | no bridge transport on the desktop, so nothing is drawn and the seam answers `None`; a native test holds that |
 | `zedis-db` | the page's scripts, tags, notes and favorites persist through `mem_store` backed by `BridgeStorage` | `mem_store` is compiled for wasm only; the desktop's redb is untouched |
 | `zedis-connection` | `encrypt_bytes` / `decrypt_bytes` for the bin's payloads, beside the string forms | additions only, native only; the desktop's code is not touched |
 
@@ -230,6 +230,17 @@ give the desktop the same results before and after each step, and
    tag (which is why they wait for this step rather than move twice); the
    setup token; registration; sign-in on hashed passwords; the account and
    administration pages; the import from the users file; the audit lines.
+   Done, with three changes to the plan: the menu has one item, *Account…*,
+   for every account, and administration is a section of that page shown to
+   administrators (two items would have been two seams for one page); a
+   forgotten password is a one-use reset link of the invitation kind, made
+   by an administrator; and an account without a password while no proxy
+   is configured is a warning at startup rather than a refusal, since a
+   registered account can outlive the proxy setting and an administrator
+   can give it a reset link. Invitation codes travel only in POST bodies and
+   in a link's `#` fragment, which no request carries. A deleted account's
+   private server entries stay on the bridge, seen by nobody; handing them
+   over is left for later.
 4. The page's data: scripts (private or shared, audited), key tags and
    notes, per-account favorites, recent keys and preferences.
 5. A SQL implementation when a deployment asks for more than one process

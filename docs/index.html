@@ -422,11 +422,11 @@
             <div class="install-card">
               <h3>Browser (self-hosted)</h3>
               <div class="cmd-box">
-                <code id="cmd-docker">docker run -p 7379:7379 -e ZEDIS_BRIDGE_USERS=admin@change-me -v zedis-data:/data vicanso/zedis-web:latest --listen 0.0.0.0:7379 --insecure-cookie</code>
+                <code id="cmd-docker">docker run -p 7379:7379 -v zedis-data:/data vicanso/zedis-web:latest --listen 0.0.0.0:7379 --insecure-cookie</code>
                 <button type="button" class="copy-btn" data-copy="cmd-docker">Copy</button>
               </div>
               <p class="install-alt">
-                Open <code>localhost:7379</code> and sign in as <code>admin</code> / <code>change-me</code>. Beyond a trial, drop
+                Open <code>localhost:7379</code> and create the administrator with the setup token the command prints. Beyond a trial, drop
                 <code>--insecure-cookie</code> and put HTTPS in front &mdash; see the
                 <a href="https://github.com/vicanso/zedis/blob/main/docs/WEB.md" target="_blank" rel="noopener"
                   >Web version</a

@@ -1,0 +1,424 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Zedis</title>
+<!-- Relative, like every address on this page: the bridge may live under a
+     base path, and `/` belongs to the neighbours. -->
+<link rel="icon" type="image/png" href="./assets/icon.png" />
+<style>
+  :root { color-scheme: light dark; --line: #8883; --bad: #cf222e; --good: #3fb950; --muted: #9da7b3; }
+  html, body { margin: 0; background: #1e1e1e; }
+  body { font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; color: #ddd; }
+  main { max-width: 64rem; margin: 2rem auto; padding: 0 1rem; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: .5rem 1rem; margin-bottom: 1.5rem; }
+  header h1 { font-size: 1.25rem; margin: 0; }
+  header .who { color: var(--muted); }
+  header nav { margin-left: auto; display: flex; gap: .5rem; align-items: center; }
+  section { border: 1px solid var(--line); border-radius: .5rem; padding: 1rem 1.25rem; margin-bottom: 1.25rem; }
+  h2 { font-size: 1rem; margin: 0 0 .75rem; }
+  h3 { font-size: .9rem; margin: 1.25rem 0 .5rem; }
+  p.note { margin: 0 0 .75rem; color: var(--muted); font-size: .85rem; }
+  form.row { display: flex; flex-wrap: wrap; gap: .75rem; align-items: flex-end; }
+  label { display: block; }
+  label span { display: block; margin-bottom: .25rem; font-size: .8rem; color: var(--muted); }
+  label.check { display: flex; align-items: center; gap: .4rem; }
+  label.check span { margin: 0; color: inherit; font-size: inherit; white-space: nowrap; }
+  input, select, textarea { box-sizing: border-box; padding: .4rem .5rem; border: 1px solid var(--line); border-radius: .375rem;
+                            background: transparent; color: inherit; font: inherit; }
+  label.check input { width: auto; }
+  textarea { width: 100%; min-width: 12rem; font-family: ui-monospace, monospace; font-size: .85rem; resize: vertical; }
+  button { padding: .4rem .9rem; border: 1px solid var(--line); border-radius: .375rem; background: transparent; color: inherit;
+           font: inherit; cursor: pointer; white-space: nowrap; }
+  button.primary { border-color: #1f6feb; background: #1f6feb; color: #fff; }
+  button.danger { color: #ff7b72; }
+  button:disabled { opacity: .5; cursor: default; }
+  a { color: #58a6ff; }
+  table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+  th, td { text-align: left; padding: .45rem .5rem; border-top: 1px solid var(--line); vertical-align: top; }
+  th { font-weight: 500; color: var(--muted); border-top: 0; }
+  td .actions { display: flex; flex-wrap: wrap; gap: .35rem; }
+  .muted { color: var(--muted); }
+  .msg { margin-top: .6rem; min-height: 1.2em; white-space: pre-wrap; font-size: .85rem; }
+  .bad { color: var(--bad); }
+  .good { color: var(--good); }
+  .shown { margin-top: .75rem; padding: .75rem; border: 1px dashed #d29922; border-radius: .375rem; }
+  .shown input { width: 100%; font-family: ui-monospace, monospace; }
+  .shown .copy { margin-top: .5rem; display: flex; gap: .5rem; align-items: center; }
+  .tokens li { display: flex; flex-wrap: wrap; gap: .25rem .5rem; align-items: center; margin-bottom: .35rem; }
+  .tokens { margin: 0 0 .35rem; padding: 0; list-style: none; }
+  td.token-cell { min-width: 14rem; }
+  button.small { padding: .15rem .5rem; font-size: .8rem; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main id="page" hidden>
+  <header>
+    <h1 data-i18n="account_title">Account</h1>
+    <span class="who" id="who"></span>
+    <nav>
+      <a href="./" data-i18n="back_to_app">Back to Zedis</a>
+      <button id="sign-out" type="button" data-i18n="sign_out">Sign out</button>
+    </nav>
+  </header>
+
+  <section id="password-section">
+    <h2 data-i18n="password_section">Password</h2>
+    <p class="note" id="proxy-note" data-i18n="proxy_no_password" hidden></p>
+    <form id="password-form" class="row" autocomplete="on">
+      <input type="text" name="username" id="password-user" autocomplete="username" hidden />
+      <label><span data-i18n="current_password">Current password</span>
+        <input id="password-current" type="password" autocomplete="current-password" required /></label>
+      <label><span data-i18n="new_password">New password</span>
+        <input id="password-new" type="password" autocomplete="new-password" required /></label>
+      <label><span data-i18n="repeat_password">Repeat the password</span>
+        <input id="password-confirm" type="password" autocomplete="new-password" required /></label>
+      <button id="password-go" class="primary" type="submit" data-i18n="change_password">Change the password</button>
+    </form>
+    <div class="msg" id="password-msg"></div>
+  </section>
+
+  <section id="tokens-section" hidden>
+    <h2 data-i18n="tokens_section">MCP tokens</h2>
+    <p class="note" data-i18n="tokens_intro"></p>
+    <ul class="tokens" id="own-tokens"></ul>
+    <form id="token-form" class="row">
+      <label><span data-i18n="token_name">Name</span><input id="token-name" type="text" required /></label>
+      <label><span data-i18n="token_expires">Expires (optional)</span><input id="token-expires" type="date" /></label>
+      <button class="primary" type="submit" data-i18n="token_issue">Issue a token</button>
+    </form>
+    <div class="msg" id="token-msg"></div>
+  </section>
+
+  <!-- What is shown once: a token, or a link. -->
+  <div id="shown" class="shown" hidden>
+    <div id="shown-text"></div>
+    <div class="copy">
+      <input id="shown-value" type="text" readonly />
+      <button id="shown-copy" type="button" data-i18n="copy">Copy</button>
+    </div>
+  </div>
+
+  <section id="admin-section" hidden>
+    <h2 data-i18n="accounts_section">Accounts</h2>
+    <p class="note" data-i18n="servers_hint"></p>
+    <table>
+      <thead><tr>
+        <th data-i18n="col_name">Name</th><th data-i18n="col_role">Role</th><th data-i18n="col_servers">Servers</th>
+        <th data-i18n="col_tokens">Tokens</th><th data-i18n="col_state">State</th><th></th>
+      </tr></thead>
+      <tbody id="accounts"></tbody>
+    </table>
+    <div class="msg" id="accounts-msg"></div>
+
+    <h3 data-i18n="invites_section">Invitations</h3>
+    <form id="invite-form" class="row">
+      <label><span data-i18n="col_role">Role</span><select id="invite-role"></select></label>
+      <label style="flex: 1"><span data-i18n="col_servers">Servers</span>
+        <textarea id="invite-servers" rows="1" data-i18n-placeholder="servers_all"></textarea></label>
+      <label><span data-i18n="invite_days">Valid for (days)</span>
+        <input id="invite-days" type="number" min="1" max="90" value="7" style="width: 6rem" /></label>
+      <label class="check" id="invite-proxy-row" hidden>
+        <input id="invite-proxy" type="checkbox" /><span data-i18n="invite_proxy">Signs in through the proxy</span></label>
+      <button class="primary" type="submit" data-i18n="invite_create">Create an invitation</button>
+    </form>
+    <div class="msg" id="invites-msg"></div>
+    <table>
+      <thead><tr>
+        <th data-i18n="col_invitation">Invitation</th><th data-i18n="col_expires">Expires</th><th data-i18n="col_by">By</th><th></th>
+      </tr></thead>
+      <tbody id="invites"></tbody>
+    </table>
+  </section>
+</main>
+<main id="signed-out" hidden>
+  <p data-i18n="not_signed_in">You are not signed in.</p>
+  <a href="./" data-i18n="back_to_app">Back to Zedis</a>
+</main>
+
+<script type="module">
+  import { api, send, loadStrings, localize, failure, when, el, root, roleKey } from "./pages.js";
+
+  const $ = (id) => document.getElementById(id);
+  const { locale, t } = await loadStrings();
+  localize(t);
+  const ROLES = ["admin", "full", "read_only"];
+  const roleName = (role) => t(roleKey(role));
+
+  function say(id, text, good = false) {
+    $(id).textContent = text;
+    $(id).className = `msg ${good ? "good" : "bad"}`;
+  }
+
+  // A token or a link: shown once, with a way to copy it.
+  function showOnce(text, value) {
+    $("shown-text").textContent = text;
+    $("shown-value").value = value;
+    $("shown").hidden = false;
+    $("shown").scrollIntoView({ block: "nearest" });
+    $("shown-value").select();
+  }
+  $("shown-copy").onclick = async () => {
+    try {
+      await navigator.clipboard.writeText($("shown-value").value);
+      $("shown-copy").textContent = t("copied");
+    } catch {
+      // No clipboard on a plain-http page: the value is selected to copy by hand.
+      $("shown-value").select();
+    }
+  };
+
+  const linkFor = (code) => `${root}/#invite=${code}`;
+  // One rule a line; nothing at all is every shared entry.
+  const rulesOf = (text) => {
+    const rules = text.split(/[\n,]/).map((r) => r.trim()).filter(Boolean);
+    return rules.length ? rules : null;
+  };
+
+  const res = await api("/v1/account");
+  if (!res.ok) {
+    $("signed-out").hidden = false;
+    throw new Error("not signed in");
+  }
+  const me = await res.json();
+  $("who").textContent = t("signed_in_as", { name: me.name, role: roleName(me.role) });
+  $("page").hidden = false;
+
+  $("sign-out").onclick = async () => {
+    await api("/v1/logout", { method: "POST" });
+    window.location.href = "./";
+  };
+
+  // ---- password -----------------------------------------------------------
+  if (me.has_password) {
+    $("password-user").value = me.name;
+  } else {
+    $("password-form").hidden = true;
+    $("proxy-note").hidden = false;
+  }
+  $("password-form").onsubmit = async (event) => {
+    event.preventDefault();
+    const fresh = $("password-new").value;
+    if ([...fresh].length < 8) return say("password-msg", t("password_short"));
+    if (fresh !== $("password-confirm").value) return say("password-msg", t("passwords_differ"));
+    $("password-go").disabled = true;
+    try {
+      const res = await send("POST", "/v1/account/password", { current: $("password-current").value, new: fresh });
+      if (!res.ok) {
+        const known = { 403: "current_password_wrong", 429: "too_many_attempts" }[res.status];
+        return say("password-msg", known ? t(known) : t("error_generic", { error: await failure(res) }));
+      }
+      for (const id of ["password-current", "password-new", "password-confirm"]) $(id).value = "";
+      say("password-msg", t("password_changed"), true);
+    } finally {
+      $("password-go").disabled = false;
+    }
+  };
+
+  // ---- one's own tokens ---------------------------------------------------
+  function tokenItems(list, tokens, revoke) {
+    list.replaceChildren();
+    if (!tokens.length) list.append(el("li", t("token_none"), { class: "muted" }));
+    for (const token of tokens) {
+      const item = el("li");
+      const expires = token.expires_at ? when(token.expires_at, locale) : t("expires_never");
+      item.append(el("span", token.name), el("span", `· ${t("col_expires")}: ${expires}`, { class: "muted" }));
+      const button = el("button", t("revoke"), { type: "button", class: "danger small" });
+      button.onclick = () => revoke(token.name);
+      item.append(button);
+      list.append(item);
+    }
+  }
+
+  async function reloadOwnTokens() {
+    const res = await api("/v1/account");
+    if (res.ok) tokenItems($("own-tokens"), (await res.json()).tokens, revokeOwn);
+  }
+
+  async function revokeOwn(name) {
+    const res = await api(`/v1/account/tokens/${encodeURIComponent(name)}`, { method: "DELETE" });
+    if (!res.ok) return say("token-msg", t("error_generic", { error: await failure(res) }));
+    await reloadOwnTokens();
+  }
+
+  if (me.role === "read_only") {
+    $("tokens-section").hidden = false;
+    tokenItems($("own-tokens"), me.tokens, revokeOwn);
+    $("token-form").onsubmit = async (event) => {
+      event.preventDefault();
+      const res = await send("POST", "/v1/account/tokens", {
+        name: $("token-name").value.trim(),
+        expires: $("token-expires").value || null,
+      });
+      if (!res.ok) {
+        const known = { 409: "token_name_taken" }[res.status];
+        return say("token-msg", known ? t(known) : t("error_generic", { error: await failure(res) }));
+      }
+      showOnce(t("token_shown_once"), (await res.json()).token);
+      $("token-name").value = "";
+      say("token-msg", "");
+      await reloadOwnTokens();
+    };
+  }
+
+  // ---- administration -----------------------------------------------------
+  function roleSelect(current) {
+    const select = el("select");
+    for (const role of ROLES) {
+      const option = el("option", roleName(role), { value: role });
+      if (role === current) option.selected = true;
+      select.append(option);
+    }
+    return select;
+  }
+
+  async function adminCall(method, path, body, msg) {
+    const res = await send(method, path, body);
+    if (!res.ok) {
+      const error = await failure(res);
+      const known = { 403: "admins_only" }[res.status];
+      say(msg, known ? t(known) : t("error_generic", { error }));
+      return null;
+    }
+    return res.status === 204 ? {} : res.json();
+  }
+
+  function accountRow(account) {
+    const row = el("tr");
+    const name = el("td");
+    name.append(el("div", account.name));
+    name.append(el("div", t("created", { date: when(account.created_at, locale) }), { class: "muted" }));
+    if (!account.has_password) name.append(el("div", t("proxy_account"), { class: "muted" }));
+
+    const role = roleSelect(account.role);
+    const servers = el("textarea", (account.servers || []).join("\n"), { rows: "2", placeholder: t("servers_all") });
+    const disabled = el("input", null, { type: "checkbox" });
+    disabled.checked = account.disabled;
+    const state = el("label", null, { class: "check" });
+    state.append(disabled, el("span", t("disabled")));
+
+    const tokens = el("ul", null, { class: "tokens" });
+    const path = `/v1/admin/accounts/${encodeURIComponent(account.name)}`;
+    tokenItems(tokens, account.tokens, async (token) => {
+      if (await adminCall("DELETE", `${path}/tokens/${encodeURIComponent(token)}`, undefined, "accounts-msg")) {
+        await loadAccounts();
+      }
+    });
+    const tokenCell = el("td", null, { class: "token-cell" });
+    tokenCell.append(tokens);
+    if (account.role === "read_only") {
+      const issue = el("button", t("token_issue_for"), { type: "button" });
+      issue.onclick = async () => {
+        const label = prompt(t("token_name"));
+        if (!label) return;
+        const made = await adminCall("POST", `${path}/tokens`, { name: label.trim(), expires: null }, "accounts-msg");
+        if (made) {
+          showOnce(t("token_shown_once"), made.token);
+          await loadAccounts();
+        }
+      };
+      tokenCell.append(issue);
+    }
+
+    const actions = el("div", null, { class: "actions" });
+    const save = el("button", t("save"), { type: "button", class: "primary" });
+    save.onclick = async () => {
+      const updated = await adminCall(
+        "PATCH",
+        path,
+        { role: role.value, servers: rulesOf(servers.value), disabled: disabled.checked },
+        "accounts-msg",
+      );
+      if (updated) {
+        say("accounts-msg", t("saved", { name: account.name }), true);
+        await loadAccounts();
+      }
+    };
+    const reset = el("button", t("reset_password"), { type: "button" });
+    reset.onclick = async () => {
+      const made = await adminCall("POST", `${path}/reset`, {}, "accounts-msg");
+      if (made) showOnce(t("reset_link_made", { name: account.name, date: when(made.expires_at, locale) }), linkFor(made.code));
+    };
+    const remove = el("button", t("delete"), { type: "button", class: "danger" });
+    remove.onclick = async () => {
+      if (!confirm(t("delete_confirm", { name: account.name }))) return;
+      if (await adminCall("DELETE", path, undefined, "accounts-msg")) {
+        say("accounts-msg", t("deleted", { name: account.name }), true);
+        await loadAccounts();
+      }
+    };
+    actions.append(save, reset, remove);
+
+    for (const cell of [name, el("td"), el("td"), tokenCell, el("td"), el("td")]) row.append(cell);
+    row.children[1].append(role);
+    row.children[2].append(servers);
+    row.children[4].append(state);
+    row.children[5].append(actions);
+    return row;
+  }
+
+  async function loadAccounts() {
+    const accounts = await adminCall("GET", "/v1/admin/accounts", undefined, "accounts-msg");
+    if (accounts) $("accounts").replaceChildren(...accounts.map(accountRow));
+  }
+
+  function inviteRow(invite) {
+    const row = el("tr");
+    const what =
+      invite.kind === "reset"
+        ? t("invite_kind_reset", { name: invite.account })
+        : t(invite.proxy ? "invite_kind_proxy" : "invite_kind_register", { role: roleName(invite.role) });
+    const revoke = el("button", t("revoke"), { type: "button", class: "danger" });
+    revoke.onclick = async () => {
+      if (await adminCall("DELETE", `/v1/admin/invites/${encodeURIComponent(invite.id)}`, undefined, "invites-msg")) {
+        await loadInvites();
+      }
+    };
+    const actions = el("td");
+    actions.append(revoke);
+    row.append(el("td", what), el("td", when(invite.expires_at, locale)), el("td", invite.created_by), actions);
+    return row;
+  }
+
+  async function loadInvites() {
+    const invites = await adminCall("GET", "/v1/admin/invites", undefined, "invites-msg");
+    if (!invites) return;
+    if (!invites.length) {
+      const empty = el("tr");
+      empty.append(el("td", t("invite_none"), { class: "muted", colspan: "4" }));
+      $("invites").replaceChildren(empty);
+    } else {
+      $("invites").replaceChildren(...invites.map(inviteRow));
+    }
+  }
+
+  if (me.role === "admin") {
+    $("admin-section").hidden = false;
+    $("invite-role").replaceChildren(...roleSelect("read_only").children);
+    $("invite-proxy-row").hidden = !me.proxy;
+    $("invite-form").onsubmit = async (event) => {
+      event.preventDefault();
+      const made = await adminCall(
+        "POST",
+        "/v1/admin/invites",
+        {
+          role: $("invite-role").value,
+          servers: rulesOf($("invite-servers").value),
+          proxy: $("invite-proxy").checked,
+          days: Number($("invite-days").value) || 7,
+        },
+        "invites-msg",
+      );
+      if (made) {
+        say("invites-msg", "");
+        showOnce(t("invite_link_made", { date: when(made.expires_at, locale) }), linkFor(made.code));
+        await loadInvites();
+      }
+    };
+    await Promise.all([loadAccounts(), loadInvites()]);
+  }
+</script>
+</body>
+</html>

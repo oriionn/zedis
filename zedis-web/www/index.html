@@ -26,6 +26,8 @@
   button:disabled { opacity: .5; cursor: default; }
   .msg { margin-top: .75rem; white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: .85rem; }
   .bad { color: var(--bad); }
+  .note { margin: 0 0 1rem; font-size: .85rem; opacity: .8; }
+  .link { margin-top: 1rem; padding: 0; background: none; color: #58a6ff; font-size: .85rem; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -37,22 +39,76 @@
        fill it in next time. The password is never kept by this page. -->
   <form id="login-form" autocomplete="on">
     <label>
-      <span>Username</span>
+      <span data-i18n="username">Username</span>
       <input id="username" name="username" type="text" autocomplete="username" required />
     </label>
     <label>
-      <span>Password</span>
+      <span data-i18n="password">Password</span>
       <input id="password" name="password" type="password" autocomplete="current-password" required />
     </label>
     <label class="check">
       <input id="remember" name="remember" type="checkbox" checked />
-      <span>Keep me signed in on this device (30 days)</span>
+      <span data-i18n="remember_device">Keep me signed in on this device (30 days)</span>
     </label>
-    <button id="go" type="submit">Sign in</button>
+    <button id="go" type="submit" data-i18n="sign_in">Sign in</button>
   </form>
   <div class="msg bad" id="login-msg"></div>
+  <button id="to-setup" class="link" type="button" data-i18n="setup_title" hidden>Create the administrator</button>
 </main>
-<main id="loading" hidden><h1>Zedis</h1><div class="msg" id="loading-msg">Loading…</div></main>
+<!-- The first account, or one more after every administrator was lost: the
+     setup token from the bridge's log seats it (ADR 17). -->
+<main id="setup" hidden>
+  <h1 data-i18n="setup_title">Create the administrator</h1>
+  <p class="note" data-i18n="setup_intro"></p>
+  <form id="setup-form" autocomplete="on">
+    <label>
+      <span data-i18n="setup_token">Setup token</span>
+      <input id="setup-token" type="password" autocomplete="off" required />
+    </label>
+    <label>
+      <span data-i18n="account_name">Account name</span>
+      <input id="setup-name" name="username" type="text" autocomplete="username" required />
+    </label>
+    <label>
+      <span data-i18n="password">Password</span>
+      <input id="setup-password" name="password" type="password" autocomplete="new-password" required />
+    </label>
+    <label>
+      <span data-i18n="repeat_password">Repeat the password</span>
+      <input id="setup-confirm" type="password" autocomplete="new-password" required />
+    </label>
+    <button id="setup-go" type="submit" data-i18n="setup_title">Create the administrator</button>
+  </form>
+  <p class="note" data-i18n="setup_existing_hint"></p>
+  <div class="msg bad" id="setup-msg"></div>
+  <button id="to-login" class="link" type="button" data-i18n="sign_in_instead">Sign in instead</button>
+</main>
+<!-- An invitation link (`#invite=…`): a new account, or a new password. -->
+<main id="register" hidden>
+  <h1 id="register-title"></h1>
+  <p class="note" id="register-intro"></p>
+  <form id="register-form" autocomplete="on">
+    <label id="register-name-row">
+      <span data-i18n="account_name">Account name</span>
+      <input id="register-name" name="username" type="text" autocomplete="username" />
+    </label>
+    <label id="register-password-row">
+      <span data-i18n="password">Password</span>
+      <input id="register-password" name="password" type="password" autocomplete="new-password" />
+    </label>
+    <label id="register-confirm-row">
+      <span data-i18n="repeat_password">Repeat the password</span>
+      <input id="register-confirm" type="password" autocomplete="new-password" />
+    </label>
+    <label class="check">
+      <input id="register-remember" type="checkbox" checked />
+      <span data-i18n="remember_device">Keep me signed in on this device (30 days)</span>
+    </label>
+    <button id="register-go" type="submit"></button>
+  </form>
+  <div class="msg bad" id="register-msg"></div>
+</main>
+<main id="loading" hidden><h1>Zedis</h1><div class="msg" id="loading-msg" data-i18n="loading">Loading…</div></main>
 
 <script type="module">
   // Same origin on purpose: the bridge serves this page, so the API is right
@@ -69,11 +125,15 @@
   const api = (path, init) => fetch(root + path, { credentials: "same-origin", ...init });
   // Filled by `web-bundle.sh` between the ASSET_REV markers on the next
   // line. Leave `{}` in git: an unbundled page just fetches unversioned URLs.
-  const ASSET_REV = /*ASSET_REV*/{}/*/ASSET_REV*/;
+  const ASSET_REV = /*ASSET_REV*/{"assets/commands.json":"a1f58c0b4949","assets/config_docs/en.json":"90b5e6e1426a","assets/config_docs/zh.json":"32d145cb21ce","assets/icon.png":"9121a3cab487","fonts/IBMPlexSans.ttf":"335a2b2a3a64","fonts/JetBrainsMono-Bold.ttf":"8658ffe39dbf","fonts/JetBrainsMono-Regular.ttf":"d09f65145228","fonts/OFL.txt":"4d4949dda4b2","locales/de.toml":"a525b5f6ba79","locales/en.toml":"0139c58cba4b","locales/es.toml":"ee3175fa9b9c","locales/fr.toml":"518acda9ca3a","locales/ja.toml":"a463f0c15bf8","locales/pt.toml":"336a284f7e60","locales/ru.toml":"df12f43f32f2","locales/zh.toml":"5f7e9039e95f","wasm/zedis_web.d.ts":"7ce84307d97f","wasm/zedis_web.js":"d0882bec19e8","wasm/zedis_web_bg.wasm":"1f9e07fe061f","wasm/zedis_web_bg.wasm.d.ts":"c8a12d2a60aa"}/*/ASSET_REV*/;
   const url = (path) => {
     const v = ASSET_REV[path];
     return v ? `${root}/${path}?v=${v}` : `${root}/${path}`;
   };
+  // The forms' strings and helpers, shared with the account page.
+  const pages = await import(url("pages.js"));
+  const { t } = await pages.loadStrings(url);
+  pages.localize(t);
 
   // An input method's keystrokes are not the application's. gpui-pre-web
   // (through 0.3.5) decides that from `isComposing` alone, but the *first*
@@ -113,8 +173,7 @@
 
   async function start() {
     // The whole application, as the desktop builds it, compiled to wasm.
-    $("login").hidden = true;
-    $("loading").hidden = false;
+    show("loading");
     try {
       // The UI font rides in with the call: the web text system has no
       // fonts of its own, and the first frame measures text. Locales are
@@ -157,7 +216,7 @@
       document.addEventListener("visibilitychange", reportVisibility);
       reportVisibility();
     } catch (e) {
-      $("loading-msg").textContent = `The application could not start: ${e}`;
+      $("loading-msg").textContent = t("start_failed", { error: e });
       $("loading-msg").className = "msg bad";
     }
   }
@@ -167,8 +226,8 @@
     return res.ok;
   }
 
-  // The bridge signs people in by name (ZEDIS_BRIDGE_USERS); which entries
-  // they then see depends on who they are.
+  // The bridge signs people in by the name they registered (ADR 17); which
+  // entries they then see depends on who they are.
   // Signed in once, a browser stays signed in: the bridge keeps the login on
   // disk, so neither a reload nor a restart of the bridge asks again, and this
   // form only comes back when /v1/servers answers 401 — the login lapsed, was
@@ -189,33 +248,187 @@
         body: JSON.stringify(credentials()),
       });
       if (!res.ok) {
-        $("login-msg").textContent = "Wrong username or password.";
+        $("login-msg").textContent = t(res.status === 429 ? "too_many_attempts" : "wrong_password");
         return;
       }
       $("password").value = "";
-      // A 200 only says the password was right. The login is the cookie, and
-      // a browser silently drops a `Secure` cookie that arrives over plain
-      // http from anything but localhost — the app would then start and meet
-      // a 401 on its first request with nothing to explain it. Ask once, the
-      // way the app is about to, and say what happened instead.
-      if (!(await signedIn())) {
-        $("login-msg").textContent = window.location.protocol === "http:"
-          ? "Signed in, but this browser did not keep the login cookie: the page is on plain http and the cookie is Secure. Serve the bridge over https, or start it with --insecure-cookie."
-          : "Signed in, but this browser did not keep the login cookie. Check that cookies are allowed for this site.";
-        return;
-      }
+      if (!(await keptCookie("login-msg"))) return;
       await start();
     } catch (e) {
-      $("login-msg").textContent = `Could not reach the bridge: ${e}`;
+      $("login-msg").textContent = t("unreachable", { error: e });
     } finally {
       $("go").disabled = false;
     }
   };
-  if (await signedIn()) {
+
+  // A 200 only says the request was right. The login is the cookie, and a
+  // browser silently drops a `Secure` cookie that arrives over plain http
+  // from anything but localhost — the app would then start and meet a 401
+  // on its first request with nothing to explain it. Ask once, the way the
+  // app is about to, and say what happened instead.
+  async function keptCookie(msg) {
+    if (await signedIn()) return true;
+    $(msg).textContent = t(window.location.protocol === "http:" ? "cookie_http" : "cookie_blocked");
+    return false;
+  }
+
+  function show(id) {
+    for (const main of ["login", "setup", "register", "loading"]) $(main).hidden = main !== id;
+  }
+
+  // What a new password has to be, said before the bridge says it.
+  function passwordProblem(password, confirm) {
+    if ([...password].length < 8) return t("password_short");
+    if (password !== confirm) return t("passwords_differ");
+    return null;
+  }
+
+  async function setupOpen() {
+    try {
+      const res = await pages.api("/v1/setup");
+      return res.ok && (await res.json()).open === true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function showSignIn() {
+    const open = await setupOpen();
+    $("to-setup").hidden = !open;
+    if (open) {
+      show("setup");
+      $("setup-token").focus();
+    } else {
+      show("login");
+      $("username").focus();
+    }
+  }
+  $("to-setup").onclick = () => {
+    show("setup");
+    $("setup-token").focus();
+  };
+  $("to-login").onclick = () => {
+    show("login");
+    $("username").focus();
+  };
+
+  $("setup-form").onsubmit = async (event) => {
+    event.preventDefault();
+    const problem = passwordProblem($("setup-password").value, $("setup-confirm").value);
+    if (problem) {
+      $("setup-msg").textContent = problem;
+      return;
+    }
+    $("setup-go").disabled = true;
+    try {
+      const res = await pages.send("POST", "/v1/setup", {
+        token: $("setup-token").value.trim(),
+        name: $("setup-name").value.trim(),
+        password: $("setup-password").value,
+        remember: true,
+      });
+      if (!res.ok) {
+        const known = { 403: "setup_refused", 404: "setup_closed", 429: "too_many_attempts" }[res.status];
+        $("setup-msg").textContent = known ? t(known) : t("error_generic", { error: await pages.failure(res) });
+        return;
+      }
+      $("setup-password").value = "";
+      $("setup-confirm").value = "";
+      if (!(await keptCookie("setup-msg"))) return;
+      await start();
+    } catch (e) {
+      $("setup-msg").textContent = t("unreachable", { error: e });
+    } finally {
+      $("setup-go").disabled = false;
+    }
+  };
+
+  // `#invite=<code>`: the fragment is never sent to the bridge, so the code
+  // stays out of every access log on the way; it goes in a request body.
+  async function showInvitation(code) {
+    show("register");
+    const res = await pages.send("POST", "/v1/invitation", { code });
+    if (!res.ok) {
+      $("register-title").textContent = t("invite_title");
+      $("register-intro").textContent = t(res.status === 429 ? "too_many_attempts" : "invite_invalid");
+      $("register-form").hidden = true;
+      return;
+    }
+    const invite = await res.json();
+    const role = t(pages.roleKey(invite.role));
+    let ask = { name: true, password: true };
+    if (invite.kind === "reset") {
+      $("register-title").textContent = t("reset_title");
+      $("register-intro").textContent = t("reset_intro", { name: invite.account });
+      $("register-go").textContent = t("reset_go");
+      ask = { name: false, password: true };
+    } else if (invite.proxy) {
+      $("register-title").textContent = t("register_title");
+      $("register-go").textContent = t("register_go");
+      ask = { name: false, password: false };
+      if (invite.proxy_name) {
+        $("register-intro").textContent = t("register_proxy_intro", { role, name: invite.proxy_name });
+      } else {
+        $("register-intro").textContent = t("register_proxy_missing");
+        $("register-form").hidden = true;
+      }
+    } else {
+      $("register-title").textContent = t("register_title");
+      $("register-intro").textContent = t("register_intro", { role });
+      $("register-go").textContent = t("register_go");
+    }
+    $("register-name-row").hidden = !ask.name;
+    $("register-password-row").hidden = !ask.password;
+    $("register-confirm-row").hidden = !ask.password;
+    $("register-form").onsubmit = async (event) => {
+      event.preventDefault();
+      if (ask.password) {
+        const problem = passwordProblem($("register-password").value, $("register-confirm").value);
+        if (problem) {
+          $("register-msg").textContent = problem;
+          return;
+        }
+      }
+      $("register-go").disabled = true;
+      try {
+        const res = await pages.send("POST", "/v1/register", {
+          code,
+          name: $("register-name").value.trim(),
+          password: $("register-password").value,
+          remember: $("register-remember").checked,
+        });
+        if (!res.ok) {
+          const known = { 409: "name_taken", 429: "too_many_attempts" }[res.status];
+          $("register-msg").textContent = known ? t(known) : t("error_generic", { error: await pages.failure(res) });
+          return;
+        }
+        // Used up: a reload must not offer it again.
+        history.replaceState(null, "", window.location.pathname + window.location.search);
+        if (!(await keptCookie("register-msg"))) return;
+        await start();
+      } catch (e) {
+        $("register-msg").textContent = t("unreachable", { error: e });
+      } finally {
+        $("register-go").disabled = false;
+      }
+    };
+    (ask.name ? $("register-name") : $("register-password")).focus();
+  }
+
+  // An invitation link pasted into a tab already on this page — the
+  // sign-in form, or the application itself — changes only the fragment,
+  // which reloads nothing: start over so it is read.
+  window.addEventListener("hashchange", () => {
+    if (new URLSearchParams(window.location.hash.slice(1)).has("invite")) window.location.reload();
+  });
+
+  const invite = new URLSearchParams(window.location.hash.slice(1)).get("invite");
+  if (invite) {
+    await showInvitation(invite);
+  } else if (await signedIn()) {
     await start();
   } else {
-    $("login").hidden = false;
-    $("username").focus();
+    await showSignIn();
   }
 </script>
 </body>

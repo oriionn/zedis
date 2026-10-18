@@ -52,15 +52,17 @@ check-web:
 # in a release build and reads from disk in a debug one — so `web-serve`, a
 # debug run, serves whichever bundle was built last with no rebuild of the
 # bridge. It serves the page and the API from one origin; open
-# http://127.0.0.1:7379/ and sign in as dev / dev — the bridge needs accounts
-# to start, so this target supplies one unless `ZEDIS_BRIDGE_USERS` is set.
+# http://127.0.0.1:7379/. The first time, the page asks to create the
+# administrator, with a setup token this target makes `dev` unless
+# `ZEDIS_BRIDGE_SETUP_TOKEN` is set — the token counts only while there is no
+# administrator. Invite a second account from the account page to see that
+# each one's private entries are its own.
 #
 # `RUST_ENV=dev`, the same as `bacon.toml` sets for `make dev`: the bridge
 # then keeps everything under `<config_dir>/dev` — the server list it serves
-# (and rewrites on save) and its key file — and never touches the installed
-# app's list. A bridge without it *is* the production deployment.
-# `ZEDIS_BRIDGE_USERS=alice@a,bob@b make web-serve` to try two accounts and
-# see that each one's private entries are its own.
+# (and rewrites on save), its key file and its accounts — and never touches
+# the installed app's list. A bridge without it *is* the production
+# deployment.
 web-bundle:
 	scripts/web-bundle.sh
 
@@ -78,7 +80,7 @@ web-dist:
 	scripts/web-dist.sh
 
 web-serve:
-	RUST_ENV=dev ZEDIS_BRIDGE_USERS="$${ZEDIS_BRIDGE_USERS:-zedis@123123}" cargo run -p zedis-bridge -- --insecure-cookie
+	RUST_ENV=dev ZEDIS_BRIDGE_SETUP_TOKEN="$${ZEDIS_BRIDGE_SETUP_TOKEN:-dev}" cargo run -p zedis-bridge -- --insecure-cookie
 
 # Dependency gate (advisories / licenses / bans / sources); the config is
 # deny.toml. `cargo install cargo-deny --locked` once.

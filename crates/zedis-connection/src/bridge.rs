@@ -461,6 +461,11 @@ pub trait BridgeTransport: Send + Sync + 'static {
     /// dropped on one side alone would still be good until it lapsed.
     fn sign_out(&self) -> BoxFuture<'static, Result<(), BridgeError>>;
 
+    /// The address of `page`, one of the bridge's own pages beside the one
+    /// the application runs in (`account.html`) — from where the page was
+    /// served, so it follows a base path (ADR 17).
+    fn page_url(&self, page: &str) -> String;
+
     /// Have the bridge subscribe, or start `MONITOR`, for this caller.
     /// `confirm` answers the question the bridge asks before `MONITOR` on
     /// an entry whose writes are locked (`ServerDb::confirmed`).
@@ -510,6 +515,13 @@ pub fn bridge_transport() -> Option<Arc<dyn BridgeTransport>> {
 /// and has no login to end, so "Sign out" is drawn where this says so.
 pub fn signed_in_to_bridge() -> bool {
     TRANSPORT.get().is_some()
+}
+
+/// The address of the bridge's own `page` ([`BridgeTransport::page_url`]),
+/// or `None` where there is no bridge — the desktop, which has no accounts
+/// to manage.
+pub fn bridge_page_url(page: &str) -> Option<String> {
+    TRANSPORT.get().map(|transport| transport.page_url(page))
 }
 
 /// End the bridge login ([`BridgeTransport::sign_out`]).
@@ -883,6 +895,15 @@ impl BridgePipeline for Pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The account page is the web version's (ADR 17): a process that never
+    /// installed a transport — the desktop, and every native test — has no
+    /// address for it, and draws no menu item that would open it.
+    #[test]
+    fn the_desktop_has_no_bridge_page_to_open() {
+        assert!(!signed_in_to_bridge());
+        assert_eq!(bridge_page_url("account.html"), None);
+    }
     use std::sync::Mutex;
 
     /// `args` packed the way redis-rs packs a command. The name goes in as a
@@ -1009,6 +1030,10 @@ mod tests {
 
         fn sign_out(&self) -> BoxFuture<'static, Result<(), BridgeError>> {
             Box::pin(async { Ok(()) })
+        }
+
+        fn page_url(&self, page: &str) -> String {
+            format!("https://bridge.test/{page}")
         }
 
         fn open_watch(
