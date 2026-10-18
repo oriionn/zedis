@@ -78,6 +78,8 @@ docker run -d --name zedis-web -p 127.0.0.1:7379:7379 \
   vicanso/zedis-web:latest
 ```
 
+The [PostgreSQL and MySQL storage guide](./SQL_STORE.md) has the Docker commands for both databases, the database user and its privileges, TLS, backups, upgrades and the schema; what follows is the short version.
+
 `ZEDIS_BRIDGE_STORE` (or `--store`) is a `postgres://…` or `mysql://…` URL. Prefer the environment: the URL carries a password, and a flag is visible to anyone who can list processes. The log only ever shows its host. The bridge creates its tables on start and brings them up to date with each release, under the database's own lock, so bridges starting together do it once; a bridge older than the tables refuses to start. MariaDB is not supported.
 
 What the database then holds: the accounts, invitations, requests for an account and MCP tokens, the logins, the server list, the recycle bin, the Metrics history, the page's data, the setup token and failed sign-ins. A browser signed in on one bridge is signed in on all of them, ten failed sign-ins are ten across all of them, and a change made on one — an account disabled, a server rule removed, a sign-out — reaches the others within **two seconds**. The audit is on and kept there too (see [Audit log](#audit-log)).

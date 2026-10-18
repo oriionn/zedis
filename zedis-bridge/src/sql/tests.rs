@@ -49,6 +49,33 @@ fn a_store_url_is_logged_without_its_password() {
     assert_eq!(redacted("not a url"), "a store URL");
 }
 
+/// The storage guide (`docs/SQL_STORE.md` and its twin) shows the schema as
+/// the migrations write it, file for file: a migration added or changed
+/// without the guide fails here rather than in a reader's database.
+#[test]
+fn the_storage_guide_shows_every_migration_as_it_is() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for guide in ["SQL_STORE.md", "SQL_STORE_zh.md"] {
+        let text = std::fs::read_to_string(root.join("../docs").join(guide)).expect("the guide");
+        for dialect in ["postgres", "mysql"] {
+            let mut files: Vec<_> = std::fs::read_dir(root.join("migrations").join(dialect))
+                .expect("migrations")
+                .map(|entry| entry.expect("entry").path())
+                .collect();
+            files.sort();
+            assert!(!files.is_empty(), "no {dialect} migrations");
+            for file in files {
+                let sql = std::fs::read_to_string(&file).expect("migration");
+                assert!(
+                    text.contains(sql.trim_end()),
+                    "{guide} does not show {} as it is",
+                    file.display()
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test]
 #[ignore]
 async fn the_database_keeps_the_contract() {

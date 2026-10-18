@@ -153,6 +153,7 @@ docker logs zedis-web 2>&1 | grep "setup token"
 - **账号、角色、SSO** —— 第一个账号是管理员，其他人凭邀请注册，或提交申请由管理员审核；条目默认私有；账号可以只读或只能看到部分服务器；身份可以来自反向代理写入的请求头。
 - **生产环境默认锁写** —— Prod 每次解锁 15 分钟；审计日志记录登录、条目变更和每条经确认的命令。
 - **MCP** —— Claude Code、Cursor 或任何 MCP 客户端以只读账号读 Redis，每次调用都留审计。
+- **多个 bridge 共用一个数据库** —— 用 PostgreSQL 或 MySQL 保存账号、登录状态与审计，bridge 可以放在负载均衡之后（[指南](./docs/SQL_STORE_zh.md)）。
 
 > **早期预览。** linux/amd64 与 linux/arm64（约 26 MB）。部分桌面面板在浏览器里不可用，指南里有清单。
 
@@ -168,6 +169,7 @@ Valkey 在这里是一等公民，不是兼容模式。依赖版本的功能能�
 
 - **[完整功能介绍](./docs/FEATURES_zh.md)** —— 每个面板、查看器和快捷键。
 - **[Web 版：自托管指南](./docs/WEB_zh.md)** —— 部署、账号、SSO、审计日志与 MCP。
+- **[Web 版：PostgreSQL 与 MySQL 存储](./docs/SQL_STORE_zh.md)** —— Docker 启动命令、数据库用户、TLS、备份、升级与建表语句。
 - **[Redis 与 Valkey](./docs/REDIS_VALKEY_zh.md)** —— 两者的差异，以及它们之间的复制如何工作。
 - **[安全策略](./SECURITY.md)** · **[更新日志](./CHANGELOG.md)**
 

@@ -105,8 +105,8 @@ async fn import_local_command() -> Result<(), Box<dyn std::error::Error>> {
         println!("zedis-bridge import-local --store <url> [--from <dir>] [--audit-file <file>]");
         println!();
         println!("Copies what a bridge keeps in its data directory (--from, else ZEDIS_CONFIG_DIR)");
-        println!("— accounts, invitations, logins, the server list, scripts, the page's data, the");
-        println!("recycle bin, the metrics history and a waiting setup token — into the empty");
+        println!("— accounts, invitations, waiting requests, logins, the server list, scripts, the page's");
+        println!("data, the recycle bin, the metrics history and a waiting setup token — into the empty");
         println!(
             "database --store ({}) names. It runs with that directory's master.key:",
             sql::STORE_ENV

@@ -155,6 +155,7 @@ Open <http://localhost:7379> and create the administrator with the setup token f
 - **Accounts, roles, SSO** — the first account is the administrator, everyone else registers by invitation or by a request an administrator approves; an entry is private until it is shared; an account can be read-only or limited to some servers; identity can come from a reverse-proxy header.
 - **Production stays locked** — Prod entries open for 15 minutes at a time; the audit log records logins, entry changes and every confirmed command.
 - **MCP** — Claude Code, Cursor or any MCP client reads Redis as a read-only account, every call audited.
+- **Several bridges, one database** — PostgreSQL or MySQL keeps the accounts, logins and audit for bridges behind a load balancer ([guide](./docs/SQL_STORE.md)).
 
 > **Early preview.** linux/amd64 and linux/arm64 (~26 MB). A few desktop panels are missing in the browser; the guide lists them.
 
@@ -170,6 +171,7 @@ Valkey is first-class, not a compatibility mode. Whether a version-dependent fea
 
 - **[Full feature tour](./docs/FEATURES.md)** — every panel, viewer and shortcut.
 - **[Web version: self-hosting guide](./docs/WEB.md)** — deployment, accounts, SSO, the audit log and MCP.
+- **[Web version: PostgreSQL and MySQL storage](./docs/SQL_STORE.md)** — Docker commands, the database user, TLS, backups, upgrades and the schema.
 - **[Redis and Valkey](./docs/REDIS_VALKEY.md)** — what differs between the two, and how a copy between them works.
 - **[Security policy](./SECURITY.md)** · **[Changelog](./CHANGELOG.md)**
 
