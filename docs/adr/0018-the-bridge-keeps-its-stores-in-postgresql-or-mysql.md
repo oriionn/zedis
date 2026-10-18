@@ -246,9 +246,18 @@ the process it reached, and says which.
   release later.
 - MySQL does not run DDL in a transaction: every statement of a migration
   runs again safely (`IF NOT EXISTS`, `INSERT IGNORE`), so one that stopped
-  halfway is finished by running it again. The first migration creates the
+  halfway is finished by running it again — which the bridge does itself:
+  sqlx marks such a step unfinished and refuses to go on, every bridge on
+  the database with it, so `sql::migrate` forgets the mark and runs the step
+  once more, with a warning in the log. The first migration creates the
   stores' tables, the second the audit's, the third the requests for an
   account (ADR 17, amended 2026-10-18).
+- A released migration never changes. sqlx keeps each applied step's
+  checksum and refuses a database whose steps no longer match the files a
+  bridge was built with, so `released_migrations_never_change` pins every
+  file's hash, and `.gitattributes` keeps them LF on a checkout that would
+  turn them into CRLF. What a step should have done differently is a new
+  step.
 
 ### The audit
 

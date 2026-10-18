@@ -9,6 +9,8 @@ By default `zedis-bridge` — the server of the [web version](./WEB.md) — keep
 
 The desktop app is not affected: it keeps its data on your machine. MariaDB, SQLite and other servers that only speak the MySQL or PostgreSQL protocol are not supported.
 
+> **Which image.** The database store comes with the first release after v0.14.0. Until that release is out, use `vicanso/zedis-web:nightly` (built from `main`) wherever the commands below say `:latest`: v0.14.0 does not know `ZEDIS_BRIDGE_STORE`, ignores it, and stops at start with `no accounts are configured`.
+
 - [Quick start with Docker](#quick-start-with-docker)
 - [The connection URL](#the-connection-url)
 - [The database and its user](#the-database-and-its-user)
@@ -217,7 +219,7 @@ A restore goes into an empty database; then start the bridges with the same `mas
 
 ## Upgrading
 
-A release may add to the schema. The first bridge of the new release to start adds it, under the database's own lock (`pg_advisory_lock` / `GET_LOCK`), so bridges starting together do it once. A bridge of an older release then refuses to start on that database — it does not know the new step — so upgrade every bridge together, and take a backup first: going back means restoring it. A step only ever adds; nothing a release before it wrote is changed.
+A release may add to the schema. The first bridge of the new release to start adds it, under the database's own lock (`pg_advisory_lock` / `GET_LOCK`), so bridges starting together do it once. A bridge of an older release then refuses to start on that database — it does not know the new step — so upgrade every bridge together, and take a backup first: going back means restoring it. A step only ever adds; nothing a release before it wrote is changed. A step cut short — the bridge stopped, or the database went away, in the middle of one; MySQL cannot take back the half that ran — is run again at the next start, with a warning in the log: every statement of a step is safe to run twice.
 
 ## When it does not start
 
@@ -226,6 +228,7 @@ A release may add to the schema. The first bridge of the new release to start ad
 | `this bridge's master.key is not the one the store's other bridges use` | It has another key, or cannot read the mounted one (it must be readable by uid 65532). Mount the key every other bridge uses. |
 | `the store's schema could not be brought up to date: … permission denied …` | Its user may not create tables in that database. See [The database and its user](#the-database-and-its-user). |
 | `… was previously applied but is missing in the resolved migrations` | A bridge older than the schema: a newer release has already run on this database. Upgrade it. |
+| `… was previously applied but has been modified` | A bridge built from changed schema files — not a release. Released steps never change; build from a release tag. |
 | An error naming the URL's host, at start | The database is not reachable yet, or the URL is wrong. The log shows the host only. |
 | `import-local`: `the database already holds accounts, server entries or scripts` | `import-local` copies into an empty database only. |
 

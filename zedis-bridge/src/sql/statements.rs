@@ -63,6 +63,13 @@ pub const META_PUT_IF_NONE: Stmt = Stmt {
     my: "INSERT IGNORE INTO store_meta (name, value) VALUES (?, ?)",
 };
 
+/// Forget sqlx's mark on a schema step that was cut short, so it runs again
+/// (`sql::migrate`): only an unfinished one, never a step that completed.
+pub const FORGET_UNFINISHED_STEP: Stmt = Stmt {
+    pg: "DELETE FROM _sqlx_migrations WHERE version = $1 AND success = FALSE",
+    my: "DELETE FROM _sqlx_migrations WHERE version = ? AND success = FALSE",
+};
+
 /// What `import-local` asks before it copies: a database that has any of
 /// these is not empty, and is refused.
 pub const AUTHORED_COUNT: Stmt =

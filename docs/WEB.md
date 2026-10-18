@@ -78,7 +78,7 @@ docker run -d --name zedis-web -p 127.0.0.1:7379:7379 \
   vicanso/zedis-web:latest
 ```
 
-The [PostgreSQL and MySQL storage guide](./SQL_STORE.md) has the Docker commands for both databases, the database user and its privileges, TLS, backups, upgrades and the schema; what follows is the short version.
+It comes with the first release after v0.14.0; until then use `vicanso/zedis-web:nightly`. The [PostgreSQL and MySQL storage guide](./SQL_STORE.md) has the Docker commands for both databases, the database user and its privileges, TLS, backups, upgrades and the schema; what follows is the short version.
 
 `ZEDIS_BRIDGE_STORE` (or `--store`) is a `postgres://…` or `mysql://…` URL. Prefer the environment: the URL carries a password, and a flag is visible to anyone who can list processes. The log only ever shows its host. The bridge creates its tables on start and brings them up to date with each release, under the database's own lock, so bridges starting together do it once; a bridge older than the tables refuses to start. MariaDB is not supported.
 

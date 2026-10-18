@@ -19,8 +19,10 @@
 
 use super::*;
 use crate::accounts::{AccountChange, AccountOp, AccountRecord, Accounts, Role};
-use crate::auth::{Login, LoginChange, Logins, Throttle, attempt_key};
+use crate::auth::{Login, LoginChange, Logins, Throttle, attempt_key, hex};
 use crate::store::{STORE_POLL, conformance};
+use sha2::{Digest, Sha256};
+use sqlx::AssertSqlSafe;
 use zedis_connection::{RedisServer, disable_keychain, get_server};
 use zedis_core::fs::override_config_dir;
 
@@ -74,6 +76,92 @@ fn the_storage_guide_shows_every_migration_as_it_is() {
             }
         }
     }
+}
+
+/// sqlx keeps each applied step's checksum and refuses a database whose
+/// steps no longer match the files a bridge was built with — every bridge
+/// on it, at once. So a released step never changes: what it should have
+/// done differently is a new step, and a new one adds its line here.
+#[test]
+fn released_migrations_never_change() {
+    const RELEASED: [(&str, &str); 6] = [
+        (
+            "mysql/0001_stores.sql",
+            "07b3ac13673d11bc3e7ba1187ee18cc7028129a02405a0ed12392353eab12171",
+        ),
+        (
+            "mysql/0002_audit.sql",
+            "c0c856ccf6cc3337f9de2463e2cb69df462f12d63460ea955721a18ccfea6954",
+        ),
+        (
+            "mysql/0003_signups.sql",
+            "064824710ee350e183128e88299f62195ba17dadd6cae713a854c6b372ae808f",
+        ),
+        (
+            "postgres/0001_stores.sql",
+            "d7992d5194a074ea75c758f09d4aa3fdecd4507f974321ecf63b0b9466cdc3cd",
+        ),
+        (
+            "postgres/0002_audit.sql",
+            "f11807dac24545438376f4e2802186872a7ead3e2691220589778ea6ae08c639",
+        ),
+        (
+            "postgres/0003_signups.sql",
+            "e1786ced856858e0d1a274943c69d8eac39e6285628543078c899070a78fdc53",
+        ),
+    ];
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let mut found = Vec::new();
+    for dialect in ["mysql", "postgres"] {
+        for entry in std::fs::read_dir(root.join(dialect)).expect("migrations") {
+            let name = entry.expect("entry").file_name().to_string_lossy().into_owned();
+            found.push(format!("{dialect}/{name}"));
+        }
+    }
+    found.sort();
+    let pinned: Vec<String> = RELEASED.iter().map(|(name, _)| name.to_string()).collect();
+    assert_eq!(found, pinned, "a new step adds its line to RELEASED");
+    for (name, sha256) in RELEASED {
+        let bytes = std::fs::read(root.join(name)).expect("migration");
+        assert_eq!(
+            hex(&Sha256::digest(&bytes)),
+            sha256,
+            "{name} was released and never changes: write a new step instead"
+        );
+    }
+}
+
+/// A schema step cut short — MySQL cannot take back the half of one that
+/// ran, and sqlx marks it unfinished — is run again at the next start,
+/// rather than refusing every bridge until someone edits sqlx's table.
+#[tokio::test]
+#[ignore]
+async fn a_schema_step_cut_short_is_run_again_at_the_next_start() {
+    let first = store().await;
+    let latest: i64 = sqlx::query("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&first.pool)
+        .await
+        .expect("steps")
+        .try_get(0)
+        .expect("the latest step");
+    // The step's number is the database's own, not anything typed in.
+    sqlx::query(AssertSqlSafe(format!(
+        "UPDATE _sqlx_migrations SET success = FALSE WHERE version = {latest}"
+    )))
+    .execute(&first.pool)
+    .await
+    .expect("cut short");
+
+    let again = store().await;
+    let finished: i64 = sqlx::query(AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = {latest} AND success = TRUE"
+    )))
+    .fetch_one(&again.pool)
+    .await
+    .expect("steps")
+    .try_get(0)
+    .expect("count");
+    assert_eq!(finished, 1, "the step ran again and is marked finished");
 }
 
 #[tokio::test]

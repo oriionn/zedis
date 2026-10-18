@@ -36,6 +36,7 @@ mod tests;
 
 use crate::store::{StoreFuture, StoreVersions, Stores, Versions};
 use sqlx::any::{AnyPoolOptions, install_default_drivers};
+use sqlx::migrate::{MigrateError, Migrator};
 use sqlx::{AnyPool, Row};
 use statements::Stmt;
 use std::io;
@@ -77,6 +78,39 @@ impl Dialect {
             ))),
         }
     }
+
+    /// `stmt` as this database spells it.
+    fn sql(self, stmt: &Stmt) -> &'static str {
+        match self {
+            Self::Postgres => stmt.pg,
+            Self::MySql => stmt.my,
+        }
+    }
+}
+
+/// Bring the schema up to this bridge's. A step that was cut short — MySQL
+/// cannot take back the half of one that ran, so sqlx marks it unfinished
+/// and refuses to go on (`MigrateError::Dirty`), every bridge on the
+/// database with it — is run again: every statement of a step is written to
+/// run twice safely (`IF NOT EXISTS`, `INSERT IGNORE`). Once: a step that
+/// fails again says why.
+async fn migrate(pool: &AnyPool, dialect: Dialect, migrator: &Migrator) -> io::Result<()> {
+    let failed = |e: MigrateError| io::Error::other(format!("the store's schema could not be brought up to date: {e}"));
+    match migrator.run(pool).await {
+        Err(MigrateError::Dirty(version)) => {
+            tracing::warn!(version, "a schema step was cut short; running it again");
+            // Not under the migrator's lock: a bridge starting beside this
+            // one may forget the mark of a step it is running, which then
+            // runs once more — as every step is written to bear.
+            sqlx::query(dialect.sql(&statements::FORGET_UNFINISHED_STEP))
+                .bind(version)
+                .execute(pool)
+                .await
+                .map_err(db)?;
+            migrator.run(pool).await.map_err(failed)
+        }
+        done => done.map_err(failed),
+    }
 }
 
 /// The stores on one database.
@@ -107,11 +141,11 @@ impl SqlStore {
         };
         // A database holding a migration this bridge does not know refuses
         // it: an older bridge does not start on a newer schema.
-        let migrated = match dialect {
-            Dialect::Postgres => sqlx::migrate!("migrations/postgres").run(&pool).await,
-            Dialect::MySql => sqlx::migrate!("migrations/mysql").run(&pool).await,
+        let migrator = match dialect {
+            Dialect::Postgres => sqlx::migrate!("migrations/postgres"),
+            Dialect::MySql => sqlx::migrate!("migrations/mysql"),
         };
-        migrated.map_err(|e| io::Error::other(format!("the store's schema could not be brought up to date: {e}")))?;
+        migrate(&pool, dialect, &migrator).await?;
         let store = Self {
             pool,
             dialect,
@@ -127,10 +161,7 @@ impl SqlStore {
 
     /// `stmt` as this database spells it.
     fn sql(&self, stmt: &Stmt) -> &'static str {
-        match self.dialect {
-            Dialect::Postgres => stmt.pg,
-            Dialect::MySql => stmt.my,
-        }
+        self.dialect.sql(stmt)
     }
 
     /// Every store on this database.

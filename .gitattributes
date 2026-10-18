@@ -1,0 +1,4 @@
+# sqlx keeps a checksum of every schema step it applied and refuses a
+# database whose steps no longer match the bridge's files: a checkout that
+# turned these into CRLF would build a bridge every database refuses.
+zedis-bridge/migrations/**/*.sql text eol=lf

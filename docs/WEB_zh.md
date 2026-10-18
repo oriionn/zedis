@@ -78,7 +78,7 @@ docker run -d --name zedis-web -p 127.0.0.1:7379:7379 \
   vicanso/zedis-web:latest
 ```
 
-[PostgreSQL 与 MySQL 存储指南](./SQL_STORE_zh.md)里有两种数据库的 Docker 启动命令、数据库用户与权限、TLS、备份、升级和建表语句；下面是简要说明。
+这个功能从 v0.14.0 之后的第一个正式版本开始提供，在那之前请用 `vicanso/zedis-web:nightly`。[PostgreSQL 与 MySQL 存储指南](./SQL_STORE_zh.md)里有两种数据库的 Docker 启动命令、数据库用户与权限、TLS、备份、升级和建表语句；下面是简要说明。
 
 `ZEDIS_BRIDGE_STORE`（或 `--store`）是一个 `postgres://…` 或 `mysql://…` URL。推荐用环境变量：URL 里带着密码，而命令行参数能被任何可以列出进程的人看到。日志里只会出现它的主机部分。bridge 启动时会建表，每次升级时把表结构更新到当前版本，期间持有数据库自己的锁，所以同时启动的多个 bridge 只会执行一次；比表结构旧的 bridge 会拒绝启动。不支持 MariaDB。
 

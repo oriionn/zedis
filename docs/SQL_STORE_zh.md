@@ -9,6 +9,8 @@
 
 桌面应用不受影响：它的数据保存在本机。不支持 MariaDB、SQLite，也不支持其他只是兼容 MySQL 或 PostgreSQL 协议的服务。
 
+> **用哪个镜像。** 数据库存储从 v0.14.0 之后的第一个正式版本开始提供。在它发布之前，请把下面命令里的 `:latest` 换成 `vicanso/zedis-web:nightly`（由 `main` 构建）：v0.14.0 不认识 `ZEDIS_BRIDGE_STORE`，会忽略它，并在启动时以 `no accounts are configured` 退出。
+
 - [用 Docker 快速开始](#用-docker-快速开始)
 - [连接 URL](#连接-url)
 - [数据库与用户](#数据库与用户)
@@ -217,7 +219,7 @@ docker exec zedis-mysql mysqldump -u zedis -pchange-me --single-transaction --no
 
 ## 升级
 
-新版本可能会给表结构增加内容。新版本第一个启动的 bridge 会在数据库自己的锁（`pg_advisory_lock` / `GET_LOCK`）之下完成这一步，所以同时启动的多个 bridge 只会执行一次。之后，旧版本的 bridge 在这个数据库上会拒绝启动 —— 它不认识新的步骤 —— 所以请同时升级所有 bridge，并且先做备份：想回退就只能从备份恢复。每一步都只会新增，不会改动旧版本写入的任何东西。
+新版本可能会给表结构增加内容。新版本第一个启动的 bridge 会在数据库自己的锁（`pg_advisory_lock` / `GET_LOCK`）之下完成这一步，所以同时启动的多个 bridge 只会执行一次。之后，旧版本的 bridge 在这个数据库上会拒绝启动 —— 它不认识新的步骤 —— 所以请同时升级所有 bridge，并且先做备份：想回退就只能从备份恢复。每一步都只会新增，不会改动旧版本写入的任何东西。如果某一步执行到一半被打断 —— bridge 被停掉，或数据库连接断了；MySQL 无法撤回已经执行的那一半 —— 下次启动时会重新执行这一步，并在日志里记一条警告：每一步里的每条语句都可以安全地执行两次。
 
 ## 启动失败时
 
@@ -226,6 +228,7 @@ docker exec zedis-mysql mysqldump -u zedis -pchange-me --single-transaction --no
 | `this bridge's master.key is not the one the store's other bridges use` | 它用的是另一个密钥，或者读不到挂进来的密钥文件（必须能被 uid 65532 读取）。挂入其他 bridge 用的那个密钥。 |
 | `the store's schema could not be brought up to date: … permission denied …` | 它的用户不能在这个数据库里建表。见[数据库与用户](#数据库与用户)。 |
 | `… was previously applied but is missing in the resolved migrations` | bridge 比表结构旧：更新的版本已经在这个数据库上运行过。请升级它。 |
+| `… was previously applied but has been modified` | bridge 是用改动过的表结构文件构建的 —— 不是正式发布版本。已发布的步骤永远不会改动；请从发布的 tag 构建。 |
 | 启动时报错，并提到 URL 中的主机名 | 数据库还连不上，或者 URL 写错了。日志里只显示主机名。 |
 | `import-local`：`the database already holds accounts, server entries or scripts` | `import-local` 只能复制进空数据库。 |
 
