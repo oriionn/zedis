@@ -365,7 +365,7 @@ impl ZedisSidebar {
         // Discoverability hints appended to every server row's tooltip: the
         // workspace-tab gestures (⌘/Ctrl+click to reveal-or-open, add Shift to
         // force a duplicate tab) are otherwise invisible. `%{key}` is filled
-        // with the platform keystroke (⌘/⌘⇧ on macOS, Ctrl/Ctrl+Shift else).
+        // with the platform keystroke (⌘ / ⌘ ⇧ on macOS, Ctrl/Ctrl+Shift else).
         let store = cx.global::<ZedisGlobalStore>().read(cx);
         let locale = store.locale().to_string();
         // When the setting makes a plain click open a tab, ⌘/Ctrl+click inverts

@@ -163,7 +163,12 @@ impl TrashStore {
             }
         }
         let meta = Meta {
-            id: uuid::Uuid::new_v4().simple().to_string(),
+            // Time-ordered, not random: the listing breaks a tie on
+            // `deleted_at_ms` by id, and a multi-key delete puts several
+            // entries in one millisecond — with v4 ids "the oldest makes
+            // room" dropped one of those at random. `now_v7` is ordered
+            // within the process, and its hex sorts as its bytes do.
+            id: uuid::Uuid::now_v7().simple().to_string(),
             key: entry.key.to_string(),
             db: entry.db,
             pttl_ms: entry.pttl_ms,

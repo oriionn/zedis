@@ -127,7 +127,9 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.23", features = ["local-time"] }
 url = { workspace = true }
-uuid = { workspace = true }
+# `v4` for the single-instance token, a secret: a v7 id spends 48 of its bits
+# on the time and 42 on a counter, so it is ordered, not unguessable.
+uuid = { workspace = true, features = ["v4"] }
 web-time = { workspace = true }
 zedis-connection = { workspace = true }
 zedis-core = { workspace = true }

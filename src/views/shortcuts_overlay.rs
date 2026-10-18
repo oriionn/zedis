@@ -137,6 +137,9 @@ impl Render for ZedisShortcutsOverlay {
             .w_full()
             .gap_3()
             .p_3()
+            // Clear of the scrollbar laid over the list's right edge (its
+            // track is 16px): at `p_3` the key chips sat under it.
+            .pr_6()
             .h(px(420.))
             .overflow_y_scroll()
             .track_scroll(&self.scroll_handle);

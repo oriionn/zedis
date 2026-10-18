@@ -398,7 +398,11 @@ pub fn humanize_keystroke(keystroke: &str) -> String {
     }
 
     let mac = uses_command_key();
-    let separator = if mac { "" } else { "+" };
+    // A space between the symbols on a Mac keyboard: the bundled mono face
+    // draws ⌘ ⇧ ⌥ ⌃ across a whole cell, so "⌘F" in a key chip read as one
+    // glyph. A plain space, not a thin one — neither JetBrains Mono nor the
+    // browser build's two fonts carry U+2009.
+    let separator = if mac { " " } else { "+" };
     let mut display_text = String::new();
 
     for (i, part) in keystroke_parts(keystroke).into_iter().enumerate() {
@@ -981,7 +985,7 @@ mod tests {
     fn a_keystroke_is_drawn_for_the_keyboard_it_is_on() {
         let drawn = humanize_keystroke("secondary-shift-k");
         if uses_command_key() {
-            assert_eq!(drawn, "⌘⇧K");
+            assert_eq!(drawn, "⌘ ⇧ K");
         } else {
             assert_eq!(drawn, "Ctrl+Shift+K");
         }
@@ -989,8 +993,8 @@ mod tests {
         // A `-` key, and a name spelled in capitals.
         let zoom_out = humanize_keystroke("secondary--");
         if uses_command_key() {
-            assert_eq!(zoom_out, "⌘-");
-            assert_eq!(humanize_keystroke("Cmd-8"), "⌘8");
+            assert_eq!(zoom_out, "⌘ -");
+            assert_eq!(humanize_keystroke("Cmd-8"), "⌘ 8");
         } else {
             assert_eq!(zoom_out, "Ctrl+-");
             assert_eq!(humanize_keystroke("Cmd-8"), "Ctrl+8");
@@ -999,7 +1003,7 @@ mod tests {
         assert_eq!(keystroke_parts("secondary-shift--"), ["secondary", "shift", "-"]);
         // Two chords joined by an ellipsis stay two chords, same modifier name.
         if uses_command_key() {
-            assert_eq!(humanize_keystroke("secondary-1 … secondary-8"), "⌘1 … ⌘8");
+            assert_eq!(humanize_keystroke("secondary-1 … secondary-8"), "⌘ 1 … ⌘ 8");
         } else {
             assert_eq!(humanize_keystroke("secondary-1 … secondary-8"), "Ctrl+1 … Ctrl+8");
             assert_eq!(humanize_keystroke("cmd-1 … cmd-8"), "Ctrl+1 … Ctrl+8");
@@ -1055,7 +1059,7 @@ mod tests {
             .expect("workspace tab row");
         let drawn = humanize_keystroke(keystroke);
         if uses_command_key() {
-            assert_eq!(drawn, "⌘1 … ⌘8");
+            assert_eq!(drawn, "⌘ 1 … ⌘ 8");
         } else {
             assert_eq!(drawn, "Ctrl+1 … Ctrl+8");
         }

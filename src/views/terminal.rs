@@ -23,7 +23,7 @@ use crate::{
     db::get_cmd_history_manager,
     error::Error,
     helpers::{
-        TerminalAction, get_download_dir, get_mono_font_family, get_or_create_config_dir,
+        TerminalAction, get_download_dir, get_mono_font_family, get_or_create_config_dir, humanize_keystroke,
         starts_with_ignore_ascii_case, write_file_atomic,
     },
     states::{
@@ -1554,7 +1554,10 @@ impl Render for ZedisTerminal {
                                         .on_click(cx.listener(|this, _, window, cx| this.run_batch(window, cx))),
                                 )
                                 .child(
-                                    Label::new("⌘/Ctrl+Enter")
+                                    // The input's own `secondary` Enter: ⌘ on a
+                                    // Mac keyboard, Ctrl elsewhere — one of the
+                                    // two, not both spelled out.
+                                    Label::new(humanize_keystroke("secondary-enter"))
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground),
                                 )

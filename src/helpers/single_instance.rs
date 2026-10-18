@@ -164,7 +164,9 @@ pub fn claim_instance(message: &InstanceMessage) -> InstanceRole {
             return InstanceRole::Primary;
         }
     };
-    let token = Uuid::now_v7().simple().to_string();
+    // A secret, so random rather than time-ordered: a v7 id carries the time
+    // it was made and, within a millisecond, its neighbour's counter plus one.
+    let token = Uuid::new_v4().simple().to_string();
     let record = InstanceRecord {
         port,
         token: token.clone(),
