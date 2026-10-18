@@ -165,6 +165,9 @@ pub enum ServerToolsAction {
     FlushAll,
     /// The probed command matrix for the active connection (a dialog).
     Capabilities,
+    /// A troubleshooting report of the active connection, to copy or save
+    /// (a dialog — ADR 19).
+    TroubleshootingReport,
 }
 
 const LIGHT_THEME_MODE: &str = "light";

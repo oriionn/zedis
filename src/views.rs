@@ -89,6 +89,7 @@ mod title_bar;
 #[cfg(not(target_family = "wasm"))]
 mod topology;
 mod trash_dialog;
+mod troubleshoot_report;
 mod ttl_dialog;
 mod unsupported_panel;
 mod update_dialog;
@@ -142,6 +143,7 @@ pub use score_filter_dialog::open_score_filter_dialog;
 pub use sentinel_dialogs::{ZedisSentinelMonitorDialog, ZedisSentinelSetDialog};
 pub use server_report_dialog::{ServerReport, open_server_report_dialog};
 pub use timeseries_explorer::ZedisTimeSeriesExplorer;
+pub use troubleshoot_report::open_troubleshoot_report;
 // The charts every diagnostic panel draws, one module so the axes and the
 // tooltip read the same in all of them.
 pub(crate) use charts::{

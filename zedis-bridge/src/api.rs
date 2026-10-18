@@ -22,7 +22,7 @@ use crate::accounts::{Accounts, Basic, Setup, Signup};
 use crate::audit::{self, Audit, Event, Origin, ServerRef};
 use crate::presence::{Client, ClientKey, ONLINE_WINDOW, Presence};
 use crate::static_files::{Representation, WebBuild};
-use crate::store::{KeyNoteStore, MetricsStore, PageRowStore, ScriptStore, ServerStore, TrashStore};
+use crate::store::{KeyNoteStore, MetricsStore, PageRowStore, ScriptStore, ServerStore, StoreVersions, TrashStore};
 use crate::trash::{NewEntry, PutError};
 use crate::watch::{Batch, WatchError, WatchKind, Watches};
 use crate::{account_api, auth, mcp, page_data, policy, resp, session::Sessions, static_files};
@@ -43,7 +43,9 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path as FsPath;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::time::Duration;
 use uuid::Uuid;
 use zedis_connection::string::{decrypt_bytes, encrypt_bytes};
 use zedis_connection::{PipelineSpec, RedisServer, get_connection_manager, get_server, get_servers};
@@ -94,6 +96,9 @@ pub struct AppState {
     /// `--signup`: whether anyone may ask for an account, for an
     /// administrator to approve (ADR 17, amended 2026-10-18).
     pub signup: Signup,
+    /// The database the stores are in, asked by `/v1/ready`; `None` for the
+    /// local directory, which is there while the process is.
+    pub store_probe: Option<Arc<dyn StoreVersions>>,
 }
 
 /// The page and the API, under `state.base_path` when there is one.
@@ -112,6 +117,7 @@ pub fn router(state: AppState) -> Router {
     let at = |path: &str| format!("{}{path}", state.base_path);
     let router = Router::new()
         .route(&at("/v1/health"), get(health))
+        .route(&at("/v1/ready"), get(ready))
         .route(&at("/v1/login"), post(login))
         .route(&at("/v1/logout"), post(logout))
         .route(&at("/v1/servers"), get(servers).post(add_server))
@@ -762,9 +768,50 @@ async fn web_asset(State(state): State<AppState>, headers: HeaderMap, uri: Uri) 
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-/// Unauthenticated, and says only that the bridge is up.
+/// Unauthenticated, and says only that the bridge is up: liveness. It does
+/// not ask the database — restarting a bridge whose database is away mends
+/// nothing — which is `/v1/ready`'s question.
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
+}
+
+/// How long `/v1/ready` waits for the database to answer.
+const READY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Whether the last `/v1/ready` found the database answering, so the log
+/// says when that changes rather than once a probe.
+static STORE_ANSWERED: AtomicBool = AtomicBool::new(true);
+
+/// Readiness, for a load balancer in front of several bridges (ADR 18):
+/// `200` while this bridge can serve — with a database, while it answers
+/// within [`READY_TIMEOUT`] — and `503` otherwise, so traffic goes to the
+/// others. Unauthenticated, and says nothing of the database but whether it
+/// answered: the reason is in the process log.
+async fn ready(State(state): State<AppState>) -> Response {
+    let Some(store) = state.store_probe.clone() else {
+        return Json(serde_json::json!({ "status": "ok" })).into_response();
+    };
+    let failure = match tokio::time::timeout(READY_TIMEOUT, store.read()).await {
+        Ok(Ok(_)) => None,
+        Ok(Err(e)) => Some(e.to_string()),
+        Err(_) => Some(format!("no answer within {}s", READY_TIMEOUT.as_secs())),
+    };
+    let answered = failure.is_none();
+    if STORE_ANSWERED.swap(answered, Ordering::Relaxed) != answered {
+        match &failure {
+            Some(error) => tracing::warn!(error, "not ready: the database does not answer"),
+            None => tracing::info!("ready again: the database answers"),
+        }
+    }
+    if answered {
+        Json(serde_json::json!({ "status": "ok", "store": "ok" })).into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "status": "unavailable", "store": "unreachable" })),
+        )
+            .into_response()
+    }
 }
 
 /// One entry as a caller sees it: every setting, no secret.
@@ -2408,7 +2455,7 @@ mod exec_request_tests {
 mod mcp_auth_tests {
     use super::*;
 
-    fn state(accounts: &str) -> AppState {
+    pub(super) fn state(accounts: &str) -> AppState {
         AppState {
             accounts: Accounts::from_toml(accounts).expect("accounts"),
             sessions: Sessions::new(),
@@ -2441,6 +2488,7 @@ mod mcp_auth_tests {
             throttle: auth::Throttle::new(),
             setup: Setup::in_dir(&std::env::temp_dir().join("zedis-bridge-test-setup")),
             signup: Signup::Off,
+            store_probe: None,
         }
     }
 
@@ -2535,6 +2583,46 @@ mod mcp_auth_tests {
 }
 
 #[cfg(test)]
+mod ready_tests {
+    use super::*;
+    use crate::store::{StoreFuture, Versions};
+
+    /// A database that answers, or one that does not.
+    struct Probe(bool);
+
+    impl StoreVersions for Probe {
+        fn read(&self) -> StoreFuture<Versions> {
+            let answers = self.0;
+            Box::pin(async move {
+                if answers {
+                    Ok(Versions::default())
+                } else {
+                    Err(std::io::Error::other("connection refused"))
+                }
+            })
+        }
+    }
+
+    /// Ready while the database answers and not while it does not — and
+    /// always on the local directory, which is there while the process is;
+    /// the liveness check never asks the database at all.
+    #[tokio::test]
+    async fn ready_follows_the_database_and_health_does_not() {
+        let state = |probe: Option<bool>| AppState {
+            store_probe: probe.map(|answers| Arc::new(Probe(answers)) as Arc<dyn StoreVersions>),
+            ..super::mcp_auth_tests::state("[[users]]\nname = \"alice\"\npassword = \"alice-password\"\n")
+        };
+        assert_eq!(ready(State(state(None))).await.status(), StatusCode::OK);
+        assert_eq!(ready(State(state(Some(true)))).await.status(), StatusCode::OK);
+        assert_eq!(
+            ready(State(state(Some(false)))).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(health().await.into_response().status(), StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
 mod bin_tests {
     use super::*;
     use zedis_core::fs::override_config_dir;
@@ -2581,6 +2669,7 @@ mod bin_tests {
             throttle: auth::Throttle::new(),
             setup: Setup::in_dir(&dir),
             signup: Signup::Off,
+            store_probe: None,
         };
         let peer: SocketAddr = "10.0.0.7:5000".parse().expect("address");
         let mut headers = HeaderMap::new();

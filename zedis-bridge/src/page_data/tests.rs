@@ -55,6 +55,7 @@ fn state(dir: &StdPath) -> AppState {
         throttle: auth::Throttle::new(),
         setup: crate::accounts::Setup::in_dir(dir),
         signup: crate::accounts::Signup::Off,
+        store_probe: None,
     }
 }
 

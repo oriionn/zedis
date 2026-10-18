@@ -45,6 +45,7 @@ mod this_build;
 mod update_info;
 #[cfg(not(target_family = "wasm"))]
 mod updater;
+mod web_download;
 mod zip;
 
 pub use action::*;
@@ -85,6 +86,7 @@ pub use updater::relaunch;
 pub use updater::{
     download_and_verify, fetch_latest_release, focus_installer_ui, install_update, installer_requires_quit,
 };
+pub use web_download::{WebDownload, set_web_download, web_download};
 // Pure logic lives in `zedis-core`, fs/crypto/time in `zedis-connection`;
 // re-exported here so call sites keep using `crate::helpers::*` unchanged.
 pub use zedis_connection::string::*;

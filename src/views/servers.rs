@@ -28,7 +28,7 @@ use crate::helpers::{
 };
 use crate::states::{
     CLONE_SERVER_QUERY, EDIT_SERVER_QUERY, GlobalEvent, NotificationAction, Route, ZedisGlobalStore,
-    dialog_button_props, escalate_dangerous_body, get_session_option, i18n_common, i18n_servers,
+    account_is_read_only, dialog_button_props, escalate_dangerous_body, get_session_option, i18n_common, i18n_servers,
     update_app_state_and_save,
 };
 #[cfg(not(target_family = "wasm"))]
@@ -185,6 +185,11 @@ fn clone_of(server: &RedisServer, locale: &str) -> RedisServer {
         ..server.clone()
     }
 }
+
+/// The empty page's and the toolbar's *Add connection*: not drawn for a
+/// read-only bridge account.
+pub(super) const SERVERS_EMPTY_ADD_ID: &str = "servers-empty-add";
+pub(super) const SERVERS_TOOLBAR_ADD_ID: &str = "servers-toolbar-add";
 
 /// Ask before removing a saved connection, and remove it on yes — the
 /// connection card's and the sidebar's Delete. The destructive shape:
@@ -394,8 +399,12 @@ impl ZedisServers {
     /// Insight migration path right where it matters. `min_h` keeps it
     /// vertically centered even though the parent scroll viewport sizes to
     /// its content.
+    ///
+    /// A read-only bridge account (the web version) adds no connection — the
+    /// bridge refuses it — so it is told who does, and offered nothing.
     fn render_empty(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
+        let may_change = !account_is_read_only();
         let add_label = i18n_servers(cx, "empty_add");
         let import_label = i18n_servers(cx, "empty_import");
         // Stay a touch shorter than the viewport so centering doesn't add a
@@ -419,37 +428,50 @@ impl ZedisServers {
                     .font_medium()
                     .text_color(cx.theme().foreground),
             )
-            .child(Label::new(i18n_servers(cx, "empty_hint")).text_sm().text_color(muted))
             .child(
-                h_flex()
-                    .gap_2()
-                    .pt_2()
-                    .child(
-                        Button::new("servers-empty-add")
-                            .primary()
-                            .icon(IconName::Plus)
-                            .label(add_label)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.add_or_update_server_dialog(
-                                    &RedisServer {
-                                        port: DEFAULT_REDIS_PORT,
-                                        ..Default::default()
-                                    },
-                                    window,
-                                    cx,
-                                );
-                            })),
-                    )
-                    .child(
-                        Button::new("servers-empty-import")
-                            .outline()
-                            .icon(IconName::Asterisk)
-                            .label(import_label)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.import_server_dialog(window, cx);
-                            })),
-                    ),
+                Label::new(i18n_servers(
+                    cx,
+                    if may_change {
+                        "empty_hint"
+                    } else {
+                        "empty_hint_read_only"
+                    },
+                ))
+                .text_sm()
+                .text_color(muted),
             )
+            .when(may_change, |page| {
+                page.child(
+                    h_flex()
+                        .gap_2()
+                        .pt_2()
+                        .child(
+                            Button::new(SERVERS_EMPTY_ADD_ID)
+                                .primary()
+                                .icon(IconName::Plus)
+                                .label(add_label)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.add_or_update_server_dialog(
+                                        &RedisServer {
+                                            port: DEFAULT_REDIS_PORT,
+                                            ..Default::default()
+                                        },
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .child(
+                            Button::new("servers-empty-import")
+                                .outline()
+                                .icon(IconName::Asterisk)
+                                .label(import_label)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.import_server_dialog(window, cx);
+                                })),
+                        ),
+                )
+            })
     }
 }
 
@@ -673,6 +695,10 @@ impl Render for ZedisServers {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.placeholders.follow(window, cx);
         let width = window.viewport_size().width;
+        // A read-only bridge account changes no entry — the bridge refuses
+        // it — so it is offered no way to (the web version; always on the
+        // desktop).
+        let may_change = !account_is_read_only();
 
         if let Some(server) = self.pending_server_form.take() {
             self.add_or_update_server_dialog(&server, window, cx);
@@ -820,7 +846,7 @@ impl Render for ZedisServers {
                         // toolbar order is active — the arrows move `sort_order`,
                         // which the card positions no longer reflect.
                         let mut hover_actions: Vec<Button> = Vec::new();
-                        if !single_in_group && sort == ServerSort::Manual {
+                        if may_change && !single_in_group && sort == ServerSort::Manual {
                             hover_actions.push(
                                 Button::new(("servers-card-action-up", index))
                                     .ghost()
@@ -894,17 +920,19 @@ impl Render for ZedisServers {
                                     .items_center()
                                     .gap_1()
                                     .on_click(|_, _, cx| cx.stop_propagation())
-                                    .child(
-                                        Button::new(("servers-card-edit", index))
-                                            .ghost()
-                                            .xsmall()
-                                            .tooltip(update_tooltip.clone())
-                                            .icon(CustomIconName::FilePenLine)
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                cx.stop_propagation();
-                                                this.add_or_update_server_dialog(&edit_server, window, cx);
-                                            })),
-                                    )
+                                    .when(may_change, |actions| {
+                                        actions.child(
+                                            Button::new(("servers-card-edit", index))
+                                                .ghost()
+                                                .xsmall()
+                                                .tooltip(update_tooltip.clone())
+                                                .icon(CustomIconName::FilePenLine)
+                                                .on_click(cx.listener(move |this, _, window, cx| {
+                                                    cx.stop_propagation();
+                                                    this.add_or_update_server_dialog(&edit_server, window, cx);
+                                                })),
+                                        )
+                                    })
                                     .child(
                                         Button::new(("servers-card-more", index))
                                             .ghost()
@@ -914,20 +942,29 @@ impl Render for ZedisServers {
                                                 let clone_id = more_id.clone();
                                                 let exp_id = more_id.clone();
                                                 let del_id = more_id.clone();
-                                                menu.menu_element_with_icon(
-                                                    Icon::new(IconName::Copy),
-                                                    Box::new(ServersCardAction::Clone(clone_id)),
-                                                    |_, cx| Label::new(i18n_servers(cx, "clone_tooltip")),
-                                                )
+                                                // Export only reads; a read-only
+                                                // account is offered nothing else.
+                                                menu.when(may_change, |menu| {
+                                                    menu.menu_element_with_icon(
+                                                        Icon::new(IconName::Copy),
+                                                        Box::new(ServersCardAction::Clone(clone_id)),
+                                                        |_, cx| Label::new(i18n_servers(cx, "clone_tooltip")),
+                                                    )
+                                                })
                                                 .menu_element_with_icon(
                                                     Icon::new(IconName::ExternalLink),
                                                     Box::new(ServersCardAction::Export(exp_id)),
                                                     |_, cx| Label::new(i18n_servers(cx, "export_tooltip")),
                                                 )
-                                                .menu_element_with_icon(
-                                                    Icon::new(CustomIconName::FileXCorner),
-                                                    Box::new(ServersCardAction::Delete(del_id)),
-                                                    |_, cx| Label::new(i18n_servers(cx, "remove_tooltip")),
+                                                .when(
+                                                    may_change,
+                                                    |menu| {
+                                                        menu.menu_element_with_icon(
+                                                            Icon::new(CustomIconName::FileXCorner),
+                                                            Box::new(ServersCardAction::Delete(del_id)),
+                                                            |_, cx| Label::new(i18n_servers(cx, "remove_tooltip")),
+                                                        )
+                                                    },
                                                 )
                                             }),
                                     ),
@@ -1083,31 +1120,34 @@ impl Render for ZedisServers {
                     .items_center()
                     .gap_2()
                     .flex_none()
-                    .child(
-                        Button::new("servers-toolbar-add")
-                            .primary()
-                            .icon(IconName::Plus)
-                            .label(i18n_servers(cx, "toolbar_new"))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.add_or_update_server_dialog(
-                                    &RedisServer {
-                                        port: DEFAULT_REDIS_PORT,
-                                        ..Default::default()
-                                    },
-                                    window,
-                                    cx,
-                                );
-                            })),
-                    )
-                    .child(
-                        Button::new("servers-toolbar-import")
-                            .outline()
-                            .icon(IconName::Asterisk)
-                            .label(i18n_servers(cx, "toolbar_import"))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.import_server_dialog(window, cx);
-                            })),
-                    )
+                    .when(may_change, |actions| {
+                        actions
+                            .child(
+                                Button::new(SERVERS_TOOLBAR_ADD_ID)
+                                    .primary()
+                                    .icon(IconName::Plus)
+                                    .label(i18n_servers(cx, "toolbar_new"))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.add_or_update_server_dialog(
+                                            &RedisServer {
+                                                port: DEFAULT_REDIS_PORT,
+                                                ..Default::default()
+                                            },
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                            )
+                            .child(
+                                Button::new("servers-toolbar-import")
+                                    .outline()
+                                    .icon(IconName::Asterisk)
+                                    .label(i18n_servers(cx, "toolbar_import"))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.import_server_dialog(window, cx);
+                                    })),
+                            )
+                    })
                     .child(
                         Button::new("servers-toolbar-export")
                             .outline()
@@ -1165,6 +1205,48 @@ impl Render for ZedisServers {
             .child(toolbar)
             .children(sections)
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod read_only_tests {
+    use super::*;
+    use crate::states::pretend_account_read_only;
+    use crate::test_support::init_ui;
+    use gpui::{AnyWindowHandle, TestAppContext, size};
+    use gpui_kit::component::Root;
+    use gpui_kit::test::TestWindowExt;
+
+    /// Whether the page offers to add a connection: on the empty page or in
+    /// the toolbar, whichever the list (the process's) makes it draw.
+    fn offers_to_add(cx: &mut TestAppContext, window: AnyWindowHandle) -> bool {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find(SERVERS_EMPTY_ADD_ID).is_some() || window.try_find(SERVERS_TOOLBAR_ADD_ID).is_some()
+        })
+        .expect("the window is open")
+    }
+
+    /// A read-only bridge account is offered no way to add a connection —
+    /// the bridge would refuse it — and an account that may write is.
+    #[gpui::test]
+    fn a_read_only_account_is_offered_no_way_to_add_a_connection(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let mut servers = None;
+        let window: AnyWindowHandle = cx
+            .open_window(size(px(1200.), px(800.)), |window, cx| {
+                let view = cx.new(|cx| ZedisServers::new(window, cx));
+                servers = Some(view.clone());
+                Root::new(view, window, cx)
+            })
+            .into();
+        let servers = servers.expect("the window built the page");
+        cx.run_until_parked();
+        assert!(offers_to_add(cx, window), "an account that may write is offered one");
+
+        pretend_account_read_only(true);
+        servers.update(cx, |_, cx| cx.notify());
+        assert!(!offers_to_add(cx, window), "a read-only one is not");
     }
 }
 

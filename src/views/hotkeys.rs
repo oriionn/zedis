@@ -26,11 +26,14 @@ use crate::connection::{
     Capability, HotkeyEntry, HotkeysReport, ServerDb, hotkeys_report, hotkeys_reset, hotkeys_start, hotkeys_stop,
 };
 use crate::error::Error;
-use crate::helpers::{get_mono_font_family, pacing};
-use crate::states::{ServerView, ZedisGlobalStore, ZedisServerState, back_to_editor_tooltip, i18n_hotkeys};
+use crate::helpers::{get_mono_font_family, now_datetime, pacing};
+use crate::states::{
+    ReportFinding, ServerView, ZedisGlobalStore, ZedisServerState, back_to_editor_tooltip, i18n_hotkeys,
+    i18n_troubleshoot,
+};
 use crate::views::panel_poll::{PanelPoll, summary_chip};
 use crate::views::unavailable_chip;
-use gpui::{ClipboardItem, Entity, ScrollHandle, SharedString, Window, div, prelude::*, px};
+use gpui::{App, ClipboardItem, Entity, ScrollHandle, SharedString, Window, div, prelude::*, px};
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt, WindowExt,
     button::{Button, ButtonVariants},
@@ -40,6 +43,7 @@ use gpui_kit::component::{
     v_flex,
 };
 use std::time::Duration;
+use zedis_core::report::{Block, Section};
 use zedis_core::string::format_duration;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -103,12 +107,26 @@ impl ZedisHotkeys {
                     Ok(report) => {
                         this.report = Some(report);
                         this.error = None;
+                        this.publish_report_finding(cx);
                     }
                     Err(e) => this.error = Some(e.to_string().into()),
                 }
                 cx.notify();
             },
         ));
+    }
+
+    /// Leave the latest collection with the server state for a
+    /// troubleshooting report (ADR 19): this page is dropped as soon as
+    /// another one opens. An empty one leaves what an earlier one found.
+    fn publish_report_finding(&self, cx: &mut Context<Self>) {
+        let Some(report) = self.report.as_ref().filter(|report| !report.is_empty()) else {
+            return;
+        };
+        let section = report_section(report, cx);
+        self.server_state.update(cx, |state, _| {
+            state.set_report_finding(ReportFinding::Hotkeys, section);
+        });
     }
 
     fn tracking_active(&self) -> bool {
@@ -180,21 +198,7 @@ impl ZedisHotkeys {
         } else {
             ("status_stopped", theme.foreground)
         };
-        let duration: SharedString = if report.collection_duration_ms > 0 {
-            format_duration(Duration::from_millis(report.collection_duration_ms)).into()
-        } else {
-            "—".into()
-        };
-        let cpu_total: SharedString = if report.total_cpu_us > 0 {
-            format!("{:.1} ms", report.total_cpu_us as f64 / 1000.0).into()
-        } else {
-            "—".into()
-        };
-        let net_total: SharedString = if report.total_net_bytes > 0 {
-            humansize::format_size(report.total_net_bytes, humansize::DECIMAL).into()
-        } else {
-            "—".into()
-        };
+        let (duration, cpu_total, net_total) = summary_values(report);
         h_flex()
             .w_full()
             .px_3()
@@ -391,11 +395,7 @@ impl ZedisHotkeys {
                 .into_any_element();
         }
         for (ix, entry) in entries.iter().enumerate() {
-            let share = if total > 0 {
-                entry.value as f64 / total as f64
-            } else {
-                0.0
-            };
+            let share = share_of(entry, total);
             let key: SharedString = entry.key.clone().into();
             let copy_key = key.clone();
             list = list.child(
@@ -479,7 +479,7 @@ impl ZedisHotkeys {
                 "by_cpu_title",
                 &report.by_cpu,
                 report.total_cpu_us,
-                |v| format!("{v} µs"),
+                format_cpu,
                 cx,
             ));
         }
@@ -489,7 +489,7 @@ impl ZedisHotkeys {
                 "by_net_title",
                 &report.by_net,
                 report.total_net_bytes,
-                |v| humansize::format_size(v, humansize::DECIMAL),
+                format_net,
                 cx,
             ));
         }
@@ -557,6 +557,114 @@ impl Render for ZedisHotkeys {
                     .child(body),
             )
     }
+}
+
+fn format_cpu(us: u64) -> String {
+    format!("{us} µs")
+}
+
+fn format_net(bytes: u64) -> String {
+    humansize::format_size(bytes, humansize::DECIMAL)
+}
+
+fn share_of(entry: &HotkeyEntry, total: u64) -> f64 {
+    if total > 0 {
+        entry.value as f64 / total as f64
+    } else {
+        0.0
+    }
+}
+
+/// The collection's length and totals as the summary shows them.
+fn summary_values(report: &HotkeysReport) -> (String, String, String) {
+    let duration = if report.collection_duration_ms > 0 {
+        format_duration(Duration::from_millis(report.collection_duration_ms))
+    } else {
+        "—".to_string()
+    };
+    let cpu_total = if report.total_cpu_us > 0 {
+        format!("{:.1} ms", report.total_cpu_us as f64 / 1000.0)
+    } else {
+        "—".to_string()
+    };
+    let net_total = if report.total_net_bytes > 0 {
+        format_net(report.total_net_bytes)
+    } else {
+        "—".to_string()
+    };
+    (duration, cpu_total, net_total)
+}
+
+/// A collection as a troubleshooting report's section: the summary, then
+/// each ranked list the collection has.
+fn report_section(report: &HotkeysReport, cx: &App) -> Section {
+    let k = |key: &str| i18n_hotkeys(cx, key).to_string();
+    let (duration, cpu_total, net_total) = summary_values(report);
+    let status = if report.tracking_active {
+        "status_tracking"
+    } else {
+        "status_stopped"
+    };
+    let mut facts = vec![
+        (i18n_troubleshoot(cx, "fact_recorded").to_string(), now_datetime()),
+        (k("sum_status"), k(status)),
+        (k("sum_duration"), duration),
+        (k("sum_cpu_total"), cpu_total),
+        (k("sum_net_total"), net_total),
+    ];
+    if report.sample_ratio > 1 {
+        facts.push((k("sum_sample"), format!("1/{}", report.sample_ratio)));
+    }
+    let mut blocks = vec![Block::Facts(facts)];
+    blocks.extend(ranked_list(
+        k("by_cpu_title"),
+        &report.by_cpu,
+        report.total_cpu_us,
+        format_cpu,
+        cx,
+    ));
+    blocks.extend(ranked_list(
+        k("by_net_title"),
+        &report.by_net,
+        report.total_net_bytes,
+        format_net,
+        cx,
+    ));
+    Section {
+        title: k("title"),
+        blocks,
+    }
+}
+
+/// One ranked list as the report shows it, or nothing for a metric the
+/// collection did not track.
+fn ranked_list(
+    title: String,
+    entries: &[HotkeyEntry],
+    total: u64,
+    format_value: fn(u64) -> String,
+    cx: &App,
+) -> Vec<Block> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let columns = ["col_rank", "col_key", "col_value", "col_share"]
+        .iter()
+        .map(|key| i18n_troubleshoot(cx, key).to_string())
+        .collect();
+    let rows = entries
+        .iter()
+        .enumerate()
+        .map(|(ix, entry)| {
+            vec![
+                (ix + 1).to_string(),
+                entry.key.clone(),
+                format_value(entry.value),
+                format!("{:.1}%", share_of(entry, total) * 100.0),
+            ]
+        })
+        .collect();
+    vec![Block::Heading(title), Block::Table { columns, rows }]
 }
 
 async fn fetch_report(server_id: String, db: usize) -> Result<HotkeysReport> {

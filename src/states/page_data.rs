@@ -36,11 +36,28 @@ pub use web::{page_data_generation, refresh_page_data, save_preferences, seed_pa
 
 static ACCOUNT_READ_ONLY: AtomicBool = AtomicBool::new(false);
 
+#[cfg(test)]
+thread_local! {
+    /// What a test says the account is, on its own thread: the flag above is
+    /// the whole process's, and tests run side by side.
+    static READ_ONLY_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Draw this thread's views as a read-only bridge account would see them.
+#[cfg(test)]
+pub(crate) fn pretend_account_read_only(read_only: bool) {
+    READ_ONLY_HERE.with(|here| here.set(Some(read_only)));
+}
+
 /// Whether the signed-in bridge account may change nothing anybody else
 /// sees — a saved script among them. Never, on the desktop, which has no
 /// account. A key's tag and note ask per server instead
 /// (`account_is_read_only_on`), the way a write does.
 pub fn account_is_read_only() -> bool {
+    #[cfg(test)]
+    if let Some(read_only) = READ_ONLY_HERE.with(std::cell::Cell::get) {
+        return read_only;
+    }
     ACCOUNT_READ_ONLY.load(Ordering::Relaxed)
 }
 

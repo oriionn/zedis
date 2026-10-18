@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::states::{command_status_label, i18n_features, i18n_trash};
+use crate::states::{command_status_label, i18n_features, i18n_trash, i18n_troubleshoot};
 use crate::{
     assets::CustomIconName,
     connection::{
@@ -61,7 +61,7 @@ use zedis_ui::ZedisDivider;
 /// and number of another product. Its own comes first, and the Redis it
 /// claims stays beside it because that is what decides which commands the
 /// app expects of it: `Dragonfly 2.0.2 (Redis 7.4.0)`.
-fn product_line(flavor: ServerFlavor, own_version: &str, version: &str) -> String {
+pub(crate) fn product_line(flavor: ServerFlavor, own_version: &str, version: &str) -> String {
     let label = flavor.label();
     if own_version.is_empty() || own_version == version {
         format!("{label} {version}")
@@ -1141,6 +1141,16 @@ impl ZedisStatusBar {
             capabilities_label,
             Icon::new(CustomIconName::ListCheck),
             Box::new(ServerToolsAction::Capabilities),
+        )
+        // Everything the server says about itself, read once, to paste into
+        // a ticket — beside the matrix, the other thing asked of a server
+        // that misbehaves.
+        .menu_with_icon(
+            i18n_troubleshoot(cx, "menu"),
+            // Two `IconName`s are in scope here: the component set's has no
+            // FileText.
+            Icon::new(gpui_kit::assets::IconName::FileText),
+            Box::new(ServerToolsAction::TroubleshootingReport),
         )
     }
     /// Render the server status

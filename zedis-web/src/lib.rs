@@ -66,7 +66,7 @@ use zedis_connection::{
 #[cfg(target_family = "wasm")]
 use zedis_gui::helpers::pacing::{PAGE_DATA_REFRESH, PAGE_DATA_RETRY, SERVER_LIST_REFRESH, set_unattended, unattended};
 #[cfg(target_family = "wasm")]
-use zedis_gui::helpers::set_web_command_key;
+use zedis_gui::helpers::{set_web_command_key, set_web_download};
 #[cfg(target_family = "wasm")]
 use zedis_gui::states::{GlobalEvent, ZedisAppState, ZedisGlobalStore};
 
@@ -203,6 +203,7 @@ pub fn run(
 
         // Before `launch`, which binds the keys and draws their labels.
         set_web_command_key(apple_keyboard);
+        set_web_download(download_file);
         zedis_gui::init_embedded_commands();
         if let Err(e) = zedis_gui::db::init_database() {
             error!(error = %e, "the in-memory local store could not be created");
@@ -383,4 +384,49 @@ pub fn set_page_visible(visible: bool) {
 #[cfg(target_family = "wasm")]
 thread_local! {
     static APP: RefCell<Option<ApplicationHandle>> = const { RefCell::new(None) };
+}
+
+/// How long the browser is given to start reading a download before its
+/// object URL is let go of: revoked in the same turn as the click, some
+/// browsers cancel it.
+#[cfg(target_family = "wasm")]
+const DOWNLOAD_URL_LIFETIME_MS: i32 = 60_000;
+
+/// Hand the browser a text file to save (ADR 19): a page has no save dialog,
+/// so it is the browser's own download — a `Blob`'s object URL clicked
+/// through an `<a download>`.
+#[cfg(target_family = "wasm")]
+fn download_file(name: &str, media_type: &str, contents: &str) {
+    if let Err(e) = start_download(name, media_type, contents) {
+        error!(error = ?e, "the browser did not start the download");
+    }
+}
+
+#[cfg(target_family = "wasm")]
+fn start_download(name: &str, media_type: &str, contents: &str) -> Result<(), wasm_bindgen::JsValue> {
+    use wasm_bindgen::JsCast as _;
+    use wasm_bindgen::JsValue;
+    use wasm_bindgen::closure::Closure;
+    use web_sys::{Blob, BlobPropertyBag, HtmlAnchorElement, Url};
+
+    let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
+    let document = window.document().ok_or_else(|| JsValue::from_str("no document"))?;
+    let body = document.body().ok_or_else(|| JsValue::from_str("no body"))?;
+    let options = BlobPropertyBag::new();
+    options.set_type(&format!("{media_type};charset=utf-8"));
+    let blob = Blob::new_with_str_sequence_and_options(&JsValue::from(vec![contents.to_string()]), &options)?;
+    let url = Url::create_object_url_with_blob(&blob)?;
+    let anchor: HtmlAnchorElement = document.create_element("a")?.dyn_into()?;
+    anchor.set_href(&url);
+    anchor.set_download(name);
+    // In the document while it is clicked: a detached link downloads
+    // nothing in some browsers.
+    body.append_child(&anchor)?;
+    anchor.click();
+    anchor.remove();
+    let revoke = Closure::once_into_js(move || {
+        let _ = Url::revoke_object_url(&url);
+    });
+    window.set_timeout_with_callback_and_timeout_and_arguments_0(revoke.unchecked_ref(), DOWNLOAD_URL_LIFETIME_MS)?;
+    Ok(())
 }

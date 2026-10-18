@@ -66,11 +66,12 @@ pub fn init_commands_json(bytes: Vec<u8>) {
     let _ = COMMANDS_JSON.set(bytes);
 }
 
-/// Whether [`init_commands_json`] has run. Callers that cache a derived
-/// set (slow-log two-word names) must not pin an empty result before this
-/// is true — in the browser the file arrives after the first frame.
-pub fn commands_metadata_loaded() -> bool {
-    COMMANDS_JSON.get().is_some()
+/// Whether `name sub` is a subcommand the table lists (`CONFIG SET`,
+/// `XINFO STREAM`), in any case and whatever version the server is: how a
+/// logged command line is split into its name and its arguments. False
+/// until the table is in — in the browser it arrives after the first frame.
+pub fn is_subcommand(name: &str, sub: &str) -> bool {
+    is_known_command(&format!("{} {}", name.to_ascii_uppercase(), sub.to_ascii_uppercase()))
 }
 
 /// The group `commands.json` files `name` under (`"string"`, `"server"`, …),

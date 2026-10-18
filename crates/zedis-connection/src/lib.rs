@@ -94,6 +94,7 @@ mod subscription;
 #[cfg(target_family = "wasm")]
 mod subscription_web;
 mod terminal;
+mod troubleshoot;
 mod vector_set;
 mod zset_ops;
 
@@ -272,6 +273,7 @@ pub use subscription_web::{
     ChannelMessage, ChannelSubscription, MonitorFeed, MonitorFeeds, SubscribeKind, open_monitor_feeds,
 };
 pub use terminal::{ExecReplies, TerminalReply, TerminalSession};
+pub use troubleshoot::{Part, REPORT_CONFIG, TroubleshootingSnapshot, troubleshooting_snapshot};
 pub use vector_set::{
     VectorNeighbour, VectorSetInfo, VectorSim, VectorSimOptions, vset_info, vset_remove, vset_set_attr, vset_sim,
 };

@@ -1017,6 +1017,7 @@ mod tests {
             throttle: auth::Throttle::new(),
             setup: crate::accounts::Setup::in_dir(dir),
             signup: Signup::Off,
+            store_probe: None,
         }
     }
 

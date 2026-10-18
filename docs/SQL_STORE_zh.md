@@ -185,6 +185,7 @@ GRANT ALL PRIVILEGES ON zedis.* TO 'zedis'@'%';
   ```
 
 - **每个浏览器固定落在一个 bridge 上**，按登录 cookie `zedis_bridge` 做会话保持（负载均衡的 sticky session）：终端会话和各个实时面板是开在某一个 bridge 里的 Redis 连接。
+- **健康检查指向 `/v1/ready`**：这个 bridge 的数据库两秒内没有响应时返回 `503`，负载均衡就会把流量转给其他 bridge。`/v1/health` 只表示进程还活着，用作容器的存活探针。
 - **各台主机时钟同步**（NTP）。
 
 ## 迁移已有的 bridge

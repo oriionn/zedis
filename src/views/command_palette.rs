@@ -24,7 +24,7 @@ use crate::states::{
     Route, ServerToolsAction, ServerView, SettingsAction, ZedisGlobalStore, ZedisServerState, command_status_label,
     i18n_command_palette, i18n_features, i18n_shortcuts,
 };
-use crate::states::{i18n_status_bar, i18n_trash};
+use crate::states::{i18n_status_bar, i18n_trash, i18n_troubleshoot};
 use crate::views::placeholders::Placeholders;
 use gpui::{Context, FocusHandle, Focusable, KeyDownEvent, ScrollHandle, Window, div, prelude::*, px};
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
@@ -523,6 +523,11 @@ impl ZedisCommandPalette {
                 None,
                 ServerToolsAction::Capabilities,
             ));
+            tools.push((
+                i18n_troubleshoot(cx, "menu"),
+                Some(i18n_troubleshoot(cx, "keywords")),
+                ServerToolsAction::TroubleshootingReport,
+            ));
             for (label, keywords, action) in tools {
                 // Other names people look for it by, as the issue did: the
                 // label alone answered "recycle" and not "trash".
@@ -976,6 +981,7 @@ mod tests {
                 ServerToolsAction::ExportKeys,
                 ServerToolsAction::CompareKeys,
                 ServerToolsAction::Capabilities,
+                ServerToolsAction::TroubleshootingReport,
             ] {
                 assert!(
                     items

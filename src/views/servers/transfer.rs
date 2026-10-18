@@ -213,6 +213,10 @@ impl ZedisServers {
     /// server entry is created with a freshly-allocated UUID — never
     /// overwrites an existing config.
     pub(super) fn import_server_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A read-only bridge account adds nothing (the bridge refuses it).
+        if account_is_read_only() {
+            return;
+        }
         let json_state = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(6, 16)

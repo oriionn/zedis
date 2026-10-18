@@ -24,7 +24,7 @@ use crate::connection::ServerCommand;
 /// behind a log-kind switch; the Duration column reads Size there.
 use crate::connection::{
     CommandLogKind, LatencyEvent, LatencySample, ServerDb, SlowLogEntry, command_log_reset, command_logs, config_set,
-    floors, get_server, latency_history, latency_latest, latency_monitor_threshold, latency_reset, list_commands,
+    floors, get_server, is_subcommand, latency_history, latency_latest, latency_monitor_threshold, latency_reset,
     script_show,
 };
 use crate::error::Error;
@@ -56,7 +56,7 @@ use gpui_kit::component::{
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::rc::Rc;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 use zedis_core::tally::totals_by_command;
 use zedis_ui::{
@@ -75,29 +75,6 @@ enum PerformanceTab {
     SlowLog,
     TopCommands,
     Latency,
-}
-
-/// Set of two-word Redis command names in uppercase (e.g. "CONFIG GET", "SLOWLOG GET").
-/// Built once from the full command list so we can correctly split slowlog args into
-/// `command` vs `args` columns in the table.
-static TWO_WORD_COMMANDS: OnceLock<HashSet<String>> = OnceLock::new();
-
-/// Returns a reference to the lazily-initialized set of two-word Redis commands.
-/// The set is built once and reused for all subsequent slow-log entries.
-fn two_word_commands() -> &'static HashSet<String> {
-    static EMPTY: OnceLock<HashSet<String>> = OnceLock::new();
-    // Do not pin an empty set: in the browser commands.json is fetched after
-    // the first frame, and OnceLock would then keep "no two-word commands".
-    if !crate::connection::commands_metadata_loaded() {
-        return EMPTY.get_or_init(HashSet::new);
-    }
-    TWO_WORD_COMMANDS.get_or_init(|| {
-        list_commands("0.0.0")
-            .into_iter()
-            .filter(|cmd| cmd.contains(' '))
-            .map(|cmd| cmd.to_string().to_uppercase())
-            .collect()
-    })
 }
 
 /// A single row in the slowlog table, pre-formatted for display.
@@ -163,10 +140,13 @@ impl SlowLogRow {
 
         // Check whether the first two tokens form a known two-word command
         // (e.g. "CONFIG GET", "SLOWLOG GET") before splitting.
+        // The set this was asked of used to be built from `list_commands`
+        // at version 0.0.0, which every command in the table postdates, so
+        // it was empty and `CONFIG GET` read as `CONFIG` with `GET …`.
         let (command, args) = if entry.args.len() >= 2 {
-            let candidate = format!("{} {}", entry.args[0], entry.args[1]).to_uppercase();
-            if two_word_commands().contains(&candidate) {
+            if is_subcommand(&entry.args[0], &entry.args[1]) {
                 // Two-word command: treat both tokens as the command name.
+                let candidate = format!("{} {}", entry.args[0], entry.args[1]).to_uppercase();
                 (candidate, entry.args.get(2..).unwrap_or(&[]).join(" "))
             } else {
                 // Single-word command: first token is the name, rest are args.
@@ -1829,7 +1809,8 @@ fn format_unix_seconds(ts: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SlowLogRow, aggregate_commands, format_us_as_ms};
+    use super::{CommandLogKind, SlowLogEntry, SlowLogRow, aggregate_commands, format_us_as_ms};
+    use std::time::Duration;
 
     fn row(command: &str, duration_us: u64) -> SlowLogRow {
         SlowLogRow {
@@ -1864,6 +1845,29 @@ mod tests {
         assert_eq!(aggs[2].max, 4_000);
         let share_sum: f64 = aggs.iter().map(|a| a.share_pct).sum();
         assert!((share_sum - 100.0).abs() < 1e-6);
+    }
+
+    /// A container's subcommand is part of the command whatever version
+    /// the server is: `CONFIG GET` is the command and `maxmemory` its
+    /// argument. The set this was asked of was built at version 0.0.0, which
+    /// every command postdates, so it was empty and the column said `CONFIG`.
+    #[test]
+    fn a_subcommand_is_part_of_the_command() {
+        crate::init_embedded_commands();
+        let entry = |args: &[&str]| SlowLogEntry {
+            id: 1,
+            timestamp: 1,
+            duration: Duration::from_micros(10),
+            amount: 10,
+            args: args.iter().map(|arg| arg.to_string()).collect(),
+            client_addr: None,
+            client_name: None,
+        };
+        let row = SlowLogRow::from_entry(&entry(&["config", "get", "maxmemory"]), CommandLogKind::Slow);
+        assert_eq!((row.command.as_ref(), row.args.as_ref()), ("CONFIG GET", "maxmemory"));
+        // A key that happens to spell a subcommand is still a key.
+        let row = SlowLogRow::from_entry(&entry(&["GET", "set"]), CommandLogKind::Slow);
+        assert_eq!((row.command.as_ref(), row.args.as_ref()), ("GET", "set"));
     }
 
     #[test]

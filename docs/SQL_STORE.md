@@ -185,6 +185,7 @@ Every bridge on one database is the same bridge to a browser: signed in on one i
   ```
 
 - **Keep each browser on one bridge** by its `zedis_bridge` login cookie (sticky sessions on the load balancer): the terminal's session and the streaming panels are open Redis connections inside one bridge.
+- **Health checks on `/v1/ready`**: `503` while that bridge's database does not answer within two seconds, so the load balancer sends the traffic to the others. `/v1/health` only says the process is up, for a container's liveness probe.
 - **Synchronized clocks** (NTP) on every host.
 
 ## Moving an existing bridge

@@ -79,6 +79,7 @@ pub use i18n::i18n_topology;
 pub use i18n::i18n_trash;
 #[cfg(not(target_os = "linux"))]
 pub use i18n::i18n_tray;
+pub use i18n::i18n_troubleshoot;
 pub use i18n::i18n_update;
 pub use i18n::i18n_value_search;
 pub use i18n::i18n_vector_set;
@@ -88,6 +89,8 @@ pub use i18n::save_ui_locale;
 pub use i18n::{command_status_label, command_unavailable_message, server_view_title};
 #[cfg(not(target_family = "wasm"))]
 pub use migration::{ExportFormat, LogStatus, MigrationEvent, MigrationJob, MigrationPhase, MigrationState};
+#[cfg(test)]
+pub(crate) use page_data::pretend_account_read_only;
 pub use page_data::{account_is_read_only, ask_for_fresh_page_data};
 /// The browser entry point loads the page data from the bridge here, before
 /// `init_caches`, and refreshes it while the page is open (ADR 17).
@@ -109,6 +112,7 @@ pub use server::element::KvElement;
 pub use server::event::ServerEvent;
 pub use server::event::ServerTask;
 pub use server::key::{RestoredKey, recycles_deleted_keys};
+pub use server::report::ReportFinding;
 pub use server::stream::project_stream_entries;
 // Used by the value-diff view to render the same RFC 7396 merge patch
 // document the Save path sends as JSON.MERGE — single source of truth.

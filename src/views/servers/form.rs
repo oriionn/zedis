@@ -31,6 +31,11 @@ impl ZedisServers {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Every way here is hidden from a read-only bridge account, whose
+        // save the bridge would refuse; a route or a shortcut is not.
+        if account_is_read_only() {
+            return;
+        }
         let server_id = redis_server.id.clone();
         let is_new = server_id.is_empty();
         let server_type_list = i18n_servers(cx, "server_type_list");

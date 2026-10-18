@@ -643,6 +643,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         throttle,
         setup,
         signup,
+        store_probe: stores.versions.clone(),
     });
     // With the peer's address, which the audit log records beside whatever
     // a proxy wrote in `X-Forwarded-For`.

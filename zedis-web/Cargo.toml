@@ -52,7 +52,20 @@ wasm-bindgen = "0.2.104"
 # `tracing` has nowhere to go in a page without a writer for the console.
 tracing-subscriber = "0.3.23"
 tracing-web = "0.1.3"
-web-sys = { version = "0.3.105", features = ["Window", "Location"] }
+# The rest of the list is the report's download (`download_file`): a `Blob`,
+# its object URL and a link to click.
+web-sys = { version = "0.3.105", features = [
+  "Window",
+  "Location",
+  "Blob",
+  "BlobPropertyBag",
+  "Document",
+  "Element",
+  "HtmlAnchorElement",
+  "HtmlElement",
+  "Node",
+  "Url",
+] }
 # Lets go of a watch (`release_watch`) from a `Drop`, which cannot await:
 # the request is started on the page's own executor and not waited for.
 wasm-bindgen-futures = "0.4.79"

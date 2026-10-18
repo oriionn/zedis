@@ -150,7 +150,11 @@ or mismatched session" or "no such watch" — and an unlock window is
 asked for again. So the load balancer keeps a browser on one process by
 its login cookie, as ADR 17 said, for those; a process that goes down
 costs the page its terminal session and its subscriptions, not its
-sign-in.
+sign-in. The load balancer asks `/v1/ready` whether a process can serve:
+`503` while its database does not answer within two seconds, so the
+traffic goes to the others. `/v1/health` stays the process's liveness and
+never asks the database: restarting a bridge whose database is away mends
+nothing.
 
 **A counter per cached set.** `store_versions` holds one for each set a
 process keeps in memory — `servers`, `accounts` (with invitations and

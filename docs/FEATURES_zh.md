@@ -13,7 +13,7 @@ Zedis 会自动识别值的格式，并实时格式化显示。本页是详尽�
 | 🚀 **原生 & 快** | GPU 渲染 · `SCAN` + 虚拟滚动，百万键 60+ FPS · macOS / Windows / Linux · 浅色 / 深色 / 跟随系统 + 6 套内置主题 · 界面与等宽字体可自选 |
 | 🧠 **智能数据查看器** | 自动解压(LZ4 / Snappy / GZIP / ZSTD)· JSON & RedisJSON + JSONPath · Protobuf · MessagePack · Java / PHP / pickle 序列化 · BSON · JWT · Base64 · URL 编码 · 时间戳 · 图片 · Hex · 自定义脚本——Hash / List / Set / ZSet 的元素同样适用，编辑的仍是存储的字节；Stream 的字段值也会解码显示 |
 | 🗂️ **类型 & 模块查看器** | 位图（`BITOP`）· HyperLogLog（`PFMERGE`）· 向量集(KNN)· 地理地图（`GEOADD` / `GEODIST`，半径 + 矩形搜索）· Bloom / Cuckoo / Count-Min / Top-K · 时间序列（`TS.ADD` / `TS.ALTER` / 聚合规则，以及基于 `TS.MRANGE` 的多序列浏览器）· Streams(实时跟踪、`XSETID`、消费者管理)· Pub/Sub(含分片)· RediSearch（索引大小、`FT.TAGVALS` 取值、`FT.SPELLCHECK` 拼写建议）· Functions |
-| 📊 **可观测性** | 实时指标 + 7 天历史（可导出 CSV）· `MEMORY DOCTOR` / `MEMORY STATS` 与 `LATENCY DOCTOR` 报告 · 内存分析（在线扫描或离线 RDB 文件），含类型/编码占比、逐级下钻前缀 + AI 建议 · 慢日志 ↔ Latency（含 Valkey `COMMANDLOG` 大请求 / 大回复）· `MONITOR` · 按值搜索 · 集群健康、重分片 / 槽位修复 / 再平衡 · 主从复制（`REPLICAOF` / `FAILOVER`）· 持久化 & 键事件 · 按参数类型编辑的 CONFIG 编辑器（含 `CONFIG REWRITE`） · 原始 INFO 浏览器 |
+| 📊 **可观测性** | 实时指标 + 7 天历史（可导出 CSV）· `MEMORY DOCTOR` / `MEMORY STATS` 与 `LATENCY DOCTOR` 报告 · 内存分析（在线扫描或离线 RDB 文件），含类型/编码占比、逐级下钻前缀 + AI 建议 · 慢日志 ↔ Latency（含 Valkey `COMMANDLOG` 大请求 / 大回复）· `MONITOR` · 按值搜索 · 集群健康、重分片 / 槽位修复 / 再平衡 · 主从复制（`REPLICAOF` / `FAILOVER`）· 持久化 & 键事件 · 按参数类型编辑的 CONFIG 编辑器（含 `CONFIG REWRITE`） · 原始 INFO 浏览器 · 可粘贴、可发送的排查报告（Markdown / HTML，不含值） |
 | 🔑 **Keys & 数据** | 带 TTL chip 的命名空间树 · 分页加载的 Hash / List / Set / ZSet 编辑器（`HSCAN`/`SSCAN`/`ZSCAN`）· 多选批量删除 · 类型原生操作（`LTRIM` / `LPOP` / `ZINCRBY` / `ZPOPMIN` / `HINCRBY` / `INCRBY` / `APPEND` / `GETEX`）· ZSet 分数区间筛选（`ZRANGEBYSCORE`）· 标签 / 备注 / 收藏 · 重命名 · 字段级 TTL · 绝对到期时刻（`EXPIREAT`）· 键栏显示存储编码 / 空闲时间 · 版本历史 · 会话变更记录（集合类型带结构化 diff）· 值编辑器查找替换 · JSON 树视图与路径级操作（`JSON.SET` / `JSON.DEL` / `JSON.NUMINCRBY` / `JSON.TOGGLE` / `JSON.ARRAPPEND` / `JSON.STRAPPEND` / `JSON.CLEAR`，对普通字符串里的 JSON 则在本地执行）· 保存前 JSON 校验、格式化与压缩 · 本地回收站(24h)· 文件导入导出 · 批量操作(Tools 导出、前缀过滤、二进制 / JSON / CSV)· 跨服务器复制 & 对比——单键或整个前缀：`DUMP`/`RESTORE` 直传批量复制，以及两库对比 |
 | 🔐 **安全 & 隐私** | 环境标签，Prod 上确认更严格 · 只读锁 · Prod 默认锁写、每次解锁 15 分钟 · ACL 编辑（安全日志、DRYRUN 权限测试、`ACL GENPASS` 生成密码、aclfile 保存/载入）· TLS/SSL & SSH · 分阶段连接诊断 · 断线自愈并跟随 Sentinel/Cluster 故障转移 · 凭据按机器加密 · 纯本地、无遥测 |
 | 🧭 **受限服务端** | 连接后自动探测服务端支持哪些命令：在代理（Twemproxy / Codis / Envoy）、云托管（ElastiCache / Azure / Tair）和 Redis 兼容服务端（Valkey / Dragonfly / KeyDB / Kvrocks）上，依赖缺失命令的面板与按钮会灰显并*说明原因*（`CONFIG GET` 不支持、`SLOWLOG` 无权限）而不是报错 · 没有 `SCAN` 时键编辑器仍可按键名打开 · 完整命令矩阵在 工具 → 服务端能力 中查看 |
@@ -154,6 +154,11 @@ Redis 无法索引值，所以这种 `O(keyspace)` 的搜索加了几道限制�
 
 ---
 
+### 排查报告
+**服务器关于自己的所有信息，一次粘贴就够。**
+
+**工具 → 排查报告…** 一次读完服务器：它是谁、每个主节点的 `INFO` 状态（内存与上限、碎片率、客户端、命中率、淘汰、复制、持久化、keyspace）、服务器自己写的 `MEMORY DOCTOR` 和 `LATENCY DOCTOR`、延迟事件、最新的慢日志，以及能解释这些现象的配置——再加上本次会话已有的分析结果：内存分析最近一次扫描（体检建议、最大的前缀和 key）和最近一次热点 key 采集。可以**复制**为 Markdown 贴进工单或聊天，也可以**保存**为 Markdown，或一个随处可打开、自带浅色 / 深色样式的 HTML 文件。报告里只有 key 名、大小和配置，没有任何值：慢日志条目只保留命令和第一个参数，凭据会被抹掉。服务器拒绝提供的部分——比如托管云上的 `CONFIG` 或 doctor 命令——会在报告里写明服务器给出的原因，其余部分照常输出。在浏览器里，文件以下载的方式保存。
+
 ## 🔑 Key 与数据管理
 
 ### Key 的组织方式
@@ -249,7 +254,7 @@ Valkey 从 Redis 7.2.4 分叉，版本号走自己的节奏，所以为 Redis �
 ### 浏览器里没有什么
 **几乎都有：缺的只是需要文件、第二个窗口或逐个连接节点的功能。**
 
-键树、所有值编辑器、终端、指标（含 1 小时 / 24 小时 / 7 天历史）、慢日志、CONFIG、客户端、内存分析、按值搜索、多数据库键搜索、跨服务器对比（以对话框形式）和回收站都可用，流式面板——`MONITOR`、Pub/Sub、键空间通知——也可用：连接由 bridge 持有，页面轮询取消息；回收站和指标历史保存在 bridge 上，回收站由能看到该服务器的所有人共享。`MONITOR` 只限完整账号，在写锁定的条目上会先问写锁的确认，记入审计日志，10 分钟后自动停止。不提供：拓扑与 Sentinel 管理、脚本查看器与 Protobuf schema 编辑器、迁移（文件导入 / 导出，因此对比里也没有“复制到目标”）、连接诊断，以及被浏览器自己占用的快捷键（⌘N / ⌘T / ⌘W / ⌘Q）。值编辑器里的代码不着色、也不能折叠：语法高亮依赖 `tree-sitter`，而 WebAssembly 构建带不上它，所以那里的编辑器根本没有高亮器。格式化、JSONPath 与编辑不受影响。标签、备注、收藏、最近打开的 key、搜索历史、已保存脚本和设置都由 bridge 保存：账号自己的列表和偏好跟着账号走，换浏览器也在；key 的标签和备注属于服务器（按 key 逐条保存，只有在该服务器上有写权限的账号能留）；保存的脚本默认私有、可以共享，每次保存都记审计。没有提供的面板会显示和"服务端缺少该命令"时一样的说明，而不是直接报错。停在后台标签页的页面会自行放慢轮询。桌面端仍是功能完整的客户端。
+键树、所有值编辑器、终端、指标（含 1 小时 / 24 小时 / 7 天历史）、慢日志、CONFIG、客户端、内存分析、按值搜索、多数据库键搜索、跨服务器对比（以对话框形式）、排查报告（以下载方式保存）和回收站都可用，流式面板——`MONITOR`、Pub/Sub、键空间通知——也可用：连接由 bridge 持有，页面轮询取消息；回收站和指标历史保存在 bridge 上，回收站由能看到该服务器的所有人共享。`MONITOR` 只限完整账号，在写锁定的条目上会先问写锁的确认，记入审计日志，10 分钟后自动停止。不提供：拓扑与 Sentinel 管理、脚本查看器与 Protobuf schema 编辑器、迁移（文件导入 / 导出，因此对比里也没有“复制到目标”）、连接诊断，以及被浏览器自己占用的快捷键（⌘N / ⌘T / ⌘W / ⌘Q）。值编辑器里的代码不着色、也不能折叠：语法高亮依赖 `tree-sitter`，而 WebAssembly 构建带不上它，所以那里的编辑器根本没有高亮器。格式化、JSONPath 与编辑不受影响。标签、备注、收藏、最近打开的 key、搜索历史、已保存脚本和设置都由 bridge 保存：账号自己的列表和偏好跟着账号走，换浏览器也在；key 的标签和备注属于服务器（按 key 逐条保存，只有在该服务器上有写权限的账号能留）；保存的脚本默认私有、可以共享，每次保存都记审计。没有提供的面板会显示和"服务端缺少该命令"时一样的说明，而不是直接报错。停在后台标签页的页面会自行放慢轮询。桌面端仍是功能完整的客户端。
 
 ---
 

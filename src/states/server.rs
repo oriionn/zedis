@@ -27,6 +27,7 @@ use crate::error::{ConnectionErrorKind, Error};
 use crate::helpers::{pacing, unix_ts};
 use crate::states::server::event::{ServerEvent, ServerTask};
 use crate::states::server::history::{KeyHistories, ValueHistoryEntry};
+use crate::states::server::report::ReportFinding;
 use crate::states::server::stat::{ClientPause, RedisInfo, client_pause_now, get_metrics_cache};
 use crate::states::{
     HINT_FIRST_CONNECT, QueryMode, ServerView, ZedisGlobalStore, ask_for_fresh_page_data, command_unavailable_message,
@@ -49,6 +50,7 @@ use uuid::Uuid;
 use value::{KeyType, RedisValue, RedisValueData};
 use web_time::Instant;
 use zedis_core::change_log::ChangeEntry;
+use zedis_core::report::Section;
 
 #[cfg(not(target_family = "wasm"))]
 pub mod cluster;
@@ -61,6 +63,7 @@ pub mod key;
 pub mod list;
 pub mod persistence;
 pub mod replication;
+pub mod report;
 pub mod script_kill;
 #[cfg(not(target_family = "wasm"))]
 pub mod sentinel;
@@ -159,6 +162,9 @@ pub type LoadedKeys = OrdMap<SharedString, KeyType>;
 #[derive(Debug, Clone, Default)]
 pub struct ZedisServerState {
     redis_info: Option<RedisInfo>,
+    /// What this session's panels found, for a troubleshooting report
+    /// (`report.rs`).
+    report_findings: Vec<(ReportFinding, Section)>,
     /// Last time `dbsize` was filled from `DBSIZE` — the heartbeat asks at
     /// most once a minute; a user-driven add/delete asks at once.
     last_dbsize_refreshed_at: i64,
@@ -758,6 +764,7 @@ impl ZedisServerState {
         self.regex_keyword = false;
         self.reset_scan(cx);
         self.terminal = false;
+        self.report_findings.clear();
         self.last_dbsize_refreshed_at = 0;
         self.dbsize_refresh_inflight = false;
         self.dbsize_refresh_again = false;
@@ -1822,7 +1829,12 @@ impl ZedisServerState {
             // And what the link failed with stays on screen while it is
             // tried again.
             let link_failure = if retry_failed { self.link_failure.take() } else { None };
+            // And what this session's panels found is still this server's.
+            let findings = retry_failed.then(|| std::mem::take(&mut self.report_findings));
             self.reset(cx);
+            if let Some(findings) = findings {
+                self.report_findings = findings;
+            }
             if let Some((until, task)) = open_window {
                 self.write_unlocked_until = until;
                 self.unlock_task = task;

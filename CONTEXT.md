@@ -82,6 +82,11 @@ Architecture and conventions live in `CLAUDE.md`; decisions in `docs/adr/`.
   and dropped on route change, so only `ZedisAppState` persists.
 - **Server tool** — a panel about the server rather than a key: metrics,
   memory analysis, slow log, clients, config, ACL, topology, …
+- **Troubleshooting report** — what the server says about itself, read once
+  and written as Markdown or HTML (ADR 19): key names, sizes and settings,
+  never a value. A **finding** is a server tool's result left on the server
+  state for it (the memory analyzer's online scan, the hot keys), kept while
+  the tab stays on that server and database.
 
 ## Web build
 

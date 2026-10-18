@@ -35,12 +35,12 @@ use zedis_connection::{
     AclDryRun, BitOpKind, ChannelSubscription, ClusterNode, CommandLogKind, CommandStatus, CompareOptions, CompareSide,
     ConflictMode, ExpireCondition, FAILOVER_TIMEOUT_MS, FieldTtl, FromEnd, GeoShape, HeatMetric, HeatProbe,
     HllEncoding, ImportFormat, KeyDifference, KeyOp, KeyOpOutcome, KillFilter, KillOutcome, KillTarget, PauseMode,
-    ProbKind, ProbeOutcome, PubsubChannel, ReadLimits, ReadableValue, ReadableWriteStatus, RedisAsyncConn, RedisServer,
-    ReplicationInfo, ReplicationRole, ReplyFormat, RestoreStatus, SERVER_TYPE_SENTINEL, SearchOptions, ServerCommand,
-    ServerDb, ServerFlavor, SlotStatMetric, StreamGroup, StreamTail, StreamTrim, StringWrite, SubscribeKind,
-    TerminalSession, TsAlter, TsMRange, VectorSimOptions, acl_del_user, acl_dryrun, acl_file, acl_genpass,
-    acl_get_user, acl_log, acl_log_reset, acl_save, acl_set_user, acl_whoami, bgrewriteaof, bgsave, bit_field, bit_op,
-    bitmap_info, client_kill_by, client_kill_id, client_list, client_pause, client_unpause,
+    ProbKind, ProbeOutcome, PubsubChannel, REPORT_CONFIG, ReadLimits, ReadableValue, ReadableWriteStatus,
+    RedisAsyncConn, RedisServer, ReplicationInfo, ReplicationRole, ReplyFormat, RestoreStatus, SERVER_TYPE_SENTINEL,
+    SearchOptions, ServerCommand, ServerDb, ServerFlavor, SlotStatMetric, StreamGroup, StreamTail, StreamTrim,
+    StringWrite, SubscribeKind, TerminalSession, TsAlter, TsMRange, VectorSimOptions, acl_del_user, acl_dryrun,
+    acl_file, acl_genpass, acl_get_user, acl_log, acl_log_reset, acl_save, acl_set_user, acl_whoami, bgrewriteaof,
+    bgsave, bit_field, bit_op, bitmap_info, client_kill_by, client_kill_id, client_list, client_pause, client_unpause,
     cluster_get_slot_migrations, cluster_migrate_slots, command_log_reset, command_logs, compare_prefix,
     config_get_all, config_get_named, config_get_one, config_load, config_resetstat, config_rewrite, config_set,
     consumer_create, consumer_delete, count_keys_matching, create_key, csv_header, dbsize, delete_key, delete_keys,
@@ -60,10 +60,10 @@ use zedis_connection::{
     server_supports, set_add, set_bit, set_card, set_hash_field_ttl, set_keys_ttl, set_remove, set_replace_member,
     set_scan, set_ttl_matching, slow_logs, snapshot_key, sniff_import_format, split_acl_rules, stream_ack, stream_add,
     stream_autoclaim, stream_claim, stream_delete, stream_info, stream_len, stream_page, stream_set_id, stream_trim,
-    string_get, string_prefix, string_set, test_connection, ts_add, ts_alter, ts_create_rule, ts_delete_rule,
-    ts_mrange, ts_window, unassigned_slot_ranges, value_preview, vset_info, vset_remove, vset_set_attr, vset_sim,
-    write_hash_field, write_readable_chunk, zset_card, zset_count_by_score, zset_looks_geo, zset_put, zset_range,
-    zset_range_by_score, zset_remove, zset_scan,
+    string_get, string_prefix, string_set, test_connection, troubleshooting_snapshot, ts_add, ts_alter, ts_create_rule,
+    ts_delete_rule, ts_mrange, ts_window, unassigned_slot_ranges, value_preview, vset_info, vset_remove, vset_set_attr,
+    vset_sim, write_hash_field, write_readable_chunk, zset_card, zset_count_by_score, zset_looks_geo, zset_put,
+    zset_range, zset_range_by_score, zset_remove, zset_scan,
 };
 use zedis_connection::{
     CopyLoss, SearchableType, ValueSearchSpec, copy_preflight, multi_search_exact, multi_search_scan, scan_values_round,
@@ -295,6 +295,40 @@ fn standalone_connects_from_inside_a_tokio_runtime() {
         let value: String = cmd("GET").arg(&key).query_async(&mut c).await.expect("get under tokio");
         assert_eq!(value, "through-tokio");
         cmd("DEL").arg(&key).exec_async(&mut c).await.expect("cleanup");
+    });
+}
+
+/// The troubleshooting report's snapshot (ADR 19): every part answers on a
+/// plain server, read-only, and the settings come back in the report's
+/// order, named.
+#[test]
+#[ignore]
+fn standalone_troubleshooting_snapshot_reads_every_part() {
+    smol::block_on(async {
+        let id = register(server("it-standalone", standalone())).await;
+        let snapshot = troubleshooting_snapshot(&ServerDb::new(&id, 0)).await;
+        let summary = snapshot.summary.as_ref().expect("who the server is");
+        assert!(!summary.version.is_empty());
+        let info = snapshot.info.as_ref().expect("INFO");
+        assert_eq!(info.len(), 1, "one master");
+        assert!(info[0].1.contains("used_memory:"), "the fullest INFO: {}", info[0].1);
+        let doctor = snapshot.memory_doctor.as_ref().expect("MEMORY DOCTOR");
+        assert!(doctor.first().is_some_and(|reply| !reply.value.trim().is_empty()));
+        assert!(
+            snapshot.latency_doctor.is_ok(),
+            "{:?}",
+            snapshot.latency_doctor.as_ref().err()
+        );
+        assert!(snapshot.latency.is_ok() && snapshot.slow_log.is_ok());
+        let config = snapshot.config.as_ref().expect("CONFIG GET");
+        let names: Vec<&str> = config.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, REPORT_CONFIG);
+        assert!(
+            config
+                .iter()
+                .any(|(name, value)| name == "maxmemory-policy" && value.is_some()),
+            "{config:?}"
+        );
     });
 }
 

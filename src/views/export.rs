@@ -106,6 +106,11 @@ pub(crate) fn export_to_file_global(
 /// The `YYYYMMDD-HHMMSS` timestamp keeps repeated exports from overwriting
 /// each other; `stem` is sanitized to an ASCII-alphanumeric slug.
 pub(crate) fn export_filename(stem: &str) -> String {
+    export_filename_with(stem, "json")
+}
+
+/// [`export_filename`] with another extension: `zedis-<slug>-<ts>.<extension>`.
+pub(crate) fn export_filename_with(stem: &str, extension: &str) -> String {
     let slug: String = stem
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -113,8 +118,8 @@ pub(crate) fn export_filename(stem: &str) -> String {
     let slug = slug.trim_matches('-');
     let ts = Local::now().format("%Y%m%d-%H%M%S");
     if slug.is_empty() {
-        format!("zedis-{ts}.json")
+        format!("zedis-{ts}.{extension}")
     } else {
-        format!("zedis-{slug}-{ts}.json")
+        format!("zedis-{slug}-{ts}.{extension}")
     }
 }

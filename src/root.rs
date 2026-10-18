@@ -56,7 +56,7 @@ use crate::views::{
 use crate::views::{
     ZedisCommandPalette, ZedisContent, ZedisMultiSearch, ZedisRecentKeysPalette, ZedisShortcutsOverlay, ZedisSidebar,
     ZedisTitleBar, confirm_dangerous_command, confirm_remove_server, open_account, open_compare, open_features_dialog,
-    open_new_group_dialog, open_settings, open_trash_dialog,
+    open_new_group_dialog, open_settings, open_trash_dialog, open_troubleshoot_report,
 };
 use crate::window_setup::*;
 use gpui::{
@@ -1248,6 +1248,13 @@ impl Render for Zedis {
                     ServerToolsAction::Capabilities => {
                         let server_state = this.active_content().read(cx).server_state();
                         open_features_dialog(server_state, window, cx);
+                        return;
+                    }
+                    // What the server says about itself, with what this
+                    // session's panels found, to paste or send.
+                    ServerToolsAction::TroubleshootingReport => {
+                        let server_state = this.active_content().read(cx).server_state();
+                        open_troubleshoot_report(server_state, window, cx);
                         return;
                     }
                     // Dump import into the active server / db (not a

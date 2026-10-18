@@ -24,9 +24,9 @@ use crate::helpers::{
     MemoryAnalysisAction, build_csv, format_duration, get_mono_font_family, group_thousands, unix_ts_millis,
 };
 use crate::states::{
-    HINT_MEMORY_ANALYSIS, ServerEvent, ServerView, ZedisGlobalStore, ZedisServerState, back_to_editor_tooltip,
-    content_area_width, get_metrics_cache, i18n_common, i18n_hints, i18n_memory_analysis,
-    update_app_state_and_save_quiet,
+    HINT_MEMORY_ANALYSIS, ReportFinding, ServerEvent, ServerView, ZedisGlobalStore, ZedisServerState,
+    back_to_editor_tooltip, content_area_width, get_metrics_cache, i18n_common, i18n_hints, i18n_memory_analysis,
+    i18n_troubleshoot, update_app_state_and_save_quiet,
 };
 use crate::views::{ChartParams, ValueLabel, format_timestamp_ms, make_bar_chart, make_line_chart};
 /// Redis Memory Analysis viewer.
@@ -67,7 +67,7 @@ use zedis_ui::ZedisTextTable;
 use zedis_ui::{ZedisDivider, fitted_table, help_popover, hint_banner};
 
 mod render;
-/// Maximum rows kept per table.
+mod report;
 mod rules;
 mod stats;
 mod tables;
@@ -76,6 +76,7 @@ use rules::*;
 use stats::*;
 use tables::*;
 
+/// Maximum rows kept per table.
 const TOP_N: usize = 20;
 
 /// Default table row height (Medium size in gpui-component).
@@ -1123,6 +1124,7 @@ impl ZedisMemoryAnalysis {
                 });
                 this.prefix_rows = prefix_rows;
                 this.single_rows = single_rows;
+                this.publish_report_finding(cx);
                 cx.notify();
             });
         }));
