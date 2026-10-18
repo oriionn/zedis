@@ -72,8 +72,8 @@ pub fn install_locale(name: String, toml: String) {
     zedis_gui::i18n_loader::install_locale_toml(&name, &toml);
 }
 
-/// Content hashes inlined in the page, so later `web_fetch` GETs carry
-/// `?v=<md5>` and the browser can keep those files forever.
+/// The content hashes the bridge served the page with, so later `web_fetch`
+/// GETs carry `?v=<hash>` and the browser can keep those files forever.
 #[cfg(target_family = "wasm")]
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn set_asset_revs(json: String) {

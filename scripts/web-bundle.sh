@@ -126,9 +126,5 @@ else
   echo "wasm ($mode): $(mib "$(size "$wasm")") raw -> $(mib "$(size "$wasm.gz")") gzip -1"
 fi
 
-# Content hashes inlined into `index.html` so the page does not need a
-# second request for `asset-rev.json`. The marker, the hashing rules and the
-# git clean filter that keeps the built map out of commits all live in one
-# script — two copies of that regex is how the builder and the filter would
-# come to disagree about what they are both editing.
-python3 scripts/asset-rev.py write
+# No step edits `index.html`: the bridge fills in the page's asset map as it
+# serves it (`static_files::with_asset_map`), from the files it serves.

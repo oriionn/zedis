@@ -27,6 +27,7 @@
 use flate2::read::GzDecoder;
 use rust_embed::RustEmbed;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
@@ -132,13 +133,108 @@ pub fn etag_of(bytes: &[u8]) -> String {
     etag(Sha256::digest(bytes).into())
 }
 
+/// The page, whose asset map is filled in as it is served ([`with_asset_map`]).
+pub const PAGE: &str = "index.html";
+
+/// The markers the page keeps its asset map between: `{}` as written, the
+/// map as served.
+const MAP_START: &str = "/*ASSET_REV*/";
+const MAP_END: &str = "/*/ASSET_REV*/";
+
+/// Whether the page versions `name` (a file's own name, not a compressed
+/// twin's): everything it fetches by name, except itself and the kit's
+/// icons, which the kit fetches by name and which stay on their `ETag`.
+fn versioned(name: &str) -> bool {
+    name != PAGE
+        && !name.starts_with("assets/icons/")
+        && !name.ends_with(".d.ts")
+        && !name.ends_with("package.json")
+        && !name.ends_with(".gitignore")
+}
+
+/// The page's asset map: each file the page fetches by name, and twelve hex
+/// digits of its content's hash, which the page appends as `?v=` so the
+/// browser can keep that body for a year ([`cache_control`]). A module
+/// stored only compressed is named by the name the page asks for, its
+/// `.gz`'s hash standing for it; a `.br` is the same content again.
+///
+/// Worked out by the bridge as it serves the page, from what it serves.
+/// The build used to write it into `index.html`, which made a built file of
+/// an authored one: every commit that touched the page carried a line of
+/// hashes, unless a git filter that does not travel with the repository was
+/// installed and the tool committing ran it.
+pub fn asset_map(files: impl IntoIterator<Item = (String, [u8; 32])>) -> BTreeMap<String, String> {
+    let mut own = BTreeMap::new();
+    let mut gzipped = BTreeMap::new();
+    for (key, hash) in files {
+        let hex: String = hash[..6].iter().map(|b| format!("{b:02x}")).collect();
+        if key.ends_with(".br") {
+            continue;
+        }
+        match key.strip_suffix(".gz") {
+            Some(name) => gzipped.insert(name.to_string(), hex),
+            None => own.insert(key, hex),
+        };
+    }
+    for (name, hex) in gzipped {
+        own.entry(name).or_insert(hex);
+    }
+    own.retain(|name, _| versioned(name));
+    own
+}
+
+/// The embedded build's [`asset_map`]. Cheap in a release build, whose
+/// hashes rust-embed worked out when it compiled them in; a debug build
+/// reads and hashes the directory, which is what lets `make web-bundle`
+/// show without a restart.
+pub fn embedded_asset_map() -> BTreeMap<String, String> {
+    asset_map(
+        WebBuild::iter()
+            .filter_map(|key| WebBuild::get(&key).map(|file| (key.to_string(), file.metadata.sha256_hash()))),
+    )
+}
+
+/// `--static <dir>`'s [`asset_map`], from the files under `root`.
+pub fn directory_asset_map(root: &Path) -> BTreeMap<String, String> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, [u8; 32])>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else if let (Ok(relative), Ok(bytes)) = (path.strip_prefix(root), std::fs::read(&path)) {
+                out.push((embed_key(relative), Sha256::digest(bytes).into()));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(root, root, &mut files);
+    asset_map(files)
+}
+
+/// `html` with `map` between its markers, as the page reads it; unchanged
+/// when it has no markers.
+pub fn with_asset_map(html: &[u8], map: &BTreeMap<String, String>) -> Vec<u8> {
+    let text = String::from_utf8_lossy(html);
+    let Some(start) = text.find(MAP_START).map(|at| at + MAP_START.len()) else {
+        return html.to_vec();
+    };
+    let Some(end) = text[start..].find(MAP_END).map(|at| start + at) else {
+        return html.to_vec();
+    };
+    let json = serde_json::to_string(map).unwrap_or_else(|_| "{}".to_string());
+    format!("{}{json}{}", &text[..start], &text[end..]).into_bytes()
+}
+
 /// Cache policy for a static-file request.
 ///
 /// `index.html` has no `v=` and stays `no-cache` so a new bundle (and the
-/// hashes inlined in it) is noticed. A `?v=<md5>` URL is a content hash
-/// from the bundle script: that exact body never changes, so it can sit
-/// in the browser for a year (`immutable` skips the revalidation that
-/// `no-cache` would send on every load of the wasm).
+/// map served in it) is noticed. A `?v=<hash>` URL is a content hash from
+/// that map: that exact body never changes, so it can sit in the browser
+/// for a year (`immutable` skips the revalidation that `no-cache` would
+/// send on every load of the wasm).
 pub fn cache_control(query: Option<&str>) -> &'static str {
     if query.is_some_and(has_asset_rev) {
         "public, max-age=31536000, immutable"
@@ -284,6 +380,52 @@ mod tests {
         // After the leading slashes come off, anything still rooted is a
         // caller trying something, not a relative asset.
         assert_eq!(safe_relative("/\0evil"), None);
+    }
+
+    /// The page names a module stored only compressed by the name it asks
+    /// for, and leaves out itself, the icons and what an npm consumer needs.
+    #[test]
+    fn the_asset_map_names_what_the_page_asks_for() {
+        let hash = |byte: u8| [byte; 32];
+        let map = asset_map([
+            ("index.html".to_string(), hash(1)),
+            ("wasm/zedis_web.js".to_string(), hash(2)),
+            ("wasm/zedis_web_bg.wasm.gz".to_string(), hash(3)),
+            ("wasm/zedis_web_bg.wasm.br".to_string(), hash(4)),
+            ("wasm/zedis_web.d.ts".to_string(), hash(5)),
+            ("wasm/package.json".to_string(), hash(6)),
+            ("assets/icons/copy.svg".to_string(), hash(7)),
+            ("locales/en.toml".to_string(), hash(8)),
+        ]);
+        let names: Vec<&str> = map.keys().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            vec!["locales/en.toml", "wasm/zedis_web.js", "wasm/zedis_web_bg.wasm"]
+        );
+        assert_eq!(map["wasm/zedis_web_bg.wasm"], "030303030303", "the .gz stands for it");
+        // Where the raw module is there too (`--static` on a dev bundle), its
+        // own hash is the one.
+        let both = asset_map([
+            ("wasm/zedis_web_bg.wasm".to_string(), hash(9)),
+            ("wasm/zedis_web_bg.wasm.gz".to_string(), hash(3)),
+        ]);
+        assert_eq!(both["wasm/zedis_web_bg.wasm"], "090909090909");
+    }
+
+    #[test]
+    fn the_page_gets_its_map_between_its_markers() {
+        let map = BTreeMap::from([("fonts/a.ttf".to_string(), "abc".to_string())]);
+        let page = b"<script>const ASSET_REV = /*ASSET_REV*/{}/*/ASSET_REV*/;</script>";
+        assert_eq!(
+            String::from_utf8(with_asset_map(page, &map)).expect("utf-8"),
+            r#"<script>const ASSET_REV = /*ASSET_REV*/{"fonts/a.ttf":"abc"}/*/ASSET_REV*/;</script>"#
+        );
+        assert_eq!(with_asset_map(b"<p>no map</p>", &map), b"<p>no map</p>");
+        // The page as written carries an empty map: nothing built is in it.
+        let written =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../zedis-web/www/index.html"))
+                .expect("the page");
+        assert!(written.contains("/*ASSET_REV*/{}/*/ASSET_REV*/"));
     }
 
     #[test]

@@ -2,17 +2,10 @@
 # and because leaving it out made "make lint passes" a claim that did not
 # cover formatting: a test file landed unformatted, the gate stayed green,
 # and the lint job went red on a diff the author never saw.
-#
-# The asset-rev check is last and is not about Rust: it fails when
-# `zedis-web/www/index.html` is staged carrying its built cache-bust map. The
-# clean filter that strips it is local configuration and cannot ship in the
-# repository, so this is what a clone that never ran `install-git-filters`
-# trips over. It is a no-op outside a git checkout.
 lint:
 	cargo fmt --check
 	typos
 	cargo clippy --all-targets --all -- --deny=warnings
-	python3 scripts/asset-rev.py check
 
 # The GPUI Fast build (the `gpui-fast` feature — every platform's `-fast` files):
 # clippy for what sits behind the feature, which `make lint` never compiles,
@@ -21,13 +14,6 @@ lint:
 lint-fast:
 	cargo clippy --all-targets --features gpui-fast -- --deny=warnings
 	ZEDIS_CONFIG_DIR="$$(mktemp -d)" cargo test --features gpui-fast
-
-# Configure the repository-local git filters `.gitattributes` names. Run once
-# per clone; `git add` does not re-clean files already staged, so anything
-# caught by `make lint` needs staging again afterwards.
-install-git-filters:
-	git config filter.asset-rev.clean "python3 scripts/asset-rev.py clean"
-	@echo "asset-rev clean filter installed; re-stage zedis-web/www/index.html if it was already staged"
 
 # The browser half of the build (ADR 9). `make lint` cannot see it: clippy
 # there is native-only, so a native-only API leaking into shared code compiles

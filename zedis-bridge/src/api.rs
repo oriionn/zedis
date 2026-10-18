@@ -703,6 +703,20 @@ async fn web_asset(State(state): State<AppState>, headers: HeaderMap, uri: Uri) 
     } else {
         stored
     };
+    // The page, with the hashes of what it fetches filled in — and its tag
+    // that of what is sent, so a new bundle is a new page.
+    let (bytes, hash) = if key == static_files::PAGE {
+        let root = root.map(FsPath::to_path_buf);
+        let map = tokio::task::spawn_blocking(move || match root {
+            Some(root) => static_files::directory_asset_map(&root),
+            None => static_files::embedded_asset_map(),
+        })
+        .await
+        .unwrap_or_default();
+        (Bytes::from(static_files::with_asset_map(&bytes, &map)), None)
+    } else {
+        (bytes, hash)
+    };
     let etag = hash
         .map(static_files::etag)
         .unwrap_or_else(|| static_files::etag_of(&bytes));

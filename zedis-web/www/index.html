@@ -123,9 +123,11 @@
   // bar already knows it, and it stays right behind a proxy that rewrites it.
   const root = new URL(".", window.location.href).href.replace(/\/$/, "");
   const api = (path, init) => fetch(root + path, { credentials: "same-origin", ...init });
-  // Filled by `web-bundle.sh` between the ASSET_REV markers on the next
-  // line. Leave `{}` in git: an unbundled page just fetches unversioned URLs.
-  const ASSET_REV = /*ASSET_REV*/{"assets/commands.json":"a1f58c0b4949","assets/config_docs/en.json":"90b5e6e1426a","assets/config_docs/zh.json":"32d145cb21ce","assets/icon.png":"9121a3cab487","fonts/IBMPlexSans.ttf":"335a2b2a3a64","fonts/JetBrainsMono-Bold.ttf":"8658ffe39dbf","fonts/JetBrainsMono-Regular.ttf":"d09f65145228","fonts/OFL.txt":"4d4949dda4b2","locales/de.toml":"9148a0d97852","locales/en.toml":"92a76a2c5381","locales/es.toml":"5531f189c92e","locales/fr.toml":"3c16b5b2df65","locales/ja.toml":"03337dd7355d","locales/pt.toml":"f9af1fef7ad1","locales/ru.toml":"444cff3c974f","locales/zh.toml":"c65fea3fb893","wasm/zedis_web.d.ts":"2764f832465b","wasm/zedis_web.js":"20fb3ed01d7c","wasm/zedis_web_bg.wasm":"688dcfd4bb4a","wasm/zedis_web_bg.wasm.d.ts":"c50a1b79f7fd"}/*/ASSET_REV*/;
+  // Filled by the bridge as it serves this page: the content hash of each
+  // file the page fetches, from the bundle it is serving
+  // (`static_files::with_asset_map`). Written empty, and only ever written
+  // empty — a page opened any other way fetches unversioned URLs.
+  const ASSET_REV = /*ASSET_REV*/{}/*/ASSET_REV*/;
   const url = (path) => {
     const v = ASSET_REV[path];
     return v ? `${root}/${path}?v=${v}` : `${root}/${path}`;
