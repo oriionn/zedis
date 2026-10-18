@@ -876,6 +876,29 @@ fn is_plain_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// One change to the server list at a time.
+///
+/// The list is read, changed and saved whole — and saving it updates the
+/// in-memory copy first and writes the file afterwards, off the request — so
+/// two changes that overlapped kept only one of them: an entry added while
+/// another was edited could vanish from the list, from the file, or from
+/// one of the two. Every change goes through [`edit_servers`], which holds
+/// this from the read to the end of the write.
+static LIST_EDIT: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(Default::default);
+
+/// Read the server list, let `change` edit it, and save it, under
+/// [`LIST_EDIT`]. Never hold it across anything slow — a dial is not part of
+/// an edit (see [`save_and_dial`]).
+async fn edit_servers<T>(change: impl FnOnce(&mut Vec<RedisServer>) -> T) -> ApiResult<T> {
+    let _edit = LIST_EDIT.lock().await;
+    let mut servers = get_servers().map_err(|e| ApiError::Upstream(e.to_string()))?;
+    let answer = change(&mut servers);
+    save_servers(servers)
+        .await
+        .map_err(|e| ApiError::Upstream(e.to_string()))?;
+    Ok(answer)
+}
+
 /// Put `server` into the shared list and prove it reachable, or put the list
 /// back the way it was: `previous` is the entry it replaces (an edit), `None`
 /// when it is new.
@@ -893,30 +916,37 @@ async fn save_and_dial(server: RedisServer, previous: Option<RedisServer>) -> Ap
         get_connection_manager().remove_client(&id, 0);
     }
 
-    let mut servers = get_servers().map_err(|e| ApiError::Upstream(e.to_string()))?;
-    // In place, so an edit does not move the entry to the end of the list.
-    match servers.iter_mut().find(|s| s.id == id) {
-        Some(slot) => *slot = server,
-        None => servers.push(server),
-    }
-    save_servers(servers)
-        .await
-        .map_err(|e| ApiError::Upstream(e.to_string()))?;
+    let saved = server.clone();
+    edit_servers(|servers| {
+        // In place, so an edit does not move the entry to the end of the list.
+        match servers.iter_mut().find(|s| s.id == id) {
+            Some(slot) => *slot = server,
+            None => servers.push(server),
+        }
+    })
+    .await?;
 
     let client = match get_connection_manager().get_client(&id, 0).await {
         Ok(client) => client,
         Err(e) => {
-            if let Ok(mut list) = get_servers() {
-                match previous {
-                    Some(previous) => {
-                        if let Some(slot) = list.iter_mut().find(|s| s.id == id) {
-                            *slot = previous;
-                        }
-                    }
-                    None => list.retain(|s| s.id != id),
+            // Take back this request's entry and nothing else: the dial took
+            // seconds, the lock was not held through it, and an edit someone
+            // made to the same entry meanwhile is theirs to keep.
+            let _ = edit_servers(|list| {
+                let Some(at) = list.iter().position(|s| s.id == id) else {
+                    return;
+                };
+                if list[at] != saved {
+                    return;
                 }
-                let _ = save_servers(list).await;
-            }
+                match previous {
+                    Some(previous) => list[at] = previous,
+                    None => {
+                        list.remove(at);
+                    }
+                }
+            })
+            .await;
             return Err(ApiError::Upstream(e.to_string()));
         }
     };
@@ -1036,23 +1066,27 @@ async fn delete_server(
 ) -> ApiResult<StatusCode> {
     let mut origin = Origin::new(peer, &headers);
     let account = authorize_write(&state, &headers, &mut origin, "server_delete")?;
-    let list = get_servers().map_err(|e| ApiError::Upstream(e.to_string()))?;
     // Someone else's entry is left alone and answered like one already gone;
-    // one the account may see but not write to is refused.
-    let removed = list
-        .iter()
-        .find(|s| s.id == id && visible_to(&state.accounts, s, &account));
-    if let Some(server) = removed {
+    // one the account may see but not write to is refused — and nothing is
+    // saved, since nothing changed.
+    let found = get_server(&id)
+        .ok()
+        .filter(|s| visible_to(&state.accounts, s, &account));
+    if let Some(server) = &found {
         refuse_read_only_on(&state, &account, server, &origin, "server_delete")?;
     }
-    let removed = removed.map(ServerRef::from);
-    let kept: Vec<_> = list
-        .into_iter()
-        .filter(|s| s.id != id || !visible_to(&state.accounts, s, &account))
-        .collect();
-    save_servers(kept)
-        .await
-        .map_err(|e| ApiError::Upstream(e.to_string()))?;
+    let removed = match found {
+        Some(_) => {
+            edit_servers(|list| {
+                let at = list
+                    .iter()
+                    .position(|s| s.id == id && visible_to(&state.accounts, s, &account))?;
+                Some(ServerRef::from(&list.remove(at)))
+            })
+            .await?
+        }
+        None => None,
+    };
     // Only a deletion that deleted something: the second of two asks for
     // the same id changed nothing.
     if let Some(server) = removed {
@@ -2359,5 +2393,52 @@ mod mcp_auth_tests {
         seen.sort();
         assert_eq!(seen, [("ops", "browser"), ("viewer", "basic")]);
         assert!(reply.clients.iter().all(|c| c.peer.as_deref() == Some("10.0.0.7")));
+    }
+}
+
+#[cfg(test)]
+mod list_edits {
+    use super::*;
+    use zedis_core::fs::{get_or_create_config_dir, override_config_dir};
+
+    /// Overlapping changes to the server list all land — in the list the
+    /// bridge serves and in the file it starts from next time. Without
+    /// [`LIST_EDIT`], two of them read the same list and the one saved last
+    /// dropped the other's entry, and the file writes, done off the request,
+    /// could land in either order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn overlapping_edits_all_land_in_the_list_and_the_file() {
+        override_config_dir(std::env::temp_dir().join(format!("zedis-bridge-list-{}", std::process::id())));
+        let ids: Vec<String> = (0..64).map(|n| format!("list-edit-{n}")).collect();
+        let edits = ids.iter().cloned().map(|id| {
+            tokio::spawn(async move {
+                edit_servers(|list| {
+                    list.push(RedisServer {
+                        id: id.clone(),
+                        name: id,
+                        host: "127.0.0.1".to_string(),
+                        port: 6379,
+                        ..Default::default()
+                    })
+                })
+                .await
+            })
+        });
+        for edit in edits.collect::<Vec<_>>() {
+            if let Err(e) = edit.await.expect("task") {
+                panic!("edit failed: {}", e.describe());
+            }
+        }
+
+        let listed = get_servers().expect("list");
+        let file = std::fs::read_to_string(get_or_create_config_dir().expect("dir").join("redis-servers.toml"))
+            .expect("server file");
+        for id in &ids {
+            assert!(listed.iter().any(|s| &s.id == id), "{id} is missing from the list");
+            assert!(
+                file.contains(&format!("id = \"{id}\"")),
+                "{id} is missing from the file"
+            );
+        }
     }
 }

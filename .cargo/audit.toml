@@ -43,13 +43,15 @@ ignore = [
     "RUSTSEC-2026-0206", # rustybuzz       (gpui: usvg 0.46 → rustybuzz)
     # zbus 5's split-out crates, unmaintained since zbus 6.0.0 (2026-10-16)
     # folded them back in as `zbus::names` / `zbus::wire`. Linux-only (D-Bus),
-    # reached two ways, neither ours to move:
+    # built through gpui-kit alone, not ours to move:
     #   gpui-kit → gpui-pre-linux / gpui-base → accesskit_unix (atspi), ashpd,
     #     oo7, notify-rust
-    #   keyring → zbus-secret-service-keyring-store → secret-service
-    # Every one of them still requires zbus ^5 at its newest release (checked
-    # 2026-10-18), and swapping keyring's store would leave the gpui path.
-    # Drop all three once that chain is on zbus >= 6. Issues #227–#229.
+    # Cargo.lock also lists keyring → zbus-secret-service-keyring-store →
+    # secret-service, but zedis-connection takes keyring on macOS / Windows
+    # only (Linux keeps the master key in a file), so that path never builds.
+    # Every crate on the gpui path still requires zbus ^5 at its newest
+    # release (checked 2026-10-18). Drop all three once it is on zbus >= 6.
+    # Issues #227–#229.
     "RUSTSEC-2026-0370", # zvariant        (zbus 5)
     "RUSTSEC-2026-0371", # zbus_names      (zbus 5)
     "RUSTSEC-2026-0372", # zvariant_derive (zbus 5)
