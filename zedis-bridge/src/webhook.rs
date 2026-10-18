@@ -53,7 +53,7 @@ pub const SECRET_ENV: &str = "ZEDIS_BRIDGE_AUDIT_WEBHOOK_SECRET";
 pub const EVENTS_ENV: &str = "ZEDIS_BRIDGE_AUDIT_WEBHOOK_EVENTS";
 
 /// Every `event` a line can carry, as the log spells it.
-pub const EVENTS: [&str; 26] = [
+pub const EVENTS: [&str; 27] = [
     "login",
     "login_failed",
     "no_account",
@@ -73,6 +73,7 @@ pub const EVENTS: [&str; 26] = [
     "account_registered",
     "account_updated",
     "account_deleted",
+    "orphans_settled",
     "password_changed",
     "token_issued",
     "token_revoked",
@@ -81,6 +82,21 @@ pub const EVENTS: [&str; 26] = [
     "script_deleted",
     "tool",
 ];
+
+/// Where a deleted account's own entries and scripts went, in words.
+fn handover(private: &Value) -> String {
+    let count = |field: &str| private.get(field).and_then(Value::as_u64).unwrap_or(0);
+    let what = format!("{} server entries and {} scripts", count("servers"), count("scripts"));
+    match private.get("action").and_then(Value::as_str) {
+        Some("handed_to") => format!(
+            "its {what} handed to {}",
+            private.get("to").and_then(Value::as_str).unwrap_or("?")
+        ),
+        Some("shared") => format!("its {what} shared with every account"),
+        Some("deleted") => format!("its {what} deleted with it"),
+        _ => what,
+    }
+}
 
 /// Left out unless asked for: what happens all day.
 const ROUTINE: [&str; 3] = ["login", "logout", "tool"];
@@ -504,7 +520,15 @@ fn summary(line: &Value) -> String {
                 .unwrap_or_default();
             format!("changed account {}: {}", get("target"), changed.join(", "))
         }
-        "account_deleted" => format!("deleted account {}", get("target")),
+        "account_deleted" => match line.get("private") {
+            Some(private) => format!("deleted account {}, {}", get("target"), handover(private)),
+            None => format!("deleted account {}", get("target")),
+        },
+        "orphans_settled" => format!(
+            "settled what the deleted account {} left: {}",
+            get("owner"),
+            line.get("private").map(handover).unwrap_or_default()
+        ),
         "password_changed" => {
             if line.get("reset").and_then(Value::as_bool).unwrap_or(false) {
                 "set a new password with a reset link".to_string()

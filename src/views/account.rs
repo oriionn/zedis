@@ -24,6 +24,7 @@
 //! the global, so a test gives it a fake bridge.
 
 mod admin;
+mod handover;
 mod invites;
 mod password;
 mod tokens;

@@ -23,20 +23,22 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use futures::AsyncReadExt as _;
 use futures::StreamExt as _;
-use futures::channel::mpsc::{UnboundedSender, unbounded};
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures::future::BoxFuture;
 use gpui::http_client::{AsyncBody, HttpClient, http::Request};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use zedis_connection::{
     BridgeAccount, BridgeAccountChange, BridgeAccountError, BridgeAccountErrorKind, BridgeAccountResult,
-    BridgeAccounts, BridgeError, BridgeErrorKind, BridgeInvite, BridgeInviteKind, BridgeKeyNote, BridgeNewInvite,
-    BridgeOwnAccount, BridgePageData, BridgePageRow, BridgePageSeed, BridgeReply, BridgeRequest, BridgeRole,
-    BridgeScript, BridgeServerStore, BridgeStorage, BridgeToken, BridgeTransport, BridgeTrashEntry, RedisServer,
-    WatchBatch, WatchItem, WatchKind, WatchOpened, describe_commands, get_servers, set_account_read_only_on,
+    BridgeAccounts, BridgeDisposition, BridgeError, BridgeErrorKind, BridgeInvite, BridgeInviteKind, BridgeKeyNote,
+    BridgeNewInvite, BridgeOrphans, BridgeOwnAccount, BridgeOwned, BridgeOwnedItem, BridgePageData, BridgePageRow,
+    BridgePageSeed, BridgeReply, BridgeRequest, BridgeRole, BridgeScript, BridgeServerStore, BridgeStorage,
+    BridgeToken, BridgeTransport, BridgeTrashEntry, RedisServer, WatchBatch, WatchItem, WatchKind, WatchOpened,
+    describe_commands, get_servers, set_account_read_only_on,
 };
 
 /// Talks to one `zedis-bridge`.
@@ -47,6 +49,13 @@ pub struct HttpBridgeTransport {
     /// The page's data changes, sent one after another in the order they
     /// were made ([`BridgePageData`]). Started with the first one.
     page_writes: OnceLock<UnboundedSender<PageWrite>>,
+    /// How many of those have not been answered yet.
+    page_writes_pending: Arc<AtomicUsize>,
+    /// Asks for an early read of what other accounts changed
+    /// ([`BridgePageData::refresh_soon`]), and the end the page's refresh
+    /// loop listens on, until it takes it.
+    refresh_requests: UnboundedSender<()>,
+    refresh_listener: Mutex<Option<UnboundedReceiver<()>>>,
 }
 
 /// One change of the page's data, as the request that carries it.
@@ -62,11 +71,69 @@ impl HttpBridgeTransport {
     /// used to be a bearer token here for the bridge's token mode, which is
     /// gone — ADR 9.)
     pub fn new(client: Arc<dyn HttpClient>, base_url: impl Into<String>) -> Self {
+        let (refresh_requests, refresh_listener) = unbounded();
         Self {
             client,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             page_writes: OnceLock::new(),
+            page_writes_pending: Arc::default(),
+            refresh_requests,
+            refresh_listener: Mutex::new(Some(refresh_listener)),
         }
+    }
+
+    /// Where [`BridgePageData::refresh_soon`] is heard — once, by the page's
+    /// refresh loop.
+    pub fn take_refresh_requests(&self) -> Option<UnboundedReceiver<()>> {
+        self.refresh_listener
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    /// `GET /v1/page-data` again, for what other accounts changed: `None`
+    /// when the bridge says it is what `etag` names (a `304`), else the
+    /// answer and its tag.
+    pub fn fetch_page_data(&self, etag: Option<String>) -> BoxFuture<'static, Result<Option<PageData>, BridgeError>> {
+        let client = self.client.clone();
+        let url = format!("{}/v1/page-data", self.base_url);
+        Box::pin(async move {
+            let mut builder = Request::builder().method("GET").uri(&url);
+            if let Some(etag) = &etag {
+                builder = builder.header("if-none-match", etag);
+            }
+            let request = builder
+                .body(AsyncBody::empty())
+                .map_err(|e| BridgeError::transport(format!("could not build the request: {e}")))?;
+            let mut response = client
+                .send(request)
+                .await
+                .map_err(|e| BridgeError::transport(format!("{url} is unreachable: {e}")))?;
+            let status = response.status().as_u16();
+            if status == 304 {
+                return Ok(None);
+            }
+            let tag = response
+                .headers()
+                .get("etag")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let mut bytes = Vec::new();
+            response
+                .body_mut()
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|e| BridgeError::transport(format!("the bridge's reply could not be read: {e}")))?;
+            if status == 401 {
+                sign_in_again();
+            }
+            if status != 200 {
+                return Err(failure(status, &bytes));
+            }
+            let text = String::from_utf8(bytes)
+                .map_err(|e| BridgeError::transport(format!("the page data is not text: {e}")))?;
+            Ok(Some(PageData { json: text, etag: tag }))
+        })
     }
 
     /// POST `body` to `url` and hand back the status and the raw response.
@@ -894,6 +961,55 @@ struct NewTokenBody {
     token: String,
 }
 
+#[derive(Deserialize)]
+struct OwnedItemBody {
+    id: String,
+    #[serde(default)]
+    name: String,
+}
+
+/// The bridge's `Owned`.
+#[derive(Deserialize)]
+struct OwnedBody {
+    #[serde(default)]
+    servers: Vec<OwnedItemBody>,
+    #[serde(default)]
+    scripts: Vec<OwnedItemBody>,
+}
+
+impl OwnedBody {
+    fn into_owned(self) -> BridgeOwned {
+        let items = |list: Vec<OwnedItemBody>| {
+            list.into_iter()
+                .map(|item| BridgeOwnedItem {
+                    id: item.id,
+                    name: item.name,
+                })
+                .collect()
+        };
+        BridgeOwned {
+            servers: items(self.servers),
+            scripts: items(self.scripts),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct OrphansBody {
+    owner: String,
+    #[serde(flatten)]
+    owned: OwnedBody,
+}
+
+/// What becomes of a deleted account's own, as the bridge reads it.
+fn disposition_json(private: &BridgeDisposition) -> serde_json::Value {
+    match private {
+        BridgeDisposition::HandTo(account) => serde_json::json!({ "action": "hand_to", "account": account }),
+        BridgeDisposition::Share => serde_json::json!({ "action": "share" }),
+        BridgeDisposition::Delete => serde_json::json!({ "action": "delete" }),
+    }
+}
+
 impl HttpBridgeTransport {
     /// One account request: `method` on `path`, with `body` as JSON, its
     /// answer read by `read`. Any 2xx is an answer (`204` for a removal).
@@ -988,9 +1104,36 @@ impl BridgeAccounts for HttpBridgeTransport {
         })
     }
 
-    fn delete_account(&self, name: String) -> BridgeAccountResult<()> {
+    fn owned(&self, name: String) -> BridgeAccountResult<BridgeOwned> {
+        let path = format!("/v1/admin/accounts/{}/owned", segment(&name));
+        self.account_call("GET", path, None, |bytes| {
+            json::<OwnedBody>(bytes).map(OwnedBody::into_owned)
+        })
+    }
+
+    fn delete_account(&self, name: String, private: BridgeDisposition) -> BridgeAccountResult<()> {
         let path = format!("/v1/admin/accounts/{}", segment(&name));
-        self.account_call("DELETE", path, None, nothing)
+        let body = serde_json::json!({ "private": disposition_json(&private) });
+        self.account_call("DELETE", path, Some(body), nothing)
+    }
+
+    fn orphans(&self) -> BridgeAccountResult<Vec<BridgeOrphans>> {
+        self.account_call("GET", "/v1/admin/orphans".to_string(), None, |bytes| {
+            json::<Vec<OrphansBody>>(bytes).map(|list| {
+                list.into_iter()
+                    .map(|orphans| BridgeOrphans {
+                        owner: orphans.owner,
+                        owned: orphans.owned.into_owned(),
+                    })
+                    .collect()
+            })
+        })
+    }
+
+    fn settle_orphans(&self, owner: String, private: BridgeDisposition) -> BridgeAccountResult<()> {
+        let path = format!("/v1/admin/orphans/{}", segment(&owner));
+        let body = serde_json::json!({ "private": disposition_json(&private) });
+        self.account_call("POST", path, Some(body), nothing)
     }
 
     fn reset_link(&self, name: String) -> BridgeAccountResult<BridgeNewInvite> {
@@ -1077,6 +1220,13 @@ struct ScriptBody {
     script: serde_json::Value,
 }
 
+/// The page data as the bridge answered it again, with its tag for the next
+/// ask.
+pub struct PageData {
+    pub json: String,
+    pub etag: Option<String>,
+}
+
 /// What the page keeps on the bridge, from the `GET /v1/page-data` the page
 /// made before it started the application (`index.html`).
 pub fn page_seed(json: &str) -> Result<BridgePageSeed, String> {
@@ -1126,8 +1276,10 @@ impl HttpBridgeTransport {
         let queue = self.page_writes.get_or_init(|| {
             let (queue, mut writes) = unbounded::<PageWrite>();
             let (client, base_url) = (self.client.clone(), self.base_url.clone());
+            let pending = self.page_writes_pending.clone();
             start_detached(async move {
                 while let Some(write) = writes.next().await {
+                    let _answered = Answered(&pending);
                     let url = format!("{base_url}{}", write.path);
                     match Self::call(client.clone(), write.method, url, write.body).await {
                         Ok((status, _)) if (200..300).contains(&status) => {}
@@ -1147,9 +1299,20 @@ impl HttpBridgeTransport {
             });
             queue
         });
+        self.page_writes_pending.fetch_add(1, Ordering::SeqCst);
         if queue.unbounded_send(PageWrite { method, path, body }).is_err() {
+            self.page_writes_pending.fetch_sub(1, Ordering::SeqCst);
             tracing::warn!("the page's data queue is closed; a change was not sent");
         }
+    }
+}
+
+/// Counts a queued change as answered once its request is, however it ends.
+struct Answered<'a>(&'a AtomicUsize);
+
+impl Drop for Answered<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -1181,6 +1344,14 @@ impl BridgePageData for HttpBridgeTransport {
     fn delete_script(&self, id: String) {
         let path = format!("/v1/scripts/{}", segment(&id));
         self.send_page_write("DELETE", path, String::new());
+    }
+
+    fn writes_pending(&self) -> bool {
+        self.page_writes_pending.load(Ordering::SeqCst) > 0
+    }
+
+    fn refresh_soon(&self) {
+        let _ = self.refresh_requests.unbounded_send(());
     }
 }
 
@@ -1365,6 +1536,99 @@ mod tests {
         let script: serde_json::Value = serde_json::from_str(&seen[3].2).expect("json");
         assert_eq!(script["script"]["name"], "top");
         assert_eq!(script["shared"], true);
+    }
+
+    /// Deleting an account says what becomes of what it kept to itself, in
+    /// the shape the bridge reads.
+    #[test]
+    fn a_deletion_says_where_the_account_s_own_go() {
+        let (transport, seen) = transport_recording(204, "");
+        futures::executor::block_on(
+            transport.delete_account("bob".to_string(), BridgeDisposition::HandTo("alice".to_string())),
+        )
+        .expect("deleted");
+        futures::executor::block_on(transport.settle_orphans("ghost".to_string(), BridgeDisposition::Share))
+            .expect("settled");
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen[0].0, "DELETE");
+        let body: serde_json::Value = serde_json::from_str(&seen[0].2).expect("json");
+        assert_eq!(
+            body,
+            serde_json::json!({ "private": { "action": "hand_to", "account": "alice" } })
+        );
+        assert_eq!(
+            (seen[1].0.as_str(), seen[1].1.as_str()),
+            ("POST", "http://bridge:7379/zedis/v1/admin/orphans/ghost")
+        );
+        let body: serde_json::Value = serde_json::from_str(&seen[1].2).expect("json");
+        assert_eq!(body, serde_json::json!({ "private": { "action": "share" } }));
+    }
+
+    #[test]
+    fn what_an_account_owns_is_read_by_kind() {
+        let (transport, _) = transport_recording(
+            200,
+            r#"{"servers":[{"id":"s1","name":"prod"}],"scripts":[{"id":"x","name":"top"}]}"#,
+        );
+        let owned = futures::executor::block_on(transport.owned("bob".to_string())).expect("owned");
+        assert_eq!(owned.servers[0].name, "prod");
+        assert_eq!(owned.scripts[0].id, "x");
+        assert!(!owned.is_empty());
+    }
+
+    /// A refresh asks with the tag it last had: the same answer is a 304
+    /// and nothing to apply, a new one comes with its tag.
+    #[test]
+    fn a_refresh_is_nothing_when_the_bridge_says_unchanged() {
+        let asked: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+        let captured = asked.clone();
+        let client = FakeHttpClient::create(move |req| {
+            let captured = captured.clone();
+            async move {
+                let tag = req
+                    .headers()
+                    .get("if-none-match")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                captured.lock().expect("lock").push(tag.clone());
+                let response = gpui::http_client::http::Response::builder().header("etag", "\"v2\"");
+                Ok(match tag.as_deref() {
+                    Some("\"v2\"") => response.status(304).body(AsyncBody::empty())?,
+                    _ => response
+                        .status(200)
+                        .body(AsyncBody::from(r#"{"account":"ai"}"#.to_string()))?,
+                })
+            }
+        });
+        let transport = HttpBridgeTransport::new(client, "http://bridge:7379");
+        let fresh = futures::executor::block_on(transport.fetch_page_data(None)).expect("answer");
+        let fresh = fresh.expect("a new answer");
+        assert_eq!(fresh.json, r#"{"account":"ai"}"#);
+        assert_eq!(fresh.etag.as_deref(), Some("\"v2\""));
+        let same = futures::executor::block_on(transport.fetch_page_data(fresh.etag)).expect("answer");
+        assert!(same.is_none(), "unchanged: nothing to apply");
+        assert_eq!(asked.lock().expect("lock").len(), 2);
+    }
+
+    /// A change on its way to the bridge is pending until it is answered —
+    /// what keeps a refresh from putting back what the change replaces.
+    #[test]
+    fn a_change_is_pending_until_the_bridge_answers() {
+        let (transport, seen) = transport_recording(204, "");
+        assert!(!transport.writes_pending());
+        transport.put_row("favorites".to_string(), "srv:0".to_string(), Some("[]".to_string()));
+        for _ in 0..200 {
+            if !transport.writes_pending() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!transport.writes_pending(), "answered");
+        assert_eq!(seen.lock().expect("lock").len(), 1);
+        transport.refresh_soon();
+        let mut requests = transport.take_refresh_requests().expect("the listener, once");
+        assert!(transport.take_refresh_requests().is_none());
+        assert_eq!(requests.try_recv().ok(), Some(()));
     }
 
     #[test]

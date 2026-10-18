@@ -76,7 +76,8 @@ fn status<T: IntoResponse>(result: ApiResult<T>) -> StatusCode {
 }
 
 async fn data(state: &AppState, pair: &str) -> PageData {
-    let Ok(Json(data)) = page_data(State(state.clone()), peer(), as_account(pair)).await else {
+    let ConnectInfo(at) = peer();
+    let Ok(data) = gather(state, &as_account(pair), at).await else {
         panic!("{pair} reads its page data");
     };
     data
@@ -356,4 +357,46 @@ async fn the_files_are_owner_only_and_forgotten_with_the_account() {
             .expect("rows")
             .is_empty()
     );
+}
+
+/// A page asks again every minute: an answer that has not changed is a 304
+/// with no body, and one that has carries a new tag.
+#[tokio::test]
+async fn an_unchanged_answer_is_not_sent_again() {
+    let dir = scratch();
+    let state = state(&dir);
+    let ask = |if_none_match: Option<String>| {
+        let mut headers = as_account("alice:alice-password");
+        if let Some(tag) = if_none_match {
+            headers.insert("if-none-match", tag.parse().expect("header"));
+        }
+        let state = state.clone();
+        async move {
+            match page_data(State(state), peer(), headers).await {
+                Ok(response) => response,
+                Err(_) => panic!("the page data is answered"),
+            }
+        }
+    };
+    let first = ask(None).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let tag = first.headers()["etag"].to_str().expect("tag").to_string();
+    let again = ask(Some(tag.clone())).await;
+    assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+
+    let row = put_row(
+        State(state.clone()),
+        peer(),
+        as_account("alice:alice-password"),
+        Json(RowRequest {
+            table: "favorites".to_string(),
+            key: "srv:0".to_string(),
+            value: Some("[\"k\"]".to_string()),
+        }),
+    )
+    .await;
+    assert_eq!(status(row), StatusCode::NO_CONTENT);
+    let changed = ask(Some(tag.clone())).await;
+    assert_eq!(changed.status(), StatusCode::OK);
+    assert_ne!(changed.headers()["etag"].to_str().expect("tag"), tag);
 }

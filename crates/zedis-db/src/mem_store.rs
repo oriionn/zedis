@@ -464,6 +464,18 @@ impl WriteTransaction {
         })
     }
 
+    /// Commit without telling the observer: what is written is what the
+    /// bridge already holds (a refresh of the page's data), and sending it
+    /// back would be an echo.
+    pub fn commit_quietly(self) -> Result<(), CommitError> {
+        let staged = self.staged.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut live = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+        for (name, rows) in staged {
+            live.insert(name, rows);
+        }
+        Ok(())
+    }
+
     pub fn commit(self) -> Result<(), CommitError> {
         let staged = self.staged.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let observer = self.observer.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -754,6 +766,29 @@ mod tests {
                 row("changed", Some("1"), Some("2")),
                 row("removed", Some("1"), None),
             ]
+        );
+    }
+
+    #[test]
+    fn a_quiet_commit_is_kept_and_told_to_nobody() {
+        let db = db();
+        let told = Arc::new(Mutex::new(0usize));
+        let count = Arc::clone(&told);
+        db.observe(Arc::new(move |_, _, _, _| {
+            *count.lock().expect("lock") += 1;
+        }));
+        let write = db.begin_write().expect("write");
+        {
+            let mut table = write.open_table(STRINGS).expect("open");
+            table.insert("a", "1").expect("insert");
+        }
+        write.commit_quietly().expect("commit");
+        assert_eq!(*told.lock().expect("lock"), 0);
+        let read = db.begin_read().expect("read");
+        let table = read.open_table(STRINGS).expect("open");
+        assert_eq!(
+            table.get("a").expect("get").map(|v| v.value().to_string()),
+            Some("1".into())
         );
     }
 

@@ -295,6 +295,15 @@ pub enum GlobalEvent {
     /// Installer download progress changed (0–100, or cleared). The status bar
     /// re-reads `download_progress` to show the percentage on the update chip.
     UpdateDownloadProgress,
+    /// In the browser: what other accounts changed was brought in from the
+    /// bridge (ADR 17) — the key notes of these servers, the saved scripts,
+    /// and the account's own lists (favorites, recent keys, search history)
+    /// from another browser. Never sent on the desktop.
+    PageDataRefreshed {
+        key_notes_of: Vec<String>,
+        rows: bool,
+        scripts: bool,
+    },
 }
 
 /// Cap on remembered per-display window placements (MRU order). Bounds the

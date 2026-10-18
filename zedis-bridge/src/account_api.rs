@@ -30,6 +30,7 @@ use crate::accounts::{
 use crate::api::{ApiError, ApiResult, AppState, MAX_TRIED_NAME, authorize};
 use crate::audit::{Change, Event, Origin};
 use crate::auth::{self, attempt_key, parse_expiry};
+use crate::handover::{self, Disposition, Owned};
 use axum::{
     Json, Router,
     extract::{ConnectInfo, Path, State},
@@ -56,6 +57,9 @@ pub(crate) fn routes(router: Router<AppState>, at: &impl Fn(&str) -> String) -> 
             &at("/v1/admin/accounts/{name}"),
             patch(update_account).delete(delete_account),
         )
+        .route(&at("/v1/admin/accounts/{name}/owned"), get(owned_of))
+        .route(&at("/v1/admin/orphans"), get(list_orphans))
+        .route(&at("/v1/admin/orphans/{owner}"), post(settle_orphans))
         .route(&at("/v1/admin/accounts/{name}/reset"), post(reset_link))
         .route(&at("/v1/admin/accounts/{name}/tokens"), post(issue_token_for))
         .route(&at("/v1/admin/accounts/{name}/tokens/{token}"), delete(revoke_token_of))
@@ -546,24 +550,120 @@ async fn update_account(
     state.accounts.view(&name).map(Json).ok_or(ApiError::NotFound(name))
 }
 
+/// What happens to what the account kept to itself (ADR 17).
+#[derive(Deserialize)]
+struct HandoverRequest {
+    private: Disposition,
+}
+
+/// What `name` keeps to itself, for the question its deletion asks.
+async fn owned_of(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Owned>> {
+    authorize_admin(&state, &headers, &mut Origin::new(peer, &headers), "accounts")?;
+    if !state.accounts.exists(&name) {
+        return Err(AccountError::NotFound.into());
+    }
+    Ok(Json(handover::owned_by(&state, &name).await?))
+}
+
+/// Delete `name`, and settle what it kept to itself as the request says —
+/// handed to the administrator deleting it when it says nothing, so nothing
+/// is left that nobody can see, and nothing a password was saved in is
+/// shared without someone choosing that.
 async fn delete_account(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(name): Path<String>,
+    body: Option<Json<HandoverRequest>>,
 ) -> ApiResult<axum::http::StatusCode> {
     let mut origin = Origin::new(peer, &headers);
     let admin = authorize_admin(&state, &headers, &mut origin, "account_delete")?;
+    // Refused before anything is handed over: a deletion that then fails
+    // must not have moved the account's entries first.
+    if !state.accounts.exists(&name) {
+        return Err(AccountError::NotFound.into());
+    }
+    if state.accounts.is_admin(&name) && state.accounts.admin_count() <= 1 {
+        return Err(AccountError::LastAdmin.into());
+    }
+    let private = body
+        .map(|Json(request)| request.private)
+        .unwrap_or_else(|| Disposition::HandTo { account: admin.clone() });
+    let owned = handover::settle(&state, &admin, &origin, &name, &private).await?;
     state.accounts.delete(&name).await?;
-    // What it kept for itself goes with it; what it wrote for others — its
-    // shared scripts, its notes on shared keys — stays theirs.
+    // What it kept for itself alone — its favorites, its settings — goes
+    // with it; what it wrote for others, its notes on shared keys, stays.
     if let Err(e) = state.page_rows.forget(name.clone()).await {
         tracing::error!(error = %e, account = name, "the deleted account's own rows could not be removed");
     }
-    state
-        .audit
-        .record(&admin, &origin, Event::AccountDeleted { target: name.clone() });
+    state.audit.record(
+        &admin,
+        &origin,
+        Event::AccountDeleted {
+            target: name.clone(),
+            private: (!owned.is_empty()).then(|| owned.handover(&private)),
+        },
+    );
     tracing::info!(account = name, by = admin, "account deleted");
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize)]
+struct Orphans {
+    owner: String,
+    #[serde(flatten)]
+    owned: Owned,
+}
+
+/// What accounts deleted before handovers existed left behind: owned by a
+/// name that is no account, so seen by nobody.
+async fn list_orphans(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Vec<Orphans>>> {
+    authorize_admin(&state, &headers, &mut Origin::new(peer, &headers), "accounts")?;
+    let orphans = handover::orphans(&state).await?;
+    Ok(Json(
+        orphans
+            .into_iter()
+            .map(|(owner, owned)| Orphans { owner, owned })
+            .collect(),
+    ))
+}
+
+async fn settle_orphans(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(owner): Path<String>,
+    Json(request): Json<HandoverRequest>,
+) -> ApiResult<axum::http::StatusCode> {
+    let mut origin = Origin::new(peer, &headers);
+    let admin = authorize_admin(&state, &headers, &mut origin, "orphans_settle")?;
+    // An account's own is settled by deleting the account, never from here.
+    if state.accounts.exists(&owner) {
+        return Err(ApiError::BadRequest(format!(
+            "{owner} is an account; what it keeps is its own"
+        )));
+    }
+    let owned = handover::settle(&state, &admin, &origin, &owner, &request.private).await?;
+    if owned.is_empty() {
+        return Err(ApiError::NotFound(format!("nothing is left by {owner}")));
+    }
+    state.audit.record(
+        &admin,
+        &origin,
+        Event::OrphansSettled {
+            owner,
+            private: owned.handover(&request.private),
+        },
+    );
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -953,6 +1053,238 @@ mod tests {
         )
         .await;
         assert_eq!(status(blocked), StatusCode::TOO_MANY_REQUESTS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The handover tests' accounts: alice administers, bob and carol write,
+    /// ro reads. The server list is the process's, shared by every test, so
+    /// each test's names are its own.
+    struct Names {
+        bob: String,
+        carol: String,
+        ro: String,
+    }
+
+    fn handover_state(dir: &std::path::Path) -> (AppState, Names) {
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let names = Names {
+            bob: format!("bob-{tag}"),
+            carol: format!("carol-{tag}"),
+            ro: format!("ro-{tag}"),
+        };
+        let inline = format!(
+            "{}@bob-password,{}@carol-password,{}:ro@ro-password",
+            names.bob, names.carol, names.ro
+        );
+        let state = AppState {
+            accounts: Accounts::from_inline(&inline).expect("accounts"),
+            audit: Audit::open(&dir.join("audit.log"), false).expect("audit"),
+            ..state(dir)
+        };
+        (state, names)
+    }
+
+    async fn seat_alice(state: &AppState) {
+        let token = state.setup.mint().expect("token");
+        let seated = setup(
+            State(state.clone()),
+            peer(),
+            HeaderMap::new(),
+            Json(SetupRequest {
+                token,
+                name: "alice".to_string(),
+                password: "alice-password".to_string(),
+                remember: false,
+            }),
+        )
+        .await;
+        assert!(seated.is_ok(), "alice administers");
+    }
+
+    /// A server entry in the bridge's list, `owner`'s, or shared.
+    async fn entry(owner: Option<&str>) -> zedis_connection::RedisServer {
+        let server = zedis_connection::RedisServer {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            name: "handover".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 6379,
+            owner: owner.map(str::to_string),
+            ..Default::default()
+        };
+        crate::store::ServerStore::put(&crate::store::LocalServers, server.clone())
+            .await
+            .expect("server");
+        server
+    }
+
+    async fn script(state: &AppState, id: &str, owner: Option<&str>) {
+        let record = crate::page_data::ScriptRecord {
+            id: id.to_string(),
+            owner: owner.map(str::to_string),
+            script: serde_json::value::RawValue::from_string(format!(r#"{{"name":"{id}"}}"#)).expect("json"),
+            updated_by: owner.unwrap_or("alice").to_string(),
+            updated_at: 1,
+        };
+        state.scripts.put(record).await.expect("script");
+    }
+
+    fn owner_of(id: &str) -> Option<Option<String>> {
+        zedis_connection::get_server(id).ok().map(|server| server.owner)
+    }
+
+    async fn script_owner(state: &AppState, id: &str) -> Option<Option<String>> {
+        let scripts = state.scripts.list().await.expect("scripts");
+        scripts.into_iter().find(|s| s.id == id).map(|s| s.owner)
+    }
+
+    async fn delete(state: &AppState, name: &str, private: Option<Disposition>) -> StatusCode {
+        status(
+            delete_account(
+                State(state.clone()),
+                peer(),
+                basic("alice:alice-password"),
+                Path(name.to_string()),
+                private.map(|private| Json(HandoverRequest { private })),
+            )
+            .await,
+        )
+    }
+
+    fn scratch_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("zedis-handover-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
+    /// Deleting an account hands what it kept to itself to the administrator
+    /// who deletes it, unless asked otherwise — and says so in the audit.
+    #[tokio::test]
+    async fn a_deleted_account_s_own_go_to_the_administrator_by_default() {
+        let dir = scratch_dir();
+        let (state, names) = handover_state(&dir);
+        seat_alice(&state).await;
+        let bobs = entry(Some(&names.bob)).await;
+        let shared = entry(None).await;
+        script(&state, "bob-private", Some(&names.bob)).await;
+        script(&state, "everyone", None).await;
+
+        let Ok(Json(owned)) = owned_of(
+            State(state.clone()),
+            peer(),
+            basic("alice:alice-password"),
+            Path(names.bob.clone()),
+        )
+        .await
+        else {
+            panic!("bob's own");
+        };
+        assert_eq!(
+            owned.servers,
+            vec![handover::OwnedItem {
+                id: bobs.id.clone(),
+                name: "handover".to_string(),
+            }]
+        );
+        assert_eq!(owned.scripts.len(), 1);
+
+        assert_eq!(delete(&state, &names.bob, None).await, StatusCode::NO_CONTENT);
+        assert!(!state.accounts.exists(&names.bob));
+        assert_eq!(owner_of(&bobs.id), Some(Some("alice".to_string())));
+        assert_eq!(owner_of(&shared.id), Some(None), "what was everyone's stays so");
+        assert_eq!(
+            script_owner(&state, "bob-private").await,
+            Some(Some("alice".to_string()))
+        );
+        assert_eq!(script_owner(&state, "everyone").await, Some(None));
+
+        let log = std::fs::read_to_string(dir.join("audit.log")).expect("audit");
+        let deleted = log
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json"))
+            .find(|line| line["event"] == "account_deleted")
+            .expect("an account_deleted line");
+        assert_eq!(deleted["private"]["action"], "handed_to");
+        assert_eq!(deleted["private"]["to"], "alice");
+        assert_eq!(deleted["private"]["servers"], 1);
+        assert!(
+            log.contains(&format!(r#""owner":{{"from":"{}","to":"alice"}}"#, names.bob)),
+            "the entry's owner change"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Shared on purpose, deleted on purpose — and a handover that cannot
+    /// happen leaves the account and everything it had where they were.
+    #[tokio::test]
+    async fn sharing_deleting_and_a_refused_handover() {
+        let dir = scratch_dir();
+        let (state, names) = handover_state(&dir);
+        seat_alice(&state).await;
+        let bobs = entry(Some(&names.bob)).await;
+        let carols = entry(Some(&names.carol)).await;
+        script(&state, "carol-private", Some(&names.carol)).await;
+
+        let to_ro = Disposition::HandTo {
+            account: names.ro.clone(),
+        };
+        assert_eq!(delete(&state, &names.bob, Some(to_ro)).await, StatusCode::BAD_REQUEST);
+        assert!(state.accounts.exists(&names.bob), "nothing happened");
+        assert_eq!(owner_of(&bobs.id), Some(Some(names.bob.clone())));
+
+        assert_eq!(
+            delete(&state, &names.bob, Some(Disposition::Share)).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(owner_of(&bobs.id), Some(None), "everyone's now");
+
+        assert_eq!(
+            delete(&state, &names.carol, Some(Disposition::Delete)).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(owner_of(&carols.id), None, "gone with the account");
+        assert_eq!(script_owner(&state, "carol-private").await, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What an account deleted before handovers left is listed, and settled
+    /// the same way; an account's own is not an orphan's.
+    #[tokio::test]
+    async fn orphans_are_listed_and_settled() {
+        let dir = scratch_dir();
+        let (state, names) = handover_state(&dir);
+        seat_alice(&state).await;
+        let ghost = format!("ghost-{}", uuid::Uuid::new_v4().simple());
+        let left = entry(Some(&ghost)).await;
+        let bobs = entry(Some(&names.bob)).await;
+
+        let Ok(Json(orphans)) = list_orphans(State(state.clone()), peer(), basic("alice:alice-password")).await else {
+            panic!("orphans");
+        };
+        let found = orphans.iter().find(|o| o.owner == ghost).expect("the ghost's entry");
+        assert_eq!(found.owned.servers[0].id, left.id);
+        assert!(orphans.iter().all(|o| o.owner != names.bob), "an account is no orphan");
+
+        let settle = |owner: String, private: Disposition| {
+            settle_orphans(
+                State(state.clone()),
+                peer(),
+                basic("alice:alice-password"),
+                Path(owner),
+                Json(HandoverRequest { private }),
+            )
+        };
+        assert_eq!(
+            status(settle(names.bob.clone(), Disposition::Share).await),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(owner_of(&bobs.id), Some(Some(names.bob.clone())));
+        let to_carol = Disposition::HandTo {
+            account: names.carol.clone(),
+        };
+        assert_eq!(status(settle(ghost.clone(), to_carol).await), StatusCode::NO_CONTENT);
+        assert_eq!(owner_of(&left.id), Some(Some(names.carol.clone())));
+        let log = std::fs::read_to_string(dir.join("audit.log")).expect("audit");
+        assert!(log.contains(r#""event":"orphans_settled""#));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

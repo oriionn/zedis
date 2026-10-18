@@ -28,7 +28,7 @@
 
 use crate::key_metadata_manager::document_entries;
 use crate::{KeyMetadata, LuaScript};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 /// The tables an account keeps as rows: as `mem_store` names them, and as
 /// the bridge does. Favorites keep the desktop's spelling on disk.
@@ -96,23 +96,41 @@ pub fn page_changes(table: &str, key: &[u8], before: Option<&[u8]>, after: Optio
         }
         LUA_SCRIPTS => {
             let (before, after) = (script(before), script(after));
-            let counted_only = match (&before, &after) {
-                (Some(before), Some(after)) => {
-                    LuaScript {
-                        calls: after.calls,
-                        evalsha_hits: after.evalsha_hits,
-                        ..before.clone()
-                    } == *after
-                }
-                _ => false,
-            };
-            if counted_only {
+            if let (Some(before), Some(after)) = (&before, &after)
+                && same_but_counts(before, after)
+            {
                 return Vec::new();
             }
             vec![PageChange::Script { id: key, script: after }]
         }
         _ => Vec::new(),
     }
+}
+
+/// Whether two copies of a script differ only in how often it ran — which
+/// is not a change the bridge keeps, either way.
+fn same_but_counts(a: &LuaScript, b: &LuaScript) -> bool {
+    LuaScript {
+        calls: b.calls,
+        evalsha_hits: b.evalsha_hits,
+        ..a.clone()
+    } == *b
+}
+
+/// The servers whose notes differ between `current` and `wanted`, server by
+/// server, as documents of key → note.
+pub fn servers_with_new_notes<'a>(
+    current: &'a HashMap<String, HashMap<String, KeyMetadata>>,
+    wanted: &'a HashMap<String, HashMap<String, KeyMetadata>>,
+) -> Vec<&'a String> {
+    let servers: BTreeSet<&String> = current.keys().chain(wanted.keys()).collect();
+    servers
+        .into_iter()
+        .filter(|server| {
+            let empty = HashMap::new();
+            current.get(*server).unwrap_or(&empty) != wanted.get(*server).unwrap_or(&empty)
+        })
+        .collect()
 }
 
 /// What the bridge keeps for this account, as the page starts.
@@ -162,6 +180,138 @@ pub fn seed_page_data(seed: PageSeed) -> crate::Result<()> {
     }
     write_txn.commit()?;
     Ok(())
+}
+
+/// What a refresh changed, for the views to read again.
+#[cfg(target_family = "wasm")]
+#[derive(Debug, Default)]
+pub struct PageRefreshed {
+    /// An account's own list: a favorite, a recent key, a search.
+    pub rows: bool,
+    /// The servers whose key notes changed.
+    pub key_notes_of: Vec<String>,
+    pub scripts: bool,
+}
+
+#[cfg(target_family = "wasm")]
+impl PageRefreshed {
+    pub fn is_empty(&self) -> bool {
+        !self.rows && self.key_notes_of.is_empty() && !self.scripts
+    }
+}
+
+/// Bring the tables to what the bridge holds now, for what other accounts —
+/// or this account in another browser — changed since the page started.
+/// Written quietly: it is the bridge's already, and sending it back would be
+/// an echo. Only what differs is written, a script that only ran more is
+/// kept as this page has it, and the caches under what changed are dropped.
+#[cfg(target_family = "wasm")]
+pub fn refresh_page_data(seed: PageSeed) -> crate::Result<PageRefreshed> {
+    use crate::key_metadata_manager::entries_document;
+    use crate::mem_store::ReadableTable;
+    use crate::{
+        FAVORITES_TABLE, KEY_METADATA_TABLE, LUA_SCRIPT_TABLE, LuaScriptManager, RECENT_KEYS_TABLE,
+        SEARCH_HISTORY_TABLE, get_favorites_manager, get_key_metadata_manager, get_recent_keys_manager,
+        get_search_history_manager,
+    };
+    use std::collections::BTreeMap;
+
+    let db = crate::get_database()?;
+    let write_txn = db.begin_write()?;
+    let mut refreshed = PageRefreshed::default();
+    {
+        for (definition, wire) in [
+            (FAVORITES_TABLE, "favorites"),
+            (RECENT_KEYS_TABLE, "recent_keys"),
+            (SEARCH_HISTORY_TABLE, "search_history"),
+        ] {
+            let wanted: BTreeMap<&str, &str> = seed
+                .rows
+                .iter()
+                .filter(|(table, _, _)| table == wire)
+                .map(|(_, key, value)| (key.as_str(), value.as_str()))
+                .collect();
+            let mut table = write_txn.open_table(definition)?;
+            let mut current = BTreeMap::new();
+            for row in table.iter()? {
+                let (key, value) = row?;
+                current.insert(key.value().to_string(), value.value().to_string());
+            }
+            for key in current.keys().filter(|key| !wanted.contains_key(key.as_str())) {
+                table.remove(key.as_str())?;
+                refreshed.rows = true;
+            }
+            for (key, value) in &wanted {
+                if current.get(*key).map(String::as_str) != Some(*value) {
+                    table.insert(*key, *value)?;
+                    refreshed.rows = true;
+                }
+            }
+        }
+
+        let mut wanted: HashMap<String, HashMap<String, KeyMetadata>> = HashMap::new();
+        for (server_id, key, metadata) in seed.key_notes {
+            wanted.entry(server_id).or_default().insert(key, metadata);
+        }
+        let mut notes = write_txn.open_table(KEY_METADATA_TABLE)?;
+        let mut current: HashMap<String, HashMap<String, KeyMetadata>> = HashMap::new();
+        for row in notes.iter()? {
+            let (server_id, document) = row?;
+            current.insert(
+                server_id.value().to_string(),
+                document_entries(document.value()).unwrap_or_default(),
+            );
+        }
+        let changed: Vec<String> = servers_with_new_notes(&current, &wanted).into_iter().cloned().collect();
+        for server_id in &changed {
+            match wanted.remove(server_id) {
+                Some(entries) => {
+                    notes.insert(server_id.as_str(), entries_document(entries)?.as_str())?;
+                }
+                None => {
+                    notes.remove(server_id.as_str())?;
+                }
+            }
+        }
+        refreshed.key_notes_of = changed;
+
+        let mut scripts = write_txn.open_table(LUA_SCRIPT_TABLE)?;
+        let mut current: BTreeMap<String, LuaScript> = BTreeMap::new();
+        for row in scripts.iter()? {
+            let (id, json) = row?;
+            if let Ok(script) = serde_json::from_slice::<LuaScript>(json.value()) {
+                current.insert(id.value().to_string(), script);
+            }
+        }
+        let wanted: BTreeMap<&str, &LuaScript> = seed.scripts.iter().map(|(id, s)| (id.as_str(), s)).collect();
+        for id in current.keys().filter(|id| !wanted.contains_key(id.as_str())) {
+            scripts.remove(id.as_str())?;
+            refreshed.scripts = true;
+        }
+        for (id, script) in &wanted {
+            if current.get(*id).is_none_or(|kept| !same_but_counts(kept, script)) {
+                scripts.insert(*id, serde_json::to_vec(script)?.as_slice())?;
+                refreshed.scripts = true;
+            }
+        }
+    }
+    write_txn.commit_quietly()?;
+    if refreshed.rows {
+        for manager in [
+            get_favorites_manager(),
+            get_recent_keys_manager(),
+            get_search_history_manager(),
+        ] {
+            manager.forget_cached();
+        }
+    }
+    if !refreshed.key_notes_of.is_empty() {
+        get_key_metadata_manager().forget_cached();
+    }
+    if refreshed.scripts {
+        LuaScriptManager::reload()?;
+    }
+    Ok(refreshed)
 }
 
 /// Hand every later change of the page's data to `sink`.
@@ -280,6 +430,34 @@ mod tests {
                 script: None,
             }]
         );
+    }
+
+    /// A refresh writes a server's notes only where they differ, and a
+    /// server whose notes all went is one that changed.
+    #[test]
+    fn a_refresh_rewrites_only_the_servers_whose_notes_differ() {
+        let red = KeyMetadata {
+            tag: Some(TagColor::Red),
+            note: String::new(),
+        };
+        let doc = |entries: &[(&str, &KeyMetadata)]| -> HashMap<String, KeyMetadata> {
+            entries.iter().map(|(k, m)| (k.to_string(), (*m).clone())).collect()
+        };
+        let current = HashMap::from([
+            ("same".to_string(), doc(&[("a", &red)])),
+            ("changed".to_string(), doc(&[("a", &red)])),
+            ("emptied".to_string(), doc(&[("a", &red)])),
+        ]);
+        let wanted = HashMap::from([
+            ("same".to_string(), doc(&[("a", &red)])),
+            ("changed".to_string(), doc(&[("b", &red)])),
+            ("new".to_string(), doc(&[("a", &red)])),
+        ]);
+        let changed: Vec<&str> = servers_with_new_notes(&current, &wanted)
+            .into_iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(changed, vec!["changed", "emptied", "new"]);
     }
 
     /// The desktop's rows do not change for a field only the browser sets.

@@ -34,6 +34,7 @@ mod accounts;
 mod api;
 mod audit;
 mod auth;
+mod handover;
 mod mcp;
 mod metrics;
 mod page_data;

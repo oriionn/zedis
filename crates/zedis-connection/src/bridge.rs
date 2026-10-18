@@ -711,6 +711,46 @@ pub struct BridgeAccountChange {
     pub disabled: Option<bool>,
 }
 
+/// One thing an account keeps to itself: a server entry or a saved script.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BridgeOwnedItem {
+    pub id: String,
+    pub name: String,
+}
+
+/// What an account keeps to itself on the bridge — what its deletion has to
+/// say what becomes of.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BridgeOwned {
+    pub servers: Vec<BridgeOwnedItem>,
+    pub scripts: Vec<BridgeOwnedItem>,
+}
+
+impl BridgeOwned {
+    pub fn is_empty(&self) -> bool {
+        self.servers.is_empty() && self.scripts.is_empty()
+    }
+}
+
+/// What an account deleted before handovers existed left behind, seen by
+/// nobody since.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BridgeOrphans {
+    pub owner: String,
+    pub owned: BridgeOwned,
+}
+
+/// What becomes of what an account kept to itself (ADR 17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BridgeDisposition {
+    /// It becomes this account's.
+    HandTo(String),
+    /// It becomes every account's — passwords saved in it included.
+    Share,
+    /// It goes too.
+    Delete,
+}
+
 /// Why an account request was refused, in the terms its page words it in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BridgeAccountErrorKind {
@@ -779,7 +819,14 @@ pub trait BridgeAccounts: Send + Sync + 'static {
     fn accounts(&self) -> BridgeAccountResult<Vec<BridgeAccount>>;
     /// The account as it is after `change`.
     fn update_account(&self, name: String, change: BridgeAccountChange) -> BridgeAccountResult<BridgeAccount>;
-    fn delete_account(&self, name: String) -> BridgeAccountResult<()>;
+    /// What `name` keeps to itself, which its deletion has to settle.
+    fn owned(&self, name: String) -> BridgeAccountResult<BridgeOwned>;
+    /// Delete `name`, settling what it kept to itself as `private` says.
+    fn delete_account(&self, name: String, private: BridgeDisposition) -> BridgeAccountResult<()>;
+    /// What accounts deleted before handovers left behind.
+    fn orphans(&self) -> BridgeAccountResult<Vec<BridgeOrphans>>;
+    /// Settle what `owner`, an account no more, left behind.
+    fn settle_orphans(&self, owner: String, private: BridgeDisposition) -> BridgeAccountResult<()>;
     /// A link that sets a new password on `name`, once.
     fn reset_link(&self, name: String) -> BridgeAccountResult<BridgeNewInvite>;
     /// The open invitations.
@@ -866,6 +913,12 @@ pub trait BridgePageData: Send + Sync + 'static {
     fn put_key_note(&self, server_id: String, key: String, tag: Option<String>, note: String);
     fn put_script(&self, script: BridgeScript);
     fn delete_script(&self, id: String);
+    /// Whether a change made here has not reached the bridge yet. A refresh
+    /// read while one is on its way would put back what it replaces.
+    fn writes_pending(&self) -> bool;
+    /// Read what other accounts changed now rather than at the next round:
+    /// a server was opened, the script library was, the page came back.
+    fn refresh_soon(&self);
 }
 
 static PAGE_DATA: OnceLock<Arc<dyn BridgePageData>> = OnceLock::new();

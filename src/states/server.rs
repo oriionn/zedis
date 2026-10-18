@@ -29,8 +29,9 @@ use crate::states::server::event::{ServerEvent, ServerTask};
 use crate::states::server::history::{KeyHistories, ValueHistoryEntry};
 use crate::states::server::stat::{ClientPause, RedisInfo, client_pause_now, get_metrics_cache};
 use crate::states::{
-    HINT_FIRST_CONNECT, QueryMode, ServerView, ZedisGlobalStore, command_unavailable_message, first_connect_hint,
-    get_session_option, i18n_common, i18n_status_bar, save_session_option, update_app_state_and_save_quiet,
+    HINT_FIRST_CONNECT, QueryMode, ServerView, ZedisGlobalStore, ask_for_fresh_page_data, command_unavailable_message,
+    first_connect_hint, get_session_option, i18n_common, i18n_status_bar, save_session_option,
+    update_app_state_and_save_quiet,
 };
 use ahash::AHashMap;
 use ahash::AHashSet;
@@ -1872,6 +1873,9 @@ impl ZedisServerState {
             self.soft_wrap = soft_wrap;
 
             debug!(server_id = self.server_id.as_str(), "Selecting server");
+            // In the browser, the tags and notes other accounts set here
+            // since the last round, before the tree is read (ADR 17).
+            ask_for_fresh_page_data();
             let search_history_manager = get_search_history_manager();
             if let Ok(history) = search_history_manager.records(server_id.as_str()) {
                 self.search_history = history.into_iter().map(Into::into).collect();

@@ -159,6 +159,19 @@ pub const WINDOW_IDLE_AFTER: Duration = Duration::from_secs(120);
 #[cfg(target_family = "wasm")]
 pub const SERVER_LIST_REFRESH: Duration = Duration::from_secs(60);
 
+/// How often a browser page asks the bridge again for the page data other
+/// accounts change — key tags and notes, saved scripts (ADR 17). The same
+/// minute as the server list, skipped the same way while nobody looks, and
+/// asked at once besides when a server or the script library is opened or
+/// the page is looked at again; an unchanged answer is a `304`.
+#[cfg(target_family = "wasm")]
+pub const PAGE_DATA_REFRESH: Duration = Duration::from_secs(60);
+
+/// How soon a page-data refresh is tried again when it was not taken in
+/// because this page changed something while it was on its way.
+#[cfg(target_family = "wasm")]
+pub const PAGE_DATA_RETRY: Duration = Duration::from_secs(2);
+
 /// The longest a cluster's heartbeat is stretched to, however many masters.
 const HEARTBEAT_STRETCH_CAP: Duration = Duration::from_secs(30);
 

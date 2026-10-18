@@ -111,13 +111,13 @@ pub use audit::{is_administration_command, redact_secrets};
 pub use bitmap::{BitOpKind, BitmapInfo, bit_field, bit_op, bitmap_info, set_bit};
 pub use bridge::{
     BridgeAccount, BridgeAccountChange, BridgeAccountError, BridgeAccountErrorKind, BridgeAccountResult,
-    BridgeAccounts, BridgeConn, BridgeError, BridgeErrorKind, BridgeInvite, BridgeInviteKind, BridgeKeyNote,
-    BridgeNewInvite, BridgeOwnAccount, BridgePageData, BridgePageRow, BridgePageSeed, BridgeReply, BridgeRequest,
-    BridgeRole, BridgeScript, BridgeServerStore, BridgeStorage, BridgeToken, BridgeTransport, BridgeTrashEntry,
-    DESCRIBED_COMMANDS, PipelineSpec, WatchBatch, WatchItem, WatchKind, WatchOpened, bridge_accounts, bridge_page_data,
-    bridge_server_store, bridge_storage, bridge_transport, describe_commands, describe_packed_command,
-    set_bridge_accounts, set_bridge_page_data, set_bridge_server_store, set_bridge_storage, set_bridge_transport,
-    sign_out_of_bridge, signed_in_to_bridge,
+    BridgeAccounts, BridgeConn, BridgeDisposition, BridgeError, BridgeErrorKind, BridgeInvite, BridgeInviteKind,
+    BridgeKeyNote, BridgeNewInvite, BridgeOrphans, BridgeOwnAccount, BridgeOwned, BridgeOwnedItem, BridgePageData,
+    BridgePageRow, BridgePageSeed, BridgeReply, BridgeRequest, BridgeRole, BridgeScript, BridgeServerStore,
+    BridgeStorage, BridgeToken, BridgeTransport, BridgeTrashEntry, DESCRIBED_COMMANDS, PipelineSpec, WatchBatch,
+    WatchItem, WatchKind, WatchOpened, bridge_accounts, bridge_page_data, bridge_server_store, bridge_storage,
+    bridge_transport, describe_commands, describe_packed_command, set_bridge_accounts, set_bridge_page_data,
+    set_bridge_server_store, set_bridge_storage, set_bridge_transport, sign_out_of_bridge, signed_in_to_bridge,
 };
 /// What stands in for redis-rs's `Cmd::query_async` / `Pipeline::query_async`
 /// in the browser, where the `aio` feature that provides them cannot be built.

@@ -37,11 +37,14 @@ use crate::api::{
 };
 use crate::audit::{Event, Origin};
 use crate::auth::{hex, now_secs};
+use crate::static_files::{etag_of, matches_etag};
 use crate::store::{KeyNoteStore, PageRowStore, ScriptStore, StoreFuture, blocking};
 use axum::{
     Json, Router,
+    body::Body,
     extract::{ConnectInfo, Path, State},
     http::{HeaderMap, StatusCode},
+    response::Response,
     routing::{get, put},
 };
 use futures::future::BoxFuture;
@@ -112,7 +115,7 @@ pub struct ScriptRecord {
 
 impl ScriptRecord {
     /// The script's name, for the audit log.
-    fn name(&self) -> String {
+    pub(crate) fn name(&self) -> String {
         #[derive(Deserialize)]
         struct Named {
             #[serde(default)]
@@ -444,12 +447,37 @@ struct PageData {
 
 /// Everything the page keeps for this account, before it starts: its own
 /// rows, the notes on every server it sees, and the scripts it may use.
+///
+/// Asked again every minute or so by a page that is open, and when it opens
+/// a server or the script library, to see what other accounts changed — so
+/// it carries an `ETag`, and an unchanged answer is a `304` with no body.
 async fn page_data(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-) -> ApiResult<Json<PageData>> {
-    let account = authorize(&state, &headers, &mut Origin::new(peer, &headers))?;
+) -> ApiResult<Response> {
+    let data = gather(&state, &headers, peer).await?;
+    let body = serde_json::to_vec(&data).map_err(|e| ApiError::Upstream(e.to_string()))?;
+    let etag = etag_of(&body);
+    let unchanged = headers
+        .get("if-none-match")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|tags| matches_etag(Some(tags), &etag));
+    let response = Response::builder()
+        .header("etag", &etag)
+        .header("cache-control", "no-cache");
+    let response = if unchanged {
+        response.status(StatusCode::NOT_MODIFIED).body(Body::empty())
+    } else {
+        response
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+    };
+    response.map_err(|e| ApiError::Upstream(e.to_string()))
+}
+
+async fn gather(state: &AppState, headers: &HeaderMap, peer: SocketAddr) -> ApiResult<PageData> {
+    let account = authorize(state, headers, &mut Origin::new(peer, headers))?;
     let rows = state.page_rows.rows(account.clone()).await.map_err(store_error)?;
     let rows = rows
         .into_iter()
@@ -489,13 +517,13 @@ async fn page_data(
             script: script.script,
         })
         .collect();
-    Ok(Json(PageData {
+    Ok(PageData {
         read_only: state.accounts.is_read_only(&account),
         account,
         rows,
         key_notes,
         scripts,
-    }))
+    })
 }
 
 #[derive(Deserialize)]

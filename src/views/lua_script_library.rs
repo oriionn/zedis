@@ -33,8 +33,9 @@ use crate::{
     error::Error,
     helpers::{get_mono_font_family, parse_lines, unix_ts},
     states::{
-        ServerEvent, ServerView, ZedisGlobalStore, ZedisServerState, account_is_read_only, back_to_editor_tooltip,
-        dialog_button_props, escalate_dangerous_body, i18n_common, i18n_lua_scripts,
+        GlobalEvent, ServerEvent, ServerView, ZedisGlobalStore, ZedisServerState, account_is_read_only,
+        ask_for_fresh_page_data, back_to_editor_tooltip, dialog_button_props, escalate_dangerous_body, i18n_common,
+        i18n_lua_scripts,
     },
 };
 use ahash::AHashMap;
@@ -173,6 +174,14 @@ impl ZedisLuaScriptLibrary {
                 cx.notify();
             }
         }));
+        // In the browser, what other accounts saved (ADR 17). An open form
+        // keeps what is typed into it; the save is the last word.
+        let global_state = cx.global::<ZedisGlobalStore>().state();
+        subscriptions.push(cx.subscribe(&global_state, |this, _global, event, cx| {
+            if let GlobalEvent::PageDataRefreshed { scripts: true, .. } = event {
+                this.take_in_refreshed(cx);
+            }
+        }));
         let filter = cx.new(|cx| InputState::new(window, cx).placeholder(i18n_lua_scripts(cx, "filter_placeholder")));
         let mut this = Self {
             server_state,
@@ -194,6 +203,7 @@ impl ZedisLuaScriptLibrary {
         };
         this.refresh_list(cx);
         this.probe_cache(cx);
+        ask_for_fresh_page_data();
         this
     }
 
@@ -209,6 +219,24 @@ impl ZedisLuaScriptLibrary {
 
     fn reload(&mut self, cx: &mut gpui::Context<Self>) {
         self.refresh_list(cx);
+        self.probe_cache(cx);
+        ask_for_fresh_page_data();
+    }
+
+    /// The list again after a refresh from the bridge, and a code viewer
+    /// built again only where its script's source changed or went.
+    fn take_in_refreshed(&mut self, cx: &mut gpui::Context<Self>) {
+        let before = std::mem::take(&mut self.scripts);
+        self.refresh_list(cx);
+        let code_of = |scripts: &[(String, Arc<LuaScript>)], id: &str| {
+            scripts
+                .iter()
+                .find(|(script_id, _)| script_id == id)
+                .map(|(_, script)| script.code.clone())
+        };
+        let now = &self.scripts;
+        self.code_viewers
+            .retain(|id, _| code_of(now, id).is_some_and(|code| Some(code) == code_of(&before, id)));
         self.probe_cache(cx);
     }
 

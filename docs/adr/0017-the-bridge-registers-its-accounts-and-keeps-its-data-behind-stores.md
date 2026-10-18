@@ -258,7 +258,8 @@ give the desktop the same results before and after each step, and
    other), one script, and nothing when a script only counted a run. The
    page sends them one after another so a later one never lands first,
    and sends nothing when the page data could not be loaded. What other
-   accounts change appears on the next page load.
+   accounts change appears on the next page load — amended below: an open
+   page now refreshes it.
 5. A SQL implementation when a deployment asks for more than one process
    or for audit queries, with migrations, and the audit viewer for
    administrators.
@@ -351,3 +352,51 @@ the one that held `bridge_page_url` to `None`; `make lint` and `make test`
 give the desktop the same results before and after. `docs/WEB.md` and its
 twin change where they name `account.html`, and CLAUDE.md where it
 describes the pages.
+
+## Amended 2026-10-18 — what a deleted account kept, and keeping the page current
+
+Three things the first pass of steps 3 and 4 left for later.
+
+**A deleted account's own are settled in the deletion.** Its private server
+entries and scripts used to stay on the bridge, seen by nobody — the
+owner is not an account any more, so `visible_to` hides them from everyone,
+and only the files said they were there. `DELETE /v1/admin/accounts/{name}`
+now carries what becomes of them (`handover::Disposition`): handed to an
+account, shared, or deleted with the account — an entry's recycle bin,
+metrics history and key notes too, as when an entry is deleted. The page
+asks for the list first (`GET /v1/admin/accounts/{name}/owned`) and puts
+the choice in the confirmation. The default is the administrator who
+deletes, and sharing is never a default: a private entry carries its
+owner's Redis password, and sharing it gives that connection to every
+account. The recipient must be an account that can write and sign in —
+read-only could not change what it was given, disabled could not see it.
+Each entry and script is its own audit line (`server_updated` with the
+owner from → to, `server_deleted`, `script_saved`, `script_deleted`),
+and `account_deleted` says where they went, with counts. What accounts
+deleted before this left behind is an **orphan** — an owner that is no
+account — listed by `GET /v1/admin/orphans` and settled the same way by
+`POST /v1/admin/orphans/{owner}` (`orphans_settled`). The confirmation also
+says that *Disabled* is the reversible answer.
+
+**An administrator's token has an end by default.** Issued for another
+account on the account page, a token expires in 90 days unless the
+administrator picks another day or clears it; no picker offers a day already
+gone. The bridge's rules are unchanged — an expiry is still optional there.
+
+**An open page keeps up with what other accounts change.** The tags, notes
+and shared scripts are refreshed while the page is open: every minute
+(`PAGE_DATA_REFRESH`, skipped while nobody looks, like the server list), and
+at once when a server or the script library is opened or the page is looked
+at again (`BridgePageData::refresh_soon`). `GET /v1/page-data` answers with
+an `ETag` and a `304` for an unchanged one, so a round costs a header. What
+comes back is compared with the local store and only what differs is
+written, quietly — `mem_store::commit_quietly`, which the commit observer
+does not hear, or every refresh would be sent back as this page's change —
+then the managers' caches are dropped and `GlobalEvent::PageDataRefreshed`
+tells the key tree and the script library. A refresh is never taken in over
+this page's own change: not while one is on its way to the bridge
+(`writes_pending`), and not when one was made since the request went out (a
+count of commits taken before it), when it is asked for again two seconds
+later. An open script form keeps what is typed into it; the last save wins.
+The preferences are not refreshed: they are a session's settings, read once
+at the start.

@@ -17,11 +17,14 @@
 //! rather than editable cells: one account is changed at a time, and saved
 //! as one change, which is one audit line (ADR 17).
 
+use super::handover::Handover;
+use super::tokens::{ADMIN_TOKEN_DAYS, expiry_picker, picked_day};
 use super::*;
-use crate::connection::BridgeAccountChange;
+use crate::connection::{BridgeAccountChange, BridgeDisposition, BridgeOrphans};
 use gpui::Subscription;
 use gpui_kit::component::{
     checkbox::Checkbox,
+    date_picker::{DatePicker, DatePickerState},
     input::{Input, InputState, Textarea, TextareaState},
     table::{DataTable, TableEvent, TableState},
 };
@@ -36,9 +39,15 @@ const NAME_COLUMN_WIDTH: f32 = 160.;
 
 pub(super) const SAVE_ACCOUNT_ID: &str = "account-save";
 pub(super) const ADMIN_TOKEN_NAME_ID: &str = "account-admin-token-name";
+pub(super) const ADMIN_ISSUE_TOKEN_ID: &str = "account-admin-issue-token";
+pub(super) const DELETE_ACCOUNT_ID: &str = "account-delete";
+/// Followed by the owner's name.
+pub(super) const SETTLE_ORPHANS_ID: &str = "account-settle-orphans";
 
 pub(super) struct AdminForm {
     accounts: Vec<BridgeAccount>,
+    /// What accounts deleted before handovers left behind, seen by nobody.
+    orphans: Vec<BridgeOrphans>,
     pub(super) table: Entity<TableState<ZedisTextTable>>,
     /// The account whose form is under the table, by name.
     selected: Option<String>,
@@ -47,6 +56,7 @@ pub(super) struct AdminForm {
     servers: Entity<TextareaState>,
     pub(super) disabled: bool,
     token_name: Entity<InputState>,
+    token_expires: Entity<DatePickerState>,
     busy: bool,
     pub(super) status: Option<Status>,
     /// Put the selected account's settings back in the form at the next
@@ -90,6 +100,7 @@ impl AdminForm {
         let role_subscription = Self::follow_role(&role, cx);
         Self {
             accounts: Vec::new(),
+            orphans: Vec::new(),
             table,
             selected: None,
             role,
@@ -101,6 +112,7 @@ impl AdminForm {
             }),
             disabled: false,
             token_name: cx.new(|cx| InputState::new(window, cx).placeholder("claude-laptop")),
+            token_expires: expiry_picker(Some(ADMIN_TOKEN_DAYS), window, cx),
             busy: false,
             status: None,
             refill: false,
@@ -117,6 +129,10 @@ impl AdminForm {
                 cx.notify();
             }
         })
+    }
+
+    pub(super) fn accounts(&self) -> &[BridgeAccount] {
+        &self.accounts
     }
 
     fn account(&self, name: &str) -> Option<&BridgeAccount> {
@@ -175,10 +191,32 @@ impl ZedisAccount {
                             this.admin.selected = None;
                         }
                         let rows = this.admin.rows(cx);
-                        this.admin
-                            .table
-                            .update(cx, |table, _| table.delegate_mut().set_rows(rows));
+                        let none_selected = this.admin.selected.is_none();
+                        this.admin.table.update(cx, |table, cx| {
+                            table.delegate_mut().set_rows(rows);
+                            // The highlight follows the form: a row left lit
+                            // after its account went marks the next one.
+                            if none_selected {
+                                table.clear_selection(cx);
+                            }
+                        });
                     }
+                    Err(e) => this.admin.status = Status::bad(refusal(cx, &e, &[])),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        self.load_orphans(cx);
+    }
+
+    fn load_orphans(&mut self, cx: &mut Context<Self>) {
+        let request = self.bridge.orphans();
+        cx.spawn(async move |this, cx| {
+            let result = request.await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(orphans) => this.admin.orphans = orphans,
                     Err(e) => this.admin.status = Status::bad(refusal(cx, &e, &[])),
                 }
                 cx.notify();
@@ -220,6 +258,7 @@ impl ZedisAccount {
         );
         v_flex()
             .gap_3()
+            .children(self.render_orphans(cx))
             .child(div().w_full().h(px(TABLE_HEIGHT)).child(table))
             .children(status_line(cx, &self.admin.status))
             .child(match self.admin.selected_account().cloned() {
@@ -228,6 +267,53 @@ impl ZedisAccount {
             })
             .children(self.render_shown(cx))
             .into_any_element()
+    }
+
+    /// What deleted accounts left behind, each owner with a way to settle
+    /// it — nothing at all while there is none.
+    fn render_orphans(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.admin.orphans.is_empty() {
+            return None;
+        }
+        let locale = cx.global::<ZedisGlobalStore>().read(cx).locale().to_string();
+        let busy = self.admin.busy;
+        Some(
+            v_flex()
+                .gap_2()
+                .p_3()
+                .border_1()
+                .border_color(cx.theme().warning)
+                .rounded(cx.theme().radius)
+                .child(Label::new(i18n_account(cx, "orphans_title")).text_sm())
+                .child(note(cx, i18n_account(cx, "orphans_intro")))
+                .children(self.admin.orphans.iter().map(|orphans| {
+                    let counts: SharedString = t!(
+                        "account.orphans_counts",
+                        servers = orphans.owned.servers.len(),
+                        scripts = orphans.owned.scripts.len(),
+                        locale = &locale
+                    )
+                    .into();
+                    let owner = orphans.owner.clone();
+                    let owned = orphans.owned.clone();
+                    h_flex()
+                        .gap_3()
+                        .items_center()
+                        .child(Label::new(orphans.owner.clone()).text_sm())
+                        .child(note(cx, counts))
+                        .child(
+                            Button::new(SharedString::from(format!("{SETTLE_ORPHANS_ID}-{}", orphans.owner)))
+                                .ghost()
+                                .xsmall()
+                                .label(i18n_account(cx, "orphans_settle"))
+                                .disabled(busy)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.ask_handover(Handover::Orphans, owner.clone(), owned.clone(), window, cx);
+                                })),
+                        )
+                }))
+                .into_any_element(),
+        )
     }
 
     fn render_account_form(&mut self, account: &BridgeAccount, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -251,7 +337,14 @@ impl ZedisAccount {
                                 .child(Input::new(&form.token_name).id(ADMIN_TOKEN_NAME_ID)),
                         )
                         .child(
-                            Button::new("account-admin-issue-token")
+                            div().w(px(180.)).child(
+                                DatePicker::new(&form.token_expires)
+                                    .placeholder(i18n_account(cx, "expires_never"))
+                                    .cleanable(true),
+                            ),
+                        )
+                        .child(
+                            Button::new(ADMIN_ISSUE_TOKEN_ID)
                                 .outline()
                                 .label(i18n_account(cx, "token_issue"))
                                 .disabled(form.busy)
@@ -307,7 +400,7 @@ impl ZedisAccount {
                             .on_click(cx.listener(|this, _, _, cx| this.reset_link_for_selected(cx))),
                     )
                     .child(
-                        Button::new("account-delete")
+                        Button::new(DELETE_ACCOUNT_ID)
                             .ghost()
                             .danger()
                             .label(i18n_account(cx, "delete"))
@@ -401,9 +494,10 @@ impl ZedisAccount {
         if name.is_empty() {
             return;
         }
+        let expires = picked_day(self.admin.token_expires.read(cx));
         self.admin.busy = true;
         cx.notify();
-        let request = self.bridge.issue_token(Some(account), name, None);
+        let request = self.bridge.issue_token(Some(account), name, expires);
         cx.spawn(async move |this, cx| {
             let result = request.await;
             let _ = this.update(cx, |this, cx| {
@@ -424,32 +518,35 @@ impl ZedisAccount {
         .detach();
     }
 
-    /// Deleting ends the account's logins and tokens, and leaves the server
-    /// entries it made private on the bridge, seen by nobody — which is
-    /// what the question says before anything is sent.
+    /// Deleting ends the account's logins and tokens, and has to say what
+    /// becomes of the server entries and scripts it kept to itself — so the
+    /// bridge is asked what those are before the question is.
     fn confirm_delete_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(name) = self.admin.selected.clone() else {
             return;
         };
-        let locale = cx.global::<ZedisGlobalStore>().read(cx).locale().to_string();
-        let title = t!("account.delete_title", name = &name, locale = &locale).to_string();
-        let entity = cx.entity().downgrade();
-        ZedisDialog::new_alert(title, i18n_account(cx, "delete_body"))
-            .danger()
-            .ok_text(i18n_common(cx, "delete"))
-            .cancel_text(i18n_common(cx, "cancel"))
-            .on_ok(move |_, _, cx| {
-                let name = name.clone();
-                let _ = entity.update(cx, |this, cx| this.delete_account(name, cx));
-                true
-            })
-            .open(window, cx);
+        self.admin.busy = true;
+        self.admin.status = None;
+        cx.notify();
+        let request = self.bridge.owned(name.clone());
+        cx.spawn_in(window, async move |this, cx| {
+            let result = request.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.admin.busy = false;
+                match result {
+                    Ok(owned) => this.ask_handover(Handover::Delete, name, owned, window, cx),
+                    Err(e) => this.admin.status = Status::bad(refusal(cx, &e, &[])),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
-    fn delete_account(&mut self, name: String, cx: &mut Context<Self>) {
+    pub(super) fn delete_account(&mut self, name: String, private: BridgeDisposition, cx: &mut Context<Self>) {
         self.admin.busy = true;
         cx.notify();
-        let request = self.bridge.delete_account(name.clone());
+        let request = self.bridge.delete_account(name.clone(), private);
         cx.spawn(async move |this, cx| {
             let result = request.await;
             let _ = this.update(cx, |this, cx| {
@@ -467,6 +564,28 @@ impl ZedisAccount {
                         this.admin.refill = true;
                     }
                 }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn settle_orphans(&mut self, owner: String, private: BridgeDisposition, cx: &mut Context<Self>) {
+        self.admin.busy = true;
+        cx.notify();
+        let request = self.bridge.settle_orphans(owner.clone(), private);
+        cx.spawn(async move |this, cx| {
+            let result = request.await;
+            let _ = this.update(cx, |this, cx| {
+                this.admin.busy = false;
+                match result {
+                    Ok(()) => {
+                        let locale = cx.global::<ZedisGlobalStore>().read(cx).locale();
+                        this.admin.status = Status::good(t!("account.settled", name = owner, locale = locale));
+                    }
+                    Err(e) => this.admin.status = Status::bad(refusal(cx, &e, &[])),
+                }
+                this.load_accounts(cx);
                 cx.notify();
             });
         })

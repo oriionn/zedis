@@ -16,6 +16,7 @@
 //! in at `/v1/mcp` with, and nowhere else.
 
 use super::*;
+use chrono::{Duration, NaiveDate, Utc};
 use gpui_kit::component::{
     date_picker::{DatePicker, DatePickerState},
     input::{Input, InputState},
@@ -36,12 +37,40 @@ impl TokenForm {
     pub(super) fn new(window: &mut Window, cx: &mut Context<ZedisAccount>) -> Self {
         Self {
             name: cx.new(|cx| InputState::new(window, cx).placeholder("claude-laptop")),
-            expires: cx.new(|cx| DatePickerState::new(window, cx)),
+            expires: expiry_picker(None, window, cx),
             busy: false,
             status: None,
             clear: false,
         }
     }
+}
+
+/// How long a token an administrator issues for someone else lasts unless
+/// they pick otherwise: such a token is the easiest kind to forget, so not
+/// expiring is the choice that has to be made, by clearing the date.
+pub(super) const ADMIN_TOKEN_DAYS: i64 = 90;
+
+/// The first day a token may expire on. The bridge refuses a day already
+/// begun (UTC midnight is when a token stops), so today is not offered.
+pub(super) fn first_expiry_day() -> NaiveDate {
+    Utc::now().date_naive() + Duration::days(1)
+}
+
+/// A picker for a token's expiry, which offers no day the bridge would
+/// refuse, showing `days` from today when given.
+pub(super) fn expiry_picker(
+    days: Option<i64>,
+    window: &mut Window,
+    cx: &mut Context<ZedisAccount>,
+) -> Entity<DatePickerState> {
+    let first = first_expiry_day();
+    cx.new(|cx| {
+        let mut state = DatePickerState::new(window, cx).disabled_matcher(move |day: &NaiveDate| *day < first);
+        if let Some(days) = days {
+            state.set_date(Utc::now().date_naive() + Duration::days(days), window, cx);
+        }
+        state
+    })
 }
 
 /// A picked day as the bridge takes it, `2027-01-01`; none, a token that

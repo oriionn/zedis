@@ -55,6 +55,12 @@ impl HistoryManager {
     fn entry<'a>(&self, text: &'a str) -> &'a str {
         if self.key_names { text } else { text.trim() }
     }
+    /// Read the table again on the next ask: it was written under the
+    /// cache (the page's data, refreshed from the bridge).
+    pub fn forget_cached(&self) {
+        self.history_cache.clear();
+    }
+
     pub fn set_max_history_size(mut self, max_history_size: usize) -> Self {
         self.max_history_size = max_history_size;
         self

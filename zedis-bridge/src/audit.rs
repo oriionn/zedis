@@ -356,6 +356,15 @@ pub enum Event {
     },
     AccountDeleted {
         target: String,
+        /// Where what it kept to itself went; absent when it kept nothing.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        private: Option<Handover>,
+    },
+    /// What an account deleted before handovers existed had kept to itself,
+    /// settled by an administrator (ADR 17).
+    OrphansSettled {
+        owner: String,
+        private: Handover,
     },
     /// `target`'s password changed: by its owner, or with a reset link.
     PasswordChanged {
@@ -432,6 +441,7 @@ impl Event {
             Event::AccountRegistered { .. } => "account_registered",
             Event::AccountUpdated { .. } => "account_updated",
             Event::AccountDeleted { .. } => "account_deleted",
+            Event::OrphansSettled { .. } => "orphans_settled",
             Event::PasswordChanged { .. } => "password_changed",
             Event::TokenIssued { .. } => "token_issued",
             Event::TokenRevoked { .. } => "token_revoked",
@@ -479,6 +489,18 @@ impl From<&RedisServer> for ServerRef {
 pub struct Change {
     pub from: Value,
     pub to: Value,
+}
+
+/// Where a deleted account's own entries and scripts went (ADR 17).
+#[derive(Serialize, Debug, PartialEq, Eq, Clone)]
+pub struct Handover {
+    /// `handed_to`, `shared` or `deleted`.
+    pub action: &'static str,
+    /// The account they went to, for `handed_to`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    pub servers: usize,
+    pub scripts: usize,
 }
 
 /// One command, or several with the same name and outcome in one batch —
@@ -821,6 +843,16 @@ mod tests {
             },
             Event::AccountDeleted {
                 target: "bob".to_string(),
+                private: None,
+            },
+            Event::OrphansSettled {
+                owner: "carol".to_string(),
+                private: Handover {
+                    action: "shared",
+                    to: None,
+                    servers: 1,
+                    scripts: 0,
+                },
             },
             Event::PasswordChanged {
                 target: "bob".to_string(),

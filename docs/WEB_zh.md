@@ -81,6 +81,8 @@ tools.example.com {
 
 在同一页的账号表里，管理员还可以修改账号的角色和服务器规则、停用或删除账号，或者给忘了密码的人生成一个**重置链接…**——它只能设置一次新密码。每个人都在账号页上修改自己的密码。最后一个管理员不能被降级、停用或删除。万一所有管理员都丢了，在宿主机上执行 `zedis-bridge setup-token`（`docker exec zedis-web /usr/local/bin/zedis-bridge setup-token`）：它会打印一个新的初始化令牌，页面重新提供*创建管理员*，可以新建账号，也可以用已有账号自己的密码把它设为管理员。这件事通过 HTTP 做不到 —— 能登录宿主机，就等于掌握了 bridge。
 
+删除账号会结束它的登录和令牌，且无法撤销；改为勾选**已停用**则只是不让它登录，可以恢复。账号自己私有的东西 —— 私有的服务器条目和保存的脚本 —— 不会留在 bridge 上无人可见：确认框会把它们列出来，问清怎么处理。可以转交给另一个账号（默认是执行删除的管理员，也可以另选；只读或已停用的账号不行）、共享给所有账号，或者一并删除 —— 条目的回收站、指标历史和 key 备注也一起删除。共享从来不会是默认选项，因为私有条目里带着主人的 Redis 密码。每一项都记一行审计（`server_updated` 记录 owner 从谁改为谁、`server_deleted`、`script_saved`、`script_deleted`），`account_deleted` 则写明它们去了哪里。脚本通过 `DELETE /v1/admin/accounts/{name}` 删除时，在请求体里说明同样的选择 —— `{"private":{"action":"hand_to","account":"alice"}}`、`{"private":{"action":"share"}}` 或 `{"private":{"action":"delete"}}`；不带请求体时，它们归脚本登录所用的账号。在有这个功能之前删除的账号，可能已经留下了这样的东西；账号一节会在*已删除账号遗留的内容*下列出它们，每项都有**处理…**，三种选择相同（`orphans_settled`）。
+
 服务器规则限定账号能看到哪些**共享**条目，一行一条——按名字匹配（`*`、`?` 是通配符）或用 `id:` 加条目 id 精确指定——规则末尾加 `:ro` 表示在这些条目上只读，其它条目上仍是账号原本的权限。多条规则对同一条目意见不一时，**可写优先**：宽的规则做限制，例外单独点名，`prod-*:ro` 加 `prod-eu` 就是 `prod-*` 的条目都只读、其中 `prod-eu` 可写。没有规则时，看到全部共享条目。账号自己添加的条目永远可见可写。条目名是所有者自己起的，能编辑条目的人改个名字，就能让它匹配上或不再匹配某条规则——在意这一点就用 `id:`。
 
 **只读账号**可以查看它能看到的一切，但什么都改不了：不能写 Redis，也不能新增、编辑或删除服务器条目。拦截是 bridge 做的，不是页面 —— 任何不是读的请求都会收到 `403`，所以脚本直接请求 `/v1/exec` 和页面一样会被拒绝，带上确认参数也不会放行。判定用的是**读命令的白名单**，而不是"要避开的写命令"清单：`EVAL` 能执行任意脚本，`BITFIELD` 名字像读、实际会写，`GETDEL` 与 `GETEX` 名字是 get、实际是写，而模块命令根本不在 Redis 核心的命令表里 —— 因此不认识的一律拒绝；白名单万一漏了某个读命令，表现就是对应的面板提示不可用。
@@ -114,7 +116,7 @@ tools.example.com {
 
 ## 审计日志
 
-`--audit-log /data/audit.log`（`ZEDIS_BRIDGE_AUDIT_LOG`）会为每个事件追加一行 JSON：每次登录、登录失败与退出登录，只读账号被拒绝的每次请求，账号的每一次变动 —— 用初始化令牌创建管理员、邀请的创建与撤销、账号的注册、修改（角色、服务器规则、是否停用，改前改后）、删除与导入、密码的修改与重置、MCP token 的签发与吊销，从不记密码、邀请码或 token 本身 —— Lua 脚本的保存与删除，服务器条目的新增、编辑（改了哪些设置、改前改后的值；改了哪些密码之类的敏感字段，只记字段名不记值；私有条目被改为共享）和删除、每条管理服务器的命令 —— `CONFIG SET`、`ACL SETUSER`、`REPLICAOF`、`MODULE LOAD`、`CLIENT KILL`、`FLUSHDB` 之类 —— 每条需要人确认才放行的命令（所以开了“写入确认”的条目，在终端里输入的每一次写都会留痕），以及每个从回收站移出的 key（恢复或丢弃；恢复时的 `RESTORE` 另有一行写命令记录）。`--audit-writes`（`ZEDIS_BRIDGE_AUDIT_WRITES=1`）再加上普通的数据写命令，以及随之放进回收站的每个被删除的 key；读命令永远不记。参数里的密码会被抹掉，过长的值会截断，同一批里的同名命令合并成一行并记数量，文件创建时的权限是仅属主可访问。
+`--audit-log /data/audit.log`（`ZEDIS_BRIDGE_AUDIT_LOG`）会为每个事件追加一行 JSON：每次登录、登录失败与退出登录，只读账号被拒绝的每次请求，账号的每一次变动 —— 用初始化令牌创建管理员、邀请的创建与撤销、账号的注册、修改（角色、服务器规则、是否停用，改前改后）、删除（以及它私有的东西去了哪里）与导入、已删除账号遗留内容的处理、密码的修改与重置、MCP token 的签发与吊销，从不记密码、邀请码或 token 本身 —— Lua 脚本的保存与删除，服务器条目的新增、编辑（改了哪些设置、改前改后的值；改了哪些密码之类的敏感字段，只记字段名不记值；私有条目被改为共享）和删除、每条管理服务器的命令 —— `CONFIG SET`、`ACL SETUSER`、`REPLICAOF`、`MODULE LOAD`、`CLIENT KILL`、`FLUSHDB` 之类 —— 每条需要人确认才放行的命令（所以开了“写入确认”的条目，在终端里输入的每一次写都会留痕），以及每个从回收站移出的 key（恢复或丢弃；恢复时的 `RESTORE` 另有一行写命令记录）。`--audit-writes`（`ZEDIS_BRIDGE_AUDIT_WRITES=1`）再加上普通的数据写命令，以及随之放进回收站的每个被删除的 key；读命令永远不记。参数里的密码会被抹掉，过长的值会截断，同一批里的同名命令合并成一行并记数量，文件创建时的权限是仅属主可访问。
 
 ```json
 {"ts":"2026-09-25T08:12:03.417Z","account":"alice","peer":"10.0.0.7:51234","event":"command","server":{"id":"0199…","name":"prod"},"db":0,"command":"CONFIG","args":["SET","maxmemory","2gb"],"outcome":"confirmed","kind":"config_set","confirm":"type_name"}
@@ -143,7 +145,7 @@ docker run -d --name zedis-web -p 127.0.0.1:7379:7379 \
 08:13:00 mallory failed to sign in from 203.0.113.9
 ```
 
-推送的是审计日志所记内容的一个子集。默认推送除登录、退出登录和 MCP 工具调用之外的所有事件——这三种整天都在发生；`--audit-webhook-events`（`ZEDIS_BRIDGE_AUDIT_WEBHOOK_EVENTS`）可以改成一个列表——`login`、`login_failed`、`no_account`、`logout`、`refused`、`command`、`server_added`、`server_updated`、`server_deleted`、`unlocked`、`locked`、`trash_put`、`trash_removed`、`setup_completed`、`invite_created`、`invite_revoked`、`account_registered`、`account_updated`、`account_deleted`、`password_changed`、`token_issued`、`token_revoked`、`account_imported`、`script_saved`、`script_deleted`、`tool`——或 `all`。命令里只推送管理服务器的命令，以及需要人确认或被拒绝的命令：普通的数据写永远不推，开了 `--audit-writes` 也一样，否则忙一个上午群就被刷屏了；被删除的 key 放进回收站也不推，道理相同。
+推送的是审计日志所记内容的一个子集。默认推送除登录、退出登录和 MCP 工具调用之外的所有事件——这三种整天都在发生；`--audit-webhook-events`（`ZEDIS_BRIDGE_AUDIT_WEBHOOK_EVENTS`）可以改成一个列表——`login`、`login_failed`、`no_account`、`logout`、`refused`、`command`、`server_added`、`server_updated`、`server_deleted`、`unlocked`、`locked`、`trash_put`、`trash_removed`、`setup_completed`、`invite_created`、`invite_revoked`、`account_registered`、`account_updated`、`account_deleted`、`orphans_settled`、`password_changed`、`token_issued`、`token_revoked`、`account_imported`、`script_saved`、`script_deleted`、`tool`——或 `all`。命令里只推送管理服务器的命令，以及需要人确认或被拒绝的命令：普通的数据写永远不推，开了 `--audit-writes` 也一样，否则忙一个上午群就被刷屏了；被删除的 key 放进回收站也不推，道理相同。
 
 推送从不拖慢请求：审计行先进队列，第一行到达 3 秒后发出，一条消息最多 20 行，这样也不会超过机器人的频率限制（企业微信每分钟 20 条）。发送失败会在 5 秒后重试一次，仍失败就在进程日志里记一条警告；机器人返回错误码（签名不对、机器人已停用）也算失败。URL 里带着机器人的密钥，所以进程日志只记它的域名——启动时的 `audit webhook on` 一行列出域名、格式、推送的事件以及是否签名。URL、格式或事件名写错时，bridge 在启动时就会报错退出；给不签名的机器人（企业微信、Slack、JSON）配了密钥也一样，免得你以为消息是签过名的。
 
@@ -173,7 +175,7 @@ $ curl -s -u alice:secret https://zedis.example.com/v1/clients
 
 `POST /v1/mcp` 是一个 [Model Context Protocol](https://modelcontextprotocol.io) 服务端，Claude Code、Cursor 或任何 MCP 客户端都可以经由 bridge 读取你的 Redis —— 只能读。助手登录的账号**必须是只读的** —— 用这个账号的 token（见下文），或像脚本一样用 HTTP Basic；完整权限的账号在这里无论请求什么都会被拒绝。工具是按模型而不是按终端的习惯设计的：`list_servers`、`scan_keys`（分页，集群的每个 master 都会扫到）、`inspect_key`（类型、TTL、内存、编码、长度和一小段预览）、`server_info` 与 `slowlog`（按 master 解析好）；三个做汇总而不是罗列的工具——`slowlog_summary`（慢日志按命令汇总，最重的在前，并列出最慢的几条）、`hotkeys`（读取已在运行的 `HOTKEYS` 采集报告，Redis 8.6+；启动采集会改变服务器状态，所以留给人来做）和 `memory_summary`（最多抽 5000 个 key，用 `MEMORY USAGE` 测量后按前缀汇总，并列出最大的 key）；以及兜底的 `read_command`，跑任意其它只读命令。工具发出的每条命令都要过页面用的那份只读白名单，此外还会拒绝会改动共享连接状态的命令（`SELECT`、`AUTH`、`CLIENT SETNAME`、`SUBSCRIBE` 等）；写入、`_RO` 形式以外的脚本、管理命令以及会返回凭据的读（读密码的 `CONFIG GET`、`ACL LIST`）都会被拒绝，并附上模型读得懂的原因。大值会截断到能放进模型上下文的大小，每个账号每分钟最多 120 次调用，而且**每次调用都是审计日志里的一行** —— 读也记，因为调用者是替人做事的程序。
 
-给助手一个 **token**，而不是账号的密码。为它邀请一个只读账号，以这个账号登录后打开**账号…**：在 *MCP 令牌*下，用机器或客户端给 token 起个名字（`claude-laptop`），需要的话填上到期日，然后签发。管理员也可以在账号表里给任意只读账号签发（*签发令牌…*）。token 只显示一次；bridge 只保存它的 SHA-256。
+给助手一个 **token**，而不是账号的密码。为它邀请一个只读账号，以这个账号登录后打开**账号…**：在 *MCP 令牌*下，用机器或客户端给 token 起个名字（`claude-laptop`），需要的话填上到期日，然后签发。管理员也可以在账号表里给任意只读账号签发（*签发令牌…*），这样签发的 token 默认 90 天后到期，可以另选日期，或清空日期表示永不过期。已经过去的日期不能选。token 只显示一次；bridge 只保存它的 SHA-256。
 
 客户端把它放在请求头里：
 
@@ -217,7 +219,7 @@ claude mcp add --transport http zedis https://bridge.example.com/v1/mcp \
 - **key 的标签和备注**（`bridge-page-data/key-notes/`）——属于服务器：能看到这台服务器的人都能看到，每条都记着是谁、在什么时候留下的。按 key 逐条保存，所以两个人给两个 key 打标签不会互相覆盖。在这台服务器上不能写的账号——只读账号，或规则在这里写了 `:ro` 的账号——只能看，不能加。删除服务器条目时一并删除。
 - **保存的 Lua 脚本**（`bridge-scripts.json`）——默认归保存它的人；在脚本库里勾选*共享*后对所有账号可见。和共享的服务器条目一样，有写权限的账号都能修改或删除共享脚本；只读账号可以运行脚本，但改不了。每次保存、删除都记一行审计（`script_saved`、`script_deleted`），因为共享脚本会被别人运行，也包括在生产环境上。脚本的运行次数只留在当前页面。
 
-不保存的：终端的命令历史——里面是输入过的原文，可能包含密码，而且命令本身已经记在审计日志里。其他账号的改动在下次打开页面时出现。
+不保存的：终端的命令历史——里面是输入过的原文，可能包含密码，而且命令本身已经记在审计日志里。其他账号的改动 —— 标签、备注、保存的脚本，以及本账号在别的浏览器里改的自己的列表 —— 一分钟内就会出现在打开着的页面上；打开一台服务器或脚本库、或者回到这个标签页时会立刻去取。没人看着的标签页不会去问，内容没变时 bridge 只回一个 `304`。它不会盖掉本页正在发往 bridge 的改动，也不会改写正打开着的脚本表单 —— 表单里输入的内容保持不变，以最后一次保存为准。
 
 ## Web 版不包含的功能
 

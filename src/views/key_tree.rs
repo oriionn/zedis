@@ -311,14 +311,28 @@ impl ZedisKeyTree {
         // visible (user is on Metrics/Slowlog/…). Resume when Editor is
         // shown again so SCAN doesn't run against a hidden tree.
         let global_state = cx.global::<ZedisGlobalStore>().state();
-        subscriptions.push(cx.subscribe(&global_state, |this, _global, event, cx| {
-            if let GlobalEvent::RouteChanged(route) = event {
+        subscriptions.push(cx.subscribe(&global_state, |this, _global, event, cx| match event {
+            GlobalEvent::RouteChanged(route) => {
                 if route.server_view() == Some(ServerView::Editor) {
                     this.start_auto_refresh(cx);
                 } else {
                     this.auto_refresh_task = None;
                 }
             }
+            // In the browser, tags and notes another account set on this
+            // server (ADR 17): the rows carry them from the build.
+            GlobalEvent::PageDataRefreshed { key_notes_of, rows, .. } => {
+                if key_notes_of
+                    .iter()
+                    .any(|id| id.as_str() == this.state.server_id.as_ref())
+                {
+                    this.update_key_tree(true, cx);
+                } else if *rows {
+                    // Favorites and recent keys are read as the tree is drawn.
+                    cx.notify();
+                }
+            }
+            _ => {}
         }));
 
         // A scan can be started programmatically (e.g. Memory Analyzer's

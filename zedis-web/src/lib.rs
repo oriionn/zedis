@@ -31,6 +31,12 @@ mod assets;
 pub mod transport;
 
 #[cfg(target_family = "wasm")]
+use futures::StreamExt as _;
+#[cfg(target_family = "wasm")]
+use futures::channel::mpsc::UnboundedReceiver;
+#[cfg(target_family = "wasm")]
+use futures::future::{self, Either};
+#[cfg(target_family = "wasm")]
 use gpui::{Application, ApplicationHandle};
 #[cfg(target_family = "wasm")]
 use gpui_web::{CanvasFontFallback, WebBackendPreference, WebPlatform};
@@ -52,11 +58,11 @@ use tracing_subscriber::prelude::*;
 use transport::HttpBridgeTransport;
 #[cfg(target_family = "wasm")]
 use zedis_connection::{
-    RedisServer, get_servers, set_bridge_accounts, set_bridge_page_data, set_bridge_server_store, set_bridge_storage,
-    set_bridge_transport, set_servers_cache,
+    RedisServer, bridge_page_data, get_servers, set_bridge_accounts, set_bridge_page_data, set_bridge_server_store,
+    set_bridge_storage, set_bridge_transport, set_servers_cache,
 };
 #[cfg(target_family = "wasm")]
-use zedis_gui::helpers::pacing::{SERVER_LIST_REFRESH, set_unattended, unattended};
+use zedis_gui::helpers::pacing::{PAGE_DATA_REFRESH, PAGE_DATA_RETRY, SERVER_LIST_REFRESH, set_unattended, unattended};
 #[cfg(target_family = "wasm")]
 use zedis_gui::helpers::set_web_command_key;
 #[cfg(target_family = "wasm")]
@@ -188,7 +194,8 @@ pub fn run(
         set_bridge_accounts(transport.clone());
         // Only with what the bridge holds loaded: a change made on top of
         // nothing would replace the account's lists with this page's.
-        if page_seed.is_some() {
+        let page_data_loaded = page_seed.is_some();
+        if page_data_loaded {
             set_bridge_page_data(transport.clone());
         }
 
@@ -213,6 +220,10 @@ pub fn run(
             ZedisAppState::new()
         });
         zedis_gui::launch(cx, app_state);
+
+        if page_data_loaded && let Some(requests) = transport.take_refresh_requests() {
+            follow_page_data(transport.clone(), requests, cx);
+        }
 
         // The server list follows, the way it does on the desktop: the window
         // is already up, and the sidebar refreshes when the list lands. No
@@ -257,6 +268,59 @@ pub fn run(
     Ok(())
 }
 
+/// Keep the page data current with what other accounts change — the key
+/// tags and notes, the saved scripts — the way the server list is kept
+/// (ADR 17): every `PAGE_DATA_REFRESH` while someone is looking, and at once
+/// when the page asks (`refresh_soon`: a server or the script library
+/// opened, the page looked at again). The tag is kept only for an answer
+/// that was taken in: one refused because this page changed something on
+/// its way is asked for again, whole, soon after.
+#[cfg(target_family = "wasm")]
+fn follow_page_data(transport: Arc<HttpBridgeTransport>, mut requests: UnboundedReceiver<()>, cx: &mut gpui::App) {
+    cx.spawn(async move |cx| {
+        let mut etag: Option<String> = None;
+        let mut wait = PAGE_DATA_REFRESH;
+        loop {
+            let timer = cx.background_executor().timer(wait);
+            let asked = match future::select(timer, requests.next()).await {
+                Either::Left(_) => false,
+                Either::Right((Some(()), _)) => true,
+                // The transport holds the sender for the life of the page.
+                Either::Right((None, _)) => return,
+            };
+            wait = PAGE_DATA_REFRESH;
+            if !asked && unattended() {
+                continue;
+            }
+            // Asks that came together are one read.
+            while requests.try_recv().is_ok() {}
+            let generation = zedis_gui::states::page_data_generation();
+            let answer = match transport.fetch_page_data(etag.clone()).await {
+                Ok(Some(answer)) => answer,
+                Ok(None) => continue,
+                Err(e) => {
+                    info!(error = %e, "page data refresh skipped");
+                    continue;
+                }
+            };
+            let seed = match transport::page_seed(&answer.json) {
+                Ok(seed) => seed,
+                Err(e) => {
+                    error!(error = %e, "the bridge's page data could not be read");
+                    continue;
+                }
+            };
+            let taken = cx.update(|cx| zedis_gui::states::refresh_page_data(seed, generation, cx));
+            if taken {
+                etag = answer.etag;
+            } else {
+                wait = PAGE_DATA_RETRY;
+            }
+        }
+    })
+    .detach();
+}
+
 /// Take a server list from the bridge, and tell the views only if it differs
 /// from the one they are drawing.
 ///
@@ -283,12 +347,17 @@ fn apply_server_list(list: Vec<RedisServer>, cx: &mut gpui::App) {
 /// bridge at the pace of a background workspace tab instead of the heartbeat
 /// (`zedis_gui::helpers::pacing`): a browser tab is left open for days in a
 /// way a desktop window is not, and each of its beats is work for a bridge
-/// and a Redis that everybody shares. Nothing is kicked when the page comes
-/// back — the next heartbeat tick, at most one interval away, goes through.
+/// and a Redis that everybody shares. The heartbeat is not kicked when the
+/// page comes back — the next tick, at most one interval away, goes through
+/// — but the page data is asked for at once.
 #[cfg(target_family = "wasm")]
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn set_page_visible(visible: bool) {
     set_unattended(!visible);
+    // What other accounts changed while nobody looked.
+    if visible && let Some(page_data) = bridge_page_data() {
+        page_data.refresh_soon();
+    }
 }
 
 // The page is the process: it lives until the tab closes, and so does this.

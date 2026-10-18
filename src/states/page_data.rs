@@ -17,13 +17,22 @@
 //! preferences, which the page used to lose on every reload.
 //!
 //! The page asks the bridge for all of it before the application starts;
-//! [`seed_page_data`] writes it into the local store before any manager has
+//! `seed_page_data` writes it into the local store before any manager has
 //! read it, then hands every later change back to the bridge — the managers
-//! are the desktop's, unchanged, and never know. The one fact the views need
-//! about the account is [`account_is_read_only`], ungated: on the desktop it
-//! is always `false`.
+//! are the desktop's, unchanged, and never know. While the page is open it
+//! asks again — every minute, and when a server or the script library is
+//! opened — and `refresh_page_data` brings in what other accounts changed.
+//! Those are the browser's alone (`web`); what the views need is ungated:
+//! [`account_is_read_only`], always `false` on the desktop, and
+//! [`ask_for_fresh_page_data`], which does nothing there.
 
+use crate::connection::bridge_page_data;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(target_family = "wasm")]
+mod web;
+#[cfg(target_family = "wasm")]
+pub use web::{page_data_generation, refresh_page_data, save_preferences, seed_page_data};
 
 static ACCOUNT_READ_ONLY: AtomicBool = AtomicBool::new(false);
 
@@ -35,110 +44,11 @@ pub fn account_is_read_only() -> bool {
     ACCOUNT_READ_ONLY.load(Ordering::Relaxed)
 }
 
-/// Load what the bridge keeps for this account into the local store, then
-/// send every later change of it back. Before `init_caches`: the script
-/// library reads its table there.
-#[cfg(target_family = "wasm")]
-pub fn seed_page_data(seed: crate::connection::BridgePageSeed) {
-    use crate::connection::{BridgeScript, bridge_page_data};
-    use crate::db::{KeyMetadata, LuaScript, PageChange, PageSeed, TagColor, observe_page_data};
-    use tracing::{error, info, warn};
-
-    ACCOUNT_READ_ONLY.store(seed.read_only, Ordering::Relaxed);
-    let scripts: Vec<(String, LuaScript)> = seed
-        .scripts
-        .into_iter()
-        .filter_map(|script| match serde_json::from_str::<LuaScript>(&script.json) {
-            Ok(mut parsed) => {
-                parsed.shared = script.shared;
-                Some((script.id, parsed))
-            }
-            Err(e) => {
-                warn!(id = script.id, error = %e, "a saved script from the bridge could not be read");
-                None
-            }
-        })
-        .collect();
-    let key_notes: Vec<(String, String, KeyMetadata)> = seed
-        .key_notes
-        .into_iter()
-        .map(|note| {
-            let metadata = KeyMetadata {
-                tag: note.tag.as_deref().and_then(TagColor::from_name),
-                note: note.note,
-            };
-            (note.server_id, note.key, metadata)
-        })
-        .filter(|(_, _, metadata)| !metadata.is_empty())
-        .collect();
-    // The preferences are not a table: the page put them where the
-    // application reads its settings from, before it started.
-    let rows: Vec<(String, String, String)> = seed
-        .rows
-        .into_iter()
-        .filter(|row| row.table != "preferences")
-        .map(|row| (row.table, row.key, row.value))
-        .collect();
-    info!(
-        account = seed.account,
-        rows = rows.len(),
-        key_notes = key_notes.len(),
-        scripts = scripts.len(),
-        "page data from the bridge"
-    );
-    if let Err(e) = crate::db::seed_page_data(PageSeed {
-        rows,
-        key_notes,
-        scripts,
-    }) {
-        // Nothing is sent back either: a change made on top of what failed
-        // to load would replace what the bridge has with less.
-        error!(error = %e, "the page data could not be loaded; this page keeps its changes to itself");
-        return;
-    }
-    let Some(bridge) = bridge_page_data() else {
-        return;
-    };
-    let observed = observe_page_data(move |change| match change {
-        PageChange::Row { table, key, value } => bridge.put_row(table.to_string(), key, value),
-        PageChange::KeyNote {
-            server_id,
-            key,
-            metadata,
-        } => {
-            let metadata = metadata.unwrap_or_default();
-            let tag = metadata.tag.map(|tag| tag.as_str().to_string());
-            bridge.put_key_note(server_id, key, tag, metadata.note);
-        }
-        PageChange::Script {
-            id,
-            script: Some(script),
-        } => match serde_json::to_string(&script) {
-            Ok(json) => bridge.put_script(BridgeScript {
-                id,
-                json,
-                shared: script.shared,
-            }),
-            Err(e) => warn!(id, error = %e, "a saved script could not be sent"),
-        },
-        PageChange::Script { id, script: None } => bridge.delete_script(id),
-    });
-    if let Err(e) = observed {
-        error!(error = %e, "the page data's changes cannot be sent to the bridge");
-    }
-}
-
-/// Keep the preferences on the bridge too, as the account's: the page reads
-/// them back from there before it starts, on any browser. Only once the
-/// page data loaded — otherwise this browser's settings would replace the
-/// account's.
-#[cfg(target_family = "wasm")]
-pub fn save_preferences(toml: &str) {
-    if let Some(bridge) = crate::connection::bridge_page_data() {
-        bridge.put_row(
-            "preferences".to_string(),
-            "zedis.toml".to_string(),
-            Some(toml.to_string()),
-        );
+/// Read what other accounts changed now rather than at the next round —
+/// a server, or the script library, was just opened. Nothing on the
+/// desktop, which has no bridge.
+pub fn ask_for_fresh_page_data() {
+    if let Some(page_data) = bridge_page_data() {
+        page_data.refresh_soon();
     }
 }

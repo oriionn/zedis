@@ -113,6 +113,13 @@ impl LuaScriptManager {
         Ok(())
     }
 
+    /// Read the table again, dropping what is no longer in it: it was
+    /// written under the cache (the page's data, refreshed from the bridge).
+    pub fn reload() -> Result<()> {
+        LUA_SCRIPT_CACHE.clear();
+        Self::init()
+    }
+
     pub fn list_with_id() -> Vec<(String, LuaScript)> {
         let mut items: Vec<(String, LuaScript)> = LUA_SCRIPT_CACHE
             .iter()

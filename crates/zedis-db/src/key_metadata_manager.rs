@@ -169,6 +169,12 @@ impl KeyMetadataManager {
         Self { cache: DashMap::new() }
     }
 
+    /// Read the table again on the next ask: it was written under the
+    /// cache (the page's data, refreshed from the bridge).
+    pub fn forget_cached(&self) {
+        self.cache.clear();
+    }
+
     /// Materialise the full record map for a server, hitting the cache
     /// on subsequent calls. Returns an owned `HashMap` so callers don't
     /// hold a DashMap guard across UI render work (which can re-enter
