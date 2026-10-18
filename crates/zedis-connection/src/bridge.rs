@@ -654,6 +654,10 @@ pub struct BridgeAccount {
     pub name: String,
     pub role: BridgeRole,
     pub disabled: bool,
+    /// Locked by an administrator — a demonstration's: it changes neither
+    /// its password nor its tokens, and the bridge keeps no rows of its own
+    /// for it.
+    pub locked: bool,
     /// `false` for an account that signs in through the trusted proxy.
     pub has_password: bool,
     /// Which shared entries it sees (ADR 13); `None` is every one.
@@ -729,6 +733,7 @@ pub struct BridgeAccountChange {
     pub role: Option<BridgeRole>,
     pub servers: Option<Option<Vec<String>>>,
     pub disabled: Option<bool>,
+    pub locked: Option<bool>,
 }
 
 /// One thing an account keeps to itself: a server entry or a saved script.
@@ -951,6 +956,9 @@ pub struct BridgePageSeed {
     /// Whether that account may change nothing anybody else sees — the
     /// script library's saves, a key's tag and note.
     pub read_only: bool,
+    /// Whether the bridge keeps the account's own rows. Not a locked
+    /// account's: its favorites, history and preferences stay in the page.
+    pub rows_kept: bool,
     pub rows: Vec<BridgePageRow>,
     pub key_notes: Vec<BridgeKeyNote>,
     pub scripts: Vec<BridgeScript>,

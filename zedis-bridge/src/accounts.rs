@@ -168,6 +168,12 @@ pub struct AccountRecord {
     /// Tokens for the MCP entry point (ADR 15); a read-only account's only.
     pub tokens: Vec<TokenRecord>,
     pub disabled: bool,
+    /// Set by an administrator for an account many people sign in to — a
+    /// demonstration's: it may not change its own password or tokens, and
+    /// the bridge keeps no rows of its own for it (favorites, history,
+    /// preferences), so no visitor changes what the next one finds. Never
+    /// an administrator's.
+    pub locked: bool,
     /// Bumped by every change of password, role, rules or state: a login
     /// carries the version it was opened under and lapses when they differ.
     pub version: u64,
@@ -318,6 +324,7 @@ pub struct AccountView {
     pub name: String,
     pub role: Role,
     pub disabled: bool,
+    pub locked: bool,
     pub has_password: bool,
     pub servers: Option<Vec<String>>,
     pub tokens: Vec<TokenView>,
@@ -337,6 +344,7 @@ impl From<&AccountRecord> for AccountView {
             name: record.name.clone(),
             role: record.role,
             disabled: record.disabled,
+            locked: record.locked,
             has_password: record.password.is_some(),
             servers: record.servers.clone(),
             tokens: record
@@ -404,6 +412,17 @@ impl SignupView {
     }
 }
 
+/// What an administrator changes on an account; `None` leaves a setting as
+/// it is.
+#[derive(Clone, Debug, Default)]
+pub struct AccountChange {
+    pub role: Option<Role>,
+    /// `Some(None)` clears the rules: every shared entry.
+    pub servers: Option<Option<Vec<String>>>,
+    pub disabled: Option<bool>,
+    pub locked: Option<bool>,
+}
+
 /// Why a change was not made.
 #[derive(Debug)]
 pub enum AccountError {
@@ -422,6 +441,9 @@ pub enum AccountError {
     BadRule(String),
     /// [`MAX_SIGNUPS`] requests are waiting already.
     TooManySignups,
+    /// An administrator would be locked: it could not change its own
+    /// password.
+    LockedAdmin,
     Store(io::Error),
 }
 
@@ -442,6 +464,12 @@ impl std::fmt::Display for AccountError {
                 )
             }
             AccountError::TokenNameTaken => write!(f, "this account already has a token by that name"),
+            AccountError::LockedAdmin => {
+                write!(
+                    f,
+                    "an administrator cannot be locked: it could not change its own password"
+                )
+            }
             AccountError::TooManySignups => {
                 write!(f, "too many requests are waiting for an administrator; try again later")
             }
@@ -763,6 +791,12 @@ impl Accounts {
         self.read().live(name).is_some_and(|e| e.record.role == Role::Admin)
     }
 
+    /// Whether `name` is locked by an administrator: it may not change its
+    /// own password or tokens, and keeps no rows of its own on the bridge.
+    pub fn is_locked(&self, name: &str) -> bool {
+        self.read().accounts.get(name).is_some_and(|e| e.record.locked)
+    }
+
     /// Whether `name` may change anything. An account that is not there,
     /// or is disabled, is read-only: a caller whose account went
     /// mid-session must not fall through to full rights on the way to being
@@ -1036,6 +1070,9 @@ impl Accounts {
                 let mut record = entry.record.clone();
                 record.role = Role::Admin;
                 record.disabled = false;
+                // Seated from the host, with its own password: nothing an
+                // administrator set on it before stands over that.
+                record.locked = false;
                 // A token is a read-only account's; an administrator's would
                 // be a credential for a door that refuses it.
                 record.tokens.clear();
@@ -1136,16 +1173,20 @@ impl Accounts {
         .await
     }
 
-    /// An administrator's change to `name`: any of its role, its rules
-    /// (`Some(None)` clears them) and whether it is disabled. Answers what
-    /// changed, setting → (from, to), for the audit line.
+    /// An administrator's change to `name`: any of its role, its rules, and
+    /// whether it is disabled or locked. Answers what changed, setting →
+    /// (from, to), for the audit line.
     pub async fn update(
         &self,
         name: &str,
-        role: Option<Role>,
-        servers: Option<Option<Vec<String>>>,
-        disabled: Option<bool>,
+        change: AccountChange,
     ) -> Result<Vec<(&'static str, String, String)>, AccountError> {
+        let AccountChange {
+            role,
+            servers,
+            disabled,
+            locked,
+        } = change;
         if let Some(rules) = &servers {
             check_rules(rules)?;
         }
@@ -1169,8 +1210,15 @@ impl Accounts {
                 changed.push(("disabled", record.disabled.to_string(), disabled.to_string()));
                 record.disabled = disabled;
             }
+            if let Some(locked) = locked.filter(|l| *l != record.locked) {
+                changed.push(("locked", record.locked.to_string(), locked.to_string()));
+                record.locked = locked;
+            }
             if changed.is_empty() {
                 return Ok((Vec::new(), changed));
+            }
+            if record.locked && record.role == Role::Admin {
+                return Err(AccountError::LockedAdmin);
             }
             let was_admin = entry.live() && entry.record.role == Role::Admin;
             let still_admin = !record.disabled && record.role == Role::Admin;
@@ -1737,6 +1785,7 @@ impl Imported {
             servers: self.servers,
             tokens: self.tokens,
             disabled: false,
+            locked: false,
             version: 1,
             created_at: now,
         })
@@ -2542,11 +2591,27 @@ servers = []
         let accounts = with_admin("alice@secret").await;
         assert!(accounts.is_admin("root") && accounts.admin_count() == 1);
         assert!(matches!(
-            accounts.update("root", Some(Role::Full), None, None).await,
+            accounts
+                .update(
+                    "root",
+                    AccountChange {
+                        role: Some(Role::Full),
+                        ..AccountChange::default()
+                    }
+                )
+                .await,
             Err(AccountError::LastAdmin)
         ));
         assert!(matches!(
-            accounts.update("root", None, None, Some(true)).await,
+            accounts
+                .update(
+                    "root",
+                    AccountChange {
+                        disabled: Some(true),
+                        ..AccountChange::default()
+                    }
+                )
+                .await,
             Err(AccountError::LastAdmin)
         ));
         assert!(matches!(accounts.delete("root").await, Err(AccountError::LastAdmin)));
@@ -2555,13 +2620,25 @@ servers = []
             "a promotion"
         );
         let changed = accounts
-            .update("root", Some(Role::Full), None, None)
+            .update(
+                "root",
+                AccountChange {
+                    role: Some(Role::Full),
+                    ..AccountChange::default()
+                },
+            )
             .await
             .expect("demoted");
         assert_eq!(changed, vec![("role", "admin".to_string(), "full".to_string())]);
         assert!(
             accounts
-                .update("root", Some(Role::Full), None, None)
+                .update(
+                    "root",
+                    AccountChange {
+                        role: Some(Role::Full),
+                        ..AccountChange::default()
+                    }
+                )
                 .await
                 .expect("no change")
                 .is_empty()
@@ -2573,7 +2650,14 @@ servers = []
     async fn an_administrator_changes_rules_and_state_and_bad_rules_are_refused() {
         let accounts = with_admin("alice@secret").await;
         let changed = accounts
-            .update("alice", None, Some(Some(vec!["prod-*:ro".to_string()])), Some(true))
+            .update(
+                "alice",
+                AccountChange {
+                    servers: Some(Some(vec!["prod-*:ro".to_string()])),
+                    disabled: Some(true),
+                    ..AccountChange::default()
+                },
+            )
             .await
             .expect("changed");
         assert_eq!(changed.len(), 2);
@@ -2584,12 +2668,25 @@ servers = []
         assert!(accounts.is_read_only("alice"), "a disabled account changes nothing");
         assert!(matches!(
             accounts
-                .update("alice", None, Some(Some(vec![":ro".to_string()])), None)
+                .update(
+                    "alice",
+                    AccountChange {
+                        servers: Some(Some(vec![":ro".to_string()])),
+                        ..AccountChange::default()
+                    }
+                )
                 .await,
             Err(AccountError::BadRule(_))
         ));
         accounts
-            .update("alice", None, Some(None), Some(false))
+            .update(
+                "alice",
+                AccountChange {
+                    servers: Some(None),
+                    disabled: Some(false),
+                    ..AccountChange::default()
+                },
+            )
             .await
             .expect("cleared");
         assert!(accounts.may_see_shared("alice", &entry("x", "staging", None)));
@@ -2618,7 +2715,15 @@ servers = []
             "the token itself is not kept"
         );
         assert!(matches!(
-            accounts.update("ai", Some(Role::Full), None, None).await,
+            accounts
+                .update(
+                    "ai",
+                    AccountChange {
+                        role: Some(Role::Full),
+                        ..AccountChange::default()
+                    }
+                )
+                .await,
             Err(AccountError::NotReadOnly)
         ));
         accounts.revoke_token("ai", "claude").await.expect("revoked");
@@ -2701,20 +2806,39 @@ servers = []
         let store = Arc::new(MemoryAccounts(Mutex::new(at.clone())));
         let one = Accounts::with(store.clone(), at.clone());
         let two = Accounts::with(store.clone(), at);
-        one.update("alice", Some(Role::Full), None, None)
-            .await
-            .expect("demoted");
+        one.update(
+            "alice",
+            AccountChange {
+                role: Some(Role::Full),
+                ..AccountChange::default()
+            },
+        )
+        .await
+        .expect("demoted");
         assert!(matches!(
-            two.update("bob", Some(Role::Full), None, None).await,
+            two.update(
+                "bob",
+                AccountChange {
+                    role: Some(Role::Full),
+                    ..AccountChange::default()
+                }
+            )
+            .await,
             Err(AccountError::LastAdmin)
         ));
         assert!(two.is_admin("bob") && !two.is_admin("alice"), "two read what one did");
 
         // A change nobody raced lands at once.
         store.changed_elsewhere(AccountOp::PutAccount(admin("carol")));
-        two.update("bob", Some(Role::Full), None, None)
-            .await
-            .expect("carol is an administrator now");
+        two.update(
+            "bob",
+            AccountChange {
+                role: Some(Role::Full),
+                ..AccountChange::default()
+            },
+        )
+        .await
+        .expect("carol is an administrator now");
         assert_eq!(two.version_held(), 3);
     }
 
@@ -2840,6 +2964,48 @@ servers = []
         assert_eq!(listed[0].note.chars().count(), MAX_SIGNUP_NOTE_CHARS, "a note is cut");
         assert_eq!(accounts.purge_expired_signups().await.expect("purged"), 1);
         assert_eq!(accounts.purge_expired_signups().await.expect("purged"), 0);
+    }
+
+    /// A locked account is any role but an administrator's — locking one
+    /// would leave it unable to change its own password — and the setup
+    /// token, which seats one from the host, unlocks it.
+    #[tokio::test]
+    async fn a_locked_account_is_never_an_administrator() {
+        let accounts = with_admin("demo:ro@demo-password,bob@hunter22").await;
+        let lock = AccountChange {
+            locked: Some(true),
+            ..AccountChange::default()
+        };
+        let changed = accounts.update("demo", lock.clone()).await.expect("locked");
+        assert_eq!(changed, vec![("locked", "false".to_string(), "true".to_string())]);
+        assert!(accounts.is_locked("demo") && accounts.view("demo").is_some_and(|v| v.locked));
+        assert!(accounts.version("demo").is_some(), "it still signs in");
+        assert!(matches!(
+            accounts.update("root", lock.clone()).await,
+            Err(AccountError::LockedAdmin)
+        ));
+        assert!(matches!(
+            accounts
+                .update(
+                    "demo",
+                    AccountChange {
+                        role: Some(Role::Admin),
+                        ..AccountChange::default()
+                    }
+                )
+                .await,
+            Err(AccountError::LockedAdmin)
+        ));
+        assert!(!accounts.is_admin("demo"), "nothing was changed");
+        accounts
+            .update("bob", lock)
+            .await
+            .expect("a full account may be locked");
+        assert!(accounts.make_admin("bob", None).await.expect("promoted"));
+        assert!(
+            accounts.is_admin("bob") && !accounts.is_locked("bob"),
+            "seated, and unlocked"
+        );
     }
 
     #[test]

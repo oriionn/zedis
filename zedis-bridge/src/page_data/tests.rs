@@ -170,6 +170,47 @@ async fn rows_are_the_account_s_own() {
     );
 }
 
+/// A locked account keeps no rows of its own on the bridge: everyone who
+/// signs in to it would share them, the last visitor's language and
+/// favorites becoming the next one's. What it kept before it was locked is
+/// not shown while it is, and comes back if it is unlocked.
+#[tokio::test]
+async fn a_locked_account_keeps_no_rows() {
+    let dir = scratch();
+    let state = state(&dir);
+    let row = |value: &str| {
+        put_row(
+            State(state.clone()),
+            peer(),
+            as_account("ro:ro-password"),
+            Json(RowRequest {
+                table: "favorites".to_string(),
+                key: "srv:0".to_string(),
+                value: Some(value.to_string()),
+            }),
+        )
+    };
+    assert_eq!(status(row("[\"before\"]").await), StatusCode::NO_CONTENT);
+    let lock = |locked: bool| crate::accounts::AccountChange {
+        locked: Some(locked),
+        ..Default::default()
+    };
+    state.accounts.update("ro", lock(true)).await.expect("locked");
+
+    assert_eq!(status(row("[\"mine\"]").await), StatusCode::FORBIDDEN);
+    let locked = data(&state, "ro:ro-password").await;
+    assert!(
+        !locked.rows_kept && locked.rows.is_empty(),
+        "the page keeps them itself"
+    );
+    assert!(data(&state, "alice:alice-password").await.rows_kept);
+
+    state.accounts.update("ro", lock(false)).await.expect("unlocked");
+    let unlocked = data(&state, "ro:ro-password").await;
+    assert!(unlocked.rows_kept);
+    assert_eq!(unlocked.rows[0].value, "[\"before\"]");
+}
+
 /// A server's notes are seen by whoever sees the server and written by
 /// whoever may write there, one key at a time, with who wrote them.
 #[tokio::test]

@@ -15,7 +15,9 @@
 //! The account page against a bridge of its own: what it shows a role, what
 //! it checks before it asks, and what it asks.
 
-use super::admin::{ADMIN_ISSUE_TOKEN_ID, ADMIN_TOKEN_NAME_ID, DELETE_ACCOUNT_ID, SAVE_ACCOUNT_ID, SETTLE_ORPHANS_ID};
+use super::admin::{
+    ADMIN_ISSUE_TOKEN_ID, ADMIN_TOKEN_NAME_ID, DELETE_ACCOUNT_ID, LOCK_ACCOUNT_ID, SAVE_ACCOUNT_ID, SETTLE_ORPHANS_ID,
+};
 use super::audit::{AUDIT_ACCOUNT_ID, AUDIT_MORE_ID, AUDIT_SEARCH_ID};
 use super::handover::SHARE_ID;
 use super::password::{CHANGE_PASSWORD_ID, CURRENT_PASSWORD_ID, NEW_PASSWORD_ID, REPEAT_PASSWORD_ID};
@@ -345,9 +347,68 @@ fn an_administrator_saves_only_what_changed(cx: &mut TestAppContext) {
                 role: None,
                 servers: None,
                 disabled: Some(true),
+                locked: None,
             }
         )]
     );
+}
+
+/// An administrator locks an account from its form — never an
+/// administrator, whose form has no such box — and a locked account's own
+/// page offers no password to change and no tokens.
+#[gpui::test]
+fn a_locked_account_has_nothing_of_its_own_to_change(cx: &mut TestAppContext) {
+    let bridge = FakeBridge::signed_in_as("alice", BridgeRole::Admin);
+    *bridge.accounts.lock().expect("lock") = vec![
+        account("alice", BridgeRole::Admin),
+        account("demo", BridgeRole::ReadOnly),
+    ];
+    let (view, window) = open(cx, bridge.clone());
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.select_section(AccountSection::Accounts, window, cx);
+            view.select_account("alice", window, cx);
+        });
+        window.render_frame(cx);
+        assert!(
+            window.try_find(LOCK_ACCOUNT_ID).is_none(),
+            "an administrator is never locked"
+        );
+        view.update(cx, |view, cx| view.select_account("demo", window, cx));
+        window.render_frame(cx);
+        window.click(LOCK_ACCOUNT_ID, cx);
+        window.click(SAVE_ACCOUNT_ID, cx);
+    })
+    .expect("the window is open");
+    cx.run_until_parked();
+    let updates = bridge.updates.lock().expect("lock").clone();
+    assert_eq!(
+        updates,
+        vec![(
+            "demo".to_string(),
+            BridgeAccountChange {
+                locked: Some(true),
+                ..BridgeAccountChange::default()
+            }
+        )]
+    );
+
+    let demo = FakeBridge::signed_in_as("demo", BridgeRole::ReadOnly);
+    demo.me.lock().expect("lock").account.locked = true;
+    let (view, window) = open(cx, demo);
+    view.read_with(cx, |view, _| {
+        let me = view.me.as_ref().expect("signed in");
+        assert_eq!(
+            AccountSection::of(me),
+            vec![AccountSection::Password],
+            "no tokens of its own"
+        );
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find(CURRENT_PASSWORD_ID).is_none(), "no password to change");
+    })
+    .expect("the window is open");
 }
 
 /// A change the bridge refuses — the last administrator disabled — is said

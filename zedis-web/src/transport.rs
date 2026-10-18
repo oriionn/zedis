@@ -897,6 +897,8 @@ struct AccountBody {
     #[serde(default)]
     disabled: bool,
     #[serde(default)]
+    locked: bool,
+    #[serde(default)]
     has_password: bool,
     #[serde(default)]
     servers: Option<Vec<String>>,
@@ -913,6 +915,7 @@ impl AccountBody {
             // A role this side does not know reads as the least of them.
             role: BridgeRole::from_name(&self.role).unwrap_or_default(),
             disabled: self.disabled,
+            locked: self.locked,
             has_password: self.has_password,
             servers: self.servers,
             tokens: self
@@ -1203,6 +1206,9 @@ impl BridgeAccounts for HttpBridgeTransport {
         if let Some(disabled) = change.disabled {
             body.insert("disabled".to_string(), disabled.into());
         }
+        if let Some(locked) = change.locked {
+            body.insert("locked".to_string(), locked.into());
+        }
         let path = format!("/v1/admin/accounts/{}", segment(&name));
         self.account_call("PATCH", path, Some(body.into()), |bytes| {
             json::<AccountBody>(bytes).map(AccountBody::into_account)
@@ -1322,6 +1328,10 @@ struct PageDataBody {
     account: String,
     #[serde(default)]
     read_only: bool,
+    /// Absent from a bridge older than locked accounts: it keeps every
+    /// account's rows.
+    #[serde(default = "rows_kept_by_default")]
+    rows_kept: bool,
     #[serde(default)]
     rows: Vec<PageRowBody>,
     #[serde(default)]
@@ -1359,6 +1369,10 @@ struct ScriptBody {
     script: serde_json::Value,
 }
 
+fn rows_kept_by_default() -> bool {
+    true
+}
+
 /// The page data as the bridge answered it again, with its tag for the next
 /// ask.
 pub struct PageData {
@@ -1373,6 +1387,7 @@ pub fn page_seed(json: &str) -> Result<BridgePageSeed, String> {
     Ok(BridgePageSeed {
         account: body.account,
         read_only: body.read_only,
+        rows_kept: body.rows_kept,
         rows: body
             .rows
             .into_iter()
@@ -1565,20 +1580,24 @@ mod tests {
     /// reads the two differently, so the body has to keep them apart.
     #[test]
     fn an_account_change_sends_only_what_changes() {
-        let account = r#"{"name":"bob","role":"full","disabled":true,"has_password":true,"servers":null,"tokens":[],"created_at":1}"#;
+        let account = r#"{"name":"bob","role":"full","disabled":true,"locked":true,"has_password":true,"servers":null,"tokens":[],"created_at":1}"#;
         let (transport, seen) = transport_recording(200, account);
         let change = BridgeAccountChange {
             role: None,
             servers: Some(None),
             disabled: Some(true),
+            locked: Some(true),
         };
         let updated =
             futures::executor::block_on(transport.update_account("bob".to_string(), change)).expect("updated");
-        assert!(updated.disabled);
+        assert!(updated.disabled && updated.locked);
         let seen = seen.lock().expect("lock");
         assert_eq!(seen[0].0, "PATCH");
         let sent: serde_json::Value = serde_json::from_str(&seen[0].2).expect("json");
-        assert_eq!(sent, serde_json::json!({ "servers": null, "disabled": true }));
+        assert_eq!(
+            sent,
+            serde_json::json!({ "servers": null, "disabled": true, "locked": true })
+        );
     }
 
     #[test]
@@ -1618,6 +1637,7 @@ mod tests {
         .expect("seed");
         assert_eq!(seed.account, "ai");
         assert!(seed.read_only);
+        assert!(seed.rows_kept, "a bridge that does not say keeps the rows");
         assert_eq!(seed.rows[0].value, "[\"k\"]");
         assert_eq!(seed.key_notes[0].tag.as_deref(), Some("red"));
         assert_eq!(seed.key_notes[0].by, "alice");
@@ -1625,6 +1645,8 @@ mod tests {
         let script: serde_json::Value = serde_json::from_str(&seed.scripts[0].json).expect("script json");
         assert_eq!(script["name"], "top");
         assert!(page_seed("not json").is_err());
+        let locked = page_seed(r#"{"account":"demo","rows_kept":false}"#).expect("seed");
+        assert!(!locked.rows_kept && locked.rows.is_empty());
     }
 
     /// Changes go out one after another, in the order they were made, each

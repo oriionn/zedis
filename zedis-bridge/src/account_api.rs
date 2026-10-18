@@ -26,8 +26,8 @@
 //! same whatever was wrong about it.
 
 use crate::accounts::{
-    AccountError, AccountView, INVITE_DAYS, InviteKind, InviteView, Role, SignupView, check_new_name, check_password,
-    hash_password,
+    AccountChange, AccountError, AccountView, INVITE_DAYS, InviteKind, InviteView, Role, SignupView, check_new_name,
+    check_password, hash_password,
 };
 use crate::api::{ApiError, ApiResult, AppState, MAX_TRIED_NAME, authorize};
 use crate::audit::{Change, Event, Origin};
@@ -87,7 +87,8 @@ impl From<AccountError> for ApiError {
             | AccountError::BadPassword(_)
             | AccountError::BadRule(_)
             | AccountError::InviteInvalid
-            | AccountError::NotReadOnly => ApiError::BadRequest(e.to_string()),
+            | AccountError::NotReadOnly
+            | AccountError::LockedAdmin => ApiError::BadRequest(e.to_string()),
             AccountError::Store(_) => ApiError::Upstream(e.to_string()),
         }
     }
@@ -148,6 +149,19 @@ fn authorize_admin(
         return Err(ApiError::Forbidden("administrators only".to_string()));
     }
     Ok(account)
+}
+
+/// Turn away a locked account's change to its own credentials — what one
+/// visitor of a shared demonstration account would otherwise change for all
+/// of them. A refusal is an audit line, as a read-only account's is.
+fn refuse_locked(state: &AppState, account: &str, origin: &Origin, action: &'static str) -> ApiResult<()> {
+    if state.accounts.is_locked(account) {
+        state.audit.record(account, origin, Event::Refused { action });
+        return Err(ApiError::Forbidden(
+            "this account is locked: an administrator keeps its password and tokens".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// `"2027-01-01"` → the first second of that day, if it is still to come.
@@ -438,6 +452,7 @@ async fn change_password(
 ) -> ApiResult<Response> {
     let mut origin = Origin::new(peer, &headers);
     let account = authorize(&state, &headers, &mut origin)?;
+    refuse_locked(&state, &account, &origin, "password_change")?;
     if !state.accounts.view(&account).is_some_and(|v| v.has_password) {
         // A password would let it sign in around the proxy that is its door.
         return Err(ApiError::BadRequest(
@@ -536,6 +551,7 @@ async fn issue_own_token(
 ) -> ApiResult<Json<NewToken>> {
     let mut origin = Origin::new(peer, &headers);
     let account = authorize(&state, &headers, &mut origin)?;
+    refuse_locked(&state, &account, &origin, "token_issue")?;
     issue_token(&state, &account, &account, req, &origin).await
 }
 
@@ -547,6 +563,7 @@ async fn revoke_own_token(
 ) -> ApiResult<axum::http::StatusCode> {
     let mut origin = Origin::new(peer, &headers);
     let account = authorize(&state, &headers, &mut origin)?;
+    refuse_locked(&state, &account, &origin, "token_revoke")?;
     revoke_token(&state, &account, &account, &token, &origin).await
 }
 
@@ -575,6 +592,8 @@ struct UpdateRequest {
     servers: Option<Option<Vec<String>>>,
     #[serde(default)]
     disabled: Option<bool>,
+    #[serde(default)]
+    locked: Option<bool>,
 }
 
 async fn update_account(
@@ -588,7 +607,15 @@ async fn update_account(
     let admin = authorize_admin(&state, &headers, &mut origin, "account_update")?;
     let changed = state
         .accounts
-        .update(&name, req.role, req.servers, req.disabled)
+        .update(
+            &name,
+            AccountChange {
+                role: req.role,
+                servers: req.servers,
+                disabled: req.disabled,
+                locked: req.locked,
+            },
+        )
         .await?;
     if !changed.is_empty() {
         let changed: BTreeMap<String, Change> = changed
@@ -1158,6 +1185,7 @@ mod tests {
                 role: Some(Role::Full),
                 servers: None,
                 disabled: None,
+                locked: None,
             }),
         )
         .await;
@@ -1604,6 +1632,88 @@ mod tests {
         for event in ["signup_requested", "signup_approved", "signup_rejected"] {
             assert!(log.contains(&format!(r#""event":"{event}""#)), "{event}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A locked account — a demonstration's, which many people sign in to —
+    /// changes neither its password nor its tokens; an administrator still
+    /// does, an administrator cannot be locked, and every refusal is an
+    /// audit line.
+    #[tokio::test]
+    async fn a_locked_account_changes_nothing_of_its_own() {
+        let dir = scratch_dir();
+        let state = AppState {
+            accounts: Accounts::from_inline("demo:ro@demo-password").expect("accounts"),
+            audit: Audit::open(&dir.join("audit.log"), false).expect("audit"),
+            ..state(&dir)
+        };
+        seat_alice(&state).await;
+        let admin = || basic("alice:alice-password");
+        let demo = || basic("demo:demo-password");
+        let lock = |name: &str, locked: bool| {
+            update_account(
+                State(state.clone()),
+                peer(),
+                admin(),
+                Path(name.to_string()),
+                Json(UpdateRequest {
+                    role: None,
+                    servers: None,
+                    disabled: None,
+                    locked: Some(locked),
+                }),
+            )
+        };
+        let Ok(Json(view)) = lock("demo", true).await else {
+            panic!("locked");
+        };
+        assert!(view.locked);
+        let Ok(Json(me)) = own_account(State(state.clone()), peer(), demo()).await else {
+            panic!("it still signs in");
+        };
+        assert!(me.account.locked, "the page knows");
+
+        let changed = change_password(
+            State(state.clone()),
+            peer(),
+            demo(),
+            Json(PasswordRequest {
+                current: "demo-password".to_string(),
+                new: "mine-now-1".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(status(changed), StatusCode::FORBIDDEN);
+        assert!(state.accounts.accepts_password("demo", "demo-password"), "unchanged");
+        let token = |name: &str| TokenRequest {
+            name: name.to_string(),
+            expires: None,
+        };
+        assert_eq!(
+            status(issue_own_token(State(state.clone()), peer(), demo(), Json(token("laptop"))).await),
+            StatusCode::FORBIDDEN
+        );
+        let issued = issue_token_for(
+            State(state.clone()),
+            peer(),
+            admin(),
+            Path("demo".to_string()),
+            Json(token("claude")),
+        )
+        .await;
+        assert!(issued.is_ok(), "an administrator still issues its tokens");
+        assert_eq!(
+            status(revoke_own_token(State(state.clone()), peer(), demo(), Path("claude".to_string())).await),
+            StatusCode::FORBIDDEN,
+            "a visitor cannot take another's token away"
+        );
+        assert_eq!(status(lock("alice", true).await), StatusCode::BAD_REQUEST);
+
+        let log = std::fs::read_to_string(dir.join("audit.log")).expect("audit");
+        for action in ["password_change", "token_issue", "token_revoke"] {
+            assert!(log.contains(&format!(r#""action":"{action}""#)), "{action}");
+        }
+        assert!(log.contains(r#""locked":{"from":"false","to":"true"}"#), "{log}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

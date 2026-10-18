@@ -19,13 +19,18 @@ use crate::connection::{BridgePageSeed, BridgeScript, bridge_page_data};
 use crate::db::{KeyMetadata, LuaScript, PageChange, PageSeed, TagColor, observe_page_data};
 use crate::states::{GlobalEvent, ZedisGlobalStore};
 use gpui::App;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::{error, info, warn};
 
 /// How many changes this page has made — what a refresh checks it did not
 /// race: one read while a change was on its way would put back what the
 /// change replaced.
 static LOCAL_CHANGES: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the bridge keeps this account's own rows — favorites, history,
+/// preferences. Not a locked account's: everyone signed in to it would
+/// share them, so this page keeps them to itself.
+static ROWS_KEPT: AtomicBool = AtomicBool::new(true);
 
 /// The count of this page's changes, taken before a refresh asks.
 pub fn page_data_generation() -> u64 {
@@ -62,12 +67,13 @@ fn local_seed(seed: BridgePageSeed) -> PageSeed {
         })
         .filter(|(_, _, metadata)| !metadata.is_empty())
         .collect();
-    let rows: Vec<(String, String, String)> = seed
-        .rows
-        .into_iter()
-        .filter(|row| row.table != "preferences")
-        .map(|row| (row.table, row.key, row.value))
-        .collect();
+    let rows = seed.rows_kept.then(|| {
+        seed.rows
+            .into_iter()
+            .filter(|row| row.table != "preferences")
+            .map(|row| (row.table, row.key, row.value))
+            .collect()
+    });
     PageSeed {
         rows,
         key_notes,
@@ -80,11 +86,12 @@ fn local_seed(seed: BridgePageSeed) -> PageSeed {
 /// library reads its table there.
 pub fn seed_page_data(seed: BridgePageSeed) {
     ACCOUNT_READ_ONLY.store(seed.read_only, Ordering::Relaxed);
+    ROWS_KEPT.store(seed.rows_kept, Ordering::Relaxed);
     let account = seed.account.clone();
     let seed = local_seed(seed);
     info!(
         account,
-        rows = seed.rows.len(),
+        rows = seed.rows.as_ref().map_or(0, Vec::len),
         key_notes = seed.key_notes.len(),
         scripts = seed.scripts.len(),
         "page data from the bridge"
@@ -101,7 +108,11 @@ pub fn seed_page_data(seed: BridgePageSeed) {
     let observed = observe_page_data(move |change| {
         LOCAL_CHANGES.fetch_add(1, Ordering::SeqCst);
         match change {
-            PageChange::Row { table, key, value } => bridge.put_row(table.to_string(), key, value),
+            PageChange::Row { table, key, value } => {
+                if ROWS_KEPT.load(Ordering::Relaxed) {
+                    bridge.put_row(table.to_string(), key, value);
+                }
+            }
             PageChange::KeyNote {
                 server_id,
                 key,
@@ -141,6 +152,7 @@ pub fn refresh_page_data(seed: BridgePageSeed, generation: u64, cx: &mut App) ->
         return false;
     }
     ACCOUNT_READ_ONLY.store(seed.read_only, Ordering::Relaxed);
+    ROWS_KEPT.store(seed.rows_kept, Ordering::Relaxed);
     let refreshed = match crate::db::refresh_page_data(local_seed(seed)) {
         Ok(refreshed) => refreshed,
         Err(e) => {
@@ -170,8 +182,12 @@ pub fn refresh_page_data(seed: BridgePageSeed, generation: u64, cx: &mut App) ->
 /// Keep the preferences on the bridge too, as the account's: the page reads
 /// them back from there before it starts, on any browser. Only once the
 /// page data loaded — otherwise this browser's settings would replace the
-/// account's.
+/// account's — and not for a locked account, whose settings stay in each
+/// browser.
 pub fn save_preferences(toml: &str) {
+    if !ROWS_KEPT.load(Ordering::Relaxed) {
+        return;
+    }
     if let Some(bridge) = bridge_page_data() {
         bridge.put_row(
             "preferences".to_string(),

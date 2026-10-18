@@ -18,7 +18,7 @@
 //! has tested nothing here.
 
 use super::*;
-use crate::accounts::{AccountOp, AccountRecord, Accounts, Role};
+use crate::accounts::{AccountChange, AccountOp, AccountRecord, Accounts, Role};
 use crate::auth::{Login, LoginChange, Logins, Throttle, attempt_key};
 use crate::store::{STORE_POLL, conformance};
 use zedis_connection::{RedisServer, disable_keychain, get_server};
@@ -158,9 +158,24 @@ async fn the_last_administrator_holds_across_bridges() {
 
     let one = Accounts::load(one_store.stores().accounts).await.expect("load");
     let two = Accounts::load(two_store.stores().accounts).await.expect("load");
-    one.update(&alice, Some(Role::Full), None, None).await.expect("demoted");
+    one.update(
+        &alice,
+        AccountChange {
+            role: Some(Role::Full),
+            ..AccountChange::default()
+        },
+    )
+    .await
+    .expect("demoted");
     assert!(matches!(
-        two.update(&bob, Some(Role::Full), None, None).await,
+        two.update(
+            &bob,
+            AccountChange {
+                role: Some(Role::Full),
+                ..AccountChange::default()
+            }
+        )
+        .await,
         Err(crate::accounts::AccountError::LastAdmin)
     ));
 }

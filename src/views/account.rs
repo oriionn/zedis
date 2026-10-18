@@ -95,7 +95,9 @@ impl AccountSection {
     fn of(me: &BridgeOwnAccount) -> Vec<Self> {
         let mut sections = vec![Self::Password];
         match me.account.role {
-            BridgeRole::ReadOnly => sections.push(Self::Tokens),
+            // A locked account's tokens are an administrator's to keep.
+            BridgeRole::ReadOnly if !me.account.locked => sections.push(Self::Tokens),
+            BridgeRole::ReadOnly => {}
             BridgeRole::Admin => {
                 sections.extend([Self::Accounts, Self::Invites]);
                 if me.signup {

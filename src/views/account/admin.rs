@@ -38,6 +38,7 @@ const STATE_COLUMN_WIDTH: f32 = 170.;
 const NAME_COLUMN_WIDTH: f32 = 160.;
 
 pub(super) const SAVE_ACCOUNT_ID: &str = "account-save";
+pub(super) const LOCK_ACCOUNT_ID: &str = "account-locked";
 pub(super) const ADMIN_TOKEN_NAME_ID: &str = "account-admin-token-name";
 pub(super) const ADMIN_ISSUE_TOKEN_ID: &str = "account-admin-issue-token";
 pub(super) const DELETE_ACCOUNT_ID: &str = "account-delete";
@@ -55,6 +56,7 @@ pub(super) struct AdminForm {
     role_value: BridgeRole,
     servers: Entity<TextareaState>,
     pub(super) disabled: bool,
+    pub(super) locked: bool,
     token_name: Entity<InputState>,
     token_expires: Entity<DatePickerState>,
     busy: bool,
@@ -111,6 +113,7 @@ impl AdminForm {
                     .placeholder(i18n_account(cx, "servers_all"))
             }),
             disabled: false,
+            locked: false,
             token_name: cx.new(|cx| InputState::new(window, cx).placeholder("claude-laptop")),
             token_expires: expiry_picker(Some(ADMIN_TOKEN_DAYS), window, cx),
             busy: false,
@@ -170,6 +173,8 @@ impl AdminForm {
 fn account_state(cx: &App, account: &BridgeAccount) -> SharedString {
     if account.disabled {
         i18n_account(cx, "disabled")
+    } else if account.locked {
+        i18n_account(cx, "locked_state")
     } else if !account.has_password {
         i18n_account(cx, "proxy_account")
     } else {
@@ -239,6 +244,7 @@ impl ZedisAccount {
             .servers
             .update(cx, |state, cx| state.set_value(rules, window, cx));
         self.admin.disabled = account.disabled;
+        self.admin.locked = account.locked;
         self.admin.selected = Some(account.name);
         cx.notify();
     }
@@ -380,8 +386,24 @@ impl ZedisAccount {
                                 this.admin.disabled = *checked;
                                 cx.notify();
                             })),
-                    ),
+                    )
+                    // Never an administrator's: it could not change its own
+                    // password.
+                    .when(form.role_value != BridgeRole::Admin, |row| {
+                        row.child(
+                            Checkbox::new(LOCK_ACCOUNT_ID)
+                                .checked(form.locked)
+                                .label(i18n_account(cx, "locked"))
+                                .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                    this.admin.locked = *checked;
+                                    cx.notify();
+                                })),
+                        )
+                    }),
             )
+            .when(form.role_value != BridgeRole::Admin, |page| {
+                page.child(note(cx, i18n_account(cx, "locked_hint")))
+            })
             .child(field(cx, i18n_account(cx, "col_servers"), Textarea::new(&form.servers)))
             .child(note(cx, i18n_account(cx, "servers_hint")))
             .child(
@@ -420,6 +442,11 @@ impl ZedisAccount {
             role: (self.admin.role_value != account.role).then_some(self.admin.role_value),
             servers: (servers != account.servers).then_some(servers),
             disabled: (self.admin.disabled != account.disabled).then_some(self.admin.disabled),
+            // Made an administrator, it is unlocked with it.
+            locked: {
+                let locked = self.admin.locked && self.admin.role_value != BridgeRole::Admin;
+                (locked != account.locked).then_some(locked)
+            },
         };
         Some((account.name.clone(), change))
     }

@@ -137,8 +137,10 @@ pub fn servers_with_new_notes<'a>(
 #[cfg(target_family = "wasm")]
 #[derive(Debug, Clone, Default)]
 pub struct PageSeed {
-    /// `(table, key, value)`, the table as the bridge names it.
-    pub rows: Vec<(String, String, String)>,
+    /// `(table, key, value)`, the table as the bridge names it — or `None`
+    /// where the bridge keeps no rows for the account (a locked one): the
+    /// page's own are left as they are.
+    pub rows: Option<Vec<(String, String, String)>>,
     /// `(server, key, tag and note)`.
     pub key_notes: Vec<(String, String, KeyMetadata)>,
     /// `(id, script)`.
@@ -156,7 +158,7 @@ pub fn seed_page_data(seed: PageSeed) -> crate::Result<()> {
     let db = crate::get_database()?;
     let write_txn = db.begin_write()?;
     {
-        for (table, key, value) in &seed.rows {
+        for (table, key, value) in seed.rows.iter().flatten() {
             let definition = match table.as_str() {
                 "favorites" => FAVORITES_TABLE,
                 "recent_keys" => RECENT_KEYS_TABLE,
@@ -225,8 +227,11 @@ pub fn refresh_page_data(seed: PageSeed) -> crate::Result<PageRefreshed> {
             (RECENT_KEYS_TABLE, "recent_keys"),
             (SEARCH_HISTORY_TABLE, "search_history"),
         ] {
-            let wanted: BTreeMap<&str, &str> = seed
-                .rows
+            // A locked account's rows are the page's own: left as they are.
+            let Some(rows) = &seed.rows else {
+                break;
+            };
+            let wanted: BTreeMap<&str, &str> = rows
                 .iter()
                 .filter(|(table, _, _)| table == wire)
                 .map(|(_, key, value)| (key.as_str(), value.as_str()))

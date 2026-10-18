@@ -1245,12 +1245,27 @@ mod tests {
         assert_eq!(logins.account(&alice, &accounts), None, "the password changed");
 
         accounts
-            .update("bob", Some(crate::accounts::Role::ReadOnly), None, None)
+            .update(
+                "bob",
+                crate::accounts::AccountChange {
+                    role: Some(crate::accounts::Role::ReadOnly),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("demote");
         assert_eq!(logins.account(&bob, &accounts), None, "same password, other rights");
 
-        accounts.update("carol", None, None, Some(true)).await.expect("disable");
+        accounts
+            .update(
+                "carol",
+                crate::accounts::AccountChange {
+                    disabled: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("disable");
         assert_eq!(logins.account(&carol, &accounts), None, "disabled");
 
         accounts.delete("dave").await.expect("delete");

@@ -60,6 +60,9 @@ impl ZedisAccount {
         if !me.account.has_password {
             return note(cx, i18n_account(cx, "proxy_no_password")).into_any_element();
         }
+        if me.account.locked {
+            return note(cx, i18n_account(cx, "password_locked")).into_any_element();
+        }
         if std::mem::take(&mut self.password.clear) {
             for state in [&self.password.current, &self.password.new, &self.password.repeat] {
                 state.update(cx, |state, cx| state.set_value("", window, cx));

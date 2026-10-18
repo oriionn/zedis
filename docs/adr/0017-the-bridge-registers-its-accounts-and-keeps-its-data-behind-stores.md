@@ -448,3 +448,30 @@ keep coming through invitations marked for the proxy.
 
 When the door is shut again, the requests already waiting are neither shown
 nor answerable, and expire.
+
+## Amended 2026-10-18 — a locked account, for a demonstration
+
+An account many people sign in to — a demonstration's, its password on a
+slide — needs what no other account does: no visitor may change its
+password (the next one would be locked out) or its MCP tokens, and no
+visitor's favorites, history or preferences — the language among them — may
+become the next one's. `AccountRecord::locked`, ticked by an administrator on
+the account's form (`locked` in `PATCH /v1/admin/accounts/{name}`, an
+`account_updated` line), does all of it:
+
+- The account's own password and token routes answer `403` and a `refused`
+  line (`password_change`, `token_issue`, `token_revoke`); an administrator
+  still resets its password and issues and revokes its tokens. Its account
+  page offers neither.
+- The bridge keeps no rows of its own for it: `GET /v1/page-data` answers
+  none, with `rows_kept: false`, and a row written is a `403`. The page
+  keeps them itself instead — the preferences in that browser, the
+  favorites, recent keys and search history for as long as it is open — and
+  a refresh leaves them alone. What the account kept before it was locked is
+  not shown while it is, and comes back when it is unlocked.
+- It is any role but an administrator's (`AccountError::LockedAdmin`): one
+  could not change its own password. The setup token, which seats an
+  administrator from the host, unlocks the account it promotes.
+
+Locked is not read-only, and a demonstration account is usually both: a
+locked full account still writes to Redis.

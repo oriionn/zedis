@@ -466,6 +466,9 @@ struct PageScript {
 struct PageData {
     account: String,
     read_only: bool,
+    /// Whether the bridge keeps this account's own rows: not for a locked
+    /// one, whose favorites, history and preferences stay in each browser.
+    rows_kept: bool,
     rows: Vec<Row>,
     key_notes: Vec<ServerNote>,
     scripts: Vec<PageScript>,
@@ -504,7 +507,12 @@ async fn page_data(
 
 async fn gather(state: &AppState, headers: &HeaderMap, peer: SocketAddr) -> ApiResult<PageData> {
     let account = authorize(state, headers, &mut Origin::new(peer, headers))?;
-    let rows = state.page_rows.rows(account.clone()).await.map_err(store_error)?;
+    let rows_kept = !state.accounts.is_locked(&account);
+    let rows = if rows_kept {
+        state.page_rows.rows(account.clone()).await.map_err(store_error)?
+    } else {
+        Default::default()
+    };
     let rows = rows
         .into_iter()
         .flat_map(|(table, rows)| {
@@ -545,6 +553,7 @@ async fn gather(state: &AppState, headers: &HeaderMap, peer: SocketAddr) -> ApiR
         .collect();
     Ok(PageData {
         read_only: state.accounts.is_read_only(&account),
+        rows_kept,
         account,
         rows,
         key_notes,
@@ -562,7 +571,8 @@ struct RowRequest {
 }
 
 /// One of the account's own rows. A read-only account keeps its own too:
-/// they change nothing anybody else sees.
+/// they change nothing anybody else sees. A locked one keeps none: everyone
+/// who signs in to it would share them.
 async fn put_row(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -570,6 +580,11 @@ async fn put_row(
     Json(req): Json<RowRequest>,
 ) -> ApiResult<StatusCode> {
     let account = authorize(&state, &headers, &mut Origin::new(peer, &headers))?;
+    if state.accounts.is_locked(&account) {
+        return Err(ApiError::Forbidden(
+            "this account is locked: the bridge keeps no rows of its own for it".to_string(),
+        ));
+    }
     if !ROW_TABLES.contains(&req.table.as_str()) {
         return Err(ApiError::BadRequest(format!("no table {:?}", req.table)));
     }
