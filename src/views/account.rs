@@ -24,6 +24,7 @@
 //! the global, so a test gives it a fake bridge.
 
 mod admin;
+mod audit;
 mod handover;
 mod invites;
 mod password;
@@ -36,6 +37,7 @@ use crate::connection::{
 use crate::helpers::{format_unix_secs, get_mono_font_family};
 use crate::states::{ZedisGlobalStore, i18n_account, i18n_common};
 use admin::AdminForm;
+use audit::AuditForm;
 use gpui::{AnyElement, App, Entity, FocusHandle, FontWeight, SharedString, Window, div, prelude::*, px};
 use gpui_kit::component::{
     ActiveTheme, Disableable, Sizable, WindowExt,
@@ -68,6 +70,7 @@ enum AccountSection {
     Tokens,
     Accounts,
     Invites,
+    Audit,
 }
 
 impl AccountSection {
@@ -77,16 +80,17 @@ impl AccountSection {
             Self::Tokens => "section_tokens",
             Self::Accounts => "section_accounts",
             Self::Invites => "section_invites",
+            Self::Audit => "section_audit",
         }
     }
 
     /// What `account` has: tokens are a read-only account's (ADR 15), the
-    /// accounts and the invitations an administrator's.
+    /// accounts, the invitations and the audit an administrator's.
     fn of(account: &BridgeAccount) -> Vec<Self> {
         let mut sections = vec![Self::Password];
         match account.role {
             BridgeRole::ReadOnly => sections.push(Self::Tokens),
-            BridgeRole::Admin => sections.extend([Self::Accounts, Self::Invites]),
+            BridgeRole::Admin => sections.extend([Self::Accounts, Self::Invites, Self::Audit]),
             BridgeRole::Full => {}
         }
         sections
@@ -140,6 +144,7 @@ pub struct ZedisAccount {
     tokens: TokenForm,
     admin: AdminForm,
     invites: InvitesForm,
+    audit: AuditForm,
 }
 
 impl ZedisAccount {
@@ -155,6 +160,7 @@ impl ZedisAccount {
             tokens: TokenForm::new(window, cx),
             admin: AdminForm::new(window, cx),
             invites: InvitesForm::new(window, cx),
+            audit: AuditForm::new(window, cx),
         };
         this.load_me(cx);
         this
@@ -190,6 +196,10 @@ impl ZedisAccount {
 
     fn select_section(&mut self, section: AccountSection, window: &mut Window, cx: &mut Context<Self>) {
         self.section = section;
+        // The audit is read when it is first looked at, not with the page.
+        if section == AccountSection::Audit && !self.audit.loaded {
+            self.load_audit(false, cx);
+        }
         self.focus_handle.focus(window, cx);
         cx.notify();
     }
@@ -467,6 +477,7 @@ impl Render for ZedisAccount {
             AccountSection::Tokens => self.render_tokens(&me, window, cx),
             AccountSection::Accounts => self.render_accounts(window, cx),
             AccountSection::Invites => self.render_invites(&me, window, cx),
+            AccountSection::Audit => self.render_audit(window, cx),
         };
         h_flex()
             .track_focus(&self.focus_handle)

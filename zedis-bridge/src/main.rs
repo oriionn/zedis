@@ -35,6 +35,7 @@ mod api;
 mod audit;
 mod auth;
 mod handover;
+mod import;
 mod mcp;
 mod metrics;
 mod page_data;
@@ -42,6 +43,7 @@ mod policy;
 mod presence;
 mod resp;
 mod session;
+mod sql;
 mod static_files;
 mod store;
 mod trash;
@@ -76,23 +78,89 @@ fn flag(name: &str) -> Option<String> {
     None
 }
 
+/// Where the bridge keeps what it keeps (ADR 18): the database `--store`
+/// names, or the local directory.
+async fn open_stores(data_dir: &std::path::Path) -> std::io::Result<store::Stores> {
+    match store_url() {
+        Some(url) => {
+            let store = sql::SqlStore::connect(&url).await?;
+            tracing::info!(store = sql::redacted(&url), dialect = ?store.dialect(), "the stores are in a database");
+            Ok(store.stores())
+        }
+        None => Ok(store::Stores::local(data_dir)),
+    }
+}
+
+/// The database `--store` (or the environment) names, if any.
+fn store_url() -> Option<String> {
+    flag("--store")
+        .or_else(|| std::env::var(sql::STORE_ENV).ok())
+        .filter(|url| !url.trim().is_empty())
+}
+
+/// `zedis-bridge import-local`: a local directory's stores, copied once
+/// into an empty database (ADR 18).
+async fn import_local_command() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().any(|a| a == "--help" || a == "-h") {
+        println!("zedis-bridge import-local --store <url> [--from <dir>] [--audit-file <file>]");
+        println!();
+        println!("Copies what a bridge keeps in its data directory (--from, else ZEDIS_CONFIG_DIR)");
+        println!("— accounts, invitations, logins, the server list, scripts, the page's data, the");
+        println!("recycle bin, the metrics history and a waiting setup token — into the empty");
+        println!(
+            "database --store ({}) names. It runs with that directory's master.key:",
+            sql::STORE_ENV
+        );
+        println!("give every bridge on the database the same file afterwards. A database that");
+        println!("already holds accounts, server entries or scripts is refused. --audit-file copies");
+        println!("the lines of the file --audit-log wrote, too.");
+        return Ok(());
+    }
+    // The directory's master key opens its secrets and seals the database's
+    // check, so the directory is the configuration directory for this run.
+    if let Some(from) = flag("--from") {
+        zedis_core::fs::override_config_dir(std::path::PathBuf::from(from));
+    }
+    install_crypto_provider();
+    disable_keychain();
+    let from = get_or_create_config_dir()?;
+    let url = store_url().ok_or_else(|| format!("import-local needs --store <url> or {}", sql::STORE_ENV))?;
+    let store = sql::SqlStore::connect(&url).await?;
+    let audit_file = flag("--audit-file").map(std::path::PathBuf::from);
+    let done = import::import_local(&from, audit_file.as_deref(), &store).await?;
+    println!("Copied {} into {}:", from.display(), sql::redacted(&url));
+    println!("{done}");
+    println!();
+    println!(
+        "Every bridge on this database now uses {}: give each the same file.",
+        from.join("master.key").display()
+    );
+    Ok(())
+}
+
 /// `zedis-bridge setup-token`: a fresh setup token, for when every
 /// administrator is lost (ADR 17). Written beside the bridge's data, where
 /// the running bridge reads it at the next attempt, and printed once. Host
 /// access is administrator access; nothing over HTTP can do this.
-fn setup_token_command() -> Result<(), Box<dyn std::error::Error>> {
+async fn setup_token_command() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().any(|a| a == "--help" || a == "-h") {
-        println!("zedis-bridge setup-token");
+        println!("zedis-bridge setup-token [--store <url>]");
         println!();
         println!("Writes a one-time setup token to setup-token in the bridge's data directory");
-        println!("(ZEDIS_CONFIG_DIR) and prints it. On the bridge's page, Create the administrator");
-        println!("with it: a new account, or an existing one by its password, becomes an");
-        println!("administrator. The token is deleted once used.");
+        println!(
+            "(ZEDIS_CONFIG_DIR) — or, with --store ({}), to the database the bridges",
+            sql::STORE_ENV
+        );
+        println!("share — and prints it. On the bridge's page, Create the administrator with it:");
+        println!("a new account, or an existing one by its password, becomes an administrator.");
+        println!("The token is deleted once used.");
         return Ok(());
     }
-    let setup = Setup::in_dir(&get_or_create_config_dir()?);
-    let token = setup.mint()?;
-    println!("Setup token — shown once, also in {}:", setup.file().display());
+    install_crypto_provider();
+    disable_keychain();
+    let setup = Setup::new(open_stores(&get_or_create_config_dir()?).await?.setup);
+    let token = setup.mint().await?;
+    println!("Setup token — shown once, also in {}:", setup.location());
     println!();
     println!("  {token}");
     println!();
@@ -107,13 +175,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     if std::env::args().nth(1).as_deref() == Some("setup-token") {
-        return setup_token_command();
+        return setup_token_command().await;
+    }
+    if std::env::args().nth(1).as_deref() == Some("import-local") {
+        return import_local_command().await;
     }
 
     if std::env::args().any(|a| a == "--help" || a == "-h") {
         println!(
             "zedis-bridge [--listen {DEFAULT_LISTEN}] [--base-path /prefix] [--static <dir>] \
-             [--insecure-cookie] [--audit-log <file>] [--audit-writes] \
+             [--insecure-cookie] [--store <url>] [--audit-log <file>] [--audit-writes] \
              [--audit-webhook <url> [--audit-webhook-format <name>] [--audit-webhook-events <list>]] \
              [--trusted-header <name> --trusted-proxy <cidr,…>]"
         );
@@ -146,6 +217,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("The page asks for the username and password, scripts send HTTP Basic. A server");
         println!("entry is private to the account that added it unless it is marked shared.");
         println!("Secrets are encrypted with the master.key file there, never the OS keychain.");
+        println!(
+            "--store <url> ({}, preferred: the URL carries a password) keeps the accounts, logins,",
+            sql::STORE_ENV
+        );
+        println!("server list, recycle bin, metrics and the page's data in PostgreSQL 14+ or MySQL");
+        println!("8.0.19+ (postgres://… or mysql://…) instead of that directory, so several bridges");
+        println!("can share them: route each browser to one of them by its login cookie, and give");
+        println!("every bridge the same master.key.");
         println!(
             "--audit-log <file> ({}) appends one JSON line per login and failed",
             audit::LOG_ENV
@@ -249,11 +328,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // read now rather than by the first request that asks: a file that
     // cannot be read says so at start.
     let data_dir = get_or_create_config_dir()?;
-    let stores = store::Stores::local(&data_dir);
+    let stores = open_stores(&data_dir).await?;
     let entries = stores.servers.list().await?.len();
     tracing::info!(entries, "server list loaded");
     let accounts = Accounts::load(stores.accounts.clone()).await?;
-    let setup = Setup::in_dir(&data_dir);
+    let setup = Setup::new(stores.setup.clone());
 
     let passwordless = accounts.passwordless();
     match &trusted {
@@ -277,20 +356,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // configured and is silently absent is worse than none (ADR 11).
     let audit_writes = std::env::args().any(|a| a == "--audit-writes")
         || std::env::var(audit::WRITES_ENV).is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
-    let audit_path = flag("--audit-log")
+    // With a database the audit is on and kept there unless told otherwise
+    // (ADR 18): a path still means a file, and `off` means none.
+    let audit_setting = flag("--audit-log")
         .or_else(|| std::env::var(audit::LOG_ENV).ok())
-        .filter(|path| !path.trim().is_empty())
-        .map(std::path::PathBuf::from);
-    let audit = match audit_path {
-        Some(path) => {
+        .map(|setting| setting.trim().to_string())
+        .filter(|setting| !setting.is_empty());
+    let audit = match (audit_setting.as_deref(), stores.audit.clone()) {
+        (Some(audit::OFF), _) if audit_writes => return Err("--audit-writes needs an audit; --audit-log is off".into()),
+        (Some(audit::OFF), _) => audit::Audit::off(),
+        (Some(path), shared) => {
+            let path = std::path::PathBuf::from(path);
             let audit =
                 audit::Audit::open(&path, audit_writes).map_err(|e| format!("--audit-log {}: {e}", path.display()))?;
+            if shared.is_some() {
+                tracing::warn!(
+                    path = %path.display(),
+                    "the audit goes to a file instead of the database: each bridge on it keeps its own"
+                );
+            }
             tracing::info!(path = %path.display(), writes = audit_writes, "audit log open");
             audit
         }
-        None if audit_writes => return Err("--audit-writes needs --audit-log".into()),
-        None => audit::Audit::off(),
+        (None, Some(log)) => {
+            tracing::info!(writes = audit_writes, "audit kept in the database");
+            audit::Audit::to(log, audit_writes)
+        }
+        (None, None) if audit_writes => return Err("--audit-writes needs --audit-log".into()),
+        (None, None) => audit::Audit::off(),
     };
+    let audit_retention_days = flag("--audit-retention-days")
+        .or_else(|| std::env::var(audit::RETENTION_DAYS_ENV).ok())
+        .map(|days| days.trim().parse::<u32>())
+        .transpose()
+        .map_err(|e| format!("--audit-retention-days: {e}"))?
+        .unwrap_or(audit::RETENTION_DAYS);
     // The webhook, when asked for, checked here too: a URL or a list that
     // is wrong stops the bridge rather than pushing nothing all day.
     let webhook_url = flag("--audit-webhook")
@@ -366,14 +466,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if std::env::var(SETUP_TOKEN_ENV).is_ok_and(|t| !t.trim().is_empty()) {
             tracing::warn!("no administrator yet: open the page and Create the administrator with {SETUP_TOKEN_ENV}");
         } else {
-            let token = match std::fs::read_to_string(setup.file()) {
-                Ok(token) if !token.trim().is_empty() => token.trim().to_string(),
-                _ => setup.mint()?,
-            };
-            tracing::warn!(
-                file = %setup.file().display(),
-                "no administrator yet: open the page and Create the administrator with the setup token {token}"
-            );
+            match setup.for_start().await? {
+                Some(token) => tracing::warn!(
+                    kept = setup.location(),
+                    "no administrator yet: open the page and Create the administrator with the setup token {token}"
+                ),
+                // Another process kept one first, and printed it.
+                None => tracing::warn!(
+                    kept = setup.location(),
+                    "no administrator yet: a setup token is waiting (in the log of the bridge that kept it; \
+                     `zedis-bridge setup-token` keeps a new one)"
+                ),
+            }
         }
     }
 
@@ -381,7 +485,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // which, while they lived in memory, it did, every time.
     let logins = auth::Logins::load(stores.logins.clone(), &accounts).await;
     tracing::info!(live = logins.len(), "saved logins restored");
-    let throttle = auth::Throttle::new();
+    let throttle = match stores.throttle.clone() {
+        Some(shared) => auth::Throttle::shared(shared, store::process_id().to_string()),
+        None => auth::Throttle::new(),
+    };
+    if let Some(versions) = stores.versions.clone() {
+        let held = store::Held {
+            servers: stores.servers.clone(),
+            accounts: accounts.clone(),
+            logins: logins.clone(),
+            throttle: throttle.clone(),
+        };
+        tokio::spawn(store::keep_in_step(versions, held));
+    }
 
     let sessions = Sessions::new();
     let unlocks = policy::Unlocks::new();
@@ -396,6 +512,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let watch_sweeper = watches.clone();
     let trash_sweeper = stores.trash.clone();
     let metrics_pruner = stores.metrics.clone();
+    let audit_pruner = audit.log().cloned();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         loop {
@@ -405,7 +522,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if expired > 0 {
                 tracing::info!(expired, "swept idle logins");
             }
-            throttle_sweeper.sweep();
+            throttle_sweeper.sweep().await;
             match account_sweeper.purge_expired_invites().await {
                 Ok(0) => {}
                 Ok(purged) => tracing::info!(purged, "purged expired invitations"),
@@ -426,10 +543,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(purged) => tracing::info!(purged, "purged day-old recycle bin entries"),
                 Err(e) => tracing::warn!(error = %e, "the recycle bin purge did not finish"),
             }
+            if audit_retention_days > 0
+                && let Some(log) = &audit_pruner
+            {
+                let kept_ms = i64::from(audit_retention_days) * 86_400_000;
+                match log.prune(metrics::now_ms() - kept_ms).await {
+                    Ok(0) => {}
+                    Ok(pruned) => tracing::info!(pruned, days = audit_retention_days, "pruned old audit lines"),
+                    Err(e) => tracing::warn!(error = %e, "the old audit lines could not be pruned"),
+                }
+            }
             if let Ok(pruned) = metrics_pruner.prune().await
                 && pruned > 0
             {
-                tracing::info!(pruned, "pruned week-old metrics days");
+                tracing::info!(pruned, "pruned week-old metrics");
             }
             let ended = watch_sweeper.sweep();
             if ended > 0 {

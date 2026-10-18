@@ -1,0 +1,102 @@
+name: "Store"
+# The bridge's SQL store (ADR 18) against real databases: the first release
+# of each supported line — where a floor is wrong if it is wrong — and the
+# current one. The tests are `zedis-bridge`'s `sql::tests`, ignored without
+# `ZEDIS_IT_STORE_URL`: the conformance suite every store keeps, the server
+# list, logins and failed sign-ins shared by two bridges, and the last
+# administrator held across them.
+#
+# A workflow of its own rather than a job in integration.yml: paths filter a
+# whole workflow, and the bridge changing is no reason to run the Redis
+# matrix.
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "zedis-bridge/**"
+      - "crates/zedis-connection/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/store.yml"
+  pull_request:
+    paths:
+      - "zedis-bridge/**"
+      - "crates/zedis-connection/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/store.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: store-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.98.1
+
+jobs:
+  store:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: postgres:14
+            url: postgres://zedis:zedis@127.0.0.1:5432/zedis
+            health: --health-cmd "pg_isready -U zedis -d zedis" --health-interval 2s --health-timeout 5s --health-retries 60
+          - image: postgres:18
+            url: postgres://zedis:zedis@127.0.0.1:5432/zedis
+            health: --health-cmd "pg_isready -U zedis -d zedis" --health-interval 2s --health-timeout 5s --health-retries 60
+          # 8.0.19: the row alias the upserts use (`AS new ON DUPLICATE KEY
+          # UPDATE`) arrived here.
+          - image: mysql:8.0.19
+            url: mysql://zedis:zedis@127.0.0.1:3306/zedis
+            health: --health-cmd "mysqladmin ping -h 127.0.0.1 -uzedis -pzedis" --health-interval 2s --health-timeout 5s --health-retries 60
+          - image: mysql:8.4
+            url: mysql://zedis:zedis@127.0.0.1:3306/zedis
+            health: --health-cmd "mysqladmin ping -h 127.0.0.1 -uzedis -pzedis" --health-interval 2s --health-timeout 5s --health-retries 60
+    services:
+      # One service for both kinds: each image reads its own variables and
+      # ignores the other's.
+      db:
+        image: ${{ matrix.image }}
+        env:
+          POSTGRES_USER: zedis
+          POSTGRES_PASSWORD: zedis
+          POSTGRES_DB: zedis
+          MYSQL_ROOT_PASSWORD: zedis
+          MYSQL_USER: zedis
+          MYSQL_PASSWORD: zedis
+          MYSQL_DATABASE: zedis
+        ports:
+          - 5432:5432
+          - 3306:3306
+        options: ${{ matrix.health }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: store
+      # One at a time: the tests share one database, and two of them change
+      # every account's role or the one setup token.
+      #
+      # The filter is a substring of the test names, so a rename could leave
+      # it matching nothing and the step green: at least one has to have run.
+      - name: store tests
+        shell: bash
+        env:
+          RUST_BACKTRACE: "1"
+          ZEDIS_IT_STORE_URL: ${{ matrix.url }}
+        run: |
+          set -o pipefail
+          cargo test -p zedis-bridge -- --ignored --test-threads=1 sql:: | tee store-tests.log
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' store-tests.log && exit 0
+          echo "::error::no store test ran — the filter matched nothing"
+          exit 1

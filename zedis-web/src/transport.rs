@@ -34,11 +34,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use zedis_connection::{
     BridgeAccount, BridgeAccountChange, BridgeAccountError, BridgeAccountErrorKind, BridgeAccountResult,
-    BridgeAccounts, BridgeDisposition, BridgeError, BridgeErrorKind, BridgeInvite, BridgeInviteKind, BridgeKeyNote,
-    BridgeNewInvite, BridgeOrphans, BridgeOwnAccount, BridgeOwned, BridgeOwnedItem, BridgePageData, BridgePageRow,
-    BridgePageSeed, BridgeReply, BridgeRequest, BridgeRole, BridgeScript, BridgeServerStore, BridgeStorage,
-    BridgeToken, BridgeTransport, BridgeTrashEntry, RedisServer, WatchBatch, WatchItem, WatchKind, WatchOpened,
-    describe_commands, get_servers, set_account_read_only_on,
+    BridgeAccounts, BridgeAuditPage, BridgeAuditQuery, BridgeDisposition, BridgeError, BridgeErrorKind, BridgeInvite,
+    BridgeInviteKind, BridgeKeyNote, BridgeNewInvite, BridgeOrphans, BridgeOwnAccount, BridgeOwned, BridgeOwnedItem,
+    BridgePageData, BridgePageRow, BridgePageSeed, BridgeReply, BridgeRequest, BridgeRole, BridgeScript,
+    BridgeServerStore, BridgeStorage, BridgeToken, BridgeTransport, BridgeTrashEntry, RedisServer, WatchBatch,
+    WatchItem, WatchKind, WatchOpened, describe_commands, get_servers, set_account_read_only_on,
 };
 
 /// Talks to one `zedis-bridge`.
@@ -52,10 +52,32 @@ pub struct HttpBridgeTransport {
     /// How many of those have not been answered yet.
     page_writes_pending: Arc<AtomicUsize>,
     /// Asks for an early read of what other accounts changed
-    /// ([`BridgePageData::refresh_soon`]), and the end the page's refresh
-    /// loop listens on, until it takes it.
-    refresh_requests: UnboundedSender<()>,
-    refresh_listener: Mutex<Option<UnboundedReceiver<()>>>,
+    /// ([`BridgePageData::refresh_soon`]).
+    page_data_wake: Wake,
+    /// Asks for an early read of the server list: an account's deletion or
+    /// a settlement handed entries over or shared them.
+    server_list_wake: Wake,
+}
+
+/// A nudge to one of the page's loops, to run its round now: sent from
+/// anywhere, heard by the loop that takes the listening end — once.
+struct Wake {
+    sender: UnboundedSender<()>,
+    listener: Mutex<Option<UnboundedReceiver<()>>>,
+}
+
+impl Wake {
+    fn new() -> Self {
+        let (sender, listener) = unbounded();
+        Self {
+            sender,
+            listener: Mutex::new(Some(listener)),
+        }
+    }
+
+    fn take(&self) -> Option<UnboundedReceiver<()>> {
+        self.listener.lock().unwrap_or_else(PoisonError::into_inner).take()
+    }
 }
 
 /// One change of the page's data, as the request that carries it.
@@ -71,24 +93,40 @@ impl HttpBridgeTransport {
     /// used to be a bearer token here for the bridge's token mode, which is
     /// gone — ADR 9.)
     pub fn new(client: Arc<dyn HttpClient>, base_url: impl Into<String>) -> Self {
-        let (refresh_requests, refresh_listener) = unbounded();
         Self {
             client,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             page_writes: OnceLock::new(),
             page_writes_pending: Arc::default(),
-            refresh_requests,
-            refresh_listener: Mutex::new(Some(refresh_listener)),
+            page_data_wake: Wake::new(),
+            server_list_wake: Wake::new(),
         }
     }
 
     /// Where [`BridgePageData::refresh_soon`] is heard — once, by the page's
     /// refresh loop.
     pub fn take_refresh_requests(&self) -> Option<UnboundedReceiver<()>> {
-        self.refresh_listener
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
+        self.page_data_wake.take()
+    }
+
+    /// Where an early read of the server list is asked for — once, by the
+    /// page's server list loop.
+    pub fn take_server_list_requests(&self) -> Option<UnboundedReceiver<()>> {
+        self.server_list_wake.take()
+    }
+
+    /// `call`, and once it succeeds the server list read again at once:
+    /// what a deleted account kept to itself was handed over or shared, and
+    /// may be this page's to see now — the administrator's own, by default.
+    fn then_list_servers_again(&self, call: BridgeAccountResult<()>) -> BridgeAccountResult<()> {
+        let wake = self.server_list_wake.sender.clone();
+        Box::pin(async move {
+            let result = call.await;
+            if result.is_ok() {
+                let _ = wake.unbounded_send(());
+            }
+            result
+        })
     }
 
     /// `GET /v1/page-data` again, for what other accounts changed: `None`
@@ -994,6 +1032,39 @@ impl OwnedBody {
     }
 }
 
+/// A page of the audit as the bridge sends it: each line a JSON object.
+#[derive(Deserialize)]
+struct AuditPageBody {
+    #[serde(default)]
+    lines: Vec<serde_json::Value>,
+    #[serde(default)]
+    next: Option<String>,
+    #[serde(default)]
+    stopped_early: bool,
+}
+
+/// `/v1/admin/audit` with what `query` narrows by, each value encoded.
+fn audit_path(query: &BridgeAuditQuery) -> String {
+    let mut params = Vec::new();
+    if let Some(account) = &query.account {
+        params.push(format!("account={}", segment(account)));
+    }
+    if let Some(event) = &query.event {
+        params.push(format!("event={}", segment(event)));
+    }
+    if let Some(since) = query.since_ms {
+        params.push(format!("since_ms={since}"));
+    }
+    if let Some(before) = &query.before {
+        params.push(format!("before={}", segment(before)));
+    }
+    if params.is_empty() {
+        "/v1/admin/audit".to_string()
+    } else {
+        format!("/v1/admin/audit?{}", params.join("&"))
+    }
+}
+
 #[derive(Deserialize)]
 struct OrphansBody {
     owner: String,
@@ -1114,7 +1185,7 @@ impl BridgeAccounts for HttpBridgeTransport {
     fn delete_account(&self, name: String, private: BridgeDisposition) -> BridgeAccountResult<()> {
         let path = format!("/v1/admin/accounts/{}", segment(&name));
         let body = serde_json::json!({ "private": disposition_json(&private) });
-        self.account_call("DELETE", path, Some(body), nothing)
+        self.then_list_servers_again(self.account_call("DELETE", path, Some(body), nothing))
     }
 
     fn orphans(&self) -> BridgeAccountResult<Vec<BridgeOrphans>> {
@@ -1130,10 +1201,20 @@ impl BridgeAccounts for HttpBridgeTransport {
         })
     }
 
+    fn audit(&self, query: BridgeAuditQuery) -> BridgeAccountResult<BridgeAuditPage> {
+        self.account_call("GET", audit_path(&query), None, |bytes| {
+            json::<AuditPageBody>(bytes).map(|page| BridgeAuditPage {
+                lines: page.lines.iter().map(serde_json::Value::to_string).collect(),
+                next: page.next,
+                stopped_early: page.stopped_early,
+            })
+        })
+    }
+
     fn settle_orphans(&self, owner: String, private: BridgeDisposition) -> BridgeAccountResult<()> {
         let path = format!("/v1/admin/orphans/{}", segment(&owner));
         let body = serde_json::json!({ "private": disposition_json(&private) });
-        self.account_call("POST", path, Some(body), nothing)
+        self.then_list_servers_again(self.account_call("POST", path, Some(body), nothing))
     }
 
     fn reset_link(&self, name: String) -> BridgeAccountResult<BridgeNewInvite> {
@@ -1351,7 +1432,7 @@ impl BridgePageData for HttpBridgeTransport {
     }
 
     fn refresh_soon(&self) {
-        let _ = self.refresh_requests.unbounded_send(());
+        let _ = self.page_data_wake.sender.unbounded_send(());
     }
 }
 
@@ -1562,6 +1643,57 @@ mod tests {
         );
         let body: serde_json::Value = serde_json::from_str(&seen[1].2).expect("json");
         assert_eq!(body, serde_json::json!({ "private": { "action": "share" } }));
+    }
+
+    /// What a deleted account kept may be this page's now, so the server
+    /// list is read again as soon as the bridge says it was settled — and
+    /// not when it refused.
+    #[test]
+    fn a_settled_handover_reads_the_server_list_again() {
+        let (transport, _) = transport_recording(204, "");
+        let mut requests = transport.take_server_list_requests().expect("the listener, once");
+        assert!(transport.take_server_list_requests().is_none());
+        futures::executor::block_on(transport.delete_account("bob".to_string(), BridgeDisposition::Share))
+            .expect("deleted");
+        assert_eq!(requests.try_recv().ok(), Some(()));
+        futures::executor::block_on(transport.settle_orphans("ghost".to_string(), BridgeDisposition::Delete))
+            .expect("settled");
+        assert_eq!(requests.try_recv().ok(), Some(()));
+
+        let (transport, _) = transport_recording(409, r#"{"error":"the last administrator"}"#);
+        let mut requests = transport.take_server_list_requests().expect("the listener, once");
+        let refused =
+            futures::executor::block_on(transport.delete_account("alice".to_string(), BridgeDisposition::Share));
+        assert!(refused.is_err());
+        assert!(requests.try_recv().is_err(), "nothing changed, nothing to read");
+    }
+
+    /// The audit is asked for with each narrowing encoded, and its lines
+    /// come back as the objects the bridge kept.
+    #[test]
+    fn the_audit_is_asked_for_narrowed_and_read_as_lines() {
+        let (transport, seen) = transport_recording(
+            200,
+            r#"{"lines":[{"event":"logout","account":"a b"}],"next":"41","stopped_early":false}"#,
+        );
+        let page = futures::executor::block_on(transport.audit(BridgeAuditQuery {
+            account: Some("a b".to_string()),
+            event: Some("logout".to_string()),
+            since_ms: Some(1_000),
+            before: Some("42".to_string()),
+        }))
+        .expect("page");
+        assert_eq!(page.next.as_deref(), Some("41"));
+        let line: serde_json::Value = serde_json::from_str(&page.lines[0]).expect("json");
+        assert_eq!(line["account"], "a b");
+        let seen = seen.lock().expect("lock");
+        assert_eq!(
+            (seen[0].0.as_str(), seen[0].1.as_str()),
+            (
+                "GET",
+                "http://bridge:7379/zedis/v1/admin/audit?account=a%20b&event=logout&since_ms=1000&before=42"
+            )
+        );
     }
 
     #[test]

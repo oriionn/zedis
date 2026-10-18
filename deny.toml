@@ -27,8 +27,11 @@ ignore = [
     # only way to drop it is russh's `rsa` feature, i.e. no RSA keys. The
     # attack needs a local attacker timing RSA decryption during the SSH
     # handshake, outside this app's threat model. Risk accepted until
-    # russh moves off the rsa release candidate.
-    { id = "RUSTSEC-2023-0071", reason = "no fix; local timing attack on the SSH handshake is outside the threat model" },
+    # russh moves off the rsa release candidate. The bridge's MySQL store
+    # (sqlx's `mysql-rsa`, ADR 18) reaches the same crate to send a password
+    # over a connection without TLS: it only encrypts, with the server's
+    # public key — no private-key operation for the attack to time.
+    { id = "RUSTSEC-2023-0071", reason = "no fix; the SSH handshake's timing is outside the threat model, and the MySQL store only encrypts with a public key" },
 ]
 
 [licenses]

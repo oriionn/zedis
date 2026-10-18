@@ -31,9 +31,10 @@ use crate::api::{ApiError, ApiResult, AppState, MAX_TRIED_NAME, authorize};
 use crate::audit::{Change, Event, Origin};
 use crate::auth::{self, attempt_key, parse_expiry};
 use crate::handover::{self, Disposition, Owned};
+use crate::store::{AuditPage, AuditQuery};
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, Path, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::HeaderMap,
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
@@ -65,6 +66,7 @@ pub(crate) fn routes(router: Router<AppState>, at: &impl Fn(&str) -> String) -> 
         .route(&at("/v1/admin/accounts/{name}/tokens/{token}"), delete(revoke_token_of))
         .route(&at("/v1/admin/invites"), get(list_invites).post(create_invite))
         .route(&at("/v1/admin/invites/{id}"), delete(revoke_invite))
+        .route(&at("/v1/admin/audit"), get(audit_lines))
 }
 
 impl From<AccountError> for ApiError {
@@ -86,10 +88,11 @@ impl From<AccountError> for ApiError {
 
 /// What a page is answered on a sign-in it caused — setup, registration, a
 /// new password: the login cookie, as `/v1/login` sets it.
-fn signed_in(state: &AppState, account: &str, remember: bool, origin: &Origin) -> ApiResult<Response> {
+async fn signed_in(state: &AppState, account: &str, remember: bool, origin: &Origin) -> ApiResult<Response> {
     let id = state
         .logins
-        .open(account, &state.accounts, remember)
+        .open_saved(account, &state.accounts, remember)
+        .await
         .ok_or(ApiError::Unauthorized)?;
     state.audit.record(account, origin, Event::Login { remember });
     Ok((
@@ -162,7 +165,7 @@ struct SetupState {
 
 async fn setup_state(State(state): State<AppState>) -> Json<SetupState> {
     Json(SetupState {
-        open: state.setup.open(&state.accounts),
+        open: state.setup.open(&state.accounts).await,
     })
 }
 
@@ -186,12 +189,12 @@ async fn setup(
     let origin = Origin::new(peer, &headers);
     let attempt = attempt_key(origin.peer_ip, "setup");
     not_throttled(&state, &attempt)?;
-    if !state.setup.open(&state.accounts) {
+    if !state.setup.open(&state.accounts).await {
         return Err(ApiError::NotFound("setup is done: an administrator exists".to_string()));
     }
     let name = req.name.trim().to_string();
     let tried: String = name.chars().take(MAX_TRIED_NAME).collect();
-    if !state.setup.accepts(&req.token, &state.accounts) {
+    if !state.setup.accepts(&req.token, &state.accounts).await {
         state.throttle.failed(&attempt);
         state.audit.record(&tried, &origin, Event::Refused { action: "setup" });
         return Err(ApiError::Forbidden("that is not the setup token".to_string()));
@@ -211,11 +214,11 @@ async fn setup(
         let hash = hashed(req.password).await?;
         state.accounts.make_admin(&name, Some(hash)).await?
     };
-    state.setup.used();
+    state.setup.used().await;
     state.throttle.succeeded(&attempt);
     state.audit.record(&name, &origin, Event::SetupCompleted { promoted });
     tracing::info!(account = name, promoted, "administrator seated with the setup token");
-    signed_in(&state, &name, req.remember, &origin)
+    signed_in(&state, &name, req.remember, &origin).await
 }
 
 // ---- invitations and registration ----------------------------------------
@@ -245,7 +248,7 @@ async fn invitation(
     let origin = Origin::new(peer, &headers);
     let attempt = attempt_key(origin.peer_ip, "invitation");
     not_throttled(&state, &attempt)?;
-    let Some(invite) = state.accounts.invite(&req.code) else {
+    let Some(invite) = state.accounts.invite(&req.code).await else {
         state.throttle.failed(&attempt);
         return Err(AccountError::InviteInvalid.into());
     };
@@ -284,7 +287,7 @@ async fn register(
     let origin = Origin::new(peer, &headers);
     let attempt = attempt_key(origin.peer_ip, "invitation");
     not_throttled(&state, &attempt)?;
-    let Some(invite) = state.accounts.invite(&req.code) else {
+    let Some(invite) = state.accounts.invite(&req.code).await else {
         state.throttle.failed(&attempt);
         return Err(AccountError::InviteInvalid.into());
     };
@@ -327,7 +330,7 @@ async fn register(
         }
     };
     state.throttle.succeeded(&attempt);
-    signed_in(&state, &name, req.remember, &origin)
+    signed_in(&state, &name, req.remember, &origin).await
 }
 
 // ---- one's own account -----------------------------------------------------
@@ -405,7 +408,7 @@ async fn change_password(
         }
         None => return Ok(Json(serde_json::json!({ "status": "ok" })).into_response()),
     };
-    signed_in(&state, &account, remember, &origin)
+    signed_in(&state, &account, remember, &origin).await
 }
 
 #[derive(Deserialize)]
@@ -735,6 +738,27 @@ async fn revoke_token_of(
     revoke_token(&state, &admin, &name, &token, &origin).await
 }
 
+/// The audit, newest first, a page at a time, for an administrator
+/// (ADR 18): narrowed by time, account, event and server. Reading it is not
+/// itself a line — the log is of the door, and this is not a door.
+async fn audit_lines(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(query): Query<AuditQuery>,
+) -> ApiResult<Json<AuditPage>> {
+    authorize_admin(&state, &headers, &mut Origin::new(peer, &headers), "audit")?;
+    let Some(log) = state.audit.log() else {
+        return Err(ApiError::NotFound(
+            "this bridge keeps no audit: start it with --audit-log, or on a database".to_string(),
+        ));
+    };
+    log.query(query)
+        .await
+        .map(Json)
+        .map_err(|e| ApiError::Upstream(format!("the audit could not be read: {e}")))
+}
+
 async fn list_invites(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -882,7 +906,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("zedis-account-api-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).expect("dir");
         let state = state(&dir);
-        let token = state.setup.mint().expect("token");
+        let token = state.setup.mint().await.expect("token");
         assert!(setup_state(State(state.clone())).await.open);
 
         let seat = |token: &str, name: &str| {
@@ -1084,8 +1108,56 @@ mod tests {
         (state, names)
     }
 
+    /// An administrator reads the audit back, narrowed; any other account
+    /// is refused, and a bridge that keeps none says so (ADR 18).
+    #[tokio::test]
+    async fn an_administrator_reads_the_audit() {
+        let dir = std::env::temp_dir().join(format!("zedis-audit-route-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let (state, names) = handover_state(&dir);
+        seat_alice(&state).await;
+        let read = |who: &str, query: AuditQuery| audit_lines(State(state.clone()), peer(), basic(who), Query(query));
+        let Ok(Json(page)) = read("alice:alice-password", AuditQuery::default()).await else {
+            panic!("an administrator reads the audit");
+        };
+        let events: Vec<String> = page
+            .lines
+            .iter()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line.get()).expect("json")["event"].to_string())
+            .collect();
+        assert!(events.contains(&"\"setup_completed\"".to_string()), "{events:?}");
+        let narrowed = read(
+            "alice:alice-password",
+            AuditQuery {
+                event: Some("nothing_is_called_this".to_string()),
+                ..AuditQuery::default()
+            },
+        )
+        .await;
+        assert!(matches!(narrowed, Ok(Json(page)) if page.lines.is_empty()));
+
+        let bob = format!("{}:bob-password", names.bob);
+        assert!(matches!(
+            read(&bob, AuditQuery::default()).await,
+            Err(ApiError::Forbidden(_))
+        ));
+        let silent = AppState {
+            audit: crate::audit::Audit::off(),
+            ..state.clone()
+        };
+        let none = audit_lines(
+            State(silent),
+            peer(),
+            basic("alice:alice-password"),
+            Query(AuditQuery::default()),
+        )
+        .await;
+        assert!(matches!(none, Err(ApiError::NotFound(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     async fn seat_alice(state: &AppState) {
-        let token = state.setup.mint().expect("token");
+        let token = state.setup.mint().await.expect("token");
         let seated = setup(
             State(state.clone()),
             peer(),

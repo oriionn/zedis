@@ -1258,6 +1258,59 @@ pub fn get_servers() -> Result<Vec<RedisServer>> {
     }
 }
 
+/// Replace the in-memory list with one a store other than
+/// `redis-servers.toml` keeps — the bridge's database (ADR 18): what
+/// `get_servers` / `get_server` answer, and the pool dials from, from now on.
+/// Secrets opened ([`open_server_secrets`]). The file is neither read nor
+/// written afterwards, and the desktop never calls this.
+#[cfg(not(target_family = "wasm"))]
+pub fn set_servers_cache(servers: Vec<RedisServer>) {
+    let configs = servers
+        .into_iter()
+        .map(|server| (server.id.clone(), server))
+        .collect::<HashMap<_, _>>();
+    store_server_configs(configs);
+}
+
+/// The entries of the `redis-servers.toml` at `path`, secrets opened — what
+/// `zedis-bridge import-local` copies into a database (ADR 18). Only read:
+/// unlike the list's own loader, a damaged file is an error here and is
+/// left where it is, and the cache is not touched. No file, or an empty
+/// one — what a bridge that never had an entry leaves — is no entries.
+#[cfg(not(target_family = "wasm"))]
+pub fn read_servers_file(path: &std::path::Path) -> Result<Vec<RedisServer>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    if text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut servers = toml::from_str::<RedisServers>(&text)
+        .map_err(|e| Error::Invalid { message: e.to_string() })?
+        .servers;
+    for server in servers.iter_mut() {
+        open_server_secrets(server);
+    }
+    Ok(servers)
+}
+
+/// `server` as a store keeps it: each secret sealed with the master key, as
+/// [`save_servers`] seals them for the file.
+#[cfg(not(target_family = "wasm"))]
+pub fn seal_server_secrets(server: &mut RedisServer) -> Result<()> {
+    map_secrets(server, encrypt)
+}
+
+/// `server` as a store gave it back, secrets opened. A value that does not
+/// open was written in the clear and is taken as it is — the file's reader
+/// does the same.
+#[cfg(not(target_family = "wasm"))]
+pub fn open_server_secrets(server: &mut RedisServer) {
+    let _ = map_secrets(server, |value| Ok(decrypt(value).unwrap_or_else(|_| value.to_string())));
+}
+
 /// Replace the in-memory list, for the browser build.
 ///
 /// What the bridge answered to `GET /v1/servers`: ids and display names, and
@@ -1538,6 +1591,28 @@ mod upgrade_fixtures {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What `import-local` reads: no file and an empty one are no entries,
+    /// a damaged one is an error, and a file's entries come back as written.
+    #[test]
+    fn a_server_file_is_read_without_touching_the_list() {
+        let dir = std::env::temp_dir().join(format!("zedis-read-servers-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("redis-servers.toml");
+        assert!(read_servers_file(&path).expect("no file").is_empty());
+        std::fs::write(&path, "\n").expect("write");
+        assert!(read_servers_file(&path).expect("empty file").is_empty());
+        std::fs::write(
+            &path,
+            "[[servers]]\nid = \"a\"\nname = \"one\"\nhost = \"h\"\nport = 1\n",
+        )
+        .expect("write");
+        let servers = read_servers_file(&path).expect("file");
+        assert_eq!((servers.len(), servers[0].name.as_str()), (1, "one"));
+        std::fs::write(&path, "not toml [").expect("write");
+        assert!(read_servers_file(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn every_listed_secret_is_a_field_and_taking_them_leaves_none() {

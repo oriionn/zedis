@@ -51,14 +51,15 @@
 //! an outage, and a bridge that stops is a bridge someone goes around.
 
 use crate::policy::{Verdict, words};
-use crate::store::AuditLog;
+use crate::store::{AuditEntry, AuditLog, AuditPage, AuditQuery, StoreFuture, blocking};
 use crate::webhook::Webhook;
 use axum::http::HeaderMap;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -71,6 +72,12 @@ use zedis_connection::{
 pub const LOG_ENV: &str = "ZEDIS_BRIDGE_AUDIT_LOG";
 /// `--audit-writes` likewise; `1` / `true` switch it on.
 pub const WRITES_ENV: &str = "ZEDIS_BRIDGE_AUDIT_WRITES";
+/// `--audit-log off`: no audit, where a database would keep one (ADR 18).
+pub const OFF: &str = "off";
+/// How long a database keeps the audit, in days; `0` is for ever. A file
+/// keeps everything — rotating it is the host's.
+pub const RETENTION_DAYS_ENV: &str = "ZEDIS_BRIDGE_AUDIT_RETENTION_DAYS";
+pub const RETENTION_DAYS: u32 = 365;
 
 /// An argument longer than this is cut: a value is not what the log is for.
 const MAX_ARG_CHARS: usize = 128;
@@ -110,8 +117,160 @@ impl LocalAuditLog {
     }
 }
 
+/// How much of the file one page of a query reads at most, back from where
+/// the last page stopped: the viewer answers "lately", and says when it
+/// stopped short.
+const QUERY_SCAN_BYTES: u64 = 16 * 1024 * 1024;
+
+/// What a query reads of a line to decide whether it matches.
+#[derive(Deserialize)]
+struct Head {
+    ts: String,
+    account: String,
+    event: String,
+    #[serde(default)]
+    server: Option<About>,
+}
+
+#[derive(Deserialize)]
+struct About {
+    id: String,
+}
+
+/// The server a line is about, by id — what the database files it under.
+fn server_of(line: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    struct OnlyServer {
+        #[serde(default)]
+        server: Option<About>,
+    }
+    serde_json::from_slice::<OnlyServer>(line).ok()?.server.map(|s| s.id)
+}
+
+/// A line's `ts` as unix milliseconds — the inverse of [`rfc3339`], for the
+/// one format it writes (`YYYY-MM-DDTHH:MM:SS.mmmZ`).
+pub(crate) fn ms_of_ts(ts: &str) -> Option<i64> {
+    let bytes = ts.as_bytes();
+    if bytes.len() != 24 || bytes[23] != b'Z' {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| ts.get(range)?.parse::<i64>().ok();
+    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
+    let (hour, minute, second, millis) = (number(11..13)?, number(14..16)?, number(17..19)?, number(20..23)?);
+    // Howard Hinnant's days-from-civil.
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    Some(((days * 86_400 + hour * 3_600 + minute * 60 + second) * 1_000) + millis)
+}
+
+/// What `import-local` makes of a line of an audit file: the entry it would
+/// have been, or `None` for a line that is not one.
+pub(crate) fn entry_of(line: &[u8]) -> Option<AuditEntry> {
+    let head: Head = serde_json::from_slice(line).ok()?;
+    Some(AuditEntry {
+        at_ms: ms_of_ts(&head.ts)?,
+        account: head.account,
+        event: head.event,
+        server: head.server.map(|about| about.id),
+        line: line.to_vec(),
+    })
+}
+
+/// `ms` as a line's `ts`: the file is read by comparing the two as text,
+/// which their one fixed format makes the same as comparing times.
+fn ts_of(ms: i64) -> String {
+    let ms = u64::try_from(ms).unwrap_or(0);
+    rfc3339(ms / 1000, u32::try_from(ms % 1000).unwrap_or(0))
+}
+
+/// A page of the file at `path`, read back from `before` (a byte offset)
+/// or its end, at most [`QUERY_SCAN_BYTES`] of it. The lines are in the order
+/// they were written, so the first one older than `since` ends it.
+fn query_file(path: &Path, query: &AuditQuery) -> std::io::Result<AuditPage> {
+    query_file_within(path, query, QUERY_SCAN_BYTES)
+}
+
+/// [`query_file`], reading at most `scan` bytes.
+fn query_file_within(path: &Path, query: &AuditQuery, scan: u64) -> std::io::Result<AuditPage> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(AuditPage::default()),
+        Err(e) => return Err(e),
+    };
+    let len = file.metadata()?.len();
+    let end = query
+        .before
+        .as_deref()
+        .and_then(|at| at.parse::<u64>().ok())
+        .map_or(len, |at| at.min(len));
+    let floor = end.saturating_sub(scan);
+    let mut window = vec![0u8; usize::try_from(end - floor).unwrap_or(0)];
+    file.seek(SeekFrom::Start(floor))?;
+    file.read_exact(&mut window)?;
+    // A window that starts mid-line leaves that part for the next page.
+    let skip = if floor == 0 {
+        0
+    } else {
+        window
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(window.len(), |at| at + 1)
+    };
+    let since = query.since_ms.map(ts_of);
+    let until = query.until_ms.map(ts_of);
+    let limit = query.limit();
+    let mut page = AuditPage::default();
+    let mut line_end = window.len();
+    while line_end > skip {
+        let line_start = window[skip..line_end]
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .map_or(skip, |at| skip + at + 1);
+        let line = &window[line_start..line_end];
+        let offset = floor + line_start as u64;
+        line_end = line_start.saturating_sub(1);
+        let Ok(head) = serde_json::from_slice::<Head>(line) else {
+            continue;
+        };
+        if since.as_ref().is_some_and(|since| head.ts < *since) {
+            return Ok(page);
+        }
+        let matches = until.as_ref().is_none_or(|until| head.ts <= *until)
+            && query.account.as_ref().is_none_or(|a| *a == head.account)
+            && query.event.as_ref().is_none_or(|e| *e == head.event)
+            && query
+                .server
+                .as_ref()
+                .is_none_or(|s| head.server.as_ref().is_some_and(|about| about.id == *s));
+        if !matches {
+            continue;
+        }
+        let text = String::from_utf8_lossy(line).into_owned();
+        if let Ok(raw) = RawValue::from_string(text) {
+            page.lines.push(raw);
+        }
+        if page.lines.len() == limit {
+            page.next = (offset > 0).then(|| offset.to_string());
+            return Ok(page);
+        }
+    }
+    if floor > 0 {
+        page.stopped_early = true;
+        // Before the line the window started inside — or, for a line
+        // longer than a window, before the window, so the next page moves.
+        let resume = floor + skip as u64;
+        page.next = Some(if resume < end { resume } else { floor }.to_string());
+    }
+    Ok(page)
+}
+
 impl AuditLog for LocalAuditLog {
-    fn append(&self, mut line: Vec<u8>) {
+    fn append(&self, entry: AuditEntry) {
+        let mut line = entry.line;
         line.push(b'\n');
         // A poisoned lock means another writer panicked mid-line; the file
         // is still the file, and losing every later line over it is worse.
@@ -119,6 +278,16 @@ impl AuditLog for LocalAuditLog {
         if let Err(e) = file.write_all(&line) {
             tracing::error!(error = %e, path = %self.path.display(), "audit line lost");
         }
+    }
+
+    fn query(&self, query: AuditQuery) -> StoreFuture<AuditPage> {
+        let path = self.path.clone();
+        let read = blocking(move || query_file(&path, &query));
+        Box::pin(async move { read.await? })
+    }
+
+    fn prune(&self, _before_ms: i64) -> StoreFuture<u64> {
+        Box::pin(async { Ok(0) })
     }
 }
 
@@ -135,6 +304,21 @@ impl Audit {
             writes,
             webhook: None,
         })
+    }
+
+    /// Keep the lines in `log` — the database's (ADR 18).
+    pub fn to(log: Arc<dyn AuditLog>, writes: bool) -> Self {
+        Self {
+            log: Some(log),
+            writes,
+            webhook: None,
+        }
+    }
+
+    /// Where the lines are kept, if anywhere: what the viewer reads and the
+    /// sweeper prunes.
+    pub fn log(&self) -> Option<&Arc<dyn AuditLog>> {
+        self.log.as_ref()
     }
 
     /// Push the lines the webhook wants to it as well.
@@ -155,8 +339,9 @@ impl Audit {
         if self.log.is_none() && self.webhook.is_none() {
             return;
         }
+        let since = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
         let line = Line {
-            ts: rfc3339_now(),
+            ts: rfc3339(since.as_secs(), since.subsec_millis()),
             account,
             peer: origin.peer.as_deref(),
             forwarded_for: origin.forwarded_for.as_deref(),
@@ -178,7 +363,13 @@ impl Audit {
             return;
         };
         match serde_json::to_vec(&line) {
-            Ok(bytes) => log.append(bytes),
+            Ok(bytes) => log.append(AuditEntry {
+                at_ms: i64::try_from(since.as_millis()).unwrap_or(i64::MAX),
+                account: account.to_string(),
+                event: line.event.name().to_string(),
+                server: server_of(&bytes),
+                line: bytes,
+            }),
             Err(e) => tracing::error!(error = %e, "audit line could not be serialised"),
         }
     }
@@ -682,11 +873,6 @@ pub fn is_shared(server: &RedisServer) -> bool {
     server.owner.as_deref().is_none_or(str::is_empty)
 }
 
-fn rfc3339_now() -> String {
-    let since = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    rfc3339(since.as_secs(), since.subsec_millis())
-}
-
 /// `secs` since the epoch as `YYYY-MM-DDTHH:MM:SS.mmmZ`, without a date
 /// crate: the bridge's dependency list is short on purpose, and this is the
 /// one place it needs a calendar (Howard Hinnant's civil-from-days).
@@ -747,6 +933,108 @@ mod tests {
             confirm: None,
             error: None,
         })
+    }
+
+    #[test]
+    fn a_line_s_time_reads_back_as_it_was_written() {
+        for ms in [
+            0_i64,
+            1_700_000_000_123,
+            1_792_314_421_999,
+            951_782_400_000,
+            4_102_444_799_999,
+        ] {
+            let ts = ts_of(ms);
+            assert_eq!(ms_of_ts(&ts), Some(ms), "{ts}");
+        }
+        assert_eq!(ms_of_ts("2026-10-18T07:14:58Z"), None, "not the one format");
+    }
+
+    /// The administrators' viewer reads the file back newest first, narrowed
+    /// and a page at a time; a read that does not reach the start says so
+    /// and goes on from where it stopped (ADR 18).
+    #[test]
+    fn the_file_is_read_back_newest_first_narrowed_and_in_pages() {
+        let dir = std::env::temp_dir().join(format!("zedis-audit-read-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("audit.log");
+        let audit = Audit::open(&path, false).expect("open");
+        let origin = Origin::default();
+        audit.record("alice", &origin, Event::Login { remember: false });
+        audit.record("bob", &origin, Event::Logout);
+        audit.record(
+            "alice",
+            &origin,
+            Event::ServerDeleted {
+                server: ServerRef::from(&server()),
+            },
+        );
+        audit.record("alice", &origin, Event::Logout);
+        let read = |query: AuditQuery| query_file(&path, &query).expect("read");
+        let events = |page: &AuditPage| -> Vec<String> {
+            page.lines
+                .iter()
+                .map(|line| {
+                    let value: Value = serde_json::from_str(line.get()).expect("json");
+                    value["event"].as_str().expect("event").to_string()
+                })
+                .collect()
+        };
+
+        let all = read(AuditQuery::default());
+        assert_eq!(events(&all), ["logout", "server_deleted", "logout", "login"]);
+        assert!(all.next.is_none() && !all.stopped_early);
+        let alice = read(AuditQuery {
+            account: Some("alice".to_string()),
+            ..AuditQuery::default()
+        });
+        assert_eq!(events(&alice), ["logout", "server_deleted", "login"]);
+        let about = read(AuditQuery {
+            server: Some("srv-1".to_string()),
+            ..AuditQuery::default()
+        });
+        assert_eq!(events(&about), ["server_deleted"]);
+        let future = read(AuditQuery {
+            since_ms: Some(32_503_680_000_000),
+            ..AuditQuery::default()
+        });
+        assert!(future.lines.is_empty() && future.next.is_none());
+
+        let first = read(AuditQuery {
+            limit: Some(2),
+            ..AuditQuery::default()
+        });
+        assert_eq!(events(&first), ["logout", "server_deleted"]);
+        let rest = read(AuditQuery {
+            limit: Some(2),
+            before: first.next.clone(),
+            ..AuditQuery::default()
+        });
+        assert_eq!(events(&rest), ["logout", "login"]);
+        assert!(rest.next.is_none(), "the first line ends it");
+
+        // A read of half the file at a time still finds every line, in order.
+        let scan = std::fs::metadata(&path).expect("size").len() / 2;
+        let mut found = Vec::new();
+        let mut before = None;
+        for _ in 0..10 {
+            let page = query_file_within(
+                &path,
+                &AuditQuery {
+                    before: before.clone(),
+                    ..AuditQuery::default()
+                },
+                scan,
+            )
+            .expect("read");
+            found.extend(events(&page));
+            before = page.next;
+            if before.is_none() {
+                break;
+            }
+        }
+        assert_eq!(found, ["logout", "server_deleted", "logout", "login"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The webhook gets what a team wants to hear of at once — a failed

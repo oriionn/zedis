@@ -37,7 +37,7 @@ use futures::channel::mpsc::UnboundedReceiver;
 #[cfg(target_family = "wasm")]
 use futures::future::{self, Either};
 #[cfg(target_family = "wasm")]
-use gpui::{Application, ApplicationHandle};
+use gpui::{Application, ApplicationHandle, AsyncApp};
 #[cfg(target_family = "wasm")]
 use gpui_web::{CanvasFontFallback, WebBackendPreference, WebPlatform};
 #[cfg(target_family = "wasm")]
@@ -50,6 +50,8 @@ use std::collections::HashSet;
 use std::rc::Rc;
 #[cfg(target_family = "wasm")]
 use std::sync::Arc;
+#[cfg(target_family = "wasm")]
+use std::time::Duration;
 #[cfg(target_family = "wasm")]
 use tracing::{error, info};
 #[cfg(target_family = "wasm")]
@@ -237,35 +239,61 @@ pub fn run(
         // and redraws only when the answer differs from what it holds. A
         // round that lands between this page's own save and that save's
         // re-list can carry a list a moment stale; the re-list corrects it
-        // on the same path, so the worst case is one redraw too many.
-        cx.spawn(async move |cx| {
-            let servers = transport.fetch_servers().await;
-            let _ = cx.update(|cx| match servers {
-                Ok(list) => {
-                    info!(count = list.len(), "server list from the bridge");
-                    apply_server_list(list, cx);
-                }
-                Err(e) => error!(error = %e, "the server list could not be fetched"),
-            });
-            loop {
-                cx.background_executor().timer(SERVER_LIST_REFRESH).await;
-                if unattended() {
-                    continue;
-                }
-                match transport.fetch_servers().await {
-                    Ok(list) => {
-                        let _ = cx.update(|cx| apply_server_list(list, cx));
-                    }
-                    // A missed round is a missed round; the next one is a
-                    // minute away and the page keeps the list it has.
-                    Err(e) => info!(error = %e, "server list refresh skipped"),
-                }
-            }
-        })
-        .detach();
+        // on the same path, so the worst case is one redraw too many. And it
+        // asks at once when the page has just changed whose entries are whose
+        // (an account deleted, what one left behind settled).
+        if let Some(requests) = transport.take_server_list_requests() {
+            follow_server_list(transport, requests, cx);
+        }
     });
     APP.with(|slot| *slot.borrow_mut() = Some(handle));
     Ok(())
+}
+
+/// Wait for a loop's next round: `wait` gone by, or an ask on `requests` —
+/// asks that came together are one round. Answers whether it was asked
+/// for, or `None` once nothing can ask any more (the transport holds the
+/// sender for the life of the page, so that is the page going).
+#[cfg(target_family = "wasm")]
+async fn next_round(cx: &AsyncApp, wait: Duration, requests: &mut UnboundedReceiver<()>) -> Option<bool> {
+    let timer = cx.background_executor().timer(wait);
+    let asked = match future::select(timer, requests.next()).await {
+        Either::Left(_) => false,
+        Either::Right((Some(()), _)) => true,
+        Either::Right((None, _)) => return None,
+    };
+    while requests.try_recv().is_ok() {}
+    Some(asked)
+}
+
+/// Fetch the server list, then keep it current: every `SERVER_LIST_REFRESH`
+/// while someone is looking, and at once when asked.
+#[cfg(target_family = "wasm")]
+fn follow_server_list(transport: Arc<HttpBridgeTransport>, mut requests: UnboundedReceiver<()>, cx: &mut gpui::App) {
+    cx.spawn(async move |cx| {
+        let servers = transport.fetch_servers().await;
+        let _ = cx.update(|cx| match servers {
+            Ok(list) => {
+                info!(count = list.len(), "server list from the bridge");
+                apply_server_list(list, cx);
+            }
+            Err(e) => error!(error = %e, "the server list could not be fetched"),
+        });
+        while let Some(asked) = next_round(cx, SERVER_LIST_REFRESH, &mut requests).await {
+            if !asked && unattended() {
+                continue;
+            }
+            match transport.fetch_servers().await {
+                Ok(list) => {
+                    let _ = cx.update(|cx| apply_server_list(list, cx));
+                }
+                // A missed round is a missed round; the next one is a
+                // minute away and the page keeps the list it has.
+                Err(e) => info!(error = %e, "server list refresh skipped"),
+            }
+        }
+    })
+    .detach();
 }
 
 /// Keep the page data current with what other accounts change — the key
@@ -280,20 +308,11 @@ fn follow_page_data(transport: Arc<HttpBridgeTransport>, mut requests: Unbounded
     cx.spawn(async move |cx| {
         let mut etag: Option<String> = None;
         let mut wait = PAGE_DATA_REFRESH;
-        loop {
-            let timer = cx.background_executor().timer(wait);
-            let asked = match future::select(timer, requests.next()).await {
-                Either::Left(_) => false,
-                Either::Right((Some(()), _)) => true,
-                // The transport holds the sender for the life of the page.
-                Either::Right((None, _)) => return,
-            };
+        while let Some(asked) = next_round(cx, wait, &mut requests).await {
             wait = PAGE_DATA_REFRESH;
             if !asked && unattended() {
                 continue;
             }
-            // Asks that came together are one read.
-            while requests.try_recv().is_ok() {}
             let generation = zedis_gui::states::page_data_generation();
             let answer = match transport.fetch_page_data(etag.clone()).await {
                 Ok(Some(answer)) => answer,

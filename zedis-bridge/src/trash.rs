@@ -111,7 +111,7 @@ pub struct LocalTrash {
 /// A name the bin may use as a file name: the entry ids the bridge stamps
 /// and its own entry ids are both plain, and anything else is refused before
 /// it is joined to a path.
-fn plain(name: &str) -> bool {
+pub(crate) fn plain(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 128
         && name
@@ -119,7 +119,7 @@ fn plain(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -252,6 +252,21 @@ impl LocalTrash {
     }
 
     /// Forget a server's whole bin: the entry itself is gone.
+    /// The servers that have a bin here, by id: what `import-local` copies.
+    pub fn servers(&self) -> Vec<String> {
+        let Ok(dirs) = fs::read_dir(self.root.as_path()) else {
+            return Vec::new();
+        };
+        let mut servers: Vec<String> = dirs
+            .flatten()
+            .filter(|d| d.path().is_dir())
+            .filter_map(|d| d.file_name().into_string().ok())
+            .filter(|name| plain(name))
+            .collect();
+        servers.sort();
+        servers
+    }
+
     pub fn remove_server(&self, server_id: &str) {
         if let Some(dir) = self.server_dir(server_id) {
             let _ = fs::remove_dir_all(dir);

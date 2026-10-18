@@ -147,9 +147,25 @@ pub fn router(state: AppState) -> Router {
 /// server side counts idleness from the last request, but the browser
 /// dropped the cookie `Max-Age` after it was *set* — so "signed out after 8
 /// hours idle" was "signed out 8 hours after signing in", busy or not.
+///
+/// And before the request: a login another process opened is taken in from
+/// the store, and an account it registered is read, so the route's
+/// `authorize` — not async, and asked everywhere — finds them in memory
+/// (ADR 18).
 async fn renew_login_cookie(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let cookie = request.headers().get("cookie").and_then(|v| v.to_str().ok());
     let id = auth::cookie_value(cookie).map(str::to_string);
+    if let Some(id) = &id {
+        state.logins.fetch(id, &state.accounts).await;
+    }
+    // A script's account another process registered within the last poll:
+    // read the accounts again before `authorize` turns it away.
+    let basic = request.headers().get("authorization").and_then(|v| v.to_str().ok());
+    if let Some((name, _)) = auth::basic_credentials(basic)
+        && !state.accounts.exists(&name)
+    {
+        state.accounts.catch_up().await;
+    }
     let mut response = next.run(request).await;
     // A route that set a cookie of its own (login, logout) has the last word.
     if let Some(id) = id
@@ -533,7 +549,8 @@ async fn login(
     let account = req.username;
     let id = state
         .logins
-        .open(&account, &state.accounts, req.remember)
+        .open_saved(&account, &state.accounts, req.remember)
+        .await
         .ok_or(ApiError::Unauthorized)?;
     tracing::info!(account, remember = req.remember, "login");
     state
@@ -789,6 +806,9 @@ impl ServerEntry {
 /// What `GET /v1/clients` answers.
 #[derive(Serialize)]
 struct ClientsReply {
+    /// The bridge process that answers: each counts its own clients, and
+    /// several share a database store (ADR 18).
+    process: &'static str,
     /// How many clients made a request within the window.
     online: usize,
     window_secs: u64,
@@ -814,6 +834,7 @@ async fn clients(
     }
     let clients = state.presence.online();
     Ok(Json(ClientsReply {
+        process: crate::store::process_id(),
         online: clients.len(),
         window_secs: ONLINE_WINDOW.as_secs(),
         clients,

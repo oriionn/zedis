@@ -28,7 +28,7 @@
 //! code cannot be guessed at the speed of the network.
 
 use crate::accounts::Accounts;
-use crate::store::{LoginStore, StoreFuture, blocking};
+use crate::store::{LoginStore, StoreFuture, ThrottleStore, blocking};
 use axum::http::{HeaderMap, HeaderName};
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use serde::{Deserialize, Serialize};
@@ -412,15 +412,25 @@ struct LoginsInner {
 #[derive(Default)]
 struct LoginState {
     logins: HashMap<String, Login>,
-    /// What changed since the last flush: `None` is gone.
-    pending: HashMap<String, Option<Login>>,
+    /// What changed since the last flush.
+    pending: HashMap<String, LoginChange>,
+}
+
+/// What became of a login since the last flush. A use is told apart from a
+/// sign-in because a store shared by several processes (ADR 18) must never
+/// let a use put back a login another process signed out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoginChange {
+    Opened(Login),
+    Used(Login),
+    Closed,
 }
 
 impl LoginState {
     fn forget(&mut self, key: &str) -> Option<Login> {
         let removed = self.logins.remove(key);
         if removed.is_some() {
-            self.pending.insert(key.to_string(), None);
+            self.pending.insert(key.to_string(), LoginChange::Closed);
         }
         removed
     }
@@ -481,10 +491,60 @@ impl Logins {
             let mut state = self.lock();
             let key = login_key(&id);
             state.logins.insert(key.clone(), login.clone());
-            state.pending.insert(key, Some(login));
+            state.pending.insert(key, LoginChange::Opened(login));
         }
         self.flush_soon();
         Some(id)
+    }
+
+    /// [`Logins::open`], saved before it answers: the browser's next request
+    /// may reach another process, which looks the login up in the store
+    /// (ADR 18).
+    pub async fn open_saved(&self, account: &str, accounts: &Accounts, remember: bool) -> Option<String> {
+        let id = self.open(account, accounts, remember)?;
+        self.flush().await;
+        Some(id)
+    }
+
+    /// Take in a login another process opened: one this process does not
+    /// hold is looked up in the store before a request with its cookie is
+    /// answered (ADR 18). One the local directory's store, read by this
+    /// process alone, never has.
+    pub async fn fetch(&self, id: &str, accounts: &Accounts) {
+        let key = login_key(id);
+        if self.lock().logins.contains_key(&key) {
+            return;
+        }
+        let login = match self.0.store.get(key.clone()).await {
+            Ok(Some(login)) => login,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, "a login could not be looked up");
+                return;
+            }
+        };
+        let now = now_secs();
+        // Opened for an account this process has not read yet — registered
+        // or changed on another one within the last poll — the accounts are
+        // read now rather than the login turned away. Only a login the store
+        // holds can ask for this, and only one newer than what is held.
+        let newer = accounts
+            .known_version(&login.account)
+            .is_none_or(|held| login.version > held);
+        if newer && login.live_at(now) {
+            accounts.catch_up().await;
+        }
+        if login.stands(now, accounts) {
+            self.lock().logins.entry(key).or_insert(login);
+        }
+    }
+
+    /// Forget the logins held here — another process signed one out — and
+    /// take each from the store again as its cookie comes back. What changed
+    /// here goes to the store first.
+    pub async fn drop_cached(&self) {
+        self.flush().await;
+        self.lock().logins.clear();
     }
 
     /// How long a live login `id` may now sit idle — what its cookie's
@@ -515,7 +575,12 @@ impl Logins {
         {
             login.last_used = now;
             let touched = login.clone();
-            state.pending.insert(key, Some(touched));
+            // A sign-in not flushed yet stays one, at its new time.
+            let change = match state.pending.get(&key) {
+                Some(LoginChange::Opened(_)) => LoginChange::Opened(touched),
+                _ => LoginChange::Used(touched),
+            };
+            state.pending.insert(key, change);
         }
         Some(account)
     }
@@ -549,7 +614,7 @@ impl Logins {
     /// take is kept for the next one, unless something newer replaced it.
     pub async fn flush(&self) {
         let _one = self.0.flush.lock().await;
-        let changes: Vec<(String, Option<Login>)> = self.lock().pending.drain().collect();
+        let changes: Vec<(String, LoginChange)> = self.lock().pending.drain().collect();
         if changes.is_empty() {
             return;
         }
@@ -612,15 +677,30 @@ impl LoginStore for LocalLogins {
         blocking(move || store.read().logins)
     }
 
-    fn save(&self, changes: Vec<(String, Option<Login>)>) -> StoreFuture<()> {
+    /// Nothing: one process writes the file, and it holds every login the
+    /// file has.
+    fn get(&self, _key: String) -> StoreFuture<Option<Login>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn save(&self, changes: Vec<(String, LoginChange)>) -> StoreFuture<()> {
         let store = self.clone();
         let write = blocking(move || {
             let _held = store.lock.lock().unwrap_or_else(PoisonError::into_inner);
             let mut file = store.read();
             for (key, change) in changes {
                 match change {
-                    Some(login) => file.logins.insert(key, login),
-                    None => file.logins.remove(&key),
+                    LoginChange::Opened(login) => {
+                        file.logins.insert(key, login);
+                    }
+                    LoginChange::Used(login) => {
+                        if let Some(kept) = file.logins.get_mut(&key) {
+                            kept.last_used = kept.last_used.max(login.last_used);
+                        }
+                    }
+                    LoginChange::Closed => {
+                        file.logins.remove(&key);
+                    }
                 };
             }
             let bytes = serde_json::to_vec(&file).map_err(std::io::Error::other)?;
@@ -657,12 +737,28 @@ impl LoginStore for MemoryLogins {
         Box::pin(async move { Ok(held) })
     }
 
-    fn save(&self, changes: Vec<(String, Option<Login>)>) -> StoreFuture<()> {
+    fn get(&self, key: String) -> StoreFuture<Option<Login>> {
+        let held = self.0.lock().unwrap_or_else(PoisonError::into_inner).get(&key).cloned();
+        Box::pin(async move { Ok(held) })
+    }
+
+    /// As a database would: a use changes a login that is there and
+    /// never puts one back.
+    fn save(&self, changes: Vec<(String, LoginChange)>) -> StoreFuture<()> {
         let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         for (key, change) in changes {
             match change {
-                Some(login) => held.insert(key, login),
-                None => held.remove(&key),
+                LoginChange::Opened(login) => {
+                    held.insert(key, login);
+                }
+                LoginChange::Used(login) => {
+                    if let Some(kept) = held.get_mut(&key) {
+                        kept.last_used = kept.last_used.max(login.last_used);
+                    }
+                }
+                LoginChange::Closed => {
+                    held.remove(&key);
+                }
             };
         }
         Box::pin(async { Ok(()) })
@@ -681,8 +777,31 @@ pub const THROTTLE_WINDOW: Duration = Duration::from_secs(15 * 60);
 /// password: behind a reverse proxy every request comes from one address,
 /// and someone guessing one account's password must not lock everyone else
 /// out.
+///
+/// Decided in this process's memory. Where several processes share a
+/// store, each failure is also kept there and the others' are merged in at
+/// each poll ([`Throttle::merge`]), so ten tries are ten across all of them
+/// (ADR 18).
 #[derive(Clone, Default)]
-pub struct Throttle(Arc<Mutex<HashMap<String, Vec<Instant>>>>);
+pub struct Throttle {
+    failures: Arc<Mutex<Failures>>,
+    shared: Option<SharedThrottle>,
+}
+
+#[derive(Default)]
+struct Failures {
+    /// What this process saw.
+    own: HashMap<String, Vec<Instant>>,
+    /// What the others saw, as the last merge read it.
+    others: HashMap<String, Vec<Instant>>,
+}
+
+#[derive(Clone)]
+struct SharedThrottle {
+    store: Arc<dyn ThrottleStore>,
+    /// This process, so its own failures are not counted twice.
+    process: String,
+}
 
 /// What [`Throttle`] counts an attempt under: the peer and what it tried.
 pub fn attempt_key(peer: Option<IpAddr>, what: &str) -> String {
@@ -695,34 +814,116 @@ impl Throttle {
         Self::default()
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<String, Vec<Instant>>> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    /// A throttle that shares its failures through `store`, as `process`.
+    pub fn shared(store: Arc<dyn ThrottleStore>, process: String) -> Self {
+        Self {
+            failures: Arc::default(),
+            shared: Some(SharedThrottle { store, process }),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Failures> {
+        self.failures.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Whether `key` has failed [`THROTTLE_LIMIT`] times in the window.
     pub fn blocked(&self, key: &str) -> bool {
-        self.lock().get(key).is_some_and(|failures| {
-            failures.iter().filter(|at| at.elapsed() < THROTTLE_WINDOW).count() >= THROTTLE_LIMIT
-        })
+        let failures = self.lock();
+        let recent = |held: &HashMap<String, Vec<Instant>>| {
+            held.get(key)
+                .map_or(0, |at| at.iter().filter(|at| at.elapsed() < THROTTLE_WINDOW).count())
+        };
+        recent(&failures.own) + recent(&failures.others) >= THROTTLE_LIMIT
     }
 
     pub fn failed(&self, key: &str) {
-        self.lock().entry(key.to_string()).or_default().push(Instant::now());
+        self.lock().own.entry(key.to_string()).or_default().push(Instant::now());
+        if let Some(shared) = &self.shared {
+            let kept = shared
+                .store
+                .failed(shared.process.clone(), key.to_string(), now_millis());
+            spawn_store_write("a failed sign-in could not be shared", kept);
+        }
     }
 
     pub fn succeeded(&self, key: &str) {
-        self.lock().remove(key);
+        let mut failures = self.lock();
+        failures.own.remove(key);
+        failures.others.remove(key);
+        if let Some(shared) = &self.shared {
+            spawn_store_write(
+                "a sign-in's failures could not be forgotten",
+                shared.store.succeeded(key.to_string()),
+            );
+        }
     }
 
-    /// Forget the failures past the window. Answers how many keys went.
-    pub fn sweep(&self) -> usize {
-        let mut held = self.lock();
-        let before = held.len();
-        held.retain(|_, failures| {
-            failures.retain(|at| at.elapsed() < THROTTLE_WINDOW);
-            !failures.is_empty()
+    /// Read what the other processes saw in the window. Nothing to do for
+    /// one process.
+    pub async fn merge(&self) {
+        let Some(shared) = &self.shared else {
+            return;
+        };
+        let now = now_millis();
+        let window = i64::try_from(THROTTLE_WINDOW.as_millis()).unwrap_or(i64::MAX);
+        let seen = match shared.store.others(shared.process.clone(), now - window).await {
+            Ok(seen) => seen,
+            Err(e) => {
+                tracing::warn!(error = %e, "the other processes' failed sign-ins could not be read");
+                return;
+            }
+        };
+        let mut others: HashMap<String, Vec<Instant>> = HashMap::new();
+        for (key, at_ms) in seen {
+            let ago = Duration::from_millis(u64::try_from(now - at_ms).unwrap_or(0));
+            if let Some(at) = Instant::now().checked_sub(ago) {
+                others.entry(key).or_default().push(at);
+            }
+        }
+        self.lock().others = others;
+    }
+
+    /// Forget the failures past the window — here, and in a shared store.
+    /// Answers how many keys went here.
+    pub async fn sweep(&self) -> usize {
+        let gone = {
+            let mut guard = self.lock();
+            let failures = &mut *guard;
+            let before = failures.own.len();
+            for held in [&mut failures.own, &mut failures.others] {
+                held.retain(|_, at| {
+                    at.retain(|at| at.elapsed() < THROTTLE_WINDOW);
+                    !at.is_empty()
+                });
+            }
+            before - failures.own.len()
+        };
+        if let Some(shared) = &self.shared {
+            let window = i64::try_from(THROTTLE_WINDOW.as_millis()).unwrap_or(i64::MAX);
+            if let Err(e) = shared.store.prune(now_millis() - window).await {
+                tracing::warn!(error = %e, "old failed sign-ins could not be pruned");
+            }
+        }
+        gone
+    }
+}
+
+/// Unix milliseconds now.
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// A store write nobody waits for: off the request, its failure a line in
+/// the process log. Outside a runtime — a test — it is dropped.
+fn spawn_store_write(what: &'static str, write: StoreFuture<()>) {
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(async move {
+            if let Err(e) = write.await {
+                tracing::warn!(error = %e, "{what}");
+            }
         });
-        before - held.len()
     }
 }
 
@@ -1096,8 +1297,8 @@ mod tests {
 
     /// Guessing is turned away after the limit, right or wrong, per address
     /// and what was tried; a success clears the count.
-    #[test]
-    fn failed_attempts_are_counted_per_address_and_name() {
+    #[tokio::test]
+    async fn failed_attempts_are_counted_per_address_and_name() {
         let throttle = Throttle::new();
         let alice = attempt_key(Some(ip("10.0.0.7")), "alice");
         let bob = attempt_key(Some(ip("10.0.0.7")), "bob");
@@ -1118,6 +1319,124 @@ mod tests {
         );
         throttle.succeeded(&alice);
         assert!(!throttle.blocked(&alice));
-        assert_eq!(throttle.sweep(), 0, "nothing in the window has aged out");
+        assert_eq!(throttle.sweep().await, 0, "nothing in the window has aged out");
+    }
+
+    /// A store of failed sign-ins in memory, shared by the "processes" of a
+    /// test as a database is shared by real ones.
+    #[derive(Default)]
+    struct MemoryThrottle(Mutex<Vec<(String, String, i64)>>);
+
+    impl ThrottleStore for MemoryThrottle {
+        fn failed(&self, process: String, key: String, at_ms: i64) -> StoreFuture<()> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((process, key, at_ms));
+            Box::pin(async { Ok(()) })
+        }
+        fn succeeded(&self, key: String) -> StoreFuture<()> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|(_, k, _)| *k != key);
+            Box::pin(async { Ok(()) })
+        }
+        fn others(&self, process: String, since_ms: i64) -> StoreFuture<Vec<(String, i64)>> {
+            let seen = self
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .filter(|(p, _, at)| *p != process && *at >= since_ms)
+                .map(|(_, key, at)| (key.clone(), *at))
+                .collect();
+            Box::pin(async move { Ok(seen) })
+        }
+        fn prune(&self, before_ms: i64) -> StoreFuture<u64> {
+            let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let before = held.len();
+            held.retain(|(_, _, at)| *at >= before_ms);
+            let gone = (before - held.len()) as u64;
+            Box::pin(async move { Ok(gone) })
+        }
+    }
+
+    /// Let the store writes `failed` and `succeeded` spawned land.
+    async fn settle() {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Ten failed tries are ten across every process on one store, not ten
+    /// each — and a success on one clears them for all (ADR 18).
+    #[tokio::test]
+    async fn failed_attempts_are_counted_across_processes() {
+        let store: Arc<dyn ThrottleStore> = Arc::new(MemoryThrottle::default());
+        let one = Throttle::shared(store.clone(), "one".to_string());
+        let two = Throttle::shared(store, "two".to_string());
+        let alice = attempt_key(Some(ip("10.0.0.7")), "alice");
+        for _ in 0..THROTTLE_LIMIT / 2 {
+            one.failed(&alice);
+            two.failed(&alice);
+        }
+        settle().await;
+        assert!(!one.blocked(&alice), "each has seen half, before the merge");
+        one.merge().await;
+        assert!(one.blocked(&alice), "the other's half counts");
+        two.succeeded(&alice);
+        settle().await;
+        one.succeeded(&alice);
+        one.merge().await;
+        assert!(!one.blocked(&alice));
+    }
+
+    /// A login opened for an account registered on another process, which
+    /// this one has not read yet, is taken in: the accounts are read again
+    /// rather than the browser signed out until the next poll.
+    #[tokio::test]
+    async fn a_login_for_an_account_this_process_has_not_read_is_taken_in() {
+        use crate::accounts::{AccountRecord, MemoryAccounts, Role};
+        let shared = Arc::new(MemoryAccounts::default());
+        let one = Accounts::load(shared.clone()).await.expect("load");
+        let two = Accounts::load(shared).await.expect("load");
+        let dave = AccountRecord {
+            name: "dave".to_string(),
+            role: Role::Full,
+            version: 1,
+            ..AccountRecord::default()
+        };
+        one.import(vec![dave]).await.expect("registered on one");
+        assert!(!two.has("dave"), "two has not read it yet");
+
+        let store: Arc<dyn LoginStore> = Arc::new(MemoryLogins::default());
+        let id = Logins::with(store.clone(), HashMap::new())
+            .open_saved("dave", &one, false)
+            .await
+            .expect("login");
+        let logins = Logins::with(store, HashMap::new());
+        logins.fetch(&id, &two).await;
+        assert_eq!(logins.account(&id, &two).as_deref(), Some("dave"));
+    }
+
+    /// A login one process opened is accepted by another on the same store,
+    /// and one signed out is not once the others drop what they held.
+    #[tokio::test]
+    async fn a_login_is_any_process_s_and_a_sign_out_reaches_them_all() {
+        let accounts = Accounts::from_inline("alice@secret").expect("accounts");
+        let store: Arc<dyn LoginStore> = Arc::new(MemoryLogins::default());
+        let one = Logins::with(store.clone(), HashMap::new());
+        let two = Logins::with(store, HashMap::new());
+        let id = one.open_saved("alice", &accounts, false).await.expect("login");
+        assert_eq!(two.account(&id, &accounts), None, "not taken in yet");
+        two.fetch(&id, &accounts).await;
+        assert_eq!(two.account(&id, &accounts).as_deref(), Some("alice"));
+
+        assert_eq!(one.close(&id).as_deref(), Some("alice"));
+        one.flush().await;
+        two.drop_cached().await;
+        two.fetch(&id, &accounts).await;
+        assert_eq!(two.account(&id, &accounts), None);
     }
 }

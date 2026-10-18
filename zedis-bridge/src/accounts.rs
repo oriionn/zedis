@@ -51,18 +51,23 @@
 //! into an empty store ([`import_records`]), and never again.
 
 use crate::auth::{ServerRule, basic_credentials, bearer_token, hex, new_mcp_token, now_secs, parse_expiry, same};
-use crate::store::{AccountStore, StoreFuture, blocking};
+use crate::store::{AccountStore, AccountsAt, SetupStore, StoreFuture, blocking};
 use argon2::{Argon2, PasswordHasher, PasswordVerifier};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 use zedis_connection::RedisServer;
 use zedis_core::fs::write_file_atomic;
+
+/// How many times a change is decided again when another process changed
+/// the accounts under it, before it gives up.
+const CHANGE_ATTEMPTS: usize = 5;
 
 /// The accounts, inline, as they were configured before registration:
 /// `ZEDIS_BRIDGE_USERS="alice@secret,bob:ro@hunter2"`. Imported once.
@@ -363,7 +368,8 @@ pub enum Basic {
 }
 
 /// One change, as the store and the memory both apply it.
-enum Op {
+#[derive(Clone, Debug)]
+pub enum AccountOp {
     PutAccount(AccountRecord),
     RemoveAccount(String),
     PutInvite(InviteRecord),
@@ -374,9 +380,26 @@ enum Op {
 struct State {
     accounts: HashMap<String, Entry>,
     invites: HashMap<String, InviteRecord>,
+    /// The store's version of what this holds: a change is applied against
+    /// it, and refused when another process moved it (ADR 18).
+    version: u64,
 }
 
 impl State {
+    fn at(at: AccountsAt) -> Self {
+        let mut state = Self {
+            version: at.version,
+            ..Self::default()
+        };
+        for record in at.accounts {
+            state.apply(AccountOp::PutAccount(record));
+        }
+        for invite in at.invites {
+            state.apply(AccountOp::PutInvite(invite));
+        }
+        state
+    }
+
     fn live(&self, name: &str) -> Option<&Entry> {
         self.accounts.get(name).filter(|entry| entry.live())
     }
@@ -396,18 +419,18 @@ impl State {
         })
     }
 
-    fn apply(&mut self, op: Op) {
+    fn apply(&mut self, op: AccountOp) {
         match op {
-            Op::PutAccount(record) => {
+            AccountOp::PutAccount(record) => {
                 self.accounts.insert(record.name.clone(), Entry::new(record));
             }
-            Op::RemoveAccount(name) => {
+            AccountOp::RemoveAccount(name) => {
                 self.accounts.remove(&name);
             }
-            Op::PutInvite(invite) => {
+            AccountOp::PutInvite(invite) => {
                 self.invites.insert(invite.id.clone(), invite);
             }
-            Op::RemoveInvite(id) => {
+            AccountOp::RemoveInvite(id) => {
                 self.invites.remove(&id);
             }
         }
@@ -520,18 +543,12 @@ fn new_code() -> String {
 impl Accounts {
     /// The accounts `store` holds.
     pub async fn load(store: Arc<dyn AccountStore>) -> io::Result<Self> {
-        let (accounts, invites) = store.load().await?;
-        Ok(Self::with(store, accounts, invites))
+        let at = store.load().await?;
+        Ok(Self::with(store, at))
     }
 
-    fn with(store: Arc<dyn AccountStore>, accounts: Vec<AccountRecord>, invites: Vec<InviteRecord>) -> Self {
-        let mut state = State::default();
-        for record in accounts {
-            state.apply(Op::PutAccount(record));
-        }
-        for invite in invites {
-            state.apply(Op::PutInvite(invite));
-        }
+    fn with(store: Arc<dyn AccountStore>, at: AccountsAt) -> Self {
+        let state = State::at(at);
         let mut pepper = [0u8; 32];
         pepper[..16].copy_from_slice(Uuid::new_v4().as_bytes());
         pepper[16..].copy_from_slice(Uuid::new_v4().as_bytes());
@@ -550,24 +567,77 @@ impl Accounts {
 
     /// Make the changes `decide` names, one at a time: it reads the
     /// accounts as they are, and what it answers is written to the store
-    /// and then to memory, with nothing else changing in between.
+    /// and then to memory, with nothing else changing in between. When
+    /// another process changed the accounts first, the store refuses the
+    /// write: they are read again and `decide` asked again, on what they are
+    /// now — so a rule like "not the last administrator" holds across
+    /// processes (ADR 18).
     async fn change<T>(
         &self,
-        decide: impl FnOnce(&State) -> Result<(Vec<Op>, T), AccountError>,
+        decide: impl Fn(&State) -> Result<(Vec<AccountOp>, T), AccountError>,
     ) -> Result<T, AccountError> {
         let _edit = self.0.edit.lock().await;
-        let (ops, answer) = decide(&self.read())?;
-        for op in ops {
-            let stored = match &op {
-                Op::PutAccount(record) => self.0.store.put_account(record.clone()).await,
-                Op::RemoveAccount(name) => self.0.store.remove_account(name.clone()).await,
-                Op::PutInvite(invite) => self.0.store.put_invite(invite.clone()).await,
-                Op::RemoveInvite(id) => self.0.store.remove_invite(id.clone()).await,
+        // Whether the accounts were read from the store for this change: a
+        // refusal is made on what the store holds, not on what this process
+        // last read — another one may have added the administrator that
+        // makes a demotion fine.
+        let mut fresh = false;
+        for _ in 0..CHANGE_ATTEMPTS {
+            let decided = {
+                let state = self.read();
+                decide(&state).map(|(ops, answer)| (state.version, ops, answer))
             };
-            stored.map_err(AccountError::Store)?;
-            self.0.state.write().unwrap_or_else(PoisonError::into_inner).apply(op);
+            let (seen, ops, answer) = match decided {
+                Ok(decided) => decided,
+                Err(_) if !fresh => {
+                    self.reload().await.map_err(AccountError::Store)?;
+                    fresh = true;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            if ops.is_empty() {
+                return Ok(answer);
+            }
+            match self.0.store.apply(seen, ops.clone()).await {
+                Ok(Some(version)) => {
+                    let mut state = self.0.state.write().unwrap_or_else(PoisonError::into_inner);
+                    for op in ops {
+                        state.apply(op);
+                    }
+                    state.version = version;
+                    return Ok(answer);
+                }
+                Ok(None) => {
+                    self.reload().await.map_err(AccountError::Store)?;
+                    fresh = true;
+                }
+                Err(e) => return Err(AccountError::Store(e)),
+            }
         }
-        Ok(answer)
+        Err(AccountError::Store(io::Error::other(
+            "the accounts kept changing under this change; try again",
+        )))
+    }
+
+    /// Read the accounts again, as the store has them now.
+    async fn reload(&self) -> io::Result<()> {
+        let at = self.0.store.load().await?;
+        *self.0.state.write().unwrap_or_else(PoisonError::into_inner) = State::at(at);
+        Ok(())
+    }
+
+    /// The store's version of the accounts this process holds — what the
+    /// poll compares (ADR 18).
+    pub fn version_held(&self) -> u64 {
+        self.read().version
+    }
+
+    /// Read the accounts again because another process changed them: the
+    /// poll saw their counter move. Waits for a change in progress here.
+    pub async fn refresh(&self) -> io::Result<()> {
+        let _edit = self.0.edit.lock().await;
+        self.reload().await
     }
 
     // ---- who may do what -------------------------------------------------
@@ -631,6 +701,12 @@ impl Accounts {
     /// no login of it stands: the account is gone or disabled.
     pub fn version(&self, name: &str) -> Option<u64> {
         self.read().live(name).map(|e| e.record.version)
+    }
+
+    /// `name`'s credential version as this process holds it, live or not —
+    /// `None` for an account it has not read.
+    pub fn known_version(&self, name: &str) -> Option<u64> {
+        self.read().accounts.get(name).map(|e| e.record.version)
     }
 
     /// The live accounts with no password — those only a reverse proxy can
@@ -787,9 +863,31 @@ impl Accounts {
     }
 
     /// The open invitation behind `code`, as the page asks before showing
-    /// its form.
-    pub fn invite(&self, code: &str) -> Option<InviteView> {
+    /// its form — read again once if it is not here, since another process
+    /// may have just made it (ADR 18).
+    pub async fn invite(&self, code: &str) -> Option<InviteView> {
+        if let Some(found) = self.read().invite_by_code(code, now_secs()).map(InviteView::from) {
+            return Some(found);
+        }
+        self.catch_up().await;
         self.read().invite_by_code(code, now_secs()).map(InviteView::from)
+    }
+
+    /// For a miss that may only mean another process changed the accounts
+    /// within the last poll — an invitation it made, an account it
+    /// registered: ask the store for their version, and read them again
+    /// only if it moved. A name nobody registered costs that one question,
+    /// never a read of every account.
+    pub async fn catch_up(&self) {
+        match self.0.store.version().await {
+            Ok(version) if version == self.version_held() => {}
+            Ok(_) => {
+                if let Err(e) = self.refresh().await {
+                    tracing::warn!(error = %e, "the accounts could not be read again");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "the accounts' version could not be read"),
+        }
     }
 
     // ---- changes ---------------------------------------------------------
@@ -802,7 +900,7 @@ impl Accounts {
                 return Ok((Vec::new(), 0));
             }
             let count = records.len();
-            Ok((records.into_iter().map(Op::PutAccount).collect(), count))
+            Ok((records.iter().cloned().map(AccountOp::PutAccount).collect(), count))
         })
         .await
     }
@@ -812,7 +910,7 @@ impl Accounts {
     /// there is (the caller has checked its password). Answers whether it
     /// was a promotion.
     pub async fn make_admin(&self, name: &str, password_hash: Option<String>) -> Result<bool, AccountError> {
-        self.change(|state| match (state.accounts.get(name), password_hash) {
+        self.change(|state| match (state.accounts.get(name), password_hash.clone()) {
             (Some(entry), _) => {
                 let mut record = entry.record.clone();
                 record.role = Role::Admin;
@@ -821,7 +919,7 @@ impl Accounts {
                 // be a credential for a door that refuses it.
                 record.tokens.clear();
                 record.version += 1;
-                Ok((vec![Op::PutAccount(record)], true))
+                Ok((vec![AccountOp::PutAccount(record)], true))
             }
             (None, Some(hash)) => {
                 check_new_name(name)?;
@@ -833,7 +931,7 @@ impl Accounts {
                     created_at: now_secs(),
                     ..Default::default()
                 };
-                Ok((vec![Op::PutAccount(record)], false))
+                Ok((vec![AccountOp::PutAccount(record)], false))
             }
             (None, None) => Err(AccountError::NotFound),
         })
@@ -867,7 +965,7 @@ impl Accounts {
             let record = AccountRecord {
                 name: name.to_string(),
                 role: *role,
-                password: password_hash,
+                password: password_hash.clone(),
                 servers: servers.clone(),
                 version: 1,
                 created_at: now_secs(),
@@ -875,7 +973,10 @@ impl Accounts {
             };
             let view = AccountView::from(&record);
             let id = invite.id.clone();
-            Ok((vec![Op::PutAccount(record), Op::RemoveInvite(id.clone())], (view, id)))
+            Ok((
+                vec![AccountOp::PutAccount(record), AccountOp::RemoveInvite(id.clone())],
+                (view, id),
+            ))
         })
         .await
     }
@@ -891,10 +992,13 @@ impl Accounts {
             };
             let entry = state.accounts.get(account).ok_or(AccountError::InviteInvalid)?;
             let mut record = entry.record.clone();
-            record.password = Some(password_hash);
+            record.password = Some(password_hash.clone());
             record.version += 1;
             let (name, id) = (account.clone(), invite.id.clone());
-            Ok((vec![Op::PutAccount(record), Op::RemoveInvite(id.clone())], (name, id)))
+            Ok((
+                vec![AccountOp::PutAccount(record), AccountOp::RemoveInvite(id.clone())],
+                (name, id),
+            ))
         })
         .await
     }
@@ -904,9 +1008,9 @@ impl Accounts {
         self.change(|state| {
             let entry = state.live(name).ok_or(AccountError::NotFound)?;
             let mut record = entry.record.clone();
-            record.password = Some(password_hash);
+            record.password = Some(password_hash.clone());
             record.version += 1;
-            Ok((vec![Op::PutAccount(record)], ()))
+            Ok((vec![AccountOp::PutAccount(record)], ()))
         })
         .await
     }
@@ -935,7 +1039,7 @@ impl Accounts {
                 changed.push(("role", record.role.name().to_string(), role.name().to_string()));
                 record.role = role;
             }
-            if let Some(rules) = servers.filter(|rules| *rules != record.servers) {
+            if let Some(rules) = servers.clone().filter(|rules| *rules != record.servers) {
                 let show = |rules: &Option<Vec<String>>| rules.as_ref().map_or("*".to_string(), |r| r.join(", "));
                 changed.push(("servers", show(&record.servers), show(&rules)));
                 record.servers = rules;
@@ -953,7 +1057,7 @@ impl Accounts {
                 return Err(AccountError::LastAdmin);
             }
             record.version += 1;
-            Ok((vec![Op::PutAccount(record)], changed))
+            Ok((vec![AccountOp::PutAccount(record)], changed))
         })
         .await
     }
@@ -966,13 +1070,13 @@ impl Accounts {
                 return Err(AccountError::LastAdmin);
             }
             // Invitations to reset its password go with it.
-            let mut ops: Vec<Op> = state
+            let mut ops: Vec<AccountOp> = state
                 .invites
                 .values()
                 .filter(|i| matches!(&i.kind, InviteKind::Reset { account } if account == name))
-                .map(|i| Op::RemoveInvite(i.id.clone()))
+                .map(|i| AccountOp::RemoveInvite(i.id.clone()))
                 .collect();
-            ops.push(Op::RemoveAccount(name.to_string()));
+            ops.push(AccountOp::RemoveAccount(name.to_string()));
             Ok((ops, ()))
         })
         .await
@@ -1008,7 +1112,7 @@ impl Accounts {
                 expires_at,
                 created_at: now_secs(),
             });
-            Ok((vec![Op::PutAccount(record)], token))
+            Ok((vec![AccountOp::PutAccount(record)], token))
         })
         .await
     }
@@ -1023,7 +1127,7 @@ impl Accounts {
             if record.tokens.len() == before {
                 return Err(AccountError::NotFound);
             }
-            Ok((vec![Op::PutAccount(record)], ()))
+            Ok((vec![AccountOp::PutAccount(record)], ()))
         })
         .await
     }
@@ -1051,13 +1155,13 @@ impl Accounts {
             let invite = InviteRecord {
                 id: Uuid::now_v7().simple().to_string(),
                 code_sha256: hex(&Sha256::digest(code.as_bytes())),
-                kind,
+                kind: kind.clone(),
                 expires_at: now + days * 86_400,
                 created_by: by.to_string(),
                 created_at: now,
             };
             let view = InviteView::from(&invite);
-            Ok((vec![Op::PutInvite(invite)], (view, code)))
+            Ok((vec![AccountOp::PutInvite(invite)], (view, code)))
         })
         .await
     }
@@ -1068,7 +1172,7 @@ impl Accounts {
             if !state.invites.contains_key(id) {
                 return Err(AccountError::NotFound);
             }
-            Ok((vec![Op::RemoveInvite(id.to_string())], ()))
+            Ok((vec![AccountOp::RemoveInvite(id.to_string())], ()))
         })
         .await
     }
@@ -1077,11 +1181,11 @@ impl Accounts {
     pub async fn purge_expired_invites(&self) -> Result<usize, AccountError> {
         let now = now_secs();
         self.change(|state| {
-            let ops: Vec<Op> = state
+            let ops: Vec<AccountOp> = state
                 .invites
                 .values()
                 .filter(|invite| invite.expires_at <= now)
-                .map(|invite| Op::RemoveInvite(invite.id.clone()))
+                .map(|invite| AccountOp::RemoveInvite(invite.id.clone()))
                 .collect();
             let count = ops.len();
             Ok((ops, count))
@@ -1095,63 +1199,148 @@ impl Accounts {
 /// The one-time token that seats an administrator (ADR 17).
 ///
 /// While no administrator exists the bridge mints one at start-up, prints it
-/// in its log and writes it to `setup-token` beside its data — or takes
+/// in its log and keeps it where every process reads it ([`SetupStore`]: the
+/// `setup-token` file beside the data, or the database) — or takes
 /// [`SETUP_TOKEN_ENV`] from an install that wants to know it in advance.
-/// `zedis-bridge setup-token`, run on the host, writes a new one when every
-/// administrator is lost: host access is administrator access, and nothing
-/// over HTTP is. It is read from disk at each attempt, so one written while
-/// the bridge runs works at once, and it is deleted when it is used.
-#[derive(Clone, Debug)]
+/// `zedis-bridge setup-token`, run on the host against the same store,
+/// keeps a new one when every administrator is lost: host access is
+/// administrator access, and nothing over HTTP is. It is read at each
+/// attempt, so one kept while the bridge runs works at once, and it is
+/// forgotten when it is used.
+#[derive(Clone)]
 pub struct Setup {
-    file: PathBuf,
+    store: Arc<dyn SetupStore>,
 }
 
 impl Setup {
-    /// The token kept in `dir`.
+    pub fn new(store: Arc<dyn SetupStore>) -> Self {
+        Self { store }
+    }
+
+    /// The token kept in `dir`, the local directory's way.
+    #[cfg(test)]
     pub fn in_dir(dir: &Path) -> Self {
-        Self {
-            file: dir.join("setup-token"),
-        }
+        Self::new(Arc::new(LocalSetup::new(dir.join("setup-token"))))
     }
 
-    pub fn file(&self) -> &Path {
-        &self.file
+    /// Where it is kept, for the log.
+    pub fn location(&self) -> String {
+        self.store.location()
     }
 
-    /// Write a fresh token, owner-only, and answer it.
-    pub fn mint(&self) -> io::Result<String> {
+    /// Keep a fresh token in place of any waiting one, and answer it.
+    pub async fn mint(&self) -> io::Result<String> {
         let token = new_code();
-        write_file_atomic(&self.file, token.as_bytes())?;
-        restrict(&self.file);
+        self.store.put(token.clone()).await?;
         Ok(token)
     }
 
-    /// Whether the page should offer *Create the administrator*: there is
-    /// none, or a token was written for the recovery of one.
-    pub fn open(&self, accounts: &Accounts) -> bool {
-        accounts.admin_count() == 0 || self.file.exists()
+    /// The token to print at start-up while there is no administrator: the
+    /// waiting one where the store can say it, else a fresh one unless
+    /// another process kept one first (`None`: its log has it).
+    pub async fn for_start(&self) -> io::Result<Option<String>> {
+        if let Some(token) = self.store.shown().await? {
+            return Ok(Some(token));
+        }
+        let token = new_code();
+        Ok(self.store.put_if_none(token.clone()).await?.then_some(token))
     }
 
-    /// Whether `token` is the setup token: the file's, or — while there is
+    /// Whether the page should offer *Create the administrator*: there is
+    /// none, or a token was kept for the recovery of one.
+    pub async fn open(&self, accounts: &Accounts) -> bool {
+        accounts.admin_count() == 0 || self.store.waiting().await.unwrap_or(false)
+    }
+
+    /// Whether `token` is the setup token: the store's, or — while there is
     /// no administrator — the one the environment chose.
-    pub fn accepts(&self, token: &str, accounts: &Accounts) -> bool {
+    pub async fn accepts(&self, token: &str, accounts: &Accounts) -> bool {
         let token = token.trim();
         if token.is_empty() {
             return false;
         }
-        let from_file = std::fs::read_to_string(&self.file)
-            .ok()
-            .is_some_and(|stored| same(stored.trim().as_bytes(), token.as_bytes()));
         let from_env = accounts.admin_count() == 0
             && std::env::var(SETUP_TOKEN_ENV)
                 .ok()
                 .is_some_and(|chosen| !chosen.trim().is_empty() && same(chosen.trim().as_bytes(), token.as_bytes()));
-        from_file || from_env
+        from_env || self.store.accepts(token.to_string()).await.unwrap_or(false)
     }
 
     /// The token did its work.
-    pub fn used(&self) {
-        let _ = std::fs::remove_file(&self.file);
+    pub async fn used(&self) {
+        if let Err(e) = self.store.take().await {
+            tracing::warn!(error = %e, "the used setup token could not be forgotten");
+        }
+    }
+}
+
+/// The setup token in a file beside the data, owner-only — in the clear, so
+/// a restart can print it again; the file is the host's, and host access is
+/// administrator access anyway.
+pub struct LocalSetup {
+    file: PathBuf,
+}
+
+impl LocalSetup {
+    pub fn new(file: PathBuf) -> Self {
+        Self { file }
+    }
+
+    fn read(&self) -> Option<String> {
+        std::fs::read_to_string(&self.file)
+            .ok()
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty())
+    }
+
+    fn write(&self, token: &str) -> io::Result<()> {
+        write_file_atomic(&self.file, token.as_bytes())?;
+        restrict(&self.file);
+        Ok(())
+    }
+}
+
+impl SetupStore for LocalSetup {
+    fn waiting(&self) -> StoreFuture<bool> {
+        let waiting = self.file.exists();
+        Box::pin(async move { Ok(waiting) })
+    }
+
+    fn accepts(&self, token: String) -> StoreFuture<bool> {
+        let accepted = self
+            .read()
+            .is_some_and(|stored| same(stored.as_bytes(), token.as_bytes()));
+        Box::pin(async move { Ok(accepted) })
+    }
+
+    fn put(&self, token: String) -> StoreFuture<()> {
+        let written = self.write(&token);
+        Box::pin(async move { written })
+    }
+
+    fn put_if_none(&self, token: String) -> StoreFuture<bool> {
+        let kept = match self.read() {
+            Some(_) => Ok(false),
+            None => self.write(&token).map(|()| true),
+        };
+        Box::pin(async move { kept })
+    }
+
+    fn shown(&self) -> StoreFuture<Option<String>> {
+        let token = self.read();
+        Box::pin(async move { Ok(token) })
+    }
+
+    fn take(&self) -> StoreFuture<()> {
+        let removed = match std::fs::remove_file(&self.file) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+        Box::pin(async move { removed })
+    }
+
+    fn location(&self) -> String {
+        self.file.display().to_string()
     }
 }
 
@@ -1179,11 +1368,13 @@ struct AccountsFile {
 }
 
 /// The accounts in `bridge-accounts.json`, owner-only: read and written
-/// whole, one change at a time.
+/// whole, one change at a time. Its version counts this process's changes —
+/// the file has one writer.
 #[derive(Clone)]
 pub struct LocalAccounts {
     path: Arc<PathBuf>,
     lock: Arc<Mutex<()>>,
+    version: Arc<AtomicU64>,
 }
 
 impl LocalAccounts {
@@ -1191,6 +1382,7 @@ impl LocalAccounts {
         Self {
             path: Arc::new(path),
             lock: Arc::default(),
+            version: Arc::default(),
         }
     }
 
@@ -1205,59 +1397,57 @@ impl LocalAccounts {
         }
     }
 
-    fn edit(&self, change: impl FnOnce(&mut AccountsFile)) -> io::Result<()> {
+    /// Apply `ops` to the file in one write, if it is still at `seen`.
+    fn apply_now(&self, seen: u64, ops: Vec<AccountOp>) -> io::Result<Option<u64>> {
         let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.version.load(Ordering::SeqCst) != seen {
+            return Ok(None);
+        }
         let mut file = self.read()?;
-        change(&mut file);
+        for op in ops {
+            match op {
+                AccountOp::PutAccount(account) => match file.accounts.iter_mut().find(|a| a.name == account.name) {
+                    Some(slot) => *slot = account,
+                    None => file.accounts.push(account),
+                },
+                AccountOp::RemoveAccount(name) => file.accounts.retain(|a| a.name != name),
+                AccountOp::PutInvite(invite) => match file.invites.iter_mut().find(|i| i.id == invite.id) {
+                    Some(slot) => *slot = invite,
+                    None => file.invites.push(invite),
+                },
+                AccountOp::RemoveInvite(id) => file.invites.retain(|i| i.id != id),
+            }
+        }
         let bytes = serde_json::to_vec_pretty(&file).map_err(io::Error::other)?;
         write_file_atomic(&self.path, &bytes)?;
         restrict(self.path.as_path());
-        Ok(())
+        Ok(Some(self.version.fetch_add(1, Ordering::SeqCst) + 1))
     }
 }
 
 impl AccountStore for LocalAccounts {
-    fn load(&self) -> StoreFuture<(Vec<AccountRecord>, Vec<InviteRecord>)> {
+    fn load(&self) -> StoreFuture<AccountsAt> {
         let store = self.clone();
-        let read = blocking(move || store.read());
-        Box::pin(async move {
-            let file = read.await??;
-            Ok((file.accounts, file.invites))
-        })
-    }
-
-    fn put_account(&self, account: AccountRecord) -> StoreFuture<()> {
-        let store = self.clone();
-        let edit = blocking(move || {
-            store.edit(|file| match file.accounts.iter_mut().find(|a| a.name == account.name) {
-                Some(slot) => *slot = account,
-                None => file.accounts.push(account),
+        let read = blocking(move || {
+            let _held = store.lock.lock().unwrap_or_else(PoisonError::into_inner);
+            store.read().map(|file| AccountsAt {
+                version: store.version.load(Ordering::SeqCst),
+                accounts: file.accounts,
+                invites: file.invites,
             })
         });
-        Box::pin(async move { edit.await? })
+        Box::pin(async move { read.await? })
     }
 
-    fn remove_account(&self, name: String) -> StoreFuture<()> {
+    fn apply(&self, seen: u64, ops: Vec<AccountOp>) -> StoreFuture<Option<u64>> {
         let store = self.clone();
-        let edit = blocking(move || store.edit(|file| file.accounts.retain(|a| a.name != name)));
-        Box::pin(async move { edit.await? })
+        let apply = blocking(move || store.apply_now(seen, ops));
+        Box::pin(async move { apply.await? })
     }
 
-    fn put_invite(&self, invite: InviteRecord) -> StoreFuture<()> {
-        let store = self.clone();
-        let edit = blocking(move || {
-            store.edit(|file| match file.invites.iter_mut().find(|i| i.id == invite.id) {
-                Some(slot) => *slot = invite,
-                None => file.invites.push(invite),
-            })
-        });
-        Box::pin(async move { edit.await? })
-    }
-
-    fn remove_invite(&self, id: String) -> StoreFuture<()> {
-        let store = self.clone();
-        let edit = blocking(move || store.edit(|file| file.invites.retain(|i| i.id != id)));
-        Box::pin(async move { edit.await? })
+    fn version(&self) -> StoreFuture<u64> {
+        let version = self.version.load(Ordering::SeqCst);
+        Box::pin(async move { Ok(version) })
     }
 }
 
@@ -1507,51 +1697,77 @@ fn parse_users(spec: &str) -> Result<Vec<Imported>, String> {
 // ---- for the tests of this crate -----------------------------------------------
 
 /// An `AccountStore` that keeps nothing past the process: the tests'.
+/// [`MemoryAccounts::changed_elsewhere`] plays another process.
 #[cfg(test)]
 #[derive(Default)]
-pub struct MemoryAccounts(Mutex<(Vec<AccountRecord>, Vec<InviteRecord>)>);
+pub struct MemoryAccounts(Mutex<AccountsAt>);
+
+#[cfg(test)]
+impl MemoryAccounts {
+    /// Another process's change: `op` applied, and the version moved.
+    pub fn changed_elsewhere(&self, op: AccountOp) {
+        let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        apply_to(&mut held, op);
+        held.version += 1;
+    }
+}
+
+#[cfg(test)]
+fn apply_to(at: &mut AccountsAt, op: AccountOp) {
+    match op {
+        AccountOp::PutAccount(account) => {
+            at.accounts.retain(|a| a.name != account.name);
+            at.accounts.push(account);
+        }
+        AccountOp::RemoveAccount(name) => at.accounts.retain(|a| a.name != name),
+        AccountOp::PutInvite(invite) => {
+            at.invites.retain(|i| i.id != invite.id);
+            at.invites.push(invite);
+        }
+        AccountOp::RemoveInvite(id) => at.invites.retain(|i| i.id != id),
+    }
+}
 
 #[cfg(test)]
 impl AccountStore for MemoryAccounts {
-    fn load(&self) -> StoreFuture<(Vec<AccountRecord>, Vec<InviteRecord>)> {
+    fn load(&self) -> StoreFuture<AccountsAt> {
         let held = self.0.lock().unwrap_or_else(PoisonError::into_inner).clone();
         Box::pin(async move { Ok(held) })
     }
-    fn put_account(&self, account: AccountRecord) -> StoreFuture<()> {
+
+    fn version(&self) -> StoreFuture<u64> {
+        let version = self.0.lock().unwrap_or_else(PoisonError::into_inner).version;
+        Box::pin(async move { Ok(version) })
+    }
+
+    fn apply(&self, seen: u64, ops: Vec<AccountOp>) -> StoreFuture<Option<u64>> {
         let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        held.0.retain(|a| a.name != account.name);
-        held.0.push(account);
-        Box::pin(async { Ok(()) })
-    }
-    fn remove_account(&self, name: String) -> StoreFuture<()> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .0
-            .retain(|a| a.name != name);
-        Box::pin(async { Ok(()) })
-    }
-    fn put_invite(&self, invite: InviteRecord) -> StoreFuture<()> {
-        let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        held.1.retain(|i| i.id != invite.id);
-        held.1.push(invite);
-        Box::pin(async { Ok(()) })
-    }
-    fn remove_invite(&self, id: String) -> StoreFuture<()> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .1
-            .retain(|i| i.id != id);
-        Box::pin(async { Ok(()) })
+        if held.version != seen {
+            return Box::pin(async { Ok(None) });
+        }
+        for op in ops {
+            apply_to(&mut held, op);
+        }
+        held.version += 1;
+        let version = held.version;
+        Box::pin(async move { Ok(Some(version)) })
     }
 }
 
 #[cfg(test)]
 impl Accounts {
+    /// `records`, in a memory store that holds them too.
+    fn in_memory(records: Vec<AccountRecord>) -> Self {
+        let at = AccountsAt {
+            accounts: records,
+            ..AccountsAt::default()
+        };
+        Self::with(Arc::new(MemoryAccounts(Mutex::new(at.clone()))), at)
+    }
+
     /// No accounts, in memory: a fresh bridge.
     pub fn empty() -> Self {
-        Self::with(Arc::new(MemoryAccounts::default()), Vec::new(), Vec::new())
+        Self::with(Arc::new(MemoryAccounts::default()), AccountsAt::default())
     }
 
     /// Accounts in memory, as a users file would have imported them.
@@ -1561,7 +1777,7 @@ impl Accounts {
             .into_iter()
             .map(|account| account.into_record(now))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self::with(Arc::new(MemoryAccounts::default()), records, Vec::new()))
+        Ok(Self::in_memory(records))
     }
 
     /// The same from the inline form.
@@ -1571,7 +1787,7 @@ impl Accounts {
             .into_iter()
             .map(|account| account.into_record(now))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self::with(Arc::new(MemoryAccounts::default()), records, Vec::new()))
+        Ok(Self::in_memory(records))
     }
 }
 
@@ -1799,7 +2015,7 @@ servers = []
         let more = Accounts::from_inline("bob@hunter2").expect("accounts");
         let bob = more.read().accounts["bob"].record.clone();
         assert_eq!(accounts.import(vec![bob.clone()]).await.expect("import"), 0);
-        let empty = Accounts::with(Arc::new(MemoryAccounts::default()), Vec::new(), Vec::new());
+        let empty = Accounts::empty();
         assert_eq!(empty.import(vec![bob]).await.expect("import"), 1);
         assert!(
             empty.has("bob") && !empty.is_admin("bob"),
@@ -1965,7 +2181,7 @@ servers = []
             },
         )
         .await;
-        assert!(accounts.invite(&code).is_some());
+        assert!(accounts.invite(&code).await.is_some());
         let hash = || Some(hash_password("pa55word").expect("hash"));
         assert!(matches!(
             accounts.register(&code, "alice", hash()).await,
@@ -2066,7 +2282,10 @@ servers = []
         )
         .await;
         accounts.delete("bob").await.expect("delete");
-        assert!(accounts.invite(&bobs).is_none(), "the reset went with the account");
+        assert!(
+            accounts.invite(&bobs).await.is_none(),
+            "the reset went with the account"
+        );
         assert!(matches!(
             accounts
                 .invite_new(
@@ -2194,7 +2413,7 @@ servers = []
         let (_, code) = accounts.invite_new("root", register_full(), 1).await.expect("invite");
 
         let again = Accounts::load(store.clone()).await.expect("reload");
-        assert!(again.is_admin("root") && again.invite(&code).is_some());
+        assert!(again.is_admin("root") && again.invite(&code).await.is_some());
         let on_disk = std::fs::read_to_string(&path).expect("file");
         assert!(
             !on_disk.contains("root-password") && !on_disk.contains(&code),
@@ -2217,16 +2436,52 @@ servers = []
         std::fs::create_dir_all(&dir).expect("dir");
         let setup = Setup::in_dir(&dir);
         let accounts = Accounts::from_inline("alice@secret").expect("accounts");
-        assert!(setup.open(&accounts), "no administrator yet");
-        assert!(!setup.accepts("anything", &accounts));
-        let token = setup.mint().expect("minted");
-        assert!(setup.accepts(&token, &accounts) && setup.accepts(&format!(" {token}\n"), &accounts));
-        assert!(!setup.accepts("", &accounts) && !setup.accepts(&token[1..], &accounts));
+        assert!(setup.open(&accounts).await, "no administrator yet");
+        assert!(!setup.accepts("anything", &accounts).await);
+        let token = setup.mint().await.expect("minted");
+        assert!(setup.accepts(&token, &accounts).await);
+        assert!(setup.accepts(&format!(" {token}\n"), &accounts).await);
+        assert!(!setup.accepts("", &accounts).await && !setup.accepts(&token[1..], &accounts).await);
         accounts.make_admin("alice", None).await.expect("promoted");
-        assert!(setup.open(&accounts), "a written token keeps it open");
-        setup.used();
-        assert!(!setup.open(&accounts) && !setup.accepts(&token, &accounts));
+        assert!(setup.open(&accounts).await, "a written token keeps it open");
+        setup.used().await;
+        assert!(!setup.open(&accounts).await && !setup.accepts(&token, &accounts).await);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two processes on one store each demote one of the last two
+    /// administrators: the one that writes second sees the first's change,
+    /// decides again, and is refused — the bridge keeps an administrator.
+    #[tokio::test]
+    async fn a_change_another_process_made_first_is_decided_again() {
+        let admin = |name: &str| AccountRecord {
+            name: name.to_string(),
+            role: Role::Admin,
+            version: 1,
+            ..Default::default()
+        };
+        let at = AccountsAt {
+            accounts: vec![admin("alice"), admin("bob")],
+            ..AccountsAt::default()
+        };
+        let store = Arc::new(MemoryAccounts(Mutex::new(at.clone())));
+        let one = Accounts::with(store.clone(), at.clone());
+        let two = Accounts::with(store.clone(), at);
+        one.update("alice", Some(Role::Full), None, None)
+            .await
+            .expect("demoted");
+        assert!(matches!(
+            two.update("bob", Some(Role::Full), None, None).await,
+            Err(AccountError::LastAdmin)
+        ));
+        assert!(two.is_admin("bob") && !two.is_admin("alice"), "two read what one did");
+
+        // A change nobody raced lands at once.
+        store.changed_elsewhere(AccountOp::PutAccount(admin("carol")));
+        two.update("bob", Some(Role::Full), None, None)
+            .await
+            .expect("carol is an administrator now");
+        assert_eq!(two.version_held(), 3);
     }
 
     #[test]

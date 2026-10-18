@@ -21,21 +21,29 @@
 //! their metadata), the Metrics history ([`MetricsStore`], a log), the
 //! page's own data — an account's rows ([`PageRowStore`]), key tags and
 //! notes ([`KeyNoteStore`]) and saved scripts ([`ScriptStore`]), records —
-//! and the audit log ([`AuditLog`]). The implementations are the local
-//! directory's — [`LocalServers`] below, `accounts::LocalAccounts`,
-//! `auth::LocalLogins`, `trash::LocalTrash`, `metrics::LocalMetrics`,
+//! and the audit log ([`AuditLog`]), with the setup token ([`SetupStore`]).
+//! The implementations are the local directory's — [`LocalServers`] below,
+//! `accounts::{LocalAccounts, LocalSetup}`, `auth::LocalLogins`,
+//! `trash::LocalTrash`, `metrics::LocalMetrics`,
 //! `page_data::{LocalPageRows, LocalKeyNotes, LocalScripts}`,
 //! `audit::LocalAuditLog` — files beside the server list. A SQL store
 //! is another `impl` of the same traits, chosen at start-up; nothing that
 //! calls them changes.
+//!
+//! What only a store shared by several processes needs (ADR 18) is here
+//! too, and the local directory — one process — has none of it: the
+//! counters that tell a process another one changed what it keeps in
+//! memory ([`StoreVersions`]), and the failed sign-ins the others saw
+//! ([`ThrottleStore`]).
 //!
 //! Async, because a database is: the local implementations do their file
 //! work on the blocking pool ([`blocking`]), where the routes used to put it
 //! themselves. Arguments are owned and the futures `'static`, the shape
 //! `zedis_connection::bridge` gives the page's side of the same data.
 
-use crate::accounts::{AccountRecord, InviteRecord, LocalAccounts};
-use crate::auth::{LocalLogins, Login};
+use crate::accounts::Accounts;
+use crate::accounts::{AccountOp, AccountRecord, InviteRecord, LocalAccounts, LocalSetup};
+use crate::auth::{LocalLogins, Login, LoginChange, Logins, Throttle};
 use crate::metrics::{self, LocalMetrics};
 use crate::page_data::{AccountRows, KeyNote, LocalKeyNotes, LocalPageRows, LocalScripts, RowError, ScriptRecord};
 use crate::trash::{self, LocalTrash, Meta, NewEntry};
@@ -60,6 +68,9 @@ pub fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) ->
 /// An implementation keeps `zedis_connection`'s cache — what `get_server`
 /// reads and the pool dials from — in step with what it stores.
 pub trait ServerStore: Send + Sync {
+    /// Read the list into the cache again: another process changed it
+    /// ([`StoreVersions`]).
+    fn refresh(&self) -> StoreFuture<()>;
     /// Every entry, secrets decrypted.
     fn list(&self) -> StoreFuture<Vec<RedisServer>>;
     /// Add `server`, or put it in place of the entry with its id.
@@ -70,19 +81,29 @@ pub trait ServerStore: Send + Sync {
     fn swap(&self, expected: RedisServer, replacement: Option<RedisServer>) -> StoreFuture<bool>;
 }
 
+/// The accounts at one moment, and the count of changes that names it —
+/// what a change is applied against (ADR 18).
+#[derive(Clone, Debug, Default)]
+pub struct AccountsAt {
+    pub version: u64,
+    pub accounts: Vec<AccountRecord>,
+    pub invites: Vec<InviteRecord>,
+}
+
 /// The accounts (ADR 17): registered, each with its role, server rules and
-/// MCP tokens, and the invitations that register the next ones. Records,
-/// changed one at a time; the bridge keeps them in memory in front
-/// (`accounts::Accounts`) and writes through.
+/// MCP tokens, and the invitations that register the next ones. Records;
+/// the bridge keeps them in memory in front (`accounts::Accounts`), decides
+/// a change there and writes it through.
 pub trait AccountStore: Send + Sync {
-    /// Every account and every open invitation.
-    fn load(&self) -> StoreFuture<(Vec<AccountRecord>, Vec<InviteRecord>)>;
-    /// Add `account`, or put it in place of the one with its name.
-    fn put_account(&self, account: AccountRecord) -> StoreFuture<()>;
-    fn remove_account(&self, name: String) -> StoreFuture<()>;
-    /// Add `invite`, or put it in place of the one with its id.
-    fn put_invite(&self, invite: InviteRecord) -> StoreFuture<()>;
-    fn remove_invite(&self, id: String) -> StoreFuture<()>;
+    /// Every account and every open invitation, and the version they are at.
+    fn load(&self) -> StoreFuture<AccountsAt>;
+    /// The version alone: whether what a process holds is still current.
+    fn version(&self) -> StoreFuture<u64>;
+    /// Apply `ops` together, if the accounts are still at version `seen`.
+    /// Answers the version they are at now — or `None` when another process
+    /// changed them first, and the change was decided on what is no longer
+    /// there.
+    fn apply(&self, seen: u64, ops: Vec<AccountOp>) -> StoreFuture<Option<u64>>;
 }
 
 /// Browser logins: leases, each keyed by the hash of its cookie id and
@@ -91,8 +112,12 @@ pub trait AccountStore: Send + Sync {
 pub trait LoginStore: Send + Sync {
     /// Every saved login.
     fn load(&self) -> StoreFuture<HashMap<String, Login>>;
-    /// Keep each `Some`, forget each `None`.
-    fn save(&self, changes: Vec<(String, Option<Login>)>) -> StoreFuture<()>;
+    /// The saved login `key`, for a cookie this process has not seen —
+    /// another process opened it (ADR 18).
+    fn get(&self, key: String) -> StoreFuture<Option<Login>>;
+    /// Keep each sign-in, move each use's time forward on the login if it
+    /// is still there — never put it back — and forget each sign-out.
+    fn save(&self, changes: Vec<(String, LoginChange)>) -> StoreFuture<()>;
 }
 
 /// The recycle bin of the browser build: per server, a deleted key's `DUMP`
@@ -165,12 +190,174 @@ pub trait ScriptStore: Send + Sync {
     fn remove(&self, id: String) -> StoreFuture<Option<ScriptRecord>>;
 }
 
-/// The audit log (ADR 11): appended to, one JSON line at a time.
+/// One line of the audit, with what it is looked up by.
+#[derive(Clone, Debug)]
+pub struct AuditEntry {
+    /// When, in unix milliseconds — the line's `ts`.
+    pub at_ms: i64,
+    pub account: String,
+    pub event: String,
+    /// The server entry the line is about, by id.
+    pub server: Option<String>,
+    /// The JSON object, without its newline.
+    pub line: Vec<u8>,
+}
+
+/// What an administrator asks the audit (`GET /v1/admin/audit`, ADR 18):
+/// every field narrows, none is every line.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct AuditQuery {
+    pub since_ms: Option<i64>,
+    pub until_ms: Option<i64>,
+    pub account: Option<String>,
+    pub event: Option<String>,
+    pub server: Option<String>,
+    /// Where the previous page stopped: its `next`.
+    pub before: Option<String>,
+    pub limit: Option<usize>,
+}
+
+/// The most lines one page holds, and how many when not asked.
+pub const AUDIT_PAGE_MAX: usize = 500;
+pub const AUDIT_PAGE_DEFAULT: usize = 100;
+
+impl AuditQuery {
+    pub fn limit(&self) -> usize {
+        self.limit.unwrap_or(AUDIT_PAGE_DEFAULT).clamp(1, AUDIT_PAGE_MAX)
+    }
+}
+
+/// A page of the audit, newest first.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct AuditPage {
+    pub lines: Vec<Box<RawValue>>,
+    /// Where the next, older page starts; `None` when there is none.
+    pub next: Option<String>,
+    /// The local file was not read to its start for this page — it reads a
+    /// bounded part per page — so `next` may find older lines that match.
+    pub stopped_early: bool,
+}
+
+/// The audit log (ADR 11): appended to, one JSON line at a time, and read
+/// back by an administrator (ADR 18).
 pub trait AuditLog: Send + Sync {
-    /// Keep `line`, a JSON object without its newline. Never fails the
-    /// caller: an implementation that cannot keep a line says so in the
-    /// process log (ADR 11).
-    fn append(&self, line: Vec<u8>);
+    /// Keep `entry`. Never fails the caller: an implementation that cannot
+    /// keep a line says so in the process log (ADR 11).
+    fn append(&self, entry: AuditEntry);
+    fn query(&self, query: AuditQuery) -> StoreFuture<AuditPage>;
+    /// Forget the lines before `before_ms`, answering how many went. A file
+    /// keeps everything: rotating it is the host's.
+    fn prune(&self, before_ms: i64) -> StoreFuture<u64>;
+}
+
+/// The one-time token that seats an administrator (ADR 17), where every
+/// process reads it.
+pub trait SetupStore: Send + Sync {
+    /// Whether a token is waiting.
+    fn waiting(&self) -> StoreFuture<bool>;
+    /// Whether `token` is the waiting one.
+    fn accepts(&self, token: String) -> StoreFuture<bool>;
+    /// Keep `token` in place of any waiting one: `zedis-bridge setup-token`.
+    fn put(&self, token: String) -> StoreFuture<()>;
+    /// Keep `token` unless one is waiting, answering whether it was kept —
+    /// so processes that start together mint one between them.
+    fn put_if_none(&self, token: String) -> StoreFuture<bool>;
+    /// The waiting token itself, where the store can say it: the local
+    /// file can, a database keeps only its hash.
+    fn shown(&self) -> StoreFuture<Option<String>>;
+    /// The token did its work.
+    fn take(&self) -> StoreFuture<()>;
+    /// Where it is kept, for the log: a path, or "the database".
+    fn location(&self) -> String;
+}
+
+/// Failed sign-ins other processes saw (ADR 18). The throttle decides in
+/// each process's memory (`auth::Throttle`) and shares through this, so ten
+/// failed tries are ten across every process.
+pub trait ThrottleStore: Send + Sync {
+    /// Keep one failure of `key`, seen by `process` at `at_ms`.
+    fn failed(&self, process: String, key: String, at_ms: i64) -> StoreFuture<()>;
+    /// Forget `key`'s failures: it got in.
+    fn succeeded(&self, key: String) -> StoreFuture<()>;
+    /// The failures since `since_ms` seen by processes other than `process`.
+    fn others(&self, process: String, since_ms: i64) -> StoreFuture<Vec<(String, i64)>>;
+    /// Forget the failures before `before_ms`, answering how many went.
+    fn prune(&self, before_ms: i64) -> StoreFuture<u64>;
+}
+
+/// The count of changes to each set a process keeps in memory, read every
+/// [`STORE_POLL`] by every process (ADR 18): a counter that moved is a set
+/// another process changed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Versions {
+    pub servers: u64,
+    pub accounts: u64,
+    /// Moved by a sign-out or an expired login anywhere.
+    pub logins_revoked: u64,
+}
+
+/// How often a process reads the [`Versions`]: the longest it may act on an
+/// account, a server list or a login another process just changed.
+pub const STORE_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// This process, among the others on a shared store: a failed sign-in is
+/// filed under it so it is not counted twice, and `GET /v1/clients`, which
+/// answers for one process, says which.
+pub fn process_id() -> &'static str {
+    static PROCESS: LazyLock<String> = LazyLock::new(|| uuid::Uuid::new_v4().simple().to_string());
+    &PROCESS
+}
+
+pub trait StoreVersions: Send + Sync {
+    fn read(&self) -> StoreFuture<Versions>;
+}
+
+/// What a process holds in memory of a store other processes change too.
+pub struct Held {
+    pub servers: Arc<dyn ServerStore>,
+    pub accounts: Accounts,
+    pub logins: Logins,
+    pub throttle: Throttle,
+}
+
+/// Keep `held` in step with `versions`, every [`STORE_POLL`], for the life
+/// of the process: the set whose counter moved is read again — the server
+/// list into `zedis_connection`'s cache, the accounts, the logins dropped
+/// to be taken in again one by one — and the other processes' failed
+/// sign-ins merged.
+pub async fn keep_in_step(versions: Arc<dyn StoreVersions>, held: Held) {
+    let mut seen = versions.read().await.unwrap_or_default();
+    let mut tick = tokio::time::interval(STORE_POLL);
+    loop {
+        tick.tick().await;
+        held.throttle.merge().await;
+        let now = match versions.read().await {
+            Ok(now) => now,
+            Err(e) => {
+                tracing::warn!(error = %e, "the store's versions could not be read");
+                continue;
+            }
+        };
+        if now.servers != seen.servers
+            && let Err(e) = held.servers.refresh().await
+        {
+            tracing::warn!(error = %e, "the server list could not be read again");
+            continue;
+        }
+        // Compared with what is held, not with the last poll: this
+        // process's own changes move the counter too, and are held already.
+        if now.accounts != held.accounts.version_held()
+            && let Err(e) = held.accounts.refresh().await
+        {
+            tracing::warn!(error = %e, "the accounts could not be read again");
+            continue;
+        }
+        if now.logins_revoked != seen.logins_revoked {
+            held.logins.drop_cached().await;
+        }
+        seen = now;
+    }
 }
 
 /// The stores a bridge starts with.
@@ -183,21 +370,47 @@ pub struct Stores {
     pub page_rows: Arc<dyn PageRowStore>,
     pub key_notes: Arc<dyn KeyNoteStore>,
     pub scripts: Arc<dyn ScriptStore>,
+    pub setup: Arc<dyn SetupStore>,
+    /// The audit where the store keeps it — the database's — or `None`: the
+    /// local directory's audit is the file `--audit-log` names.
+    pub audit: Option<Arc<dyn AuditLog>>,
+    /// What only several processes need — `None` for one.
+    pub throttle: Option<Arc<dyn ThrottleStore>>,
+    pub versions: Option<Arc<dyn StoreVersions>>,
+}
+
+/// Where the local directory keeps each store, under the configuration
+/// directory — what `Stores::local` opens and `import-local` reads.
+pub mod local_paths {
+    pub const ACCOUNTS: &str = "bridge-accounts.json";
+    pub const LOGINS: &str = "bridge-logins.json";
+    pub const SERVERS: &str = "redis-servers.toml";
+    pub const TRASH: &str = "bridge-trash";
+    pub const METRICS: &str = "bridge-metrics";
+    pub const PAGE_ROWS: &str = "bridge-page-data/accounts";
+    pub const KEY_NOTES: &str = "bridge-page-data/key-notes";
+    pub const SCRIPTS: &str = "bridge-scripts.json";
+    pub const SETUP_TOKEN: &str = "setup-token";
 }
 
 impl Stores {
     /// The local directory's, under `dir` — the configuration directory,
     /// `/data` in the image.
     pub fn local(dir: &Path) -> Self {
+        use local_paths as at;
         Self {
-            accounts: Arc::new(LocalAccounts::new(dir.join("bridge-accounts.json"))),
-            logins: Arc::new(LocalLogins::new(dir.join("bridge-logins.json"))),
+            accounts: Arc::new(LocalAccounts::new(dir.join(at::ACCOUNTS))),
+            logins: Arc::new(LocalLogins::new(dir.join(at::LOGINS))),
             servers: Arc::new(LocalServers),
-            trash: Arc::new(LocalTrash::new(dir.join("bridge-trash"))),
-            metrics: Arc::new(LocalMetrics::new(dir.join("bridge-metrics"))),
-            page_rows: Arc::new(LocalPageRows::new(dir.join("bridge-page-data").join("accounts"))),
-            key_notes: Arc::new(LocalKeyNotes::new(dir.join("bridge-page-data").join("key-notes"))),
-            scripts: Arc::new(LocalScripts::new(dir.join("bridge-scripts.json"))),
+            trash: Arc::new(LocalTrash::new(dir.join(at::TRASH))),
+            metrics: Arc::new(LocalMetrics::new(dir.join(at::METRICS))),
+            page_rows: Arc::new(LocalPageRows::new(dir.join(at::PAGE_ROWS))),
+            key_notes: Arc::new(LocalKeyNotes::new(dir.join(at::KEY_NOTES))),
+            scripts: Arc::new(LocalScripts::new(dir.join(at::SCRIPTS))),
+            setup: Arc::new(LocalSetup::new(dir.join(at::SETUP_TOKEN))),
+            audit: None,
+            throttle: None,
+            versions: None,
         }
     }
 }
@@ -234,6 +447,11 @@ impl LocalServers {
 }
 
 impl ServerStore for LocalServers {
+    /// Nothing to read again: the file is this process's own.
+    fn refresh(&self) -> StoreFuture<()> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn list(&self) -> StoreFuture<Vec<RedisServer>> {
         Box::pin(async { get_servers().map_err(|e| io::Error::other(e.to_string())) })
     }
@@ -271,6 +489,9 @@ impl ServerStore for LocalServers {
         }))
     }
 }
+
+#[cfg(test)]
+pub(crate) mod conformance;
 
 #[cfg(test)]
 mod tests {

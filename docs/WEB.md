@@ -67,6 +67,39 @@ tools.example.com {
 
 Open `https://tools.example.com/zedis/`. For nginx the equivalent is `location /zedis { proxy_pass http://127.0.0.1:7379; }` — no trailing slash on `proxy_pass`, which would strip the prefix. The health check moves too: `/zedis/v1/health`.
 
+## Several bridges on one database
+
+By default a bridge keeps everything in its data directory: one process, nothing else to run, and a backup is one directory to copy. To run more than one bridge — behind a load balancer, or for a bridge that may go down without signing everyone out — or to have an audit you can search, give every bridge the same PostgreSQL 14+ or MySQL 8.0.19+ database:
+
+```bash
+docker run -d --name zedis-web -p 127.0.0.1:7379:7379 \
+  -v zedis-data:/data \
+  -e ZEDIS_BRIDGE_STORE='postgres://zedis:…@db.internal:5432/zedis?sslmode=require' \
+  vicanso/zedis-web:latest
+```
+
+`ZEDIS_BRIDGE_STORE` (or `--store`) is a `postgres://…` or `mysql://…` URL. Prefer the environment: the URL carries a password, and a flag is visible to anyone who can list processes. The log only ever shows its host. The bridge creates its tables on start and brings them up to date with each release, under the database's own lock, so bridges starting together do it once; a bridge older than the tables refuses to start. MariaDB is not supported.
+
+What the database then holds: the accounts, invitations and MCP tokens, the logins, the server list, the recycle bin, the Metrics history, the page's data, the setup token and failed sign-ins. A browser signed in on one bridge is signed in on all of them, ten failed sign-ins are ten across all of them, and a change made on one — an account disabled, a server rule removed, a sign-out — reaches the others within **two seconds**. The audit is on and kept there too (see [Audit log](#audit-log)).
+
+Three things to arrange:
+
+- **One `master.key` for every bridge.** It encrypts the server passwords and the recycle bin before they reach the database. The first bridge to open an empty database seals a check value with its key, and a bridge with another key refuses to start rather than write passwords the others cannot read. Mount the same file into each (`/data/master.key`), and back it up apart from the database: a dump of one is no use without the other, and should not travel with it.
+- **Keep each browser on one bridge**, by the `zedis_bridge` login cookie (sticky sessions on the load balancer). Signing in does not need it — what does is what is not data: the terminal's session and the Pub/Sub, Monitor and keyspace-notification panels are open Redis connections inside one bridge, and their requests reaching another are refused; an unlocked write window is asked for again there. A bridge that goes down costs a page those, not its sign-in. Who is online (`GET /v1/clients`) and the MCP call limit are counted per bridge.
+- **Synchronized clocks** (NTP), as for any service on several hosts: logins expire, the bin empties and the metrics are sampled by each bridge's clock.
+
+MySQL 8 signs in with `caching_sha2_password`; ask for TLS (`?ssl-mode=REQUIRED`) — without it the bridge sends the password RSA-encrypted, but everything after it travels in the clear. `zedis-bridge setup-token` takes the same `ZEDIS_BRIDGE_STORE` and keeps the new token in the database.
+
+**Moving an existing bridge.** Stop it, then copy its data directory into the empty database once — the accounts and invitations, logins (nobody signs in again), the server list, scripts, the page's data, the recycle bin and the Metrics history as they were, a waiting setup token and, with `--audit-file`, the audit file:
+
+```bash
+docker run --rm -v zedis-data:/data \
+  -e ZEDIS_BRIDGE_STORE='postgres://…' \
+  vicanso/zedis-web:latest import-local --audit-file /data/audit.log
+```
+
+It runs with that directory's `master.key`, which every bridge on the database uses from then on, and refuses a database that already holds accounts, server entries or scripts. There is no way back but the database's own backups.
+
 ## Accounts and sharing
 
 A server entry belongs to the account that added it and nobody else sees it, unless its **Shared** box is ticked — then it is everyone's. Any account that can see a shared entry and may write may edit or delete it.
@@ -124,6 +157,10 @@ A **Prod**-tagged entry starts with its writes locked, on the desktop and in the
 
 It is the log of the bridge only: what reaches Redis from `redis-cli` or an application is not in it, and it cannot tell you who changed a key — it can tell you whether anyone did so by hand. The bridge appends and never reopens the file, so rotate it with `copytruncate`.
 
+With a [database](#several-bridges-on-one-database) the audit is **on by default** and kept there — every bridge's lines in one table — for 365 days (`--audit-retention-days`, `ZEDIS_BRIDGE_AUDIT_RETENTION_DAYS`; `0` keeps them for ever). `--audit-log /path` writes a file instead (one per bridge), `--audit-log off` turns it off, and `--audit-writes` adds plain data writes as before. A line that cannot be written is an error in the bridge's log; the request it was about goes through.
+
+**Reading it.** An administrator reads the audit on the account page (**Account…** → *Audit*): newest first, narrowed by account and event, a page at a time, the line picked shown whole. A script asks `GET /v1/admin/audit` with any of `account`, `event`, `server` (an entry's id), `since_ms` / `until_ms` (unix milliseconds) and `limit`, and continues with `before` set to the previous page's `next`. From a file, each page reads at most the last 16 MB back from where the previous one stopped, and says so (`"stopped_early": true`); a database is searched whole.
+
 ### Pushed to a chat
 
 `--audit-webhook <url>` (`ZEDIS_BRIDGE_AUDIT_WEBHOOK`) sends the lines that need a person's attention to a group chat as they happen, with or without `--audit-log`. Give it a bot's webhook address and its host picks the message — Feishu / Lark (`open.feishu.cn`, `open.larksuite.com`), DingTalk (`oapi.dingtalk.com`), WeCom (`qyapi.weixin.qq.com`), Slack (`hooks.slack.com`) — and any other URL is sent the lines themselves as JSON, `{"source":"zedis-bridge","events":[…]}`, for a receiver of your own. Behind a relay whose host says nothing, name the format: `--audit-webhook-format json|feishu|dingtalk|wecom|slack` (`ZEDIS_BRIDGE_AUDIT_WEBHOOK_FORMAT`). A Feishu or DingTalk bot with signature verification switched on needs its secret in `ZEDIS_BRIDGE_AUDIT_WEBHOOK_SECRET` (there is a `--audit-webhook-secret` flag too, but a flag is visible to every user of the machine in the process list).
@@ -164,12 +201,12 @@ INFO zedis_bridge: client offline account="ops" kind="basic" online=2
 
 ```console
 $ curl -s -u alice:secret https://zedis.example.com/v1/clients
-{"online":2,"window_secs":300,"clients":[
+{"process":"4c1f…","online":2,"window_secs":300,"clients":[
   {"account":"alice","kind":"browser","peer":"10.0.0.7","last_seen":"2026-10-17T04:21:57.000Z","idle_secs":4},
   {"account":"ai","kind":"token","token":"claude-laptop","peer":"10.0.0.9","last_seen":"2026-10-17T04:20:41.000Z","idle_secs":80}]}
 ```
 
-`peer` is the socket peer, which behind a reverse proxy is the proxy; `forwarded_for` is added when the proxy wrote `X-Forwarded-For`. The count is kept in memory: after a restart each client is back with its next request.
+`peer` is the socket peer, which behind a reverse proxy is the proxy; `forwarded_for` is added when the proxy wrote `X-Forwarded-For`. The count is kept in memory: after a restart each client is back with its next request. With [several bridges](#several-bridges-on-one-database) each counts its own clients, and `process` says which bridge answered.
 
 ## Read-only access for AI assistants (MCP)
 
@@ -213,7 +250,7 @@ Deleting a server entry deletes both. The files are owner-only, like the rest of
 
 ## Your data on the bridge
 
-What the desktop keeps in its local database the bridge keeps for the page, loaded before the application starts and saved as it changes:
+What the desktop keeps in its local database the bridge keeps for the page, loaded before the application starts and saved as it changes — in the files named below, or in the [database](#several-bridges-on-one-database) when the bridge has one:
 
 - **Each account's own** — favorites, recent keys, search history and Settings (`bridge-page-data/accounts/`). They follow the account to any browser, and nobody else sees them; a read-only account keeps its own too. Deleting the account deletes them.
 - **Key tags and notes** (`bridge-page-data/key-notes/`) — a server's, seen by everyone who sees the server, each with who left it and when. They are kept one key at a time, so two people tagging two keys never undo each other. An account that may not write on the server — a read-only one, or one whose rules say `:ro` there — reads them and leaves none. Deleting the server entry deletes them.

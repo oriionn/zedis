@@ -16,13 +16,14 @@
 //! it checks before it asks, and what it asks.
 
 use super::admin::{ADMIN_ISSUE_TOKEN_ID, ADMIN_TOKEN_NAME_ID, DELETE_ACCOUNT_ID, SAVE_ACCOUNT_ID, SETTLE_ORPHANS_ID};
+use super::audit::{AUDIT_ACCOUNT_ID, AUDIT_MORE_ID, AUDIT_SEARCH_ID};
 use super::handover::SHARE_ID;
 use super::password::{CHANGE_PASSWORD_ID, CURRENT_PASSWORD_ID, NEW_PASSWORD_ID, REPEAT_PASSWORD_ID};
 use super::tokens::{ADMIN_TOKEN_DAYS, ISSUE_TOKEN_ID, TOKEN_NAME_ID};
 use super::*;
 use crate::connection::{
-    BridgeAccountChange, BridgeAccountResult, BridgeDisposition, BridgeInvite, BridgeNewInvite, BridgeOrphans,
-    BridgeOwned, BridgeOwnedItem,
+    BridgeAccountChange, BridgeAccountResult, BridgeAuditPage, BridgeAuditQuery, BridgeDisposition, BridgeInvite,
+    BridgeNewInvite, BridgeOrphans, BridgeOwned, BridgeOwnedItem,
 };
 use crate::test_support::init_ui;
 use chrono::{Duration, Utc};
@@ -47,6 +48,9 @@ struct FakeBridge {
     /// What every account keeps to itself.
     owned: Mutex<BridgeOwned>,
     orphans: Mutex<Vec<BridgeOrphans>>,
+    /// The page every audit question gets, and the questions.
+    audit_page: Mutex<BridgeAuditPage>,
+    audits: Mutex<Vec<BridgeAuditQuery>>,
 }
 
 impl FakeBridge {
@@ -135,6 +139,11 @@ impl BridgeAccounts for FakeBridge {
         answer(Ok(self.orphans.lock().expect("lock").clone()))
     }
 
+    fn audit(&self, query: BridgeAuditQuery) -> BridgeAccountResult<BridgeAuditPage> {
+        self.audits.lock().expect("lock").push(query);
+        answer(Ok(self.audit_page.lock().expect("lock").clone()))
+    }
+
     fn settle_orphans(&self, owner: String, private: BridgeDisposition) -> BridgeAccountResult<()> {
         self.asked(format!("settle {owner} {private:?}"));
         answer(Ok(()))
@@ -196,6 +205,7 @@ fn a_read_only_account_has_its_tokens_and_no_administration(cx: &mut TestAppCont
         assert!(window.try_find("section_tokens").is_some());
         assert!(window.try_find("section_accounts").is_none());
         assert!(window.try_find("section_invites").is_none());
+        assert!(window.try_find("section_audit").is_none());
     })
     .expect("the window is open");
 }
@@ -479,6 +489,64 @@ fn what_a_deleted_account_left_is_listed_and_settled(cx: &mut TestAppContext) {
     let_the_dialog_land();
     click(cx, window, "zedis-dialog-ok");
     assert_eq!(bridge.requests(), vec![r#"settle ghost HandTo("alice")"#]);
+}
+
+/// An administrator's audit is read when its section is first opened,
+/// narrowed by what the fields hold, and continued from where a page ended.
+#[gpui::test]
+fn the_audit_is_read_narrowed_and_continued(cx: &mut TestAppContext) {
+    let bridge = FakeBridge::signed_in_as("alice", BridgeRole::Admin);
+    let line = |event: &str, account: &str| {
+        format!(r#"{{"ts":"2026-10-18T07:14:58.219Z","account":"{account}","event":"{event}"}}"#)
+    };
+    *bridge.audit_page.lock().expect("lock") = BridgeAuditPage {
+        lines: vec![line("logout", "bob"), line("login", "bob")],
+        next: Some("7".to_string()),
+        stopped_early: false,
+    };
+    let (view, window) = open(cx, bridge.clone());
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.select_section(AccountSection::Audit, window, cx));
+    })
+    .expect("the window is open");
+    cx.run_until_parked();
+    assert_eq!(
+        bridge.audits.lock().expect("lock").clone(),
+        vec![BridgeAuditQuery::default()],
+        "read when first opened, everything"
+    );
+    view.read_with(cx, |view, cx| {
+        assert_eq!(view.audit.table.read(cx).delegate().visible_len(), 2);
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(AUDIT_ACCOUNT_ID, cx);
+        window.input("bob", cx);
+        window.click(AUDIT_SEARCH_ID, cx);
+    })
+    .expect("the window is open");
+    cx.run_until_parked();
+    click(cx, window, AUDIT_MORE_ID);
+    let bob = BridgeAuditQuery {
+        account: Some("bob".to_string()),
+        ..BridgeAuditQuery::default()
+    };
+    assert_eq!(
+        bridge.audits.lock().expect("lock")[1..].to_vec(),
+        vec![
+            bob.clone(),
+            BridgeAuditQuery {
+                before: Some("7".to_string()),
+                ..bob
+            }
+        ],
+        "narrowed, then the next page of the same question"
+    );
+    view.read_with(cx, |view, cx| {
+        assert_eq!(view.audit.lines.len(), 4, "the older page is added below");
+        assert_eq!(view.audit.table.read(cx).delegate().visible_len(), 4);
+    });
 }
 
 /// The desktop has no bridge to ask, so *Account…* — were anything to send

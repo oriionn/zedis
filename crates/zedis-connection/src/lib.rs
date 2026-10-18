@@ -111,13 +111,14 @@ pub use audit::{is_administration_command, redact_secrets};
 pub use bitmap::{BitOpKind, BitmapInfo, bit_field, bit_op, bitmap_info, set_bit};
 pub use bridge::{
     BridgeAccount, BridgeAccountChange, BridgeAccountError, BridgeAccountErrorKind, BridgeAccountResult,
-    BridgeAccounts, BridgeConn, BridgeDisposition, BridgeError, BridgeErrorKind, BridgeInvite, BridgeInviteKind,
-    BridgeKeyNote, BridgeNewInvite, BridgeOrphans, BridgeOwnAccount, BridgeOwned, BridgeOwnedItem, BridgePageData,
-    BridgePageRow, BridgePageSeed, BridgeReply, BridgeRequest, BridgeRole, BridgeScript, BridgeServerStore,
-    BridgeStorage, BridgeToken, BridgeTransport, BridgeTrashEntry, DESCRIBED_COMMANDS, PipelineSpec, WatchBatch,
-    WatchItem, WatchKind, WatchOpened, bridge_accounts, bridge_page_data, bridge_server_store, bridge_storage,
-    bridge_transport, describe_commands, describe_packed_command, set_bridge_accounts, set_bridge_page_data,
-    set_bridge_server_store, set_bridge_storage, set_bridge_transport, sign_out_of_bridge, signed_in_to_bridge,
+    BridgeAccounts, BridgeAuditPage, BridgeAuditQuery, BridgeConn, BridgeDisposition, BridgeError, BridgeErrorKind,
+    BridgeInvite, BridgeInviteKind, BridgeKeyNote, BridgeNewInvite, BridgeOrphans, BridgeOwnAccount, BridgeOwned,
+    BridgeOwnedItem, BridgePageData, BridgePageRow, BridgePageSeed, BridgeReply, BridgeRequest, BridgeRole,
+    BridgeScript, BridgeServerStore, BridgeStorage, BridgeToken, BridgeTransport, BridgeTrashEntry, DESCRIBED_COMMANDS,
+    PipelineSpec, WatchBatch, WatchItem, WatchKind, WatchOpened, bridge_accounts, bridge_page_data,
+    bridge_server_store, bridge_storage, bridge_transport, describe_commands, describe_packed_command,
+    set_bridge_accounts, set_bridge_page_data, set_bridge_server_store, set_bridge_storage, set_bridge_transport,
+    sign_out_of_bridge, signed_in_to_bridge,
 };
 /// What stands in for redis-rs's `Cmd::query_async` / `Pipeline::query_async`
 /// in the browser, where the `aio` feature that provides them cannot be built.
@@ -141,9 +142,6 @@ pub use compare::{
     CompareOptions, CompareProgress, CompareReport, CompareSide, CompareStage, DifferingKey, KeyDifference,
     compare_prefix, prefix_pattern, values_equal,
 };
-#[cfg(not(target_family = "wasm"))]
-pub use config::servers_toml_redacted;
-#[cfg(target_family = "wasm")]
 pub use config::set_servers_cache;
 pub use config::{
     DEFAULT_KEY_SCAN_COUNT, ImportError, MAX_KEY_SCAN_COUNT, MIN_KEY_SCAN_COUNT, PRODUCTION_KEY_SCAN_COUNT,
@@ -151,6 +149,8 @@ pub use config::{
     get_server_groups, is_connection_uri, tag_color_index, writes_index,
 };
 pub use config::{get_server, get_servers, save_servers};
+#[cfg(not(target_family = "wasm"))]
+pub use config::{open_server_secrets, read_servers_file, seal_server_secrets, servers_toml_redacted};
 pub use conn::RedisAsyncConn;
 pub use danger::{
     ConfirmStrictness, DangerKind, WRITE_UNLOCK_SECS, classify_dangerous, classify_dangerous_line,

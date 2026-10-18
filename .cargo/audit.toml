@@ -21,7 +21,9 @@ ignore = [
     # it is disabling russh's `rsa` feature, which removes RSA key support. The
     # attack requires a local attacker timing RSA decryption during the SSH
     # handshake, which is outside our threat model. Risk-accepted until russh
-    # moves off the rsa RC.
+    # moves off the rsa RC. The bridge's MySQL store (sqlx's `mysql-rsa`, ADR
+    # 18) reaches the same crate only to encrypt a password with the server's
+    # public key — no private-key operation for the attack to time.
     "RUSTSEC-2023-0071",
 
     # Unmaintained (informational warnings, not vulnerabilities) — all deep

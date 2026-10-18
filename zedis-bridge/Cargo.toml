@@ -65,6 +65,7 @@ toml.workspace = true
 # The audit webhook's POSTs (`--audit-webhook`): the blocking client the
 # desktop already uses, run off the async workers, on the same rustls + ring.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "any", "postgres", "mysql", "mysql-rsa", "migrate", "macros"] }
 
 [dev-dependencies]
 # Paused time for the watch tests (`watch.rs`): a long poll's twenty seconds

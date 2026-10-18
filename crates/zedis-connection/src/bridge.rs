@@ -740,6 +740,27 @@ pub struct BridgeOrphans {
     pub owned: BridgeOwned,
 }
 
+/// What an administrator asks the audit (ADR 18): every field narrows,
+/// none is every line. `before` is the previous page's `next`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BridgeAuditQuery {
+    pub account: Option<String>,
+    pub event: Option<String>,
+    pub since_ms: Option<i64>,
+    pub before: Option<String>,
+}
+
+/// A page of the audit, newest first: each line the JSON object the bridge
+/// kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BridgeAuditPage {
+    pub lines: Vec<String>,
+    /// Where the next, older page starts; `None` when there is none.
+    pub next: Option<String>,
+    /// The bridge read its file only so far back for this page.
+    pub stopped_early: bool,
+}
+
 /// What becomes of what an account kept to itself (ADR 17).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BridgeDisposition {
@@ -827,6 +848,8 @@ pub trait BridgeAccounts: Send + Sync + 'static {
     fn orphans(&self) -> BridgeAccountResult<Vec<BridgeOrphans>>;
     /// Settle what `owner`, an account no more, left behind.
     fn settle_orphans(&self, owner: String, private: BridgeDisposition) -> BridgeAccountResult<()>;
+    /// A page of the audit, for an administrator (ADR 18).
+    fn audit(&self, query: BridgeAuditQuery) -> BridgeAccountResult<BridgeAuditPage>;
     /// A link that sets a new password on `name`, once.
     fn reset_link(&self, name: String) -> BridgeAccountResult<BridgeNewInvite>;
     /// The open invitations.

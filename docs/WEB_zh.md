@@ -67,6 +67,39 @@ tools.example.com {
 
 访问 `https://tools.example.com/zedis/`。nginx 的等价写法是 `location /zedis { proxy_pass http://127.0.0.1:7379; }` —— `proxy_pass` 末尾不要加斜杠，否则前缀会被剥掉。健康检查地址也随之变为 `/zedis/v1/health`。
 
+## 多个 bridge 共用一个数据库
+
+默认情况下 bridge 把所有东西都存在数据目录里：只有一个进程，不需要额外的服务，备份就是复制一个目录。要运行多个 bridge（放在负载均衡后面，或者让某个 bridge 宕机时不会把所有人都踢下线），或者想要一个能检索的审计记录，就让所有 bridge 共用同一个 PostgreSQL 14+ 或 MySQL 8.0.19+ 数据库：
+
+```bash
+docker run -d --name zedis-web -p 127.0.0.1:7379:7379 \
+  -v zedis-data:/data \
+  -e ZEDIS_BRIDGE_STORE='postgres://zedis:…@db.internal:5432/zedis?sslmode=require' \
+  vicanso/zedis-web:latest
+```
+
+`ZEDIS_BRIDGE_STORE`（或 `--store`）是一个 `postgres://…` 或 `mysql://…` URL。推荐用环境变量：URL 里带着密码，而命令行参数能被任何可以列出进程的人看到。日志里只会出现它的主机部分。bridge 启动时会建表，每次升级时把表结构更新到当前版本，期间持有数据库自己的锁，所以同时启动的多个 bridge 只会执行一次；比表结构旧的 bridge 会拒绝启动。不支持 MariaDB。
+
+这时存进数据库的有：账号、邀请和 MCP 令牌，登录状态，服务器列表，回收站，指标历史，页面数据，初始化令牌，以及登录失败记录。在一个 bridge 上登录，在所有 bridge 上都算已登录；登录失败 10 次是所有 bridge 合计 10 次；在一个 bridge 上做的变更 —— 停用账号、删掉一条服务器规则、退出登录 —— **两秒内**传到其他 bridge。审计也默认开启并存在数据库里（见[审计日志](#审计日志)）。
+
+需要安排好三件事：
+
+- **所有 bridge 用同一个 `master.key`。** 服务器密码和回收站内容在写进数据库之前都用它加密。第一个打开空数据库的 bridge 会用自己的 key 封存一个校验值，key 不同的 bridge 会拒绝启动，而不是写入其他 bridge 解不开的密码。把同一个文件挂载进每个 bridge（`/data/master.key`），并且和数据库分开备份：只有其中一个毫无用处，两者也不该放在一起。
+- **让每个浏览器固定落在同一个 bridge 上**，按 `zedis_bridge` 登录 cookie 做会话粘滞。登录本身不需要这一点，需要它的是那些不是数据的东西：终端会话，以及 Pub/Sub、Monitor、键空间通知面板，都是某个 bridge 里开着的 Redis 连接，它们的请求落到别的 bridge 会被拒绝；已解锁的写入窗口在那里也要重新解锁。一个 bridge 宕机，页面丢掉的是这些，而不是登录状态。在线客户端（`GET /v1/clients`）和 MCP 调用限额按 bridge 分别统计。
+- **时钟同步**（NTP），和任何多主机服务一样：登录过期、回收站清理、指标采样都按各个 bridge 自己的时钟。
+
+MySQL 8 默认使用 `caching_sha2_password` 认证；请开启 TLS（`?ssl-mode=REQUIRED`）—— 不开时 bridge 会用 RSA 加密发送密码，但之后的所有内容都是明文传输。`zedis-bridge setup-token` 读取同一个 `ZEDIS_BRIDGE_STORE`，把新的令牌存进数据库。
+
+**迁移已有的 bridge。** 先停掉它，然后把它的数据目录一次性复制进空数据库 —— 账号和邀请、登录状态（不用重新登录）、服务器列表、脚本、页面数据，回收站和指标历史保持原样，等待中的初始化令牌，加上 `--audit-file` 的话还有审计文件：
+
+```bash
+docker run --rm -v zedis-data:/data \
+  -e ZEDIS_BRIDGE_STORE='postgres://…' \
+  vicanso/zedis-web:latest import-local --audit-file /data/audit.log
+```
+
+它使用那个目录的 `master.key`，此后这个数据库上的每个 bridge 都要用它；如果数据库里已经有账号、服务器条目或脚本，会拒绝导入。迁移之后要回退，只能靠数据库自己的备份。
+
 ## 账号与共享
 
 服务器条目属于添加它的账号，其他人看不到；勾选**共享**（Shared）后则对所有账号可见。能看到共享条目、且有写权限的账号都可以编辑或删除它。
@@ -124,6 +157,10 @@ tools.example.com {
 
 这只是 bridge 这一扇门的日志：`redis-cli` 和应用程序直连 Redis 的操作不在里面；它回答不了"谁改了这个 key"，能回答的是"有没有人手动改过"。bridge 只追加、从不重新打开文件，轮转请用 `copytruncate`。
 
+使用[数据库](#多个-bridge-共用一个数据库)时，审计**默认开启**并存在数据库里 —— 所有 bridge 的记录在同一张表 —— 保留 365 天（`--audit-retention-days`、`ZEDIS_BRIDGE_AUDIT_RETENTION_DAYS`；`0` 表示永久保留）。`--audit-log /路径` 改为写文件（每个 bridge 各写一份），`--audit-log off` 关闭审计，`--audit-writes` 照旧追加普通数据写入。写不进去的记录会作为错误写进 bridge 自己的日志，相关的请求照常放行。
+
+**查看审计。** 管理员在账号页（**账号…** → *审计*）查看：最新的在前，可按账号和事件筛选，分页加载，选中一行显示完整内容。脚本可以调用 `GET /v1/admin/audit`，参数可选 `account`、`event`、`server`（服务器条目的 id）、`since_ms` / `until_ms`（unix 毫秒）和 `limit`，用上一页返回的 `next` 作为 `before` 继续翻页。写文件时，每一页最多从上一页停下的位置往前读 16 MB，并会注明（`"stopped_early": true`）；存在数据库里时是全量查询。
+
 ### 推送到群聊
 
 `--audit-webhook <url>`（`ZEDIS_BRIDGE_AUDIT_WEBHOOK`）把需要人留意的审计行实时推送到群聊，开不开 `--audit-log` 都可以。填机器人的 webhook 地址，消息格式按域名自动识别——飞书 / Lark（`open.feishu.cn`、`open.larksuite.com`）、钉钉（`oapi.dingtalk.com`）、企业微信（`qyapi.weixin.qq.com`）、Slack（`hooks.slack.com`）；其它地址收到的是审计行本身的 JSON，`{"source":"zedis-bridge","events":[…]}`，方便接自己的程序。经过中转、从域名看不出来时，用 `--audit-webhook-format json|feishu|dingtalk|wecom|slack`（`ZEDIS_BRIDGE_AUDIT_WEBHOOK_FORMAT`）指定。飞书或钉钉机器人开了签名校验的，把密钥放进 `ZEDIS_BRIDGE_AUDIT_WEBHOOK_SECRET`（也有 `--audit-webhook-secret` 参数，但命令行参数在进程列表里本机所有用户都看得到）。
@@ -164,12 +201,12 @@ INFO zedis_bridge: client offline account="ops" kind="basic" online=2
 
 ```console
 $ curl -s -u alice:secret https://zedis.example.com/v1/clients
-{"online":2,"window_secs":300,"clients":[
+{"process":"4c1f…","online":2,"window_secs":300,"clients":[
   {"account":"alice","kind":"browser","peer":"10.0.0.7","last_seen":"2026-10-17T04:21:57.000Z","idle_secs":4},
   {"account":"ai","kind":"token","token":"claude-laptop","peer":"10.0.0.9","last_seen":"2026-10-17T04:20:41.000Z","idle_secs":80}]}
 ```
 
-`peer` 是 TCP 连接的对端，经反向代理时是代理的地址；代理写了 `X-Forwarded-For` 时会多一个 `forwarded_for`。在线数只保存在内存里：bridge 重启后，每个客户端在下一次请求时重新计入。
+`peer` 是 TCP 连接的对端，经反向代理时是代理的地址；代理写了 `X-Forwarded-For` 时会多一个 `forwarded_for`。在线数只保存在内存里：bridge 重启后，每个客户端在下一次请求时重新计入。[多个 bridge](#多个-bridge-共用一个数据库) 时各自统计自己的客户端，`process` 表明是哪个 bridge 回答的。
 
 ## 让 AI 助手只读访问（MCP）
 
@@ -213,7 +250,7 @@ claude mcp add --transport http zedis https://bridge.example.com/v1/mcp \
 
 ## 保存在 bridge 上的数据
 
-桌面版存在本地数据库里的东西，bridge 替页面保存：在应用启动前载入，有改动就随时保存。
+桌面版存在本地数据库里的东西，bridge 替页面保存：在应用启动前载入，有改动就随时保存 —— 存在下面列出的文件里，bridge 配了[数据库](#多个-bridge-共用一个数据库)时则存在数据库里。
 
 - **每个账号自己的**——收藏、最近打开的 key、搜索历史和设置（`bridge-page-data/accounts/`）。它们跟着账号走，换哪个浏览器都一样，别人看不到；只读账号也有自己的一份。删除账号时一并删除。
 - **key 的标签和备注**（`bridge-page-data/key-notes/`）——属于服务器：能看到这台服务器的人都能看到，每条都记着是谁、在什么时候留下的。按 key 逐条保存，所以两个人给两个 key 打标签不会互相覆盖。在这台服务器上不能写的账号——只读账号，或规则在这里写了 `:ro` 的账号——只能看，不能加。删除服务器条目时一并删除。

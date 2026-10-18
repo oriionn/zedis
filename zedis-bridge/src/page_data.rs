@@ -158,6 +158,18 @@ fn restrict(_path: &FsPath) {}
 
 /// `path` as JSON, or the default when there is none yet. One that cannot be
 /// read is an error, never empty: the next write would replace it whole.
+/// The text a file name's hex spells, if it spells one.
+fn unhex(hex: &str) -> Option<String> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = (0..hex.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(hex.get(at..at + 2)?, 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    String::from_utf8(bytes).ok()
+}
+
 fn read_json<T: Default + serde::de::DeserializeOwned>(path: &FsPath) -> io::Result<T> {
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(io::Error::other),
@@ -279,6 +291,20 @@ impl LocalKeyNotes {
 
     fn path(&self, server_id: &str) -> PathBuf {
         self.dir.join(format!("{}.json", hex(server_id.as_bytes())))
+    }
+
+    /// The servers that have notes here, by id: what `import-local` copies.
+    pub fn servers(&self) -> Vec<String> {
+        let Ok(files) = std::fs::read_dir(self.dir.as_path()) else {
+            return Vec::new();
+        };
+        let mut servers: Vec<String> = files
+            .flatten()
+            .filter_map(|f| f.file_name().into_string().ok())
+            .filter_map(|name| name.strip_suffix(".json").and_then(unhex))
+            .collect();
+        servers.sort();
+        servers
     }
 
     fn list(&self, server_id: &str) -> io::Result<BTreeMap<String, KeyNote>> {

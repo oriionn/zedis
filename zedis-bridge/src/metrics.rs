@@ -44,7 +44,7 @@ pub const RETENTION_DAYS: i64 = 7;
 pub const MAX_SAMPLE_BYTES: usize = 16 * 1024;
 /// The most points one read hands back.
 pub const MAX_POINTS: usize = 2_000;
-const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+pub(crate) const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 /// How far a sample's time may stray from the bridge's clock.
 const CLOCK_SLACK_MS: i64 = 10 * 60 * 1000;
 
@@ -79,7 +79,7 @@ pub struct LocalMetrics {
     last_minute: Arc<Mutex<HashMap<String, i64>>>,
 }
 
-fn plain(name: &str) -> bool {
+pub(crate) fn plain(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 128
         && name
@@ -87,7 +87,7 @@ fn plain(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -106,6 +106,27 @@ fn private_dir(dir: &std::path::Path) -> io::Result<()> {
     fs::create_dir_all(dir)
 }
 
+/// `sample` as a store keeps it, or why it is not kept: every store asks
+/// the same of it.
+pub(crate) fn checked(server_id: &str, ts_ms: i64, sample: &str, now_ms: i64) -> Result<Box<RawValue>, PutError> {
+    if !plain(server_id) {
+        return Err(PutError::Invalid("not a server id".to_string()));
+    }
+    if sample.len() > MAX_SAMPLE_BYTES {
+        return Err(PutError::Invalid(format!(
+            "a sample is at most {MAX_SAMPLE_BYTES} bytes"
+        )));
+    }
+    let raw: Box<RawValue> = serde_json::from_str(sample).map_err(|e| PutError::Invalid(format!("not JSON: {e}")))?;
+    if !raw.get().trim_start().starts_with('{') {
+        return Err(PutError::Invalid("a sample is a JSON object".to_string()));
+    }
+    if (ts_ms - now_ms).abs() > CLOCK_SLACK_MS {
+        return Err(PutError::OutOfTime);
+    }
+    Ok(raw)
+}
+
 impl LocalMetrics {
     pub fn new(root: PathBuf) -> Self {
         Self {
@@ -121,22 +142,7 @@ impl LocalMetrics {
     }
 
     fn put_at(&self, server_id: &str, ts_ms: i64, sample: &str, now_ms: i64) -> Result<bool, PutError> {
-        if !plain(server_id) {
-            return Err(PutError::Invalid("not a server id".to_string()));
-        }
-        if sample.len() > MAX_SAMPLE_BYTES {
-            return Err(PutError::Invalid(format!(
-                "a sample is at most {MAX_SAMPLE_BYTES} bytes"
-            )));
-        }
-        let raw: Box<RawValue> =
-            serde_json::from_str(sample).map_err(|e| PutError::Invalid(format!("not JSON: {e}")))?;
-        if !raw.get().trim_start().starts_with('{') {
-            return Err(PutError::Invalid("a sample is a JSON object".to_string()));
-        }
-        if (ts_ms - now_ms).abs() > CLOCK_SLACK_MS {
-            return Err(PutError::OutOfTime);
-        }
+        let raw = checked(server_id, ts_ms, sample, now_ms)?;
         let minute = ts_ms.div_euclid(INTERVAL_MS);
         {
             let mut last = self.last_minute.lock().unwrap_or_else(PoisonError::into_inner);
@@ -190,6 +196,48 @@ impl LocalMetrics {
     }
 
     /// Forget a server's whole history: the entry itself is gone.
+    /// The servers that have a history here, by id: what `import-local`
+    /// copies.
+    pub fn servers(&self) -> Vec<String> {
+        let Ok(dirs) = fs::read_dir(self.root.as_path()) else {
+            return Vec::new();
+        };
+        let mut servers: Vec<String> = dirs
+            .flatten()
+            .filter(|d| d.path().is_dir())
+            .filter_map(|d| d.file_name().into_string().ok())
+            .filter(|name| plain(name))
+            .collect();
+        servers.sort();
+        servers
+    }
+
+    /// Every sample `server_id` keeps, with its time, oldest first — not
+    /// thinned, as `since` is for a chart.
+    pub fn history(&self, server_id: &str) -> Vec<(i64, Box<RawValue>)> {
+        if !plain(server_id) {
+            return Vec::new();
+        }
+        let Ok(days) = fs::read_dir(self.root.join(server_id)) else {
+            return Vec::new();
+        };
+        let mut paths: Vec<_> = days.flatten().map(|d| d.path()).collect();
+        paths.sort();
+        let mut samples = Vec::new();
+        for path in paths {
+            let Ok(file) = fs::File::open(&path) else {
+                continue;
+            };
+            for line in io::BufReader::new(file).lines().map_while(Result::ok) {
+                if let Ok(stored) = serde_json::from_str::<StoredLine>(&line) {
+                    samples.push((stored.ts, stored.s));
+                }
+            }
+        }
+        samples.sort_by_key(|(ts, _)| *ts);
+        samples
+    }
+
     pub fn remove_server(&self, server_id: &str) {
         if plain(server_id) {
             let _ = fs::remove_dir_all(self.root.join(server_id));
@@ -259,7 +307,7 @@ impl store::MetricsStore for LocalMetrics {
 
 /// Every `n`th of `samples`, and the last, so a week reads as a week in a
 /// few hundred points.
-fn thin<T>(samples: Vec<T>, max_points: usize) -> Vec<T> {
+pub(crate) fn thin<T>(samples: Vec<T>, max_points: usize) -> Vec<T> {
     let len = samples.len();
     if len <= max_points {
         return samples;

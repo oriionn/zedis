@@ -144,6 +144,7 @@ run, and a backup one directory to copy. A SQL implementation is a second
 one, chosen at start-up by a connection URL and written when a deployment
 needs it; one implementation over PostgreSQL, MySQL and SQLite is the
 target, and its crate is chosen (and its current version checked) then.
+(ADR 18: PostgreSQL and MySQL on sqlx, and not SQLite.)
 
 All of the traits live in `zedis-bridge` (`store.rs`), the server list's
 too. Its local-directory store goes through `zedis-connection`'s own
@@ -262,7 +263,7 @@ give the desktop the same results before and after each step, and
    page now refreshes it.
 5. A SQL implementation when a deployment asks for more than one process
    or for audit queries, with migrations, and the audit viewer for
-   administrators.
+   administrators. Designed in ADR 18.
 
 ## Consequences
 
