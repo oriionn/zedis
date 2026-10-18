@@ -1019,13 +1019,48 @@ impl ZedisEditor {
 
 #[cfg(test)]
 mod tests {
-    use super::render::{ACT_HINTS, FIND_HINTS};
+    use super::ZedisEditor;
+    use super::render::{ACT_HINTS, EMPTY_NEW_KEY_ID, FIND_HINTS};
     use super::{
         bitmap_override_for, format_ttl_string, suggested_value_filename, ttl_field_text, value_export_extension,
     };
     use crate::helpers::hot_key_table;
+    use crate::states::ZedisServerState;
     use crate::states::{DataFormat, ViewMode};
+    use crate::test_support::init_ui;
+    use gpui::{AppContext, TestAppContext, px, size};
+    use gpui_kit::component::Root;
+    use gpui_kit::test::TestWindowExt;
     use zedis_core::validate::ttl_secs;
+
+    /// Whether the empty editor offers *New key*, with the connection
+    /// read-only or not.
+    fn offers_new_key(cx: &mut TestAppContext, read_only: bool) -> bool {
+        let server_state = cx.new(|_| ZedisServerState::default());
+        if read_only {
+            server_state.update(cx, |state, cx| state.toggle_readonly(cx));
+        }
+        let handle = cx.open_window(size(px(900.), px(600.)), |window, cx| {
+            let view = cx.new(|cx| ZedisEditor::new(server_state.clone(), window, cx));
+            Root::new(view, window, cx)
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find(EMPTY_NEW_KEY_ID).is_some()
+        })
+        .expect("the window is open")
+    }
+
+    /// The empty editor offers *New key* only where a key can be created.
+    /// On a read-only connection — a Redis user that may not write, an entry
+    /// set read-only, a read-only bridge account — the press did nothing,
+    /// while the tree's own button was grey and said why.
+    #[gpui::test]
+    fn the_empty_editor_offers_new_key_only_where_one_can_be_created(cx: &mut TestAppContext) {
+        init_ui(cx);
+        assert!(offers_new_key(cx, false), "a connection that may write is offered it");
+        assert!(!offers_new_key(cx, true), "a read-only one is not");
+    }
 
     /// A viewer chosen on the status bar decides between the bitmap grid
     /// and the bytes: Plain and Hex leave the grid, Auto gives the choice

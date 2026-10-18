@@ -27,6 +27,8 @@ use crate::helpers::has_file_dialogs;
 /// [`hot_key_label`]: in the browser, ⌘N (a browser window).
 pub(super) const FIND_HINTS: [&str; 4] = ["search", "command_palette", "recent_keys", "multi_search"];
 pub(super) const ACT_HINTS: [&str; 4] = ["new_key", "reload_keys", "terminal", "keyboard_shortcuts"];
+/// The empty editor's *New key* button.
+pub(super) const EMPTY_NEW_KEY_ID: &str = "empty-new-key";
 
 /// Above this a "load anyway" is warned about in plainer words: the wait is
 /// seconds, not a blink, and the memory is the larger cost.
@@ -800,19 +802,25 @@ impl ZedisEditor {
 
         // The one action that is not already on the tree or a shortcut
         // the guide lists: create a key. Search / terminal / multi-search
-        // live in the card below (and ⌘F / ⌘J / ⌘⇧F).
-        let quick_actions = h_flex().mt_3().justify_center().child(
-            Button::new("empty-new-key")
-                .outline()
-                .small()
-                .icon(IconName::Plus)
-                .label(i18n_shortcuts(cx, "new_key"))
-                .when_some(hot_key_label("new_key"), |button, chord| button.tooltip(chord))
-                .on_click(cx.listener(|this, _, _window, cx| {
-                    this.server_state
-                        .update(cx, |state, cx| state.emit_editor_action(EditorAction::Create, cx));
-                })),
-        );
+        // live in the card below (and ⌘F / ⌘J / ⌘⇧F). Only where a key can
+        // be created: on a read-only connection or account the press did
+        // nothing at all (`emit_editor_action` refuses it), while the tree's
+        // own button says why it is grey.
+        let can_create = self.server_state.read(cx).can(Capability::CreateKey);
+        let quick_actions = h_flex().mt_3().justify_center().when(can_create, |row| {
+            row.child(
+                Button::new(EMPTY_NEW_KEY_ID)
+                    .outline()
+                    .small()
+                    .icon(IconName::Plus)
+                    .label(i18n_shortcuts(cx, "new_key"))
+                    .when_some(hot_key_label("new_key"), |button, chord| button.tooltip(chord))
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.server_state
+                            .update(cx, |state, cx| state.emit_editor_action(EditorAction::Create, cx));
+                    })),
+            )
+        });
 
         // One card for discoverability blocks — shared width, border, and
         // hairline dividers keep hierarchy without floating sections.

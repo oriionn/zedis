@@ -1028,6 +1028,22 @@ impl BridgeConn {
         parse_frame(0, frame)
     }
 
+    /// One command's reply as `T`, the way redis-rs's `Cmd::query_async`
+    /// hands it over: an error reply — at the top, or inside a collection —
+    /// is an `Err` carrying the server's kind, never a value. What
+    /// [`BridgeQuery`] answers with in the browser.
+    ///
+    /// [`send_command`](Self::send_command) is the raw reply on purpose (the
+    /// terminal shows an error as the server said it); redis-rs applies
+    /// `extract_error` after its own `req_packed_command` too. The browser's
+    /// stand-in once skipped it, and every error reply there became a value
+    /// or an untyped parse failure: a script's `NOSCRIPT` read as a hit with
+    /// the error as its result and no `SCRIPT LOAD`, a refused write as done.
+    pub async fn query_command<T: FromRedisValue>(&self, cmd: &Cmd) -> Result<T, RedisError> {
+        let value = self.send_command(cmd).await?;
+        T::from_redis_value(value.extract_error()?).map_err(RedisError::from)
+    }
+
     /// A pipeline's `count` replies, after `offset` are discarded.
     pub async fn send_pipeline(
         &self,
@@ -1120,14 +1136,14 @@ pub trait BridgeQuery {
 impl BridgeQuery for Cmd {
     async fn query_async<T: FromRedisValue>(&self, conn: &mut RedisAsyncConn) -> Result<T, RedisError> {
         let RedisAsyncConn::Bridge(conn) = conn;
-        let value = conn.send_command(self).await?;
-        T::from_redis_value(value).map_err(RedisError::from)
+        conn.query_command(self).await
     }
 
+    /// redis-rs's is `query_async::<()>`: whatever the reply, unless it is
+    /// an error.
     async fn exec_async(&self, conn: &mut RedisAsyncConn) -> Result<(), RedisError> {
         let RedisAsyncConn::Bridge(conn) = conn;
-        conn.send_command(self).await?;
-        Ok(())
+        conn.query_command::<()>(self).await
     }
 }
 
@@ -1357,6 +1373,44 @@ mod tests {
         assert_eq!(seen[0].db, 2);
         assert!(seen[0].pipeline.is_none());
         assert_eq!(seen[0].commands, vec![Cmd::new().arg("PING").get_packed_command()]);
+    }
+
+    /// An error reply is an error, with the server's kind — as redis-rs's
+    /// own `query_async` gives it on the desktop — whatever type was asked
+    /// for, `()` included. The browser's stand-in used to hand `NOSCRIPT`
+    /// back as a value: a script that was not cached ran as a "hit" whose
+    /// result was the error, and nothing loaded it.
+    #[test]
+    fn an_error_reply_is_an_error_whatever_type_was_asked_for() {
+        let rec = recorder(frames(vec![
+            b"-NOSCRIPT No matching script. Please use EVAL.\r\n".to_vec(),
+        ]));
+        let conn = BridgeConn::new(rec, "srv", 0);
+        let evalsha = Cmd::new().arg("EVALSHA").arg("deadbeef").arg(0).clone();
+        let as_value = smol::block_on(conn.query_command::<Value>(&evalsha)).expect_err("an error, not a value");
+        assert_eq!(as_value.code(), Some("NOSCRIPT"));
+        let as_text = smol::block_on(conn.query_command::<String>(&evalsha)).expect_err("an error");
+        assert_eq!(
+            as_text.code(),
+            Some("NOSCRIPT"),
+            "the server's kind, not a parse failure"
+        );
+        let as_unit = smol::block_on(conn.query_command::<()>(&evalsha)).expect_err("a refused write is not done");
+        assert_eq!(as_unit.code(), Some("NOSCRIPT"));
+
+        // Inside a collection too, as redis-rs does it.
+        let rec = recorder(frames(vec![
+            b"*2\r\n:1\r\n-WRONGTYPE Operation against a key\r\n".to_vec(),
+        ]));
+        let conn = BridgeConn::new(rec, "srv", 0);
+        let nested = smol::block_on(conn.query_command::<Value>(&Cmd::new().arg("X").clone())).expect_err("nested");
+        assert_eq!(nested.code(), Some("WRONGTYPE"));
+
+        // And a reply that is not an error is the value it always was.
+        let rec = recorder(frames(vec![b"$3\r\nabc\r\n".to_vec()]));
+        let conn = BridgeConn::new(rec, "srv", 0);
+        let ok: String = smol::block_on(conn.query_command(&Cmd::new().arg("GET").arg("k").clone())).expect("value");
+        assert_eq!(ok, "abc");
     }
 
     #[test]
