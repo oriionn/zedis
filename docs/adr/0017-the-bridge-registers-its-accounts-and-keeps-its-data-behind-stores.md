@@ -213,7 +213,8 @@ shared crate, behind `cfg(target_family = "wasm")`; as pages, the desktop
 cannot see them by construction — and setup, sign-up and sign-in have to
 work before the app is loaded anyway. Their strings live in the eight
 locale files like every other, and the locale test learns to read the pages
-so their keys are not reported as orphans.
+so their keys are not reported as orphans. (Amended below: the account page
+moved into the app, and only the sign-in page is HTML.)
 
 The check is the one CLAUDE.md already names: `make lint` and `make test`
 give the desktop the same results before and after each step, and
@@ -240,7 +241,8 @@ give the desktop the same results before and after each step, and
    can give it a reset link. Invitation codes travel only in POST bodies and
    in a link's `#` fragment, which no request carries. A deleted account's
    private server entries stay on the bridge, seen by nobody; handing them
-   over is left for later.
+   over is left for later. The account page then moves into the app (the
+   amendment below), before step 4.
 4. The page's data: scripts (private or shared, audited), key tags and
    notes, per-account favorites, recent keys and preferences.
 5. A SQL implementation when a deployment asks for more than one process
@@ -266,3 +268,72 @@ give the desktop the same results before and after each step, and
 - The desktop is unchanged. `overlapping_edits_all_land_in_the_list_and_the_file`
   holds the lock that fixed the lost update: sixty-four concurrent
   additions, each present afterwards in the list and in the file.
+
+## Amended 2026-10-18 — the account page is drawn by the app
+
+The account page was HTML for two reasons, and only one of them holds for
+it. Setup, sign-up and sign-in do have to work before the app is signed in,
+and they are where a browser's password manager saves and fills a
+credential, which it can do for a real `<form>` and cannot for fields drawn
+on a canvas. The account page, though, is reached from inside the signed-in
+app, and the other reason — that as GPUI views it would be browser-only
+screens in the shared crate, behind `cfg(target_family = "wasm")` — is not
+how it has to be built: the app already draws browser-only things without a
+gate, through seams the desktop never installs (`signed_in_to_bridge()`,
+`bridge_danger`). As HTML it was a second interface beside the app, with its
+own look, its own loader for the strings, none of the app's themes or
+density, and no test but a browser driven by hand.
+
+So the line between the two moves to the sign-in:
+
+- **HTML** — `index.html`: sign-in, *Create the administrator*, and the
+  invitation form, which registers an account or, from a reset link, sets a
+  new password. All of it happens before the app is loaded, in real form
+  fields.
+- **GPUI** — everything after: the account page and its administration, as
+  views in the GUI crate (`views/account/`), opened by *Account…* as a dialog
+  over the page, the way the browser's Settings is, with its sections down
+  the left — the password, the account's MCP tokens (a read-only account's),
+  and for an administrator the accounts and the invitations.
+
+**The data comes through a seam the desktop never installs.** A
+`BridgeAccounts` trait in `zedis-connection`'s `bridge.rs`, beside
+`BridgeStorage`: one method per request to `/v1/account…` and `/v1/admin/…`,
+answering typed records of `String`s, like every struct that crate hands the
+UI. `zedis-web` implements it on its transport — so a lapsed login answers
+`401` and reloads to the sign-in form like every other request — and
+installs it beside the transport; `bridge_accounts()` is `None` on the
+desktop. The views are not `cfg`-gated: they compile on both targets, so
+`make lint` sees them, and are reached only through *Account…*, which is
+drawn while `signed_in_to_bridge()`. A view is handed the seam when it is
+opened rather than reading the global, so a UI test gives it a fake bridge.
+
+**Where the views differ from the page:**
+
+- An administrator edits an account from a table of accounts
+  (`ZedisTextTable`): the selected row's form — role, server rules one a
+  line, disabled — sits under it with *Save*, *Reset link…* and *Delete…*,
+  the delete behind the destructive confirm. No cell is editable, so no
+  table delegate is written by hand.
+- A token or a link shown once is shown in a read-only field with *Copy*:
+  the browser lets the app write the clipboard, not read it.
+- A token's expiry is picked with a `DatePicker`.
+- The strings move from `[web_account]` to a section of the app's, read with
+  `t!` through an `i18n_account` helper; `[web_account]` keeps the sign-in
+  page's own.
+- A password changed there is not seen by the browser's password manager,
+  which offers to update the saved one at the next sign-in instead. That is
+  the one thing given up.
+
+**What goes:** `account.html`; `pages.js`, which existed to be shared by two
+pages and goes back into `index.html`, its one user; and
+`BridgeTransport::page_url` / `bridge_page_url`, whose one caller was the
+menu item.
+
+**The desktop** gains code it compiles and never draws — the views and the
+trait — and nothing it runs: no transport, no accounts seam, so no menu item
+and no dialog. A native test holds `bridge_accounts()` to `None`, in place of
+the one that held `bridge_page_url` to `None`; `make lint` and `make test`
+give the desktop the same results before and after. `docs/WEB.md` and its
+twin change where they name `account.html`, and CLAUDE.md where it
+describes the pages.
