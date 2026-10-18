@@ -328,8 +328,11 @@ back but the database's own backups.
 
 ## Consequences
 
-- Every bridge links sqlx and both drivers: a longer build and a larger
-  binary, measured when they land; `make deny` checks the new crates.
+- Every bridge links sqlx and both drivers: a longer build (the bridge's
+  tree went from 302 crates to 333) and a larger binary — the release
+  bridge from 21.3 MB to 26.1 MB, 4.6 MiB more, measured on landing
+  (macOS arm64, the same page embedded in both). `make deny` checks the
+  new crates.
 - Every statement is written twice. A new store method writes both
   spellings, and the conformance suite runs it on both databases.
 - Two processes may disagree for up to two seconds about an account, the

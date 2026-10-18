@@ -549,6 +549,37 @@ fn the_audit_is_read_narrowed_and_continued(cx: &mut TestAppContext) {
     });
 }
 
+/// A new search starts with no line picked: a highlight left on the row that
+/// was picked would mark a line of the new answer nobody chose, over a detail
+/// that says to pick one.
+#[gpui::test]
+fn a_new_search_leaves_no_line_picked(cx: &mut TestAppContext) {
+    let bridge = FakeBridge::signed_in_as("alice", BridgeRole::Admin);
+    *bridge.audit_page.lock().expect("lock") = BridgeAuditPage {
+        lines: vec![r#"{"ts":"2026-10-18T07:14:58.219Z","account":"bob","event":"login"}"#.to_string()],
+        next: None,
+        stopped_early: false,
+    };
+    let (view, window) = open(cx, bridge);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.select_section(AccountSection::Audit, window, cx));
+    })
+    .expect("the window is open");
+    cx.run_until_parked();
+    view.update(cx, |view, cx| {
+        view.audit.table.update(cx, |table, cx| table.set_selected_row(0, cx));
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |view, cx| {
+        assert_eq!(view.audit.table.read(cx).selected_row(), Some(0));
+    });
+
+    click(cx, window, AUDIT_SEARCH_ID);
+    view.read_with(cx, |view, cx| {
+        assert_eq!(view.audit.table.read(cx).selected_row(), None, "nothing is marked");
+    });
+}
+
 /// The desktop has no bridge to ask, so *Account…* — were anything to send
 /// it — opens nothing.
 #[gpui::test]

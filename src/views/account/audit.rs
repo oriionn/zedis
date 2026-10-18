@@ -69,17 +69,21 @@ impl AuditForm {
             .copy_tooltip(i18n_common(cx, "copy_cell_tooltip"));
         let table = cx.new(|cx| TableState::new(table, window, cx));
         let table_subscription = cx.subscribe(&table, |this, table, event, cx| {
-            if let TableEvent::SelectRow(row) = event {
-                // The row's last cell, never drawn, is its line's place.
-                this.audit.selected = table
-                    .read(cx)
-                    .delegate()
-                    .visible_iter()
-                    .nth(*row)
-                    .and_then(|cells| cells.last())
-                    .and_then(|at| at.parse().ok());
-                cx.notify();
+            match event {
+                TableEvent::SelectRow(row) => {
+                    // The row's last cell, never drawn, is its line's place.
+                    this.audit.selected = table
+                        .read(cx)
+                        .delegate()
+                        .visible_iter()
+                        .nth(*row)
+                        .and_then(|cells| cells.last())
+                        .and_then(|at| at.parse().ok());
+                }
+                TableEvent::ClearSelection => this.audit.selected = None,
+                _ => return,
             }
+            cx.notify();
         });
         Self {
             lines: Vec::new(),
@@ -177,9 +181,14 @@ impl ZedisAccount {
         self.audit.next = page.next;
         self.audit.stopped_early = page.stopped_early;
         let rows = self.audit.rows();
-        self.audit
-            .table
-            .update(cx, |table, _| table.delegate_mut().set_rows(rows));
+        self.audit.table.update(cx, |table, cx| {
+            // A new question's rows are other lines: a highlight left on the
+            // row that was picked would point at one nobody picked.
+            if !older {
+                table.clear_selection(cx);
+            }
+            table.delegate_mut().set_rows(rows);
+        });
     }
 
     pub(super) fn render_audit(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -218,7 +227,13 @@ impl ZedisAccount {
                     .gap_2()
                     .items_center()
                     .child(div().w(px(200.)).child(Input::new(&form.account).id(AUDIT_ACCOUNT_ID)))
-                    .child(div().w(px(240.)).child(Input::new(&form.event).id(AUDIT_EVENT_ID)))
+                    // The rest of the row: its placeholder names two events.
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(240.))
+                            .child(Input::new(&form.event).id(AUDIT_EVENT_ID)),
+                    )
                     .child(
                         Button::new(AUDIT_SEARCH_ID)
                             .outline()
