@@ -17,7 +17,8 @@
 //! `Render` impl. Split out of `editor.rs`.
 
 use super::*;
-use crate::helpers::has_file_dialogs;
+use crate::helpers::{has_file_dialogs, value_write_limit};
+use crate::views::past_write_limit;
 
 /// The no-key screen's shortcut list, by hot key id — only actions that work
 /// with nothing selected (key-bound ones like save / TTL / rename / delete
@@ -681,7 +682,6 @@ impl ZedisEditor {
                         move |_, _window, cx| edit_connection(&server_id, cx)
                     }),
             );
-        #[cfg(not(target_family = "wasm"))]
         let actions = actions.when_some(server, |this, server| {
             this.child(
                 Button::new("link-down-diagnose")
@@ -980,6 +980,19 @@ impl Render for ZedisEditor {
             .value()
             .and_then(|value| value.bytes_value())
             .and_then(|bytes| bytes.viewer_failure.clone());
+        // A value the page cannot send back to the bridge opens read-only
+        // (`past_write_limit`); this is what says so, and why. Not over a
+        // value that is read-only for a reason of its own.
+        let unsendable = server_state
+            .value()
+            .filter(|value| {
+                !server_state.readonly()
+                    && value.preview_of().is_none()
+                    && !matches!(value.key_type(), KeyType::Module(_))
+            })
+            .and_then(|value| value.bytes_value())
+            .map(|bytes| bytes.bytes.len())
+            .filter(|len| past_write_limit(*len));
         if let Some(true) = self.should_enter_ttl_edit_mode.take() {
             self.enter_ttl_edit_mode(window, cx);
         }
@@ -1010,6 +1023,21 @@ impl Render for ZedisEditor {
                 .pt_2()
                 .child(Alert::warning("editor-viewer-failed", message).small().title(title))
         });
+        let write_limit_notice = unsendable.map(|len| {
+            let locale = cx.global::<ZedisGlobalStore>().read(cx).locale();
+            let message = t!(
+                "editor.read_only_past_write_limit",
+                size = format_size(len as u64, DECIMAL),
+                limit = format_size(value_write_limit().unwrap_or_default() as u64, DECIMAL),
+                locale = locale
+            )
+            .to_string();
+            div().flex_none().px_2().pt_2().child(
+                Alert::info("editor-past-write-limit", message)
+                    .small()
+                    .title(i18n_editor(cx, "read_only_past_write_limit_title")),
+            )
+        });
 
         v_flex()
             .track_focus(&self.focus_handle)
@@ -1017,6 +1045,7 @@ impl Render for ZedisEditor {
             .h_full()
             .when(!is_channel_mode, |this| this.child(self.render_select_key(cx)))
             .children(viewer_notice)
+            .children(write_limit_notice)
             // The key bar above is fixed-height; the editor body must be a
             // bounded flex item (`flex_1` + `min_h_0`) so children that scroll
             // internally — e.g. the side-by-side diff view's panes — have a

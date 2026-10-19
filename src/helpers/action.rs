@@ -76,8 +76,8 @@ pub enum SidebarServerAction {
     OpenInNewTab(SharedString),
     Edit(SharedString),
     Clone(SharedString),
-    /// The connection diagnostics window — offered where the build has
-    /// it ([`has_connection_diagnostics`](crate::helpers::has_connection_diagnostics)).
+    /// The staged connection diagnosis — run here on the desktop, by the
+    /// bridge for a page.
     Diagnose(SharedString),
     /// Into `group`; empty for no group.
     MoveToGroup {

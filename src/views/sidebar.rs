@@ -17,8 +17,7 @@ use crate::{
     connection::get_servers,
     constants::{EDITOR_KEY_BAR_HEIGHT, STATUS_BAR_HEIGHT},
     helpers::{
-        SidebarServerAction, has_connection_diagnostics, humanize_keystroke, is_quiet_tag, resolve_tag_chip,
-        resolve_tag_color, unique_monograms,
+        SidebarServerAction, humanize_keystroke, is_quiet_tag, resolve_tag_chip, resolve_tag_color, unique_monograms,
     },
     states::{
         ConnectionHealth, GlobalEvent, Route, ZedisGlobalStore, i18n_common, i18n_servers, i18n_sidebar,
@@ -139,12 +138,10 @@ impl ServerMenu {
             .separator()
             .menu(i18n_sidebar(cx, "server_edit"), action(SidebarServerAction::Edit))
             .menu(i18n_sidebar(cx, "server_clone"), action(SidebarServerAction::Clone))
-            .when(has_connection_diagnostics(), |menu| {
-                menu.menu(
-                    i18n_sidebar(cx, "server_diagnose"),
-                    action(SidebarServerAction::Diagnose),
-                )
-            });
+            .menu(
+                i18n_sidebar(cx, "server_diagnose"),
+                action(SidebarServerAction::Diagnose),
+            );
         // Every group the list shows, out of the one it is in, and a new one
         // named in a dialog (#219) — which is why the submenu is there even
         // before any group exists: creating the first one used to mean

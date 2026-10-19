@@ -50,13 +50,12 @@ use crate::states::{
 #[cfg(not(target_family = "wasm"))]
 use crate::states::{WindowPlacement, save_app_state};
 #[cfg(not(target_family = "wasm"))]
+use crate::views::open_migration_import_window;
 use crate::views::{
-    ExportSource, open_connection_diagnostics, open_migration_export_window, open_migration_import_window,
-};
-use crate::views::{
-    ZedisCommandPalette, ZedisContent, ZedisMultiSearch, ZedisRecentKeysPalette, ZedisShortcutsOverlay, ZedisSidebar,
-    ZedisTitleBar, confirm_dangerous_command, confirm_remove_server, open_account, open_compare, open_features_dialog,
-    open_new_group_dialog, open_settings, open_trash_dialog, open_troubleshoot_report,
+    ExportSource, ZedisCommandPalette, ZedisContent, ZedisMultiSearch, ZedisRecentKeysPalette, ZedisShortcutsOverlay,
+    ZedisSidebar, ZedisTitleBar, confirm_dangerous_command, confirm_remove_server, open_account, open_compare,
+    open_connection_diagnostics, open_features_dialog, open_key_export, open_new_group_dialog, open_settings,
+    open_trash_dialog, open_troubleshoot_report,
 };
 use crate::window_setup::*;
 use gpui::{
@@ -188,16 +187,11 @@ pub struct Zedis {
 
 /// The connection diagnostics window for a saved connection — the
 /// sidebar's Diagnose Connection.
-#[cfg(not(target_family = "wasm"))]
 fn diagnose_connection(server_id: &str, window: &mut Window, cx: &mut App) {
     if let Ok(server) = get_server(server_id) {
         open_connection_diagnostics(server, window, cx);
     }
 }
-/// Not in the browser, whose menu never offers it
-/// (`has_connection_diagnostics`).
-#[cfg(target_family = "wasm")]
-fn diagnose_connection(_server_id: &str, _window: &mut Window, _cx: &mut App) {}
 
 impl Zedis {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -1302,38 +1296,36 @@ impl Render for Zedis {
                     // Export every key loaded in the active tab's tree (a
                     // SCAN-limited subset, same coverage as the tree itself).
                     ServerToolsAction::ExportKeys => {
-                        #[cfg(not(target_family = "wasm"))]
-                        {
-                            let Some((server_id, db)) =
-                                cx.global::<ZedisGlobalStore>().read(cx).selected_server().cloned()
-                            else {
-                                return;
-                            };
-                            let server_name: gpui::SharedString = get_server(&server_id)
-                                .map(|s| s.name.into())
-                                .unwrap_or_else(|_| server_id.clone().into());
-                            let mut keys: Vec<gpui::SharedString> = this
-                                .active_content()
-                                .read(cx)
-                                .server_state()
-                                .read(cx)
-                                .keys()
-                                .keys()
-                                .cloned()
-                                .collect();
-                            if keys.is_empty() {
-                                return;
-                            }
-                            keys.sort_unstable();
-                            open_migration_export_window(
-                                server_id.into(),
-                                server_name,
-                                db,
-                                keys,
-                                ExportSource::Loaded,
-                                cx,
-                            );
+                        let Some((server_id, db)) = cx.global::<ZedisGlobalStore>().read(cx).selected_server().cloned()
+                        else {
+                            return;
+                        };
+                        let server_name: gpui::SharedString = get_server(&server_id)
+                            .map(|s| s.name.into())
+                            .unwrap_or_else(|_| server_id.clone().into());
+                        let mut keys: Vec<gpui::SharedString> = this
+                            .active_content()
+                            .read(cx)
+                            .server_state()
+                            .read(cx)
+                            .keys()
+                            .keys()
+                            .cloned()
+                            .collect();
+                        if keys.is_empty() {
+                            return;
                         }
+                        keys.sort_unstable();
+                        this.keep_focus_in_page(window, cx);
+                        open_key_export(
+                            server_id.into(),
+                            server_name,
+                            db,
+                            keys,
+                            ExportSource::Loaded,
+                            window,
+                            cx,
+                        );
                         return;
                     }
                 };

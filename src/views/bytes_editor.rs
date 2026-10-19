@@ -14,7 +14,7 @@
 
 use crate::helpers::{
     JsonPathAction, JsonPathOutcome, bytes_to_hex_text, get_mono_font_family, is_json_container, parse_hex_text,
-    run_jsonpath,
+    run_jsonpath, value_write_limit,
 };
 use crate::states::{
     DataFormat, JsonView, MAX_INLINE_VALUE_SIZE, RedisBytesValue, ServerEvent, ViewMode, ZedisGlobalStore,
@@ -613,11 +613,18 @@ impl ZedisBytesEditor {
             // Nor is a preview's: saved, the first bytes would replace the
             // whole value.
             let preview = value.is_some_and(|v| v.preview_of().is_some());
-            self.hex_editable = !(readonly || module_dump || preview);
+            // Nor, in a page, is one too large to send back to the bridge:
+            // the editor says so above it (`past_write_limit`).
+            let unsendable = past_write_limit(redis_bytes_value.bytes.len());
+            self.hex_editable = !(readonly || module_dump || preview || unsendable);
             // The Hex format shows its dump, read-only, until asked to edit.
             let hex_dump = hex_mode && !self.hex_editing && !redis_bytes_value.bytes.is_empty();
-            self.readonly =
-                readonly || module_dump || preview || hex_dump || (!hex_mode && !redis_bytes_value.is_utf8_text());
+            self.readonly = readonly
+                || module_dump
+                || preview
+                || unsendable
+                || hex_dump
+                || (!hex_mode && !redis_bytes_value.is_utf8_text());
             self.data = if hex_dump {
                 hex_dump_data(&redis_bytes_value.bytes, cx)
             } else {
@@ -937,6 +944,13 @@ impl ZedisBytesEditor {
                 }
             }))
     }
+}
+
+/// Whether a value of `len` bytes is more than this build can write back in
+/// one command (`value_write_limit` — only a page has a limit): it opens
+/// read-only, and the editor says why above it.
+pub(crate) fn past_write_limit(len: usize) -> bool {
+    value_write_limit().is_some_and(|max| len > max)
 }
 
 /// Whether Settings opens a JSON value as a tree (`json_view`).

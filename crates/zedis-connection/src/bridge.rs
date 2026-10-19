@@ -43,6 +43,7 @@ use redis::{RedisFuture, aio::ConnectionLike};
 use std::sync::{Arc, OnceLock};
 
 use crate::command::{command_group, is_known_command};
+use crate::diagnosis::DiagReportRow;
 
 /// Why a bridge call failed, in terms the UI can act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,7 +63,23 @@ pub enum BridgeErrorKind {
     },
     /// The bridge reached Redis and Redis (or the dial) failed.
     Upstream,
+    /// The request is larger than the bridge accepts
+    /// ([`BRIDGE_MAX_REQUEST_BYTES`]): refused before it was sent, or
+    /// answered `413`. Nothing is wrong with the link, which is why it is a
+    /// kind of its own — as a transport failure it read as a dropped
+    /// connection, and the page reconnected over a value too large to save.
+    TooLarge,
 }
+
+/// The most one request to the bridge may carry. The bridge holds every
+/// route to it, and the page refuses to send more than it rather than
+/// waiting for the `413`.
+pub const BRIDGE_MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+
+/// The largest value a page writes in one command: the request carries the
+/// command base64 — four bytes for every three — inside JSON, and the key
+/// and the rest of the request need room beside it.
+pub const BRIDGE_MAX_VALUE_BYTES: usize = BRIDGE_MAX_REQUEST_BYTES / 4 * 3 - 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct BridgeError {
@@ -99,7 +116,9 @@ impl From<BridgeError> for RedisError {
         // (`note_link_error`) still recognises a dead bridge as a dead link.
         let kind = match err.kind {
             BridgeErrorKind::Transport => ErrorKind::Io,
-            BridgeErrorKind::Unauthorized | BridgeErrorKind::ConfirmationRequired { .. } => ErrorKind::Client,
+            BridgeErrorKind::Unauthorized
+            | BridgeErrorKind::ConfirmationRequired { .. }
+            | BridgeErrorKind::TooLarge => ErrorKind::Client,
             BridgeErrorKind::UnknownServer => ErrorKind::InvalidClientConfig,
             BridgeErrorKind::Upstream => ErrorKind::Extension,
         };
@@ -480,6 +499,11 @@ pub trait BridgeTransport: Send + Sync + 'static {
     /// subscription calls, and a `Drop` cannot await. The bridge also ends
     /// a watch nobody polls, which covers a tab that closed first.
     fn release_watch(&self, token: String);
+
+    /// Diagnose the saved entry `server_id` from the bridge — the process
+    /// that dials it, and so the only one that can say which stage fails.
+    /// Every stage, answered together.
+    fn diagnose(&self, server_id: String) -> BoxFuture<'static, Result<Vec<DiagReportRow>, BridgeError>>;
 }
 
 /// The transport every bridge connection in this process uses.
@@ -516,6 +540,12 @@ pub fn signed_in_to_bridge() -> bool {
 pub async fn sign_out_of_bridge() -> Result<(), BridgeError> {
     let transport = bridge_transport().ok_or_else(|| BridgeError::transport("no bridge transport"))?;
     transport.sign_out().await
+}
+
+/// Diagnose a saved entry from the bridge ([`BridgeTransport::diagnose`]).
+pub async fn diagnose_on_bridge(server_id: String) -> Result<Vec<DiagReportRow>, BridgeError> {
+    let transport = bridge_transport().ok_or_else(|| BridgeError::transport("no bridge transport"))?;
+    transport.diagnose(server_id).await
 }
 
 /// How the browser persists the server list.
@@ -771,8 +801,40 @@ pub struct BridgeOrphans {
 pub struct BridgeAuditQuery {
     pub account: Option<String>,
     pub event: Option<String>,
+    /// A server entry's id.
+    pub server: Option<String>,
     pub since_ms: Option<i64>,
     pub before: Option<String>,
+}
+
+/// Someone using the bridge now, as `GET /v1/clients` lists them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BridgeClient {
+    pub account: String,
+    /// `browser`, `basic` (a script with HTTP Basic), `token` (an MCP token)
+    /// or `proxy` (signed in by the trusted proxy).
+    pub kind: String,
+    /// The MCP token's name, for a token client.
+    pub token: Option<String>,
+    /// The address of its last request, and what a proxy in front said.
+    pub peer: Option<String>,
+    pub forwarded_for: Option<String>,
+    /// Unix seconds.
+    pub seen_at: u64,
+    /// The server entries it used within the window, the latest first, by
+    /// name — only those the asker may see.
+    pub servers: Vec<String>,
+}
+
+/// Who is using the bridge: every client with a request in the last
+/// `window_secs`, the most recently seen first.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BridgeClients {
+    /// The bridge process that answered. Several bridges on one database
+    /// each count their own.
+    pub process: String,
+    pub window_secs: u64,
+    pub clients: Vec<BridgeClient>,
 }
 
 /// A page of the audit, newest first: each line the JSON object the bridge
@@ -876,6 +938,9 @@ pub trait BridgeAccounts: Send + Sync + 'static {
     fn settle_orphans(&self, owner: String, private: BridgeDisposition) -> BridgeAccountResult<()>;
     /// A page of the audit, for an administrator (ADR 18).
     fn audit(&self, query: BridgeAuditQuery) -> BridgeAccountResult<BridgeAuditPage>;
+    /// Who is using the bridge now, and on which servers; a full
+    /// account's question (`GET /v1/clients`).
+    fn clients(&self) -> BridgeAccountResult<BridgeClients>;
     /// A link that sets a new password on `name`, once.
     fn reset_link(&self, name: String) -> BridgeAccountResult<BridgeNewInvite>;
     /// The open invitations.
@@ -1449,6 +1514,10 @@ mod tests {
         }
 
         fn release_watch(&self, _token: String) {}
+
+        fn diagnose(&self, _server_id: String) -> BoxFuture<'static, Result<Vec<DiagReportRow>, BridgeError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
     }
 
     /// The desktop dials Redis itself: with no transport installed there is
@@ -1460,6 +1529,18 @@ mod tests {
         assert!(!signed_in_to_bridge());
         let err = smol::block_on(sign_out_of_bridge()).expect_err("nothing to sign out of");
         assert_eq!(err.kind, BridgeErrorKind::Transport);
+    }
+
+    /// A request too large for the bridge says nothing about the link: as a
+    /// transport failure it was a dropped connection, which drops the
+    /// pooled client and puts "connection lost" over a save that only had
+    /// to be smaller.
+    #[test]
+    fn a_request_too_large_is_not_a_lost_link() {
+        use crate::error::{ConnectionErrorKind, Error};
+        let kind = |kind: BridgeErrorKind| Error::from(RedisError::from(BridgeError::new(kind, "x"))).connection_kind();
+        assert_eq!(kind(BridgeErrorKind::Transport), ConnectionErrorKind::Network);
+        assert_ne!(kind(BridgeErrorKind::TooLarge), ConnectionErrorKind::Network);
     }
 
     fn frames(frames: Vec<Vec<u8>>) -> Result<BridgeReply, BridgeError> {

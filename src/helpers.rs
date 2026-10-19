@@ -78,9 +78,7 @@ pub use single_instance::{
 #[cfg(not(target_family = "wasm"))]
 pub use syntax::{register_editing_rules, register_extra_languages};
 pub use tag::{is_quiet_tag, resolve_tag_chip, resolve_tag_color, theme_color_for_tag};
-pub use this_build::{
-    has_connection_diagnostics, has_file_dialogs, opens_files, reads_clipboard_on_demand, saves_files,
-};
+pub use this_build::{has_file_dialogs, opens_files, reads_clipboard_on_demand, saves_files, value_write_limit};
 pub use update_info::{Delivery, UpdateAsset, UpdateInfo};
 #[cfg(all(not(target_family = "wasm"), target_os = "macos"))]
 pub use updater::relaunch;

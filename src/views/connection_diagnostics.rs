@@ -14,16 +14,19 @@
 
 //! Staged connection diagnostics dialog body.
 //!
-//! Opened from the server form's "Diagnose" button. Runs the probes from
-//! `connection::diagnostics` sequentially and renders one row per stage
-//! (DNS → TCP → SSH auth → SSH tunnel → TLS → AUTH → PING), updating live
-//! as each finishes. A failed stage shows the raw error plus a localized
-//! remediation hint; the stages after it are marked skipped.
+//! Opened from the server form's "Diagnose" button, a connection's menu and
+//! the editor's "can't reach the server" panel. One row per stage (DNS → TCP
+//! → SSH auth → SSH tunnel → TLS → AUTH → PING); a failed stage shows the
+//! raw error plus a localized remediation hint, and the stages after it are
+//! marked skipped. The desktop runs the probes itself and updates each row
+//! as it finishes; a page asks the bridge, which is what dials the server
+//! there, and fills the rows in from its answer.
 
-use crate::connection::{
-    DiagHint, DiagOutcome, DiagStage, DiagStatus, RedisServer, diag_stages, diag_timeout, dial_endpoint, probe_dns,
-    probe_redis, probe_ssh_auth, probe_ssh_tunnel, probe_tcp,
-};
+#[cfg(target_family = "wasm")]
+use crate::connection::diagnose_on_bridge;
+#[cfg(not(target_family = "wasm"))]
+use crate::connection::run_diagnostics;
+use crate::connection::{DiagHint, DiagOutcome, DiagStage, DiagStatus, RedisServer, diag_stages};
 use crate::states::{i18n_common, i18n_servers};
 use gpui::{App, AsyncApp, Div, SharedString, Task, WeakEntity, Window, div, prelude::*, px};
 use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, h_flex, label::Label, spinner::Spinner, v_flex};
@@ -48,6 +51,8 @@ struct RowParts {
 
 pub struct ZedisConnectionDiagnostics {
     rows: Vec<(DiagStage, RowState)>,
+    /// Why there are no answers at all: the bridge could not be asked.
+    failure: Option<SharedString>,
     /// Cancels the probe sequence when the dialog (and this view) is
     /// dropped; in-flight SSH work on the tokio runtime just gets its
     /// result discarded.
@@ -90,7 +95,11 @@ impl ZedisConnectionDiagnostics {
         let task = cx.spawn(async move |this, cx| {
             Self::run(server, this, cx).await;
         });
-        Self { rows, _task: task }
+        Self {
+            rows,
+            failure: None,
+            _task: task,
+        }
     }
 
     /// Update one stage row; returns false when the view is gone (dialog
@@ -105,98 +114,43 @@ impl ZedisConnectionDiagnostics {
         .is_ok()
     }
 
-    /// Mark every not-yet-finished stage as skipped (after a failure).
-    fn skip_rest(this: &WeakEntity<Self>, cx: &mut AsyncApp) {
-        let _ = this.update(cx, |view, cx| {
-            for row in view.rows.iter_mut() {
-                if matches!(row.1, RowState::Pending | RowState::Running) {
-                    row.1 = RowState::Done(DiagOutcome::skipped(None, None));
-                }
-            }
-            cx.notify();
-        });
+    /// Run the probes here, each row updated as its stage finishes.
+    #[cfg(not(target_family = "wasm"))]
+    async fn run(server: RedisServer, this: WeakEntity<Self>, cx: &mut AsyncApp) {
+        run_diagnostics(&server, |stage, outcome| {
+            Self::set_row(&this, cx, stage, outcome.map_or(RowState::Running, RowState::Done))
+        })
+        .await;
     }
 
+    /// Ask the bridge, which dials the server for a page. It answers every
+    /// stage at once, so the first one spins until then.
+    #[cfg(target_family = "wasm")]
     async fn run(server: RedisServer, this: WeakEntity<Self>, cx: &mut AsyncApp) {
-        let timeout = diag_timeout(&server);
-        let (dial_host, dial_port) = dial_endpoint(&server);
-
-        // DNS + TCP — not for a Unix socket, which has neither (the stage
-        // list already omits the rows).
-        if !server.is_unix_socket() {
-            if !Self::set_row(&this, cx, DiagStage::Dns, RowState::Running) {
-                return;
-            }
-            let (dns, addrs) = probe_dns(&dial_host, dial_port, timeout).await;
-            let failed = dns.status == DiagStatus::Failed;
-            if !Self::set_row(&this, cx, DiagStage::Dns, RowState::Done(dns)) {
-                return;
-            }
-            if failed {
-                Self::skip_rest(&this, cx);
-                return;
-            }
-
-            if !Self::set_row(&this, cx, DiagStage::Tcp, RowState::Running) {
-                return;
-            }
-            let tcp = probe_tcp(&addrs, timeout).await;
-            let failed = tcp.status == DiagStatus::Failed;
-            if !Self::set_row(&this, cx, DiagStage::Tcp, RowState::Done(tcp)) {
-                return;
-            }
-            if failed {
-                Self::skip_rest(&this, cx);
-                return;
-            }
-        }
-
-        // SSH auth + tunnel target
-        if server.is_ssh_tunnel() {
-            if !Self::set_row(&this, cx, DiagStage::SshAuth, RowState::Running) {
-                return;
-            }
-            let (auth, session) = probe_ssh_auth(&server).await;
-            if !Self::set_row(&this, cx, DiagStage::SshAuth, RowState::Done(auth)) {
-                return;
-            }
-            let Some(session) = session else {
-                Self::skip_rest(&this, cx);
-                return;
-            };
-            if !Self::set_row(&this, cx, DiagStage::SshTunnel, RowState::Running) {
-                return;
-            }
-            let tunnel = probe_ssh_tunnel(session, &server).await;
-            let failed = tunnel.status == DiagStatus::Failed;
-            if !Self::set_row(&this, cx, DiagStage::SshTunnel, RowState::Done(tunnel)) {
-                return;
-            }
-            if failed {
-                Self::skip_rest(&this, cx);
-                return;
-            }
-        }
-
-        // TLS / AUTH / PING: one real end-to-end connect, attributed by
-        // error classification (see connection::diagnostics). Spin the
-        // first of those rows while the connect runs.
-        let first = if server.tls.unwrap_or(false) {
-            DiagStage::Tls
-        } else {
-            DiagStage::Auth
+        let Some(first) = diag_stages(&server).first().copied() else {
+            return;
         };
         if !Self::set_row(&this, cx, first, RowState::Running) {
             return;
         }
-        let probe = probe_redis(&server).await;
-        if !Self::set_row(&this, cx, DiagStage::Tls, RowState::Done(probe.tls)) {
-            return;
+        match diagnose_on_bridge(server.id.clone()).await {
+            Ok(rows) => {
+                for row in rows {
+                    if !Self::set_row(&this, cx, row.stage, RowState::Done(row.outcome())) {
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = this.update(cx, |view, cx| {
+                    for row in view.rows.iter_mut() {
+                        row.1 = RowState::Pending;
+                    }
+                    view.failure = Some(e.message.into());
+                    cx.notify();
+                });
+            }
         }
-        if !Self::set_row(&this, cx, DiagStage::Auth, RowState::Done(probe.auth)) {
-            return;
-        }
-        Self::set_row(&this, cx, DiagStage::Ping, RowState::Done(probe.ping));
     }
 }
 
@@ -288,7 +242,9 @@ impl Render for ZedisConnectionDiagnostics {
             }
             list = list.child(row);
         }
-        list
+        list.when_some(self.failure.clone(), |list, failure| {
+            list.child(Label::new(failure).text_xs().text_color(red))
+        })
     }
 }
 

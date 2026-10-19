@@ -19,7 +19,7 @@
 
 use crate::connection::get_servers;
 use crate::db::get_favorites_manager;
-use crate::helpers::{ShortcutsAction, fuzzy_score_prepared, prepare_fuzzy_query};
+use crate::helpers::{ShortcutsAction, fuzzy_score_prepared, prepare_fuzzy_query, saves_files};
 use crate::states::{
     Route, ServerToolsAction, ServerView, SettingsAction, ZedisGlobalStore, ZedisServerState, command_status_label,
     i18n_command_palette, i18n_features, i18n_shortcuts,
@@ -499,14 +499,14 @@ impl ZedisCommandPalette {
                 ServerToolsAction::Trash,
             ));
             #[cfg(not(target_family = "wasm"))]
-            {
-                if !self.server_state.read(cx).readonly() {
-                    tools.push((
-                        i18n_status_bar(cx, "import_keys_menu"),
-                        None,
-                        ServerToolsAction::ImportKeys,
-                    ));
-                }
+            if !self.server_state.read(cx).readonly() {
+                tools.push((
+                    i18n_status_bar(cx, "import_keys_menu"),
+                    None,
+                    ServerToolsAction::ImportKeys,
+                ));
+            }
+            if saves_files() {
                 tools.push((
                     i18n_status_bar(cx, "export_keys_menu"),
                     None,

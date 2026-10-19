@@ -441,9 +441,107 @@ pub fn entry_to_csv(entry: &ReadableEntry) -> String {
     build_csv_record(&[&entry.key, &entry.key_type, &ttl, &value, truncated])
 }
 
+/// A readable export kept in memory instead of streamed to a file — what a
+/// page downloads, having no file to write into as it goes. The text is the
+/// one the desktop's export writes: a JSON array of [`entry_to_json`]
+/// objects, one to a line, or [`csv_header`] and [`entry_to_csv`] rows.
+#[derive(Debug, Clone)]
+pub struct ReadableDocument {
+    csv: bool,
+    text: String,
+    entries: usize,
+}
+
+/// What a JSON document still needs once its last entry is in.
+const JSON_CLOSE: &str = "\n]\n";
+
+impl ReadableDocument {
+    pub fn json() -> Self {
+        Self {
+            csv: false,
+            text: "[".to_string(),
+            entries: 0,
+        }
+    }
+
+    pub fn csv() -> Self {
+        Self {
+            csv: true,
+            text: csv_header(),
+            entries: 0,
+        }
+    }
+
+    /// Add `entry` — unless the finished document would then be larger than
+    /// `max_bytes`, when nothing is added and the answer is `false`.
+    pub fn push(&mut self, entry: &ReadableEntry, max_bytes: usize) -> bool {
+        let piece = if self.csv {
+            entry_to_csv(entry)
+        } else {
+            let separator = if self.entries == 0 { "\n" } else { ",\n" };
+            format!("{separator}{}", entry_to_json(entry))
+        };
+        let closing = if self.csv { 0 } else { JSON_CLOSE.len() };
+        if self.text.len() + piece.len() + closing > max_bytes {
+            return false;
+        }
+        self.text.push_str(&piece);
+        self.entries += 1;
+        true
+    }
+
+    /// How many entries it holds.
+    pub fn entries(&self) -> usize {
+        self.entries
+    }
+
+    pub fn finish(mut self) -> String {
+        if !self.csv {
+            self.text.push_str(JSON_CLOSE);
+        }
+        self.text
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The document a page downloads is the file the desktop writes: valid
+    /// JSON with no entries or with several, CSV under its header — and an
+    /// entry that would take it past its size is left out, not cut.
+    #[test]
+    fn a_document_in_memory_is_the_file_the_desktop_writes() {
+        assert_eq!(ReadableDocument::json().finish(), "[\n]\n");
+        let mut json = ReadableDocument::json();
+        assert!(json.push(&entry(Some(ReadableValue::Text("a".into()))), usize::MAX));
+        assert!(json.push(&entry(None), usize::MAX));
+        assert_eq!(json.entries(), 2);
+        let text = json.finish();
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(parsed.as_array().map(Vec::len), Some(2));
+        assert_eq!(parsed[1]["value"], serde_json::Value::Null);
+        assert!(text.starts_with("[\n{") && text.ends_with("}\n]\n"), "{text}");
+
+        let mut csv = ReadableDocument::csv();
+        assert!(csv.push(&entry(Some(ReadableValue::Text("a".into()))), usize::MAX));
+        assert_eq!(
+            csv.finish(),
+            format!(
+                "{}{}",
+                csv_header(),
+                entry_to_csv(&entry(Some(ReadableValue::Text("a".into()))))
+            )
+        );
+
+        let one = entry(Some(ReadableValue::Text("x".repeat(100))));
+        let mut capped = ReadableDocument::json();
+        let fits_one = 1 + 1 + entry_to_json(&one).to_string().len() + JSON_CLOSE.len();
+        assert!(capped.push(&one, fits_one));
+        assert!(!capped.push(&one, fits_one), "a second would not fit");
+        assert_eq!(capped.entries(), 1);
+        assert!(capped.finish().len() <= fits_one);
+    }
 
     fn entry(value: Option<ReadableValue>) -> ReadableEntry {
         ReadableEntry {

@@ -56,6 +56,7 @@ mod compare;
 mod config;
 mod conn;
 mod danger;
+mod diagnosis;
 mod dump_restore;
 mod entry_check;
 mod functions;
@@ -111,13 +112,14 @@ pub use async_connection::{
 pub use audit::{is_administration_command, redact_command_line, redact_secrets};
 pub use bitmap::{BitOpKind, BitmapInfo, bit_field, bit_op, bitmap_info, set_bit};
 pub use bridge::{
-    BridgeAccount, BridgeAccountChange, BridgeAccountError, BridgeAccountErrorKind, BridgeAccountResult,
-    BridgeAccounts, BridgeAuditPage, BridgeAuditQuery, BridgeConn, BridgeDisposition, BridgeError, BridgeErrorKind,
-    BridgeInvite, BridgeInviteKind, BridgeKeyNote, BridgeNewInvite, BridgeOrphans, BridgeOwnAccount, BridgeOwned,
-    BridgeOwnedItem, BridgePageData, BridgePageRow, BridgePageSeed, BridgeReply, BridgeRequest, BridgeRole,
-    BridgeScript, BridgeServerStore, BridgeSignup, BridgeStorage, BridgeToken, BridgeTransport, BridgeTrashEntry,
-    DESCRIBED_COMMANDS, PipelineSpec, WatchBatch, WatchItem, WatchKind, WatchOpened, bridge_accounts, bridge_page_data,
-    bridge_server_store, bridge_storage, bridge_transport, describe_commands, describe_packed_command,
+    BRIDGE_MAX_REQUEST_BYTES, BRIDGE_MAX_VALUE_BYTES, BridgeAccount, BridgeAccountChange, BridgeAccountError,
+    BridgeAccountErrorKind, BridgeAccountResult, BridgeAccounts, BridgeAuditPage, BridgeAuditQuery, BridgeClient,
+    BridgeClients, BridgeConn, BridgeDisposition, BridgeError, BridgeErrorKind, BridgeInvite, BridgeInviteKind,
+    BridgeKeyNote, BridgeNewInvite, BridgeOrphans, BridgeOwnAccount, BridgeOwned, BridgeOwnedItem, BridgePageData,
+    BridgePageRow, BridgePageSeed, BridgeReply, BridgeRequest, BridgeRole, BridgeScript, BridgeServerStore,
+    BridgeSignup, BridgeStorage, BridgeToken, BridgeTransport, BridgeTrashEntry, DESCRIBED_COMMANDS, PipelineSpec,
+    WatchBatch, WatchItem, WatchKind, WatchOpened, bridge_accounts, bridge_page_data, bridge_server_store,
+    bridge_storage, bridge_transport, describe_commands, describe_packed_command, diagnose_on_bridge,
     set_bridge_accounts, set_bridge_page_data, set_bridge_server_store, set_bridge_storage, set_bridge_transport,
     sign_out_of_bridge, signed_in_to_bridge,
 };
@@ -157,11 +159,9 @@ pub use danger::{
     ConfirmStrictness, DangerKind, WRITE_UNLOCK_SECS, classify_dangerous, classify_dangerous_line,
     classify_guarded_script, confirm_strictness, is_write_command, requires_write_confirm,
 };
+pub use diagnosis::{DiagHint, DiagOutcome, DiagReportRow, DiagStage, DiagStatus, diag_stages};
 #[cfg(not(target_family = "wasm"))]
-pub use diagnostics::{
-    DiagHint, DiagOutcome, DiagStage, DiagStatus, diag_stages, diag_timeout, dial_endpoint, probe_dns, probe_redis,
-    probe_ssh_auth, probe_ssh_tunnel, probe_tcp,
-};
+pub use diagnostics::run_diagnostics;
 pub use dump_restore::{
     ConflictMode, ConflictPreview, DumpEntry, RestoreStatus, copy_key, dump_keys_chunk, preview_key_conflicts,
     restore_key, restore_keys_chunk, ttl_left,
@@ -221,8 +221,8 @@ pub use probe::{
 };
 pub use read_only::{is_read_only_command, reveals_secrets};
 pub use readable_export::{
-    ReadLimits, ReadableEntry, ReadableValue, csv_header, entry_to_csv, entry_to_json, next_stream_id,
-    read_readable_chunk,
+    ReadLimits, ReadableDocument, ReadableEntry, ReadableValue, csv_header, entry_to_csv, entry_to_json,
+    next_stream_id, read_readable_chunk,
 };
 #[cfg(not(target_family = "wasm"))]
 pub use readable_import::{

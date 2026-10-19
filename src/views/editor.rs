@@ -44,7 +44,6 @@ use crate::{
         looks_like_bitmap, looks_like_hll, open_change_log_dialog, open_file, open_key_op_dialog,
     },
 };
-#[cfg(not(target_family = "wasm"))]
 use crate::{states::i18n_servers, views::open_connection_diagnostics};
 use bytes::Bytes;
 use gpui::{
@@ -92,13 +91,13 @@ const TTL_DURATION_EXAMPLE: &str = "1h 30m";
 #[cfg(not(target_family = "wasm"))]
 const MAX_IMPORT_VALUE_BYTES: u64 = 512 * 1024 * 1024;
 #[cfg(not(target_family = "wasm"))]
-const IMPORT_VALUE_TOO_LARGE: &str = "import_value_too_large";
-/// A page writes through the bridge, whose requests stop at 2 MB of JSON —
-/// the value base64 inside it — so a file over 1 MiB could never be saved.
+const IMPORT_VALUE_TOO_LARGE: &str = "editor.import_value_too_large";
+/// A page writes through the bridge, which takes a value only so large in
+/// one request (`BRIDGE_MAX_VALUE_BYTES`); a larger file could never be saved.
 #[cfg(target_family = "wasm")]
-const MAX_IMPORT_VALUE_BYTES: u64 = 1024 * 1024;
+const MAX_IMPORT_VALUE_BYTES: u64 = crate::connection::BRIDGE_MAX_VALUE_BYTES as u64;
 #[cfg(target_family = "wasm")]
-const IMPORT_VALUE_TOO_LARGE: &str = "import_value_too_large_web";
+const IMPORT_VALUE_TOO_LARGE: &str = "editor.import_value_too_large_web";
 
 /// Active side-by-side diff session — captured snapshot of both panes
 /// so the diff view stays stable while the user reads it, even if the
@@ -935,7 +934,10 @@ impl ZedisEditor {
                 }
                 Err(PickFailure::TooLarge { .. }) => {
                     this.server_state.update(cx, |state, cx| {
-                        state.emit_error_notification(i18n_editor(cx, IMPORT_VALUE_TOO_LARGE), cx);
+                        let locale = cx.global::<ZedisGlobalStore>().read(cx).locale();
+                        let limit = format_size(MAX_IMPORT_VALUE_BYTES, DECIMAL);
+                        let message = t!(IMPORT_VALUE_TOO_LARGE, limit = limit, locale = locale).to_string();
+                        state.emit_error_notification(message.into(), cx);
                     });
                 }
                 Err(PickFailure::Unreadable(e)) => {

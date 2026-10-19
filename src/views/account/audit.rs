@@ -13,19 +13,19 @@
 // limitations under the License.
 
 //! An administrator's audit (ADR 18): what went through the bridge's door,
-//! newest first, narrowed by account and event, a page at a time — and the
-//! line picked in the table shown whole under it, since a line says more
-//! than a row has columns for.
+//! newest first, narrowed by account, event, server and how far back, a page
+//! at a time — and the line picked in the table shown whole under it, since
+//! a line says more than a row has columns for.
 
 use super::*;
-use crate::connection::{BridgeAuditPage, BridgeAuditQuery};
-use chrono::DateTime;
+use crate::connection::{BridgeAuditPage, BridgeAuditQuery, get_servers};
+use chrono::{DateTime, Utc};
 use gpui::Subscription;
 use gpui_kit::component::{
     input::{Input, InputState},
     table::{DataTable, TableEvent, TableState},
 };
-use zedis_ui::{TextColumn, ZedisTextTable, fitted_table};
+use zedis_ui::{TextColumn, ZedisSelect, ZedisSelectEvent, ZedisTextTable, fitted_table};
 
 const TABLE_HEIGHT: f32 = 300.;
 const TIME_COLUMN_WIDTH: f32 = 170.;
@@ -38,12 +38,30 @@ pub(super) const AUDIT_EVENT_ID: &str = "account-audit-event";
 pub(super) const AUDIT_SEARCH_ID: &str = "account-audit-search";
 pub(super) const AUDIT_MORE_ID: &str = "account-audit-more";
 
+/// How far back a search reaches, after "any time": an hour, a day, a week,
+/// thirty days — each with its label.
+const PERIODS: [(i64, &str); 4] = [
+    (3_600, "audit_last_hour"),
+    (86_400, "audit_last_day"),
+    (7 * 86_400, "audit_last_week"),
+    (30 * 86_400, "audit_last_month"),
+];
+
 pub(super) struct AuditForm {
     /// The lines shown, newest first, as the bridge sent them.
     pub(super) lines: Vec<String>,
     pub(super) table: Entity<TableState<ZedisTextTable>>,
     account: Entity<InputState>,
     event: Entity<InputState>,
+    /// The server entries the page sees, by id, in the picker's order after
+    /// its "any server".
+    pub(super) servers: Vec<String>,
+    server: Entity<ZedisSelect>,
+    /// Which is picked: 0 is any.
+    pub(super) server_index: usize,
+    period: Entity<ZedisSelect>,
+    /// 0 is any time; else a [`PERIODS`] entry, one on.
+    pub(super) period_index: usize,
     /// The question the lines answer — what *Older lines* asks again.
     asked: BridgeAuditQuery,
     next: Option<String>,
@@ -54,7 +72,7 @@ pub(super) struct AuditForm {
     /// Whether the first page was asked for.
     pub(super) loaded: bool,
     pub(super) status: Option<Status>,
-    _table_subscription: Subscription,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl AuditForm {
@@ -85,11 +103,40 @@ impl AuditForm {
             }
             cx.notify();
         });
+        // The page's server list is what the account sees, which is what the
+        // bridge would narrow to anyway.
+        let (servers, names): (Vec<String>, Vec<String>) = get_servers()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|server| (server.id, server.name))
+            .unzip();
+        let server_labels = std::iter::once(i18n_account(cx, "audit_any_server").to_string())
+            .chain(names)
+            .collect();
+        let server = cx.new(|cx| ZedisSelect::new(server_labels, Some(0), window, cx));
+        let period_labels = std::iter::once(i18n_account(cx, "audit_any_time").to_string())
+            .chain(PERIODS.iter().map(|(_, key)| i18n_account(cx, key).to_string()))
+            .collect();
+        let period = cx.new(|cx| ZedisSelect::new(period_labels, Some(0), window, cx));
+        let subscriptions = vec![
+            table_subscription,
+            cx.subscribe(&server, |this, _, ZedisSelectEvent::Change(index), _| {
+                this.audit.server_index = *index;
+            }),
+            cx.subscribe(&period, |this, _, ZedisSelectEvent::Change(index), _| {
+                this.audit.period_index = *index;
+            }),
+        ];
         Self {
             lines: Vec::new(),
             table,
             account: cx.new(|cx| InputState::new(window, cx).placeholder(i18n_account(cx, "audit_any_account"))),
             event: cx.new(|cx| InputState::new(window, cx).placeholder(i18n_account(cx, "audit_any_event"))),
+            servers,
+            server,
+            server_index: 0,
+            period,
+            period_index: 0,
             asked: BridgeAuditQuery::default(),
             next: None,
             stopped_early: false,
@@ -97,8 +144,23 @@ impl AuditForm {
             busy: false,
             loaded: false,
             status: None,
-            _table_subscription: table_subscription,
+            _subscriptions: subscriptions,
         }
+    }
+
+    /// The server picked, by id; `None` for any.
+    fn server_id(&self) -> Option<String> {
+        self.server_index
+            .checked_sub(1)
+            .and_then(|at| self.servers.get(at))
+            .cloned()
+    }
+
+    /// Where the period picked starts, in Unix milliseconds; `None` for any
+    /// time.
+    fn since_ms(&self) -> Option<i64> {
+        let (secs, _) = PERIODS.get(self.period_index.checked_sub(1)?)?;
+        Some(Utc::now().timestamp_millis() - secs * 1000)
     }
 
     /// The table's rows: time, account, event, server, and the line's place.
@@ -146,6 +208,8 @@ impl ZedisAccount {
             BridgeAuditQuery {
                 account: narrowing(&self.audit.account.read(cx).value()),
                 event: narrowing(&self.audit.event.read(cx).value()),
+                server: self.audit.server_id(),
+                since_ms: self.audit.since_ms(),
                 ..BridgeAuditQuery::default()
             }
         };
@@ -233,7 +297,15 @@ impl ZedisAccount {
                             .flex_1()
                             .min_w(px(240.))
                             .child(Input::new(&form.event).id(AUDIT_EVENT_ID)),
-                    )
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().w(px(200.)).child(form.server.clone()))
+                    .child(div().w(px(200.)).child(form.period.clone()))
+                    .child(div().flex_1())
                     .child(
                         Button::new(AUDIT_SEARCH_ID)
                             .outline()

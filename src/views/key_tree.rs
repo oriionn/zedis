@@ -12,11 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(not(target_family = "wasm"))]
 use crate::connection::get_server;
 use crate::views::placeholders::Placeholders;
-#[cfg(not(target_family = "wasm"))]
-use crate::views::{ExportSource, open_migration_export_window};
+use crate::views::{ExportSource, open_key_export};
 use crate::{
     assets::CustomIconName,
     components::KeyTypeBadge,
@@ -28,7 +26,7 @@ use crate::{
     },
     helpers::{
         EditorAction, TtlChipKind, TtlFilter, clearing_an_applied_filter, folder_prefixes, format_ttl_chip,
-        get_mono_font_family, group_thousands, has_file_dialogs, single_child_expanded_set, split_key_segments,
+        get_mono_font_family, group_thousands, saves_files, single_child_expanded_set, split_key_segments,
         theme_color_for_tag, ttl_chip_kind, ttl_secs, validate_long_string, with_hot_key,
     },
     states::{

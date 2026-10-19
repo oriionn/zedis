@@ -20,13 +20,14 @@ use super::admin::{
 };
 use super::audit::{AUDIT_ACCOUNT_ID, AUDIT_MORE_ID, AUDIT_SEARCH_ID};
 use super::handover::SHARE_ID;
+use super::online::ONLINE_REFRESH_ID;
 use super::password::{CHANGE_PASSWORD_ID, CURRENT_PASSWORD_ID, NEW_PASSWORD_ID, REPEAT_PASSWORD_ID};
 use super::signups::{SIGNUP_APPROVE_ID, SIGNUP_REJECT_ID, signup_row_id};
 use super::tokens::{ADMIN_TOKEN_DAYS, ISSUE_TOKEN_ID, TOKEN_NAME_ID};
 use super::*;
 use crate::connection::{
-    BridgeAccountChange, BridgeAccountResult, BridgeAuditPage, BridgeAuditQuery, BridgeDisposition, BridgeInvite,
-    BridgeNewInvite, BridgeOrphans, BridgeOwned, BridgeOwnedItem, BridgeSignup,
+    BridgeAccountChange, BridgeAccountResult, BridgeAuditPage, BridgeAuditQuery, BridgeClient, BridgeClients,
+    BridgeDisposition, BridgeInvite, BridgeNewInvite, BridgeOrphans, BridgeOwned, BridgeOwnedItem, BridgeSignup,
 };
 use crate::test_support::init_ui;
 use chrono::{Duration, Utc};
@@ -57,6 +58,8 @@ struct FakeBridge {
     audits: Mutex<Vec<BridgeAuditQuery>>,
     /// The requests waiting; an approval or a rejection takes one out.
     signups: Mutex<Vec<BridgeSignup>>,
+    /// Who the bridge says is online.
+    clients: Mutex<BridgeClients>,
 }
 
 impl FakeBridge {
@@ -151,6 +154,11 @@ impl BridgeAccounts for FakeBridge {
         answer(Ok(self.audit_page.lock().expect("lock").clone()))
     }
 
+    fn clients(&self) -> BridgeAccountResult<BridgeClients> {
+        self.asked("clients".to_string());
+        answer(Ok(self.clients.lock().expect("lock").clone()))
+    }
+
     fn settle_orphans(&self, owner: String, private: BridgeDisposition) -> BridgeAccountResult<()> {
         self.asked(format!("settle {owner} {private:?}"));
         answer(Ok(()))
@@ -238,8 +246,64 @@ fn a_read_only_account_has_its_tokens_and_no_administration(cx: &mut TestAppCont
         assert!(window.try_find("section_accounts").is_none());
         assert!(window.try_find("section_invites").is_none());
         assert!(window.try_find("section_audit").is_none());
+        assert!(
+            window.try_find("section_online").is_none(),
+            "the list names other accounts"
+        );
     })
     .expect("the window is open");
+}
+
+/// A full account sees who is using the bridge, read each time the section
+/// is opened: one row a client, with the servers it is on.
+#[gpui::test]
+fn a_full_account_sees_who_is_online_and_on_which_servers(cx: &mut TestAppContext) {
+    let bridge = FakeBridge::signed_in_as("alice", BridgeRole::Full);
+    *bridge.clients.lock().expect("lock") = BridgeClients {
+        process: "0123456789abcdef".to_string(),
+        window_secs: 300,
+        clients: vec![
+            BridgeClient {
+                account: "alice".to_string(),
+                kind: "browser".to_string(),
+                peer: Some("10.0.0.7".to_string()),
+                seen_at: 1_700_000_000,
+                servers: vec!["prod".to_string()],
+                ..Default::default()
+            },
+            BridgeClient {
+                account: "ai".to_string(),
+                kind: "token".to_string(),
+                token: Some("claude-laptop".to_string()),
+                seen_at: 1_700_000_000,
+                servers: vec!["prod".to_string(), "staging".to_string()],
+                ..Default::default()
+            },
+        ],
+    };
+    let (view, window) = open(cx, bridge.clone());
+    assert!(
+        !bridge.requests().contains(&"clients".to_string()),
+        "not before it is looked at"
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("section_online").is_some());
+        window.click("section_online", cx);
+    })
+    .expect("the window is open");
+    cx.run_until_parked();
+    view.read_with(cx, |view, cx| {
+        let table = view.online.table.read(cx).delegate();
+        assert_eq!(table.visible_len(), 2);
+        let rows: Vec<Vec<SharedString>> = table.visible_iter().map(<[SharedString]>::to_vec).collect();
+        assert_eq!(rows[1][1].as_ref(), "MCP token · claude-laptop");
+        assert_eq!(rows[1][3].as_ref(), "prod, staging");
+    });
+
+    click(cx, window, ONLINE_REFRESH_ID);
+    let asked = bridge.requests().iter().filter(|line| *line == "clients").count();
+    assert_eq!(asked, 2, "asked again for a refresh");
 }
 
 /// A short or mistyped new password is caught on the page; a right one is
@@ -638,6 +702,34 @@ fn the_audit_is_read_narrowed_and_continued(cx: &mut TestAppContext) {
         assert_eq!(view.audit.lines.len(), 4, "the older page is added below");
         assert_eq!(view.audit.table.read(cx).delegate().visible_len(), 4);
     });
+}
+
+/// The audit narrows to a server and to how far back as picked: the
+/// server by id, the period as where it starts.
+#[gpui::test]
+fn the_audit_narrows_to_a_server_and_a_period(cx: &mut TestAppContext) {
+    let bridge = FakeBridge::signed_in_as("alice", BridgeRole::Admin);
+    let (view, window) = open(cx, bridge.clone());
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.select_section(AccountSection::Audit, window, cx);
+            view.audit.servers = vec!["srv-1".to_string(), "srv-2".to_string()];
+            view.audit.server_index = 2;
+            view.audit.period_index = 1;
+        });
+    })
+    .expect("the window is open");
+    cx.run_until_parked();
+    let before = Utc::now().timestamp_millis();
+    click(cx, window, AUDIT_SEARCH_ID);
+    let asked = bridge.audits.lock().expect("lock").last().cloned().expect("asked");
+    assert_eq!(asked.server.as_deref(), Some("srv-2"));
+    let since = asked.since_ms.expect("a period");
+    let hour = 3_600_000;
+    assert!(
+        (before - hour - 5_000..=before - hour + 5_000).contains(&since),
+        "{since} is an hour back from {before}"
+    );
 }
 
 /// A new search starts with no line picked: a highlight left on the row that

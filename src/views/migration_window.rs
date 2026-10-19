@@ -17,7 +17,7 @@
 //! Import supports conflict strategy selection (Skip / Overwrite / Abort)
 //! and an optional dry-run preview (`EXISTS` on destination) before restore.
 
-use super::export::dirs_default_directory;
+use super::export::{ExportSource, dirs_default_directory};
 use crate::connection::{
     ConflictMode, ConflictPreview, get_server, get_servers, preview_import_conflicts, preview_key_conflicts,
 };
@@ -50,19 +50,6 @@ use tracing::error;
 const WINDOW_WIDTH: f32 = 720.0;
 const WINDOW_HEIGHT: f32 = 620.0;
 const PREVIEW_SAMPLE_LIMIT: usize = 40;
-
-/// Where an export's key list came from. Only the caller knows whether the
-/// user hand-picked the keys or handed over "whatever the tree has loaded",
-/// and the difference decides whether the SCAN-subset caveat is useful
-/// information or pure noise.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ExportSource {
-    /// Keys the user explicitly selected — exactly what they asked for.
-    Selection,
-    /// Everything loaded under one folder prefix, or the whole tree: a
-    /// SCAN-paginated subset of the database.
-    Loaded,
-}
 
 /// A copy target the window opens on, when the caller already knows it —
 /// the compare window hands over what the target lacks.

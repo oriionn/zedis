@@ -28,6 +28,7 @@ mod admin;
 mod audit;
 mod handover;
 mod invites;
+mod online;
 mod password;
 mod signups;
 mod tokens;
@@ -52,6 +53,7 @@ use gpui_kit::component::{
     v_flex,
 };
 use invites::InvitesForm;
+use online::OnlineForm;
 use password::PasswordForm;
 use rust_i18n::t;
 use signups::SignupsForm;
@@ -71,6 +73,7 @@ const SECTION_NAV_WIDTH: f32 = 170.;
 enum AccountSection {
     Password,
     Tokens,
+    Online,
     Accounts,
     Invites,
     Signups,
@@ -82,6 +85,7 @@ impl AccountSection {
         match self {
             Self::Password => "section_password",
             Self::Tokens => "section_tokens",
+            Self::Online => "section_online",
             Self::Accounts => "section_accounts",
             Self::Invites => "section_invites",
             Self::Signups => "section_signups",
@@ -89,7 +93,8 @@ impl AccountSection {
         }
     }
 
-    /// What `me` has: tokens are a read-only account's (ADR 15), the
+    /// What `me` has: tokens are a read-only account's (ADR 15), who is
+    /// online a full account's (the list names other accounts), the
     /// accounts, the invitations and the audit an administrator's — and the
     /// requests for an account too, on a bridge that takes them.
     fn of(me: &BridgeOwnAccount) -> Vec<Self> {
@@ -99,13 +104,13 @@ impl AccountSection {
             BridgeRole::ReadOnly if !me.account.locked => sections.push(Self::Tokens),
             BridgeRole::ReadOnly => {}
             BridgeRole::Admin => {
-                sections.extend([Self::Accounts, Self::Invites]);
+                sections.extend([Self::Online, Self::Accounts, Self::Invites]);
                 if me.signup {
                     sections.push(Self::Signups);
                 }
                 sections.push(Self::Audit);
             }
-            BridgeRole::Full => {}
+            BridgeRole::Full => sections.push(Self::Online),
         }
         sections
     }
@@ -160,6 +165,7 @@ pub struct ZedisAccount {
     invites: InvitesForm,
     signups: SignupsForm,
     audit: AuditForm,
+    online: OnlineForm,
 }
 
 impl ZedisAccount {
@@ -177,6 +183,7 @@ impl ZedisAccount {
             invites: InvitesForm::new(window, cx),
             signups: SignupsForm::new(window, cx),
             audit: AuditForm::new(window, cx),
+            online: OnlineForm::new(window, cx),
         };
         this.load_me(cx);
         this
@@ -217,12 +224,16 @@ impl ZedisAccount {
     fn select_section(&mut self, section: AccountSection, window: &mut Window, cx: &mut Context<Self>) {
         self.section = section;
         // The audit is read when it is first looked at, not with the page;
-        // the requests every time, since they come in while it is open.
+        // the requests and who is online every time, since they change
+        // while it is open.
         if section == AccountSection::Audit && !self.audit.loaded {
             self.load_audit(false, cx);
         }
         if section == AccountSection::Signups {
             self.load_signups(cx);
+        }
+        if section == AccountSection::Online {
+            self.load_online(cx);
         }
         self.focus_handle.focus(window, cx);
         cx.notify();
@@ -499,6 +510,7 @@ impl Render for ZedisAccount {
         let body = match self.section {
             AccountSection::Password => self.render_password(&me, window, cx),
             AccountSection::Tokens => self.render_tokens(&me, window, cx),
+            AccountSection::Online => self.render_online(window, cx),
             AccountSection::Accounts => self.render_accounts(window, cx),
             AccountSection::Invites => self.render_invites(&me, window, cx),
             AccountSection::Signups => self.render_signups(window, cx),

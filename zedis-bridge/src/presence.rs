@@ -25,6 +25,10 @@
 //! with nothing open, sends nothing, and goes offline after the window like
 //! anything else that stopped asking.
 //!
+//! Each client also remembers the server entries its requests named in the
+//! same window — a page beats on the one it has open — which is what lets
+//! the list say who is on which server.
+//!
 //! Kept in memory only. A restart starts from nobody, and each client is
 //! back with its next request.
 
@@ -73,6 +77,8 @@ struct Seen {
     at: Instant,
     /// For people: wall-clock seconds.
     at_unix: u64,
+    /// The server entries its requests named, by id, and when last.
+    servers: HashMap<String, Instant>,
 }
 
 /// A client that is online, as `GET /v1/clients` lists it.
@@ -91,7 +97,21 @@ pub struct Client {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub forwarded_for: Option<String>,
     pub last_seen: String,
+    /// `last_seen` as Unix seconds, for a page to show in its own format.
+    pub seen_at: u64,
     pub idle_secs: u64,
+    /// The server entries it used within the window, the latest first —
+    /// by id here; the route that lists them names the ones the asker may
+    /// see and drops the rest.
+    pub servers: Vec<ClientServer>,
+}
+
+/// A server entry a client used.
+#[derive(Debug, PartialEq, Serialize)]
+pub struct ClientServer {
+    pub id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub name: String,
 }
 
 /// The clients seen within the window, and the ones just past it until the
@@ -123,6 +143,8 @@ impl Presence {
         let arrived = clients
             .get(&key)
             .is_none_or(|seen| now.saturating_duration_since(seen.at) >= ONLINE_WINDOW);
+        let mut servers = clients.remove(&key).map(|seen| seen.servers).unwrap_or_default();
+        servers.retain(|_, at| now.saturating_duration_since(*at) < ONLINE_WINDOW);
         clients.insert(
             key,
             Seen {
@@ -131,9 +153,23 @@ impl Presence {
                 forwarded_for: origin.forwarded_for.clone(),
                 at: now,
                 at_unix: now_unix,
+                servers,
             },
         );
         arrived.then(|| online_count(&clients, now))
+    }
+
+    /// Note that `key`'s request named the server entry `server_id`. A
+    /// client not on the list — it was never authorized — is not added.
+    pub fn used(&self, key: &ClientKey, server_id: &str) {
+        self.used_at(key, server_id, Instant::now());
+    }
+
+    fn used_at(&self, key: &ClientKey, server_id: &str, now: Instant) {
+        let mut clients = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(seen) = clients.get_mut(key) {
+            seen.servers.insert(server_id.to_string(), now);
+        }
     }
 
     /// Take a client off at once — a browser that signed out. Answers whose
@@ -176,6 +212,13 @@ impl Presence {
             .iter()
             .filter_map(|(key, seen)| {
                 let idle = now.saturating_duration_since(seen.at);
+                let mut servers: Vec<(&String, Duration)> = seen
+                    .servers
+                    .iter()
+                    .map(|(id, at)| (id, now.saturating_duration_since(*at)))
+                    .filter(|(_, since)| *since < ONLINE_WINDOW)
+                    .collect();
+                servers.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
                 (idle < ONLINE_WINDOW).then(|| Client {
                     account: seen.account.clone(),
                     kind: key.kind(),
@@ -186,7 +229,15 @@ impl Presence {
                     peer: seen.peer.clone(),
                     forwarded_for: seen.forwarded_for.clone(),
                     last_seen: rfc3339(seen.at_unix, 0),
+                    seen_at: seen.at_unix,
                     idle_secs: idle.as_secs(),
+                    servers: servers
+                        .into_iter()
+                        .map(|(id, _)| ClientServer {
+                            id: id.clone(),
+                            name: String::new(),
+                        })
+                        .collect(),
                 })
             })
             .collect();
@@ -275,6 +326,34 @@ mod tests {
         assert_eq!(online.len(), 5, "two browsers, two script addresses, a token");
         let token = online.iter().find(|c| c.kind == "token").expect("the token client");
         assert_eq!(token.token.as_deref(), Some("claude-laptop"));
+    }
+
+    /// A client remembers the servers its requests named, the latest first,
+    /// for as long as the window — and a request with no server keeps them.
+    #[test]
+    fn a_client_remembers_the_servers_it_used_within_the_window() {
+        let presence = Presence::new();
+        let t0 = Instant::now();
+        presence.seen_at(browser(1), "alice", &from("10.0.0.1"), t0, 1);
+        presence.used_at(&browser(1), "prod", t0);
+        presence.used_at(&browser(1), "staging", t0 + Duration::from_secs(10));
+        presence.used_at(&browser(9), "prod", t0);
+        let later = t0 + Duration::from_secs(20);
+        presence.seen_at(browser(1), "alice", &from("10.0.0.1"), later, 21);
+        let ids = |now: Instant| -> Vec<String> {
+            presence.online_at(now)[0]
+                .servers
+                .iter()
+                .map(|s| s.id.clone())
+                .collect()
+        };
+        assert_eq!(ids(later), ["staging", "prod"]);
+        assert_eq!(presence.online_at(later).len(), 1, "a client never seen is not added");
+
+        // Five minutes after `prod` alone, it has gone from the list.
+        let past_prod = t0 + ONLINE_WINDOW + Duration::from_secs(5);
+        presence.seen_at(browser(1), "alice", &from("10.0.0.1"), past_prod, 306);
+        assert_eq!(ids(past_prod), ["staging"]);
     }
 
     /// Signing out takes the browser off at once rather than five minutes on.

@@ -520,66 +520,32 @@ impl Render for ZedisKeyTree {
                         .update(cx, |state, cx| state.batch_set_ttl_keys(keys, None, None, cx));
                 }
                 KeyTreeAction::ExportSelectedKeys => {
-                    #[cfg(not(target_family = "wasm"))]
-                    {
-                        let keys = this.key_tree_list_state.update(cx, |state, _cx| {
-                            state
-                                .delegate()
-                                .selected_items
-                                .iter()
-                                .cloned()
-                                .collect::<Vec<SharedString>>()
-                        });
-                        if keys.is_empty() {
-                            return;
-                        }
-                        let server_state = this.server_state.read(cx);
-                        let server_id: SharedString = server_state.server_id().to_string().into();
-                        let db = server_state.db();
-                        let server_name: SharedString = get_server(server_id.as_str())
-                            .map(|s| s.name.into())
-                            .unwrap_or_else(|_| server_id.clone());
-                        open_migration_export_window(server_id, server_name, db, keys, ExportSource::Selection, cx);
-                    }
+                    let keys = this.key_tree_list_state.update(cx, |state, _cx| {
+                        state
+                            .delegate()
+                            .selected_items
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<SharedString>>()
+                    });
+                    this.export_keys(keys, ExportSource::Selection, window, cx);
                 }
                 KeyTreeAction::ExportFolder(folder) => {
-                    #[cfg(not(target_family = "wasm"))]
-                    {
-                        let folder = folder.clone();
-                        let server_state = this.server_state.read(cx);
-                        // The configured separator: with `/` or `.`, a `:`
-                        // prefix matched nothing and the export silently
-                        // never opened.
-                        let prefix = server_state.folder_prefix(folder.as_str());
-                        let keys: Vec<SharedString> = server_state
-                            .keys()
-                            .keys()
-                            .filter(|k| k.as_str() == folder.as_str() || k.as_str().starts_with(&prefix))
-                            .cloned()
-                            .collect();
-                        if keys.is_empty() {
-                            return;
-                        }
-                        let server_id: SharedString = server_state.server_id().to_string().into();
-                        let db = server_state.db();
-                        let server_name: SharedString = get_server(server_id.as_str())
-                            .map(|s| s.name.into())
-                            .unwrap_or_else(|_| server_id.clone());
-                        open_migration_export_window(server_id, server_name, db, keys, ExportSource::Loaded, cx);
-                    }
+                    let server_state = this.server_state.read(cx);
+                    // The configured separator: with `/` or `.`, a `:`
+                    // prefix matched nothing and the export silently
+                    // never opened.
+                    let prefix = server_state.folder_prefix(folder.as_str());
+                    let keys: Vec<SharedString> = server_state
+                        .keys()
+                        .keys()
+                        .filter(|k| k.as_str() == folder.as_str() || k.as_str().starts_with(&prefix))
+                        .cloned()
+                        .collect();
+                    this.export_keys(keys, ExportSource::Loaded, window, cx);
                 }
                 KeyTreeAction::ExportKey(id) => {
-                    #[cfg(not(target_family = "wasm"))]
-                    {
-                        let id = id.clone();
-                        let server_state = this.server_state.read(cx);
-                        let server_id: SharedString = server_state.server_id().to_string().into();
-                        let db = server_state.db();
-                        let server_name: SharedString = get_server(server_id.as_str())
-                            .map(|s| s.name.into())
-                            .unwrap_or_else(|_| server_id.clone());
-                        open_migration_export_window(server_id, server_name, db, vec![id], ExportSource::Selection, cx);
-                    }
+                    this.export_keys(vec![id.clone()], ExportSource::Selection, window, cx);
                 }
             }))
             .on_action(cx.listener(|this, event: &EditorAction, window, cx| match event {
@@ -607,5 +573,22 @@ impl Render for ZedisKeyTree {
                     cx.propagate();
                 }
             }))
+    }
+}
+
+impl ZedisKeyTree {
+    /// Export `keys` of the tree's server and database: the migration window
+    /// on the desktop, a download in a page (`open_key_export`).
+    fn export_keys(&self, keys: Vec<SharedString>, source: ExportSource, window: &mut Window, cx: &mut App) {
+        if keys.is_empty() {
+            return;
+        }
+        let server_state = self.server_state.read(cx);
+        let server_id: SharedString = server_state.server_id().to_string().into();
+        let db = server_state.db();
+        let server_name: SharedString = get_server(server_id.as_str())
+            .map(|s| s.name.into())
+            .unwrap_or_else(|_| server_id.clone());
+        open_key_export(server_id, server_name, db, keys, source, window, cx);
     }
 }

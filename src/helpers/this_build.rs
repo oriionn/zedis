@@ -93,15 +93,19 @@ pub const fn reads_clipboard_on_demand() -> bool {
     false
 }
 
-/// The connection diagnostics window — a second window, which a page
-/// cannot open, and a probe the bridge does not run.
+/// The largest value one write may carry, where there is a limit at all.
+///
+/// The desktop sends a value to Redis as it is. A page sends it to the
+/// bridge, one request at a time, and a request holds at most
+/// `BRIDGE_MAX_VALUE_BYTES` of value — so a larger one opens read-only there
+/// and says why, instead of editable and then refused at Save.
 #[cfg(not(target_family = "wasm"))]
-pub const fn has_connection_diagnostics() -> bool {
-    true
+pub const fn value_write_limit() -> Option<usize> {
+    None
 }
 #[cfg(target_family = "wasm")]
-pub const fn has_connection_diagnostics() -> bool {
-    false
+pub const fn value_write_limit() -> Option<usize> {
+    Some(crate::connection::BRIDGE_MAX_VALUE_BYTES)
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]
@@ -117,6 +121,6 @@ mod tests {
         assert!(saves_files());
         assert!(opens_files());
         assert!(reads_clipboard_on_demand());
-        assert!(has_connection_diagnostics());
+        assert_eq!(value_write_limit(), None, "the desktop writes a value of any size");
     }
 }

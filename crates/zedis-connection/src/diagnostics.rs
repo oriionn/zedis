@@ -23,6 +23,7 @@
 
 use super::async_connection::{open_multiplexed_connection, resolve_connection_timeout};
 use super::config::{RedisServer, SERVER_TYPE_SENTINEL};
+use super::diagnosis::{DiagHint, DiagOutcome, DiagStage, DiagStatus, diag_stages};
 use super::ssh_tunnel::{
     SshSession, new_ssh_session, open_forward_channel, resolve_ssh_target, resolve_ssh_target_with, run_in_tokio,
     user_ssh_config,
@@ -31,103 +32,6 @@ use crate::error::Error;
 use redis::{ErrorKind, cmd};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::time::{Duration, Instant};
-
-/// One diagnostic stage. The set of stages for a server depends on its
-/// config — see [`diag_stages`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DiagStage {
-    Dns,
-    Tcp,
-    SshAuth,
-    SshTunnel,
-    Tls,
-    Auth,
-    Ping,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DiagStatus {
-    Success,
-    Failed,
-    Skipped,
-}
-
-/// A remediation hint attached to an outcome; the view maps each variant
-/// to a localized message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DiagHint {
-    Dns,
-    TcpRefused,
-    TcpUnreachable,
-    SshAuth,
-    SshTunnel,
-    Tls,
-    AuthRequired,
-    AuthRejected,
-    AuthNotConfigured,
-    Redis,
-}
-
-#[derive(Debug, Clone)]
-pub struct DiagOutcome {
-    pub status: DiagStatus,
-    /// Extra context on success/skip: resolved IPs, connected address, …
-    pub detail: Option<String>,
-    /// The raw error text on failure.
-    pub error: Option<String>,
-    pub hint: Option<DiagHint>,
-    pub elapsed: Duration,
-}
-
-impl DiagOutcome {
-    pub fn success(detail: Option<String>, elapsed: Duration) -> Self {
-        Self {
-            status: DiagStatus::Success,
-            detail,
-            error: None,
-            hint: None,
-            elapsed,
-        }
-    }
-    pub fn skipped(detail: Option<String>, hint: Option<DiagHint>) -> Self {
-        Self {
-            status: DiagStatus::Skipped,
-            detail,
-            error: None,
-            hint,
-            elapsed: Duration::ZERO,
-        }
-    }
-    pub fn failed(error: String, hint: DiagHint, elapsed: Duration) -> Self {
-        Self {
-            status: DiagStatus::Failed,
-            detail: None,
-            error: Some(error),
-            hint: Some(hint),
-            elapsed,
-        }
-    }
-}
-
-/// The ordered stage list for this server's configuration.
-pub fn diag_stages(server: &RedisServer) -> Vec<DiagStage> {
-    // A Unix socket has no name to resolve and no port to reach.
-    let mut stages = if server.is_unix_socket() {
-        Vec::new()
-    } else {
-        vec![DiagStage::Dns, DiagStage::Tcp]
-    };
-    if server.is_ssh_tunnel() {
-        stages.push(DiagStage::SshAuth);
-        stages.push(DiagStage::SshTunnel);
-    }
-    if server.tls.unwrap_or(false) {
-        stages.push(DiagStage::Tls);
-    }
-    stages.push(DiagStage::Auth);
-    stages.push(DiagStage::Ping);
-    stages
-}
 
 /// The endpoint we actually dial from this machine: the jump host, else
 /// the SSH server, when a tunnel is configured (the Redis host is then
@@ -400,6 +304,96 @@ pub fn diag_timeout(server: &RedisServer) -> Duration {
     resolve_connection_timeout(server)
 }
 
+/// Diagnose `server` stage by stage, in [`diag_stages`]' order, telling
+/// `report` as each stage starts (`None`) and as it ends (`Some`). A stage
+/// that fails ends the run, and the stages after it are reported skipped;
+/// `report` answering `false` stops it, its listener gone.
+///
+/// The desktop dialog draws each answer as it comes; the bridge, which runs
+/// this for a page that cannot dial, collects them into one reply.
+pub async fn run_diagnostics(server: &RedisServer, mut report: impl FnMut(DiagStage, Option<DiagOutcome>) -> bool) {
+    let mut run = Run {
+        pending: diag_stages(server),
+        report: &mut report,
+    };
+    let _ = run.stages(server).await;
+}
+
+/// A diagnosis under way: the stages not reported finished yet, and whom to
+/// tell. Each step answers `None` once the run is over.
+struct Run<'a, F> {
+    pending: Vec<DiagStage>,
+    report: &'a mut F,
+}
+
+impl<F: FnMut(DiagStage, Option<DiagOutcome>) -> bool> Run<'_, F> {
+    fn start(&mut self, stage: DiagStage) -> Option<()> {
+        (self.report)(stage, None).then_some(())
+    }
+
+    fn end(&mut self, stage: DiagStage, outcome: DiagOutcome) -> Option<()> {
+        // TLS on an entry without it: one connect answers for all three.
+        if !self.pending.contains(&stage) {
+            return Some(());
+        }
+        self.pending.retain(|pending| *pending != stage);
+        let failed = outcome.status == DiagStatus::Failed;
+        (self.report)(stage, Some(outcome)).then_some(())?;
+        if failed {
+            self.skip_rest();
+            return None;
+        }
+        Some(())
+    }
+
+    fn skip_rest(&mut self) {
+        for stage in std::mem::take(&mut self.pending) {
+            if !(self.report)(stage, Some(DiagOutcome::skipped(None, None))) {
+                return;
+            }
+        }
+    }
+
+    async fn stages(&mut self, server: &RedisServer) -> Option<()> {
+        let timeout = diag_timeout(server);
+        // DNS + TCP — not for a Unix socket, which has neither (the stage
+        // list already omits them).
+        if !server.is_unix_socket() {
+            let (dial_host, dial_port) = dial_endpoint(server);
+            self.start(DiagStage::Dns)?;
+            let (dns, addrs) = probe_dns(&dial_host, dial_port, timeout).await;
+            self.end(DiagStage::Dns, dns)?;
+            self.start(DiagStage::Tcp)?;
+            let tcp = probe_tcp(&addrs, timeout).await;
+            self.end(DiagStage::Tcp, tcp)?;
+        }
+        if server.is_ssh_tunnel() {
+            self.start(DiagStage::SshAuth)?;
+            let (auth, session) = probe_ssh_auth(server).await;
+            self.end(DiagStage::SshAuth, auth)?;
+            let Some(session) = session else {
+                self.skip_rest();
+                return None;
+            };
+            self.start(DiagStage::SshTunnel)?;
+            let tunnel = probe_ssh_tunnel(session, server).await;
+            self.end(DiagStage::SshTunnel, tunnel)?;
+        }
+        // TLS / AUTH / PING: one real end-to-end connect, attributed by
+        // error classification. The first of them spins while it runs.
+        let first = if server.tls.unwrap_or(false) {
+            DiagStage::Tls
+        } else {
+            DiagStage::Auth
+        };
+        self.start(first)?;
+        let probe = probe_redis(server).await;
+        self.end(DiagStage::Tls, probe.tls)?;
+        self.end(DiagStage::Auth, probe.auth)?;
+        self.end(DiagStage::Ping, probe.ping)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,38 +443,6 @@ mod tests {
     }
 
     #[test]
-    fn unix_socket_skips_the_network_stages() {
-        let s = server("/var/run/redis.sock", 0);
-        assert_eq!(diag_stages(&s), vec![DiagStage::Auth, DiagStage::Ping]);
-    }
-
-    #[test]
-    fn test_diag_stages() {
-        let plain = server("127.0.0.1", 6379);
-        assert_eq!(
-            diag_stages(&plain),
-            vec![DiagStage::Dns, DiagStage::Tcp, DiagStage::Auth, DiagStage::Ping]
-        );
-
-        let mut full = server("127.0.0.1", 6379);
-        full.tls = Some(true);
-        full.ssh_tunnel = Some(true);
-        full.ssh_addr = Some("bastion:22".to_string());
-        assert_eq!(
-            diag_stages(&full),
-            vec![
-                DiagStage::Dns,
-                DiagStage::Tcp,
-                DiagStage::SshAuth,
-                DiagStage::SshTunnel,
-                DiagStage::Tls,
-                DiagStage::Auth,
-                DiagStage::Ping
-            ]
-        );
-    }
-
-    #[test]
     fn test_classify_redis_failure() {
         assert_eq!(
             classify_redis_failure("NOAUTH Authentication required.", false),
@@ -506,6 +468,40 @@ mod tests {
             classify_redis_failure("Connection reset by peer (os error 54)", false),
             FailureClass::Other
         );
+    }
+
+    /// Each stage is told as it starts and as it ends; a failure ends the
+    /// run with the rest skipped; a listener that has gone stops it at once.
+    #[test]
+    fn a_run_reports_each_stage_and_stops_at_a_failure_or_a_departed_listener() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = closed.local_addr().expect("address").port();
+        drop(closed);
+        let target = server("127.0.0.1", port);
+
+        let mut heard: Vec<(DiagStage, Option<DiagStatus>)> = Vec::new();
+        smol::block_on(run_diagnostics(&target, |stage, outcome| {
+            heard.push((stage, outcome.map(|outcome| outcome.status)));
+            true
+        }));
+        assert_eq!(
+            heard,
+            [
+                (DiagStage::Dns, None),
+                (DiagStage::Dns, Some(DiagStatus::Skipped)),
+                (DiagStage::Tcp, None),
+                (DiagStage::Tcp, Some(DiagStatus::Failed)),
+                (DiagStage::Auth, Some(DiagStatus::Skipped)),
+                (DiagStage::Ping, Some(DiagStatus::Skipped)),
+            ]
+        );
+
+        let mut told = 0;
+        smol::block_on(run_diagnostics(&target, |_, _| {
+            told += 1;
+            false
+        }));
+        assert_eq!(told, 1, "nothing after the first answer that nobody heard");
     }
 
     #[test]

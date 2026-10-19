@@ -32,7 +32,7 @@
 //! (`Event::Tool`), whatever it read — a program acting for someone is not a
 //! person looking, and reads are the whole of what it does.
 
-use crate::api::{ApiError, AppState, ExecRequest, authorize_mcp, forward_values, visible_to};
+use crate::api::{ApiError, AppState, ExecRequest, authorize_mcp, forward_values, note_server, visible_to};
 use crate::audit::{self, Event, Origin, ServerRef};
 use crate::policy;
 use axum::{
@@ -458,7 +458,10 @@ async fn call(state: &AppState, account: &str, origin: &Origin, params: Json) ->
 
     let server = match arguments.get("server").and_then(Json::as_str) {
         Some(spec) => match resolve(state, account, spec) {
-            Ok(server) => Some(server),
+            Ok(server) => {
+                note_server(state, origin, &server.id);
+                Some(server)
+            }
             Err(reason) => return Ok(finish(state, account, origin, &name, None, &arguments, Err(reason))),
         },
         None if name == "list_servers" => None,

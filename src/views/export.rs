@@ -26,11 +26,54 @@ use crate::helpers::{get_download_dir, get_home_dir};
 use crate::helpers::{media_type_for, web_download, web_upload};
 use crate::states::{GlobalEvent, NotificationAction, ZedisGlobalStore, ZedisServerState};
 use chrono::Local;
-use gpui::{App, Context, Entity, SharedString, Task};
+use gpui::{App, Context, Entity, SharedString, Task, Window};
 #[cfg(not(target_family = "wasm"))]
 use gpui::{PathPromptOptions, prelude::*};
 #[cfg(not(target_family = "wasm"))]
 use std::path::PathBuf;
+
+/// Where an export's key list came from. Only the caller knows whether the
+/// user hand-picked the keys or handed over "whatever the tree has loaded",
+/// and the difference decides whether the SCAN-subset caveat is useful
+/// information or pure noise.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ExportSource {
+    /// Keys the user explicitly selected — exactly what they asked for.
+    Selection,
+    /// Everything loaded under one folder prefix, or the whole tree: a
+    /// SCAN-paginated subset of the database.
+    Loaded,
+}
+
+/// Export `keys` of one server and database: the migration window on the
+/// desktop — binary, JSON or CSV, to a file or to another server…
+#[cfg(not(target_family = "wasm"))]
+pub fn open_key_export(
+    server_id: SharedString,
+    server_name: SharedString,
+    db: usize,
+    keys: Vec<SharedString>,
+    source: ExportSource,
+    _window: &mut Window,
+    cx: &mut App,
+) {
+    super::open_migration_export_window(server_id, server_name, db, keys, source, cx);
+}
+
+/// …and in a page, which has neither a second window nor a file to stream
+/// into, a dialog that builds the JSON or CSV in memory and downloads it.
+#[cfg(target_family = "wasm")]
+pub fn open_key_export(
+    server_id: SharedString,
+    server_name: SharedString,
+    db: usize,
+    keys: Vec<SharedString>,
+    source: ExportSource,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    super::key_export::open_key_export_dialog(server_id, server_name, db, keys, source, window, cx);
+}
 
 /// Where a save dialog opens: the platform's Downloads directory when that
 /// folder exists, else home, else wherever the process is. A configured

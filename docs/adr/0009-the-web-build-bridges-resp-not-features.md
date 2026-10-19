@@ -1268,3 +1268,35 @@ never on the bridge, whose tables are read by whoever runs its database.
 node labels, never addresses — on purpose. A read-only view would need the
 bridge to describe the cluster to the page and the view split at its
 administration seams; that is a change of its own, not a gate.
+
+## Amended 2026-10-19 (later) — diagnosis, key export and the write limit
+
+**Connection diagnostics run on the bridge.** In a page the process that
+dials a server is the bridge, so "which stage fails" is a question only it
+can answer: `POST /v1/servers/{id}/diagnose` runs the desktop's stages
+(DNS → TCP → SSH → TLS → AUTH → PING) for a saved entry the caller sees and
+answers them together. The stages are one sequence in `zedis-connection`
+(`run_diagnostics`), which the desktop dialog draws as each stage ends and
+the route collects; the rows cross the bridge as `DiagReportRow`, one type
+on both ends. It is a read — anyone who sees the entry may ask, read-only
+accounts too, and it is not an audit line — and it reaches nothing a full
+account could not already, since adding an entry dials whatever it names.
+What `~/.ssh/config` contributed is left out of the answer: it is the
+bridge host's file. The form's own Diagnose stays the desktop's, because it
+diagnoses values not yet saved, whose secrets the page never holds.
+
+**Key export is a download.** The migration window stays out (a second
+window, a file streamed as it goes, a server-to-server copy), but its
+readable export does not need any of them: a page reads the keys through the
+bridge and builds the same JSON or CSV in memory (`ReadableDocument`), then
+downloads it — up to 64 MB, since the tab holds it whole. `open_key_export`
+is the pair: the migration window on the desktop, that dialog in a page.
+
+**The write limit is one number.** `BRIDGE_MAX_REQUEST_BYTES` (2 MB) is set
+on the bridge's routes explicitly rather than left to axum's default, and
+the page sizes its writes by it: a value over `BRIDGE_MAX_VALUE_BYTES` (what
+fits base64 in one request) opens read-only there and says why
+(`value_write_limit()`), and a request over the limit is refused before it
+is sent. The refusal is `BridgeErrorKind::TooLarge`: as a transport failure
+it read as a dropped link, which dropped the pooled client and put
+"connection lost" over a save that only had to be smaller.

@@ -51,6 +51,7 @@
 //! an outage, and a bridge that stops is a bridge someone goes around.
 
 use crate::policy::{Verdict, words};
+use crate::presence::ClientKey;
 use crate::store::{AuditEntry, AuditLog, AuditPage, AuditQuery, StoreFuture, blocking};
 use crate::webhook::Webhook;
 use axum::http::HeaderMap;
@@ -411,6 +412,10 @@ pub struct Origin {
     /// script at the API: `mcp` for a tool call by an AI assistant (ADR 15).
     /// Set by that handler, written into every line of that request.
     pub via: Option<&'static str>,
+    /// Which client of the online list this is (`presence`), once
+    /// `authorize` has said — so a route that names a server can note it
+    /// against that client. Never written into a line.
+    pub client: Option<ClientKey>,
 }
 
 impl Origin {
@@ -421,6 +426,7 @@ impl Origin {
             auth: None,
             token: None,
             via: None,
+            client: None,
             forwarded_for: headers
                 .get("x-forwarded-for")
                 .and_then(|v| v.to_str().ok())

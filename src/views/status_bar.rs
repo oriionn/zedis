@@ -21,7 +21,8 @@ use crate::{
     },
     constants::STATUS_BAR_HEIGHT,
     helpers::{
-        client_counts, format_lag_bytes, get_mono_font_family, group_thousands, pacing, resolve_tag_chip, with_hot_key,
+        client_counts, format_lag_bytes, get_mono_font_family, group_thousands, pacing, resolve_tag_chip, saves_files,
+        with_hot_key,
     },
     states::{
         ConnectionErrorKind, ConnectionHealth, ErrorMessage, RedisKeySpaceStats, ReplicaInfo, SOFT_WRAP_MAX_BYTES,
@@ -976,31 +977,27 @@ impl ZedisStatusBar {
             &[],
             false,
         ));
-        // Import and export each open a window of their own over files:
-        // desktop features, like the bin above.
+        // Import opens a window of its own over a file it streams: desktop
+        // only. RESTORE: disabled, not hidden, on a read-only connection so
+        // the user knows where it lives.
         #[cfg(not(target_family = "wasm"))]
-        data.extend(
-            [
-                // RESTORE: disabled, not hidden, on a read-only connection so
-                // the user knows where it lives.
-                tool(
-                    i18n_status_bar(cx, "import_keys_menu"),
-                    Icon::new(CustomIconName::Upload),
-                    ServerToolsAction::ImportKeys,
-                    &[],
-                    true,
-                ),
-                tool(
-                    i18n_status_bar(cx, "export_keys_menu"),
-                    Icon::new(CustomIconName::Download),
-                    ServerToolsAction::ExportKeys,
-                    &[],
-                    false,
-                ),
-            ]
-            .into_iter()
-            .flatten(),
-        );
+        data.extend(tool(
+            i18n_status_bar(cx, "import_keys_menu"),
+            Icon::new(CustomIconName::Upload),
+            ServerToolsAction::ImportKeys,
+            &[],
+            true,
+        ));
+        // Export: the migration window on the desktop, a download in a page.
+        if saves_files() {
+            data.extend(tool(
+                i18n_status_bar(cx, "export_keys_menu"),
+                Icon::new(CustomIconName::Download),
+                ServerToolsAction::ExportKeys,
+                &[],
+                false,
+            ));
+        }
         // A window on the desktop, a dialog in the browser.
         data.extend(tool(
             i18n_status_bar(cx, "compare_keys_menu"),

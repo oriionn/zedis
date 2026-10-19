@@ -25,7 +25,6 @@ mod command_palette;
 mod compare_window;
 mod config_doc;
 mod config_editor;
-#[cfg(not(target_family = "wasm"))]
 mod connection_diagnostics;
 mod content;
 mod copy_key_dialog;
@@ -42,6 +41,10 @@ mod hll_editor;
 mod hotkeys;
 mod json_tree;
 mod jsonpath_completion;
+/// The page's key export: JSON or CSV built in memory and downloaded
+/// (`open_key_export`'s browser arm — the desktop has the migration window).
+#[cfg(target_family = "wasm")]
+mod key_export;
 mod key_op_dialog;
 mod key_tag_dialog;
 mod key_tree;
@@ -102,13 +105,13 @@ pub use account::open_account;
 pub use acl_manager::ZedisAclManager;
 pub use bitmap_editor::{BitmapEvent, ZedisBitmapEditor};
 pub(crate) use bitmap_editor::{bitmap_eligible, looks_like_bitmap};
+pub(crate) use bytes_editor::past_write_limit;
 pub use bytes_editor::{ZedisBytesEditor, json_invalid_message};
 pub use change_log_dialog::open_change_log_dialog;
 pub use client_dialogs::{KillFilterSupport, ZedisClientKillFilterDialog, ZedisClientPauseDialog};
 pub use clients_manager::ZedisClientsManager;
 pub use command_palette::ZedisCommandPalette;
 pub use config_editor::ZedisConfigEditor;
-#[cfg(not(target_family = "wasm"))]
 pub use connection_diagnostics::open_connection_diagnostics;
 pub use content::ZedisContent;
 pub use copy_key_dialog::ZedisCopyKeyDialog;
@@ -117,6 +120,7 @@ pub use danger_confirm::{
 };
 pub use editor::ZedisEditor;
 pub use expire_at_dialog::ZedisExpireAtDialog;
+pub use export::{ExportSource, open_key_export};
 pub(crate) use export::{export_filename, export_filename_with, export_to_file, export_to_file_global, open_file};
 pub use export_servers_dialog::ZedisExportServersDialog;
 pub use function_editor::ZedisFunctionEditor;
@@ -154,7 +158,7 @@ pub use metrics::ZedisMetrics;
 pub(crate) use metrics::format_timestamp_ms;
 #[cfg(not(target_family = "wasm"))]
 pub use migration_window::{
-    CopyPreset, ExportSource, open_migration_copy_window, open_migration_export_window, open_migration_import_window,
+    CopyPreset, open_migration_copy_window, open_migration_export_window, open_migration_import_window,
 };
 pub use monitor::ZedisMonitor;
 pub use multi_search::ZedisMultiSearch;

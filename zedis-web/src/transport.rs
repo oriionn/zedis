@@ -33,12 +33,13 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use zedis_connection::{
-    BridgeAccount, BridgeAccountChange, BridgeAccountError, BridgeAccountErrorKind, BridgeAccountResult,
-    BridgeAccounts, BridgeAuditPage, BridgeAuditQuery, BridgeDisposition, BridgeError, BridgeErrorKind, BridgeInvite,
-    BridgeInviteKind, BridgeKeyNote, BridgeNewInvite, BridgeOrphans, BridgeOwnAccount, BridgeOwned, BridgeOwnedItem,
-    BridgePageData, BridgePageRow, BridgePageSeed, BridgeReply, BridgeRequest, BridgeRole, BridgeScript,
-    BridgeServerStore, BridgeSignup, BridgeStorage, BridgeToken, BridgeTransport, BridgeTrashEntry, RedisServer,
-    WatchBatch, WatchItem, WatchKind, WatchOpened, describe_commands, get_servers, set_account_read_only_on,
+    BRIDGE_MAX_REQUEST_BYTES, BridgeAccount, BridgeAccountChange, BridgeAccountError, BridgeAccountErrorKind,
+    BridgeAccountResult, BridgeAccounts, BridgeAuditPage, BridgeAuditQuery, BridgeClient, BridgeClients,
+    BridgeDisposition, BridgeError, BridgeErrorKind, BridgeInvite, BridgeInviteKind, BridgeKeyNote, BridgeNewInvite,
+    BridgeOrphans, BridgeOwnAccount, BridgeOwned, BridgeOwnedItem, BridgePageData, BridgePageRow, BridgePageSeed,
+    BridgeReply, BridgeRequest, BridgeRole, BridgeScript, BridgeServerStore, BridgeSignup, BridgeStorage, BridgeToken,
+    BridgeTransport, BridgeTrashEntry, DiagReportRow, RedisServer, WatchBatch, WatchItem, WatchKind, WatchOpened,
+    describe_commands, get_servers, set_account_read_only_on,
 };
 
 /// Talks to one `zedis-bridge`.
@@ -189,6 +190,11 @@ impl HttpBridgeTransport {
         url: String,
         body: String,
     ) -> Result<(u16, Vec<u8>), BridgeError> {
+        // The bridge would only answer `413`, after the whole body crossed
+        // the network to get it.
+        if body.len() > BRIDGE_MAX_REQUEST_BYTES {
+            return Err(too_large(body.len()));
+        }
         let builder = Request::builder()
             .method(method)
             .uri(&url)
@@ -348,6 +354,20 @@ fn exec_payload(request: &BridgeRequest) -> serde_json::Value {
     payload
 }
 
+/// A request the bridge does not take, in the terms the person who made it
+/// can act on: how large it was, and how large one may be.
+fn too_large(bytes: usize) -> BridgeError {
+    const MIB: f64 = 1024.0 * 1024.0;
+    BridgeError::new(
+        BridgeErrorKind::TooLarge,
+        format!(
+            "the request is {:.1} MB, more than the {:.0} MB the bridge accepts in one",
+            bytes as f64 / MIB,
+            BRIDGE_MAX_REQUEST_BYTES as f64 / MIB
+        ),
+    )
+}
+
 /// The error a non-200 stands for.
 ///
 /// The status is the authority on the kind, because it is the one thing a
@@ -375,6 +395,8 @@ fn failure(status: u16, bytes: &[u8]) -> BridgeError {
             danger_key: body.kind.unwrap_or_default(),
             type_name_required: body.strictness.as_deref() == Some("type_name"),
         },
+        // A proxy in front with a lower limit than the bridge's own.
+        413 => BridgeErrorKind::TooLarge,
         502 => BridgeErrorKind::Upstream,
         _ => BridgeErrorKind::Transport,
     };
@@ -564,6 +586,24 @@ impl BridgeTransport for HttpBridgeTransport {
             // Idempotent on the bridge, and nobody is waiting to hear.
             let _ = Self::call(client, "DELETE", url, String::new()).await;
         });
+    }
+
+    fn diagnose(&self, server_id: String) -> BoxFuture<'static, Result<Vec<DiagReportRow>, BridgeError>> {
+        let client = self.client.clone();
+        let url = format!("{}/v1/servers/{}/diagnose", self.base_url, segment(&server_id));
+        Box::pin(async move {
+            let (status, bytes) = Self::post(client, url, String::new()).await?;
+            if status != 200 {
+                return Err(failure(status, &bytes));
+            }
+            #[derive(Deserialize)]
+            struct Body {
+                stages: Vec<DiagReportRow>,
+            }
+            serde_json::from_slice::<Body>(&bytes)
+                .map(|body| body.stages)
+                .map_err(|e| BridgeError::transport(format!("the bridge's diagnosis is not JSON: {e}")))
+        })
     }
 }
 
@@ -1088,6 +1128,9 @@ fn audit_path(query: &BridgeAuditQuery) -> String {
     if let Some(event) = &query.event {
         params.push(format!("event={}", segment(event)));
     }
+    if let Some(server) = &query.server {
+        params.push(format!("server={}", segment(server)));
+    }
     if let Some(since) = query.since_ms {
         params.push(format!("since_ms={since}"));
     }
@@ -1099,6 +1142,39 @@ fn audit_path(query: &BridgeAuditQuery) -> String {
     } else {
         format!("/v1/admin/audit?{}", params.join("&"))
     }
+}
+
+/// `GET /v1/clients`, as the bridge answers it.
+#[derive(Deserialize)]
+struct ClientsBody {
+    #[serde(default)]
+    process: String,
+    #[serde(default)]
+    window_secs: u64,
+    #[serde(default)]
+    clients: Vec<ClientBody>,
+}
+
+#[derive(Deserialize)]
+struct ClientBody {
+    account: String,
+    kind: String,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    peer: Option<String>,
+    #[serde(default)]
+    forwarded_for: Option<String>,
+    #[serde(default)]
+    seen_at: u64,
+    #[serde(default)]
+    servers: Vec<ClientServerBody>,
+}
+
+#[derive(Deserialize)]
+struct ClientServerBody {
+    #[serde(default)]
+    name: String,
 }
 
 #[derive(Deserialize)]
@@ -1247,6 +1323,28 @@ impl BridgeAccounts for HttpBridgeTransport {
                 lines: page.lines.iter().map(serde_json::Value::to_string).collect(),
                 next: page.next,
                 stopped_early: page.stopped_early,
+            })
+        })
+    }
+
+    fn clients(&self) -> BridgeAccountResult<BridgeClients> {
+        self.account_call("GET", "/v1/clients".to_string(), None, |bytes| {
+            json::<ClientsBody>(bytes).map(|body| BridgeClients {
+                process: body.process,
+                window_secs: body.window_secs,
+                clients: body
+                    .clients
+                    .into_iter()
+                    .map(|client| BridgeClient {
+                        account: client.account,
+                        kind: client.kind,
+                        token: client.token,
+                        peer: client.peer,
+                        forwarded_for: client.forwarded_for,
+                        seen_at: client.seen_at,
+                        servers: client.servers.into_iter().map(|server| server.name).collect(),
+                    })
+                    .collect(),
             })
         })
     }
@@ -1759,6 +1857,7 @@ mod tests {
         let page = futures::executor::block_on(transport.audit(BridgeAuditQuery {
             account: Some("a b".to_string()),
             event: Some("logout".to_string()),
+            server: Some("srv 1".to_string()),
             since_ms: Some(1_000),
             before: Some("42".to_string()),
         }))
@@ -1771,9 +1870,27 @@ mod tests {
             (seen[0].0.as_str(), seen[0].1.as_str()),
             (
                 "GET",
-                "http://bridge:7379/zedis/v1/admin/audit?account=a%20b&event=logout&since_ms=1000&before=42"
+                "http://bridge:7379/zedis/v1/admin/audit?account=a%20b&event=logout&server=srv%201&since_ms=1000&before=42"
             )
         );
+    }
+
+    /// Who is online is read with the servers each client is on, by name.
+    #[test]
+    fn who_is_online_is_read_with_the_servers_each_client_is_on() {
+        let (transport, seen) = transport_recording(
+            200,
+            r#"{"process":"4c1f","online":1,"window_secs":300,"clients":[{"account":"bob","kind":"token",
+               "token":"laptop","peer":"10.0.0.9","last_seen":"x","seen_at":1700000000,"idle_secs":3,
+               "servers":[{"id":"s1","name":"prod"},{"id":"s2","name":"staging"}]}]}"#,
+        );
+        let online = futures::executor::block_on(transport.clients()).expect("clients");
+        assert_eq!(seen.lock().expect("lock")[0].1, "http://bridge:7379/zedis/v1/clients");
+        assert_eq!((online.process.as_str(), online.window_secs), ("4c1f", 300));
+        let bob = &online.clients[0];
+        assert_eq!(bob.token.as_deref(), Some("laptop"));
+        assert_eq!(bob.seen_at, 1_700_000_000);
+        assert_eq!(bob.servers, ["prod", "staging"]);
     }
 
     #[test]
@@ -2109,6 +2226,56 @@ mod tests {
         assert_eq!(failure(404, b"{}").kind, BridgeErrorKind::UnknownServer);
         assert_eq!(failure(502, b"{}").kind, BridgeErrorKind::Upstream);
         assert_eq!(failure(500, b"{}").kind, BridgeErrorKind::Transport);
+        assert_eq!(failure(413, b"").kind, BridgeErrorKind::TooLarge);
+    }
+
+    /// A diagnosis is the bridge's to run: the page posts to the entry's
+    /// route and reads every stage back.
+    #[test]
+    fn a_diagnosis_is_asked_of_the_entry_and_read_back_stage_by_stage() {
+        let asked = Arc::new(Mutex::new(None));
+        let captured = asked.clone();
+        let client = FakeHttpClient::create(move |req| {
+            let captured = captured.clone();
+            async move {
+                *captured.lock().expect("lock") = Some((req.method().to_string(), req.uri().to_string()));
+                let body = r#"{"stages":[{"stage":"dns","status":"skipped","elapsed_ms":0},
+                    {"stage":"tcp","status":"failed","error":"refused","hint":"tcp_refused","elapsed_ms":3}]}"#;
+                Ok(gpui::http_client::http::Response::builder()
+                    .status(200)
+                    .body(AsyncBody::from(body.to_string()))?)
+            }
+        });
+        let transport = HttpBridgeTransport::new(client, "http://bridge:7379/");
+        let rows = futures::executor::block_on(transport.diagnose("srv 1".to_string())).expect("rows");
+        assert_eq!(
+            asked.lock().expect("lock").clone(),
+            Some((
+                "POST".to_string(),
+                "http://bridge:7379/v1/servers/srv%201/diagnose".to_string()
+            ))
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].stage, zedis_connection::DiagStage::Tcp);
+        assert_eq!(rows[1].outcome().error.as_deref(), Some("refused"));
+    }
+
+    /// A value the bridge would refuse is not sent: the page says how large
+    /// it was instead of shipping megabytes to be told `413` — and says it
+    /// as what it is, not as trouble with the link.
+    #[test]
+    fn a_request_over_the_limit_is_refused_before_it_is_sent() {
+        let (transport, seen) = transport_answering(200, r#"{"replies":["K09LDQo="]}"#);
+        let mut big = request();
+        big.commands = vec![vec![b'x'; zedis_connection::BRIDGE_MAX_VALUE_BYTES + 128 * 1024]];
+        let err = futures::executor::block_on(transport.send(big)).expect_err("too large");
+        assert_eq!(err.kind, BridgeErrorKind::TooLarge);
+        assert!(err.message.contains("2 MB"), "{}", err.message);
+        assert!(seen.lock().expect("lock").is_none(), "nothing went out");
+
+        let mut fits = request();
+        fits.commands = vec![vec![b'x'; zedis_connection::BRIDGE_MAX_VALUE_BYTES]];
+        futures::executor::block_on(transport.send(fits)).expect("a value at the limit goes out");
     }
 
     #[test]

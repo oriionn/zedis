@@ -29,7 +29,7 @@ use crate::{account_api, auth, mcp, page_data, policy, resp, session::Sessions, 
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{ConnectInfo, Path, Query, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
@@ -48,7 +48,10 @@ use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::Duration;
 use uuid::Uuid;
 use zedis_connection::string::{decrypt_bytes, encrypt_bytes};
-use zedis_connection::{PipelineSpec, RedisServer, get_connection_manager, get_server, get_servers};
+use zedis_connection::{
+    BRIDGE_MAX_REQUEST_BYTES, DiagReportRow, DiagStage, DiagStatus, PipelineSpec, RedisServer, get_connection_manager,
+    get_server, get_servers, run_diagnostics,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -123,6 +126,7 @@ pub fn router(state: AppState) -> Router {
         .route(&at("/v1/servers"), get(servers).post(add_server))
         .route(&at("/v1/servers/{id}"), delete(delete_server).put(update_server))
         .route(&at("/v1/servers/{id}/unlock"), post(unlock_writes).delete(lock_writes))
+        .route(&at("/v1/servers/{id}/diagnose"), post(diagnose_server))
         .route(&at("/v1/servers/{id}/trash"), get(list_trash).post(put_trash))
         .route(&at("/v1/servers/{id}/metrics"), get(metrics_since).post(put_metrics))
         .route(
@@ -148,6 +152,10 @@ pub fn router(state: AppState) -> Router {
     page_data::routes(router, &at)
         // On the API routes only — the page's files need no login.
         .route_layer(middleware::from_fn_with_state(state.clone(), renew_login_cookie))
+        // axum's default is the same number. It is said here because the
+        // page sizes what it sends by it — a value it cannot save opens
+        // read-only — and two copies of a limit drift apart.
+        .layer(DefaultBodyLimit::max(BRIDGE_MAX_REQUEST_BYTES))
         .fallback(web_asset)
         .with_state(state)
 }
@@ -401,10 +409,20 @@ pub(crate) fn authorize(state: &AppState, headers: &HeaderMap, origin: &mut Orig
 
 /// Count the caller in for `GET /v1/clients`, and say so in the process log
 /// when it has just come online.
-fn note_client(state: &AppState, key: ClientKey, account: &str, origin: &Origin) {
+fn note_client(state: &AppState, key: ClientKey, account: &str, origin: &mut Origin) {
     let kind = key.kind();
-    if let Some(online) = state.presence.seen(key, account, origin) {
+    if let Some(online) = state.presence.seen(key.clone(), account, origin) {
         tracing::info!(account, kind, online, "client online");
+    }
+    origin.client = Some(key);
+}
+
+/// Note against the caller that its request named `server_id`, for the
+/// online list's *servers*: what a page beats on, a terminal's session, a
+/// subscription, a tool call.
+pub(crate) fn note_server(state: &AppState, origin: &Origin, server_id: &str) {
+    if let Some(key) = &origin.client {
+        state.presence.used(key, server_id);
     }
 }
 
@@ -882,7 +900,18 @@ async fn clients(
             .record(&account, &origin, Event::Refused { action: "list clients" });
         return Err(ApiError::Forbidden(READ_ONLY_REFUSAL.to_string()));
     }
-    let clients = state.presence.online();
+    let mut clients = state.presence.online();
+    // Each client's servers by name — and only those the asker may see: an
+    // entry of someone else's is not confirmed to exist by who uses it.
+    for client in &mut clients {
+        client.servers.retain_mut(|used| match get_server(&used.id) {
+            Ok(server) if visible_to(&state.accounts, &server, &account) => {
+                used.name = server.name;
+                true
+            }
+            _ => false,
+        });
+    }
     Ok(Json(ClientsReply {
         process: crate::store::process_id(),
         online: clients.len(),
@@ -1544,6 +1573,52 @@ async fn lock_writes(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Serialize)]
+struct DiagnoseReply {
+    stages: Vec<DiagReportRow>,
+}
+
+/// Diagnose a saved entry from here (DNS → TCP → SSH → TLS → AUTH → PING):
+/// a page cannot, having no socket, and this is the process that dials it —
+/// so which stage fails *from the bridge* is the answer the page needs.
+///
+/// Anyone who sees the entry may ask, read-only accounts too: it connects,
+/// as opening the entry does, and changes nothing — which is also why it is
+/// not an audit line. It is no reach a full account lacks either, since
+/// adding an entry dials whatever it names. Each run dials afresh (a new
+/// SSH session, a new connection), as the desktop's does.
+async fn diagnose_server(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<Json<DiagnoseReply>> {
+    let mut origin = Origin::new(peer, &headers);
+    let account = authorize(&state, &headers, &mut origin)?;
+    let server = visible_server(&state.accounts, &id, &account)?;
+    let mut stages = Vec::new();
+    run_diagnostics(&server, |stage, outcome| {
+        if let Some(outcome) = outcome {
+            stages.push(DiagReportRow::new(stage, &outcome));
+        }
+        true
+    })
+    .await;
+    for row in &mut stages {
+        // What `~/.ssh/config` contributed is this host's file — its users,
+        // its keys' paths — and not the entry's to show whoever sees it.
+        if row.stage == DiagStage::SshAuth {
+            row.detail = None;
+        }
+    }
+    let failed = stages
+        .iter()
+        .find(|row| row.status == DiagStatus::Failed)
+        .map(|row| row.stage);
+    tracing::info!(account, server = %server.id, ?failed, "diagnosed");
+    Ok(Json(DiagnoseReply { stages }))
+}
+
 #[derive(Deserialize)]
 struct SessionRequest {
     server: String,
@@ -1565,6 +1640,7 @@ async fn open_session(
     let mut origin = Origin::new(peer, &headers);
     let account = authorize(&state, &headers, &mut origin)?;
     visible_server(&state.accounts, &req.server, &account)?;
+    note_server(&state, &origin, &req.server);
     let session = state
         .sessions
         .open(&req.server, req.db)
@@ -1659,6 +1735,7 @@ async fn open_watch(
     let kind = WatchKind::from_name(&req.kind)
         .ok_or_else(|| ApiError::BadRequest(format!("unknown watch kind {:?}", req.kind)))?;
     let server = visible_server(&state.accounts, &req.server, &account)?;
+    note_server(&state, &origin, &server.id);
     let mut confirmed = None;
     if kind == WatchKind::Monitor {
         refuse_read_only_on(&state, &account, &server, &origin, "monitor")?;
@@ -1868,6 +1945,7 @@ async fn exec(
     }
 
     let server = visible_server(&state.accounts, &req.server, &account)?;
+    note_server(&state, &origin, &server.id);
     // Not `authorize_write`: most of what reaches this route *is* a read, and
     // a read-only account has to keep running those. The role — on *this*
     // entry, since an account's rules may grant it read-only here and full
@@ -2779,5 +2857,179 @@ mod bin_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod body_limit_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The status line the bridge answers a `POST /v1/login` whose body is
+    /// `len` bytes long.
+    async fn status_for_a_body_of(addr: SocketAddr, len: usize) -> String {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let head = format!(
+            "POST /v1/login HTTP/1.1\r\nhost: bridge\r\ncontent-type: application/json\r\n\
+             content-length: {len}\r\nconnection: close\r\n\r\n"
+        );
+        stream.write_all(head.as_bytes()).await.expect("head");
+        // The bridge may answer from the header alone and close; what it
+        // says is the point, not whether all of the body got through.
+        let _ = stream.write_all(&vec![b' '; len]).await;
+        let mut reply = Vec::new();
+        let _ = stream.read_to_end(&mut reply).await;
+        String::from_utf8_lossy(&reply)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// The bridge takes a request up to `BRIDGE_MAX_REQUEST_BYTES` and no
+    /// more — the number the page sizes its writes by, so a value it opens
+    /// as editable is one it can save.
+    #[tokio::test]
+    async fn the_bridge_takes_a_body_up_to_the_limit_the_page_sizes_its_writes_by() {
+        let state = super::mcp_auth_tests::state("[[users]]\nname = \"alice\"\npassword = \"alice-password\"\n");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let over = status_for_a_body_of(addr, BRIDGE_MAX_REQUEST_BYTES + 1).await;
+        assert!(over.contains(" 413 "), "{over}");
+        // Spaces are not a login, so the answer is a refusal of another kind.
+        let at = status_for_a_body_of(addr, BRIDGE_MAX_REQUEST_BYTES).await;
+        assert!(at.starts_with("HTTP/1.1 4") && !at.contains(" 413 "), "{at}");
+        server.abort();
+    }
+}
+
+#[cfg(test)]
+mod diagnose_tests {
+    use super::*;
+    use zedis_core::fs::override_config_dir;
+
+    /// A page asks the bridge to diagnose an entry it sees, and gets every
+    /// stage back — here a port nobody listens on: no name to resolve, the
+    /// connect refused, and nothing after it tried. Someone else's entry
+    /// answers like one that does not exist.
+    #[tokio::test]
+    async fn the_bridge_diagnoses_an_entry_the_caller_sees_and_no_other() {
+        override_config_dir(std::env::temp_dir().join(format!("zedis-bridge-store-{}", std::process::id())));
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = closed.local_addr().expect("address").port();
+        drop(closed);
+        let entry = |id: &str, owner: Option<&str>| RedisServer {
+            id: id.to_string(),
+            name: id.to_string(),
+            host: "127.0.0.1".to_string(),
+            port,
+            owner: owner.map(str::to_string),
+            ..Default::default()
+        };
+        crate::store::LocalServers
+            .put(entry("diag-shared", None))
+            .await
+            .expect("server");
+        crate::store::LocalServers
+            .put(entry("diag-bobs", Some("bob")))
+            .await
+            .expect("server");
+        let state = super::mcp_auth_tests::state(
+            "[[users]]\nname = \"viewer\"\npassword = \"look\"\nread_only = true\n\n\
+             [[users]]\nname = \"bob\"\npassword = \"bobs-password\"",
+        );
+        let peer: SocketAddr = "10.0.0.7:5000".parse().expect("address");
+        let mut headers = HeaderMap::new();
+        let basic = format!("Basic {}", B64.encode("viewer:look"));
+        headers.insert("authorization", basic.parse().expect("header"));
+        let diagnose = |id: &str| {
+            diagnose_server(
+                State(state.clone()),
+                ConnectInfo(peer),
+                headers.clone(),
+                Path(id.to_string()),
+            )
+        };
+
+        let Ok(Json(reply)) = diagnose("diag-shared").await else {
+            panic!("a read-only account may diagnose what it sees");
+        };
+        let seen: Vec<(DiagStage, DiagStatus)> = reply.stages.iter().map(|row| (row.stage, row.status)).collect();
+        assert_eq!(
+            seen,
+            [
+                (DiagStage::Dns, DiagStatus::Skipped),
+                (DiagStage::Tcp, DiagStatus::Failed),
+                (DiagStage::Auth, DiagStatus::Skipped),
+                (DiagStage::Ping, DiagStatus::Skipped),
+            ]
+        );
+        assert!(reply.stages[1].error.is_some(), "the refusal is said");
+
+        assert!(matches!(diagnose("diag-bobs").await, Err(ApiError::UnknownServer(_))));
+    }
+}
+
+#[cfg(test)]
+mod online_servers_tests {
+    use super::*;
+    use zedis_core::fs::override_config_dir;
+
+    /// Who is online says which servers each client used, by name — and
+    /// only those the asker may see: someone else's private entry is not
+    /// confirmed to exist by who is on it.
+    #[tokio::test]
+    async fn the_online_list_names_the_servers_each_client_used_that_the_asker_sees() {
+        override_config_dir(std::env::temp_dir().join(format!("zedis-bridge-store-{}", std::process::id())));
+        let entry = |id: &str, name: &str, owner: Option<&str>| RedisServer {
+            id: id.to_string(),
+            name: name.to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 6379,
+            owner: owner.map(str::to_string),
+            ..Default::default()
+        };
+        for server in [
+            entry("online-prod", "prod", None),
+            entry("online-bobs", "bob's own", Some("bob")),
+        ] {
+            crate::store::LocalServers.put(server).await.expect("server");
+        }
+        let state = super::mcp_auth_tests::state(
+            "[[users]]\nname = \"ops\"\npassword = \"secret\"\n\n\
+             [[users]]\nname = \"bob\"\npassword = \"bobs-password\"",
+        );
+        let peer: SocketAddr = "10.0.0.7:5000".parse().expect("address");
+        let basic = |who: &str| {
+            let mut headers = HeaderMap::new();
+            let value = format!("Basic {}", B64.encode(who));
+            headers.insert("authorization", value.parse().expect("header"));
+            headers
+        };
+        let bob = basic("bob:bobs-password");
+        let mut origin = Origin::new(peer, &bob);
+        assert!(authorize(&state, &bob, &mut origin).is_ok());
+        note_server(&state, &origin, "online-bobs");
+        note_server(&state, &origin, "online-prod");
+
+        let Ok(Json(reply)) = clients(State(state.clone()), ConnectInfo(peer), basic("ops:secret")).await else {
+            panic!("a full account reads the list");
+        };
+        let bobs = reply
+            .clients
+            .iter()
+            .find(|client| client.account == "bob")
+            .expect("bob is online");
+        let named: Vec<(&str, &str)> = bobs.servers.iter().map(|s| (s.id.as_str(), s.name.as_str())).collect();
+        assert_eq!(named, [("online-prod", "prod")]);
+
+        let Ok(Json(reply)) = clients(State(state.clone()), ConnectInfo(peer), bob.clone()).await else {
+            panic!("bob reads the list");
+        };
+        let own = reply.clients.iter().find(|c| c.account == "bob").expect("bob");
+        assert_eq!(own.servers.len(), 2, "bob sees his own entry");
     }
 }
