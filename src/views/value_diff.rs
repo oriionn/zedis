@@ -44,7 +44,7 @@ use crate::helpers::{
     ValueDiffAction, format_duration, get_mono_font_family, group_thousands, humanize_keystroke, unix_ts, whole_patch,
     wrap_line,
 };
-use crate::states::{ZedisGlobalStore, i18n_editor, json_merge_diff};
+use crate::states::{ZedisGlobalStore, i18n_editor, json_merge_diff, update_app_state_and_save_quiet};
 use gpui::{
     App, Bounds, Entity, FocusHandle, Focusable, Hsla, Pixels, Rems, SharedString, Task, UniformListScrollHandle,
     Window, canvas, div, font, prelude::*, px, rems, uniform_list,
@@ -298,7 +298,12 @@ impl ZedisValueDiff {
             data: None,
             _compute: compute,
             state: None,
-            mode: DiffMode::Split,
+            // The layout it was last left in, side by side the first time.
+            mode: if cx.global::<ZedisGlobalStore>().read(cx).diff_unified() {
+                DiffMode::Unified
+            } else {
+                DiffMode::Split
+            },
             merge_patch: None,
             focus_handle: cx.focus_handle(),
             focused: false,
@@ -339,6 +344,12 @@ impl ZedisValueDiff {
         if let Some(state) = &self.state {
             state.update(cx, |state, cx| state.set_mode(mode, cx));
         }
+        // Remembered: the next diff opens in it, as the terminal keeps its
+        // reply format.
+        let unified = mode == DiffMode::Unified;
+        update_app_state_and_save_quiet(cx, "save_diff_layout", move |state, _| {
+            state.set_diff_unified(unified);
+        });
         cx.notify();
     }
 
@@ -880,5 +891,15 @@ mod tests {
             window.render_frame(cx);
         })
         .expect("the window is open");
+
+        // The layout is remembered: the next diff opens in it.
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(cx.global::<ZedisGlobalStore>().read(cx).diff_unified());
+            let session = session("{\"a\":1}", "{\"a\":2}", true);
+            let on_close: DiffCloseCallback = Arc::new(|_, _| {});
+            let next = cx.new(|cx| ZedisValueDiff::new(session, on_close, cx));
+            assert_eq!(next.read(cx).mode, DiffMode::Unified);
+        });
     }
 }

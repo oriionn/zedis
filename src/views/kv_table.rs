@@ -23,7 +23,7 @@ use crate::{
     },
     helpers::{EditorAction, KeyOpAction, build_csv, hot_key_label},
     states::{
-        DataFormat, KeyType, KvElement, ServerEvent, ZedisGlobalStore, ZedisServerState, detect_and_decode,
+        DataFormat, JsonView, KeyType, KvElement, ServerEvent, ZedisGlobalStore, ZedisServerState, detect_and_decode,
         i18n_common, i18n_editor, i18n_key_ops, i18n_kv_table, i18n_list_editor, i18n_zset_editor,
         update_app_state_and_save_quiet_debounced,
     },
@@ -96,6 +96,17 @@ fn preview_modes(json_shaped: bool) -> Vec<PreviewMode> {
         vec![PreviewMode::Decoded, PreviewMode::Tree, PreviewMode::Hex]
     } else {
         vec![PreviewMode::Decoded, PreviewMode::Hex]
+    }
+}
+
+/// The rendering a row's element opens in: a tree where it is JSON-shaped
+/// and Settings opens JSON as one (`json_view`), as the string editor does;
+/// else its text.
+fn opening_preview(json_shaped: bool, view: JsonView) -> PreviewMode {
+    if json_shaped && view == JsonView::Tree {
+        PreviewMode::Tree
+    } else {
+        PreviewMode::Decoded
     }
 }
 
@@ -831,12 +842,13 @@ impl<T: ZedisKvFetcher> ZedisKvTable<T> {
             });
         self.edit_element_column = main_column.map(|index| self.columns[index].name.clone());
         self.edit_element = main_column.and_then(|index| self.fetcher.element(row_ix, index + 1));
-        let max_truncate_length = cx.global::<ZedisGlobalStore>().read(cx).max_truncate_length();
+        let store = cx.global::<ZedisGlobalStore>().read(cx);
+        let (max_truncate_length, json_view) = (store.max_truncate_length(), store.json_view());
         self.edit_element_json = self
             .edit_element
             .as_ref()
             .is_some_and(|element| element_json_document(element, max_truncate_length).is_some());
-        self.preview = PreviewMode::Decoded;
+        self.preview = opening_preview(self.edit_element_json, json_view);
         self.json_tree_stale = true;
         self.editor_form = None;
         self.values_modified = false;
@@ -1975,8 +1987,9 @@ fn row_holds(
 #[cfg(test)]
 mod tests {
     use super::{
-        DATA_COLUMN_MIN_WIDTH, ENTRY_PANEL_MIN_WIDTH, PanelSplit, PreviewMode, TABLE_MIN_WIDTH, element_json_document,
-        entry_panel_split, fit_columns, parse_bulk_rows, preview_modes, row_holds, tree_editable,
+        DATA_COLUMN_MIN_WIDTH, ENTRY_PANEL_MIN_WIDTH, JsonView, PanelSplit, PreviewMode, TABLE_MIN_WIDTH,
+        element_json_document, entry_panel_split, fit_columns, opening_preview, parse_bulk_rows, preview_modes,
+        row_holds, tree_editable,
     };
 
     /// The table and the entry panel share the pane the table is in, not the
@@ -2143,6 +2156,16 @@ mod tests {
             vec![PreviewMode::Decoded, PreviewMode::Tree, PreviewMode::Hex]
         );
         assert_eq!(preview_modes(false), vec![PreviewMode::Decoded, PreviewMode::Hex]);
+    }
+
+    /// A row's element opens as the string editor's value does: a tree where
+    /// it is JSON-shaped and Settings says tree, its text otherwise.
+    #[test]
+    fn a_json_element_opens_in_the_view_settings_names() {
+        assert_eq!(opening_preview(true, JsonView::Tree), PreviewMode::Tree);
+        assert_eq!(opening_preview(true, JsonView::Text), PreviewMode::Decoded);
+        // No tree to open into.
+        assert_eq!(opening_preview(false, JsonView::Tree), PreviewMode::Decoded);
     }
 
     #[test]

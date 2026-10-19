@@ -17,8 +17,8 @@ use crate::helpers::{
     run_jsonpath,
 };
 use crate::states::{
-    DataFormat, MAX_INLINE_VALUE_SIZE, RedisBytesValue, ServerEvent, ViewMode, ZedisGlobalStore, ZedisServerState,
-    i18n_editor, soft_wrap_fits,
+    DataFormat, JsonView, MAX_INLINE_VALUE_SIZE, RedisBytesValue, ServerEvent, ViewMode, ZedisGlobalStore,
+    ZedisServerState, i18n_editor, soft_wrap_fits,
 };
 use crate::views::placeholders::Placeholders;
 use bytes::Bytes;
@@ -155,7 +155,8 @@ pub struct ZedisBytesEditor {
     /// `json_tree_mode`.
     json_tree: Entity<ZedisJsonTree>,
 
-    /// Whether a JSON value is shown as a tree instead of text.
+    /// Whether a JSON value is shown as a tree instead of text. Each key
+    /// opens as Settings says (`json_view`); the switch changes this one.
     json_tree_mode: bool,
 
     /// The text changed since the tree last read it. Rebuilt on the next
@@ -365,6 +366,9 @@ impl ZedisBytesEditor {
                     this.update_editor_data(cx);
                 }
                 ServerEvent::KeySelected(_) => {
+                    // A key opens in the view Settings names, not in the
+                    // one the last key was switched to.
+                    this.json_tree_mode = opens_as_tree(cx);
                     // A different key invalidates the current JSONPath
                     // query — clear the input (and any stale result) so
                     // it doesn't carry over to an unrelated value.
@@ -534,7 +538,7 @@ impl ZedisBytesEditor {
             jsonpath_result_editor,
             is_json_value: false,
             json_tree,
-            json_tree_mode: false,
+            json_tree_mode: opens_as_tree(cx),
             json_tree_stale: true,
             is_hex_text: false,
             hex_mode: false,
@@ -933,6 +937,11 @@ impl ZedisBytesEditor {
                 }
             }))
     }
+}
+
+/// Whether Settings opens a JSON value as a tree (`json_view`).
+fn opens_as_tree(cx: &App) -> bool {
+    cx.global::<ZedisGlobalStore>().read(cx).json_view() == JsonView::Tree
 }
 
 /// A syntax error as the notifications show it.
@@ -1372,6 +1381,42 @@ mod tests {
         editor.read_with(cx, |editor, _| {
             assert!(!editor.hex_editing, "back on the dump");
             assert!(matches!(editor.data, ByteEditorData::Hex(_)));
+        });
+    }
+
+    /// A key opens in the JSON view Settings names (`json_view`), not in
+    /// the one the last key was switched to; the switch changes only the
+    /// value on screen.
+    #[gpui::test]
+    fn a_key_opens_in_the_json_view_settings_name(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let server_state = cx.new(|_| ZedisServerState::default());
+        let mut view = None;
+        cx.open_window(size(px(900.), px(600.)), |window, cx| {
+            let editor = cx.new(|cx| ZedisBytesEditor::new(server_state.clone(), window, cx));
+            view = Some(editor.clone());
+            Root::new(editor, window, cx)
+        });
+        let editor = view.expect("the window built the editor");
+        editor.read_with(cx, |editor, _| assert!(!editor.json_tree_mode, "text by default"));
+
+        // Switched to the tree, then another key: back to the default.
+        editor.update(cx, |editor, cx| editor.set_json_tree_mode(true, cx));
+        server_state.update(cx, |state, cx| state.select_key("orders:1".into(), cx));
+        cx.run_until_parked();
+        editor.read_with(cx, |editor, _| {
+            assert!(!editor.json_tree_mode, "the next key opens as text")
+        });
+
+        // Settings says tree: the next key opens as one.
+        cx.update(|cx| {
+            let store = cx.global::<ZedisGlobalStore>().clone();
+            store.update(cx, |state, _| state.set_json_view(JsonView::Tree));
+        });
+        server_state.update(cx, |state, cx| state.select_key("orders:2".into(), cx));
+        cx.run_until_parked();
+        editor.read_with(cx, |editor, _| {
+            assert!(editor.json_tree_mode, "the next key opens as a tree")
         });
     }
 

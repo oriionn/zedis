@@ -28,7 +28,8 @@ use crate::{
         date_format_sample, parse_duration, set_datetime_prefs,
     },
     states::{
-        ZedisGlobalStore, i18n_settings, save_ui_locale, update_app_state_and_save, update_app_state_and_save_quiet,
+        JsonView, ZedisGlobalStore, i18n_editor, i18n_settings, save_ui_locale, update_app_state_and_save,
+        update_app_state_and_save_quiet,
     },
 };
 #[cfg(not(target_family = "wasm"))]
@@ -297,6 +298,7 @@ pub struct ZedisSettingEditor {
     locale_select: Entity<ZedisSelect>,
     time_zone_select: Entity<ZedisSelect>,
     date_format_select: Entity<ZedisSelect>,
+    json_view_select: Entity<ZedisSelect>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -360,6 +362,7 @@ impl ZedisSettingEditor {
         let locale = store.locale().to_string();
         let time_zone = store.time_zone();
         let date_format = store.date_format();
+        let json_view = store.json_view();
         let ai_base_url = store.ai_base_url();
         let ai_api_key = store.ai_api_key();
         let ai_model = store.ai_model();
@@ -761,6 +764,33 @@ impl ZedisSettingEditor {
             },
         ));
 
+        // How a JSON value opens. Read when a key is opened, so the next one
+        // follows the choice.
+        let json_view_labels: Vec<String> = JsonView::ALL
+            .iter()
+            .map(|view| {
+                // The switch's own words, so the two read the same.
+                let key = match view {
+                    JsonView::Text => "json_view_text",
+                    JsonView::Tree => "json_view_tree",
+                };
+                i18n_editor(cx, key).to_string()
+            })
+            .collect();
+        let json_view_index = JsonView::ALL.iter().position(|view| *view == json_view);
+        let json_view_select = cx.new(|cx| ZedisSelect::new(json_view_labels, json_view_index, window, cx));
+        subscriptions.push(cx.subscribe_in(
+            &json_view_select,
+            window,
+            |_view, _select, event: &ZedisSelectEvent, _window, cx| {
+                let ZedisSelectEvent::Change(index) = event;
+                let view = JsonView::ALL.get(*index).copied().unwrap_or_default();
+                update_app_state_and_save(cx, "save_json_view", move |state, _| {
+                    state.set_json_view(view);
+                });
+            },
+        ));
+
         // UI + monospace font pickers: searchable dropdowns of the installed
         // families (drop the `.`-prefixed internal ones), each led by a
         // "default" entry. Changing either applies + persists both.
@@ -839,6 +869,7 @@ impl ZedisSettingEditor {
             locale_select,
             time_zone_select,
             date_format_select,
+            json_view_select,
         }
     }
 
@@ -1019,6 +1050,7 @@ impl Render for ZedisSettingEditor {
                         });
                     })),
             ))
+            .child(Self::render_setting_row(cx, "json_view", self.json_view_select.clone()))
             .children(self.render_soft_delete_row(cx))
             .child(Self::render_setting_row(
                 cx,

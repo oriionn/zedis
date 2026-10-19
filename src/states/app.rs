@@ -170,6 +170,33 @@ pub enum ServerToolsAction {
     TroubleshootingReport,
 }
 
+/// How the editor opens a JSON value: as its text, or as a tree. Each key
+/// opens this way; the Text / Tree switch then changes the one on screen.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum JsonView {
+    #[default]
+    Text,
+    Tree,
+}
+
+impl JsonView {
+    pub const ALL: [JsonView; 2] = [JsonView::Text, JsonView::Tree];
+
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "tree" => JsonView::Tree,
+            _ => JsonView::Text,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            JsonView::Text => "text",
+            JsonView::Tree => "tree",
+        }
+    }
+}
+
 const LIGHT_THEME_MODE: &str = "light";
 const DARK_THEME_MODE: &str = "dark";
 
@@ -493,6 +520,12 @@ pub struct ZedisAppState {
     time_zone: Option<String>,
     /// Date + time layout id (`helpers::DATE_FORMATS`); unset = ISO-like.
     date_format: Option<String>,
+    /// How a JSON value opens in the editor: `"text"` (default) or `"tree"`
+    /// ([`JsonView`]).
+    json_view: Option<String>,
+    /// The value diff's layout as it was last left: one column (`true`) or
+    /// side by side (unset / `false`, the default).
+    diff_unified: Option<bool>,
     /// How the server list orders cards inside each group. `None` keeps the
     /// hand-made order the ↑/↓ buttons produce, which stays the default —
     /// a list someone arranged themselves should not be re-sorted for them.
@@ -1192,6 +1225,20 @@ impl ZedisAppState {
     }
     pub fn set_date_format(&mut self, id: &str) {
         self.date_format = Some(id.to_string());
+    }
+    /// How a JSON value opens in the editor.
+    pub fn json_view(&self) -> JsonView {
+        self.json_view.as_deref().map(JsonView::from_name).unwrap_or_default()
+    }
+    pub fn set_json_view(&mut self, view: JsonView) {
+        self.json_view = Some(view.name().to_string());
+    }
+    /// Whether the value diff opens as one column, as it was last left.
+    pub fn diff_unified(&self) -> bool {
+        self.diff_unified.unwrap_or(false)
+    }
+    pub fn set_diff_unified(&mut self, unified: bool) {
+        self.diff_unified = Some(unified);
     }
     /// Server-list order id — see `ServerSort` in the servers view.
     pub fn server_sort(&self) -> String {
