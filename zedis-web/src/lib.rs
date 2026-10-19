@@ -37,7 +37,7 @@ use futures::channel::mpsc::UnboundedReceiver;
 #[cfg(target_family = "wasm")]
 use futures::future::{self, Either};
 #[cfg(target_family = "wasm")]
-use gpui::{Application, ApplicationHandle, AsyncApp};
+use gpui::{Application, ApplicationHandle, AsyncApp, TextRenderingMode};
 #[cfg(target_family = "wasm")]
 use gpui_web::{CanvasFontFallback, WebBackendPreference, WebPlatform};
 #[cfg(target_family = "wasm")]
@@ -204,6 +204,14 @@ pub fn run(
         // Before `launch`, which binds the keys and draws their labels.
         set_web_command_key(apple_keyboard);
         set_web_download(download_file);
+        // Grayscale antialiasing for every glyph, before the first frame. The
+        // web text system asks for subpixel (RGB) antialiasing for the fonts
+        // it was handed and grayscale for what the browser draws, so in a
+        // Chinese line the Latin words and digits had colour fringes the
+        // characters beside them did not, and read as another colour. A page
+        // does not know the screen's subpixel order anyway, and the macOS
+        // desktop draws grayscale too.
+        cx.set_text_rendering_mode(TextRenderingMode::Grayscale);
         zedis_gui::init_embedded_commands();
         if let Err(e) = zedis_gui::db::init_database() {
             error!(error = %e, "the in-memory local store could not be created");

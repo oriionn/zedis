@@ -59,6 +59,10 @@ fn the_storage_guide_shows_every_migration_as_it_is() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for guide in ["SQL_STORE.md", "SQL_STORE_zh.md"] {
         let text = std::fs::read_to_string(root.join("../docs").join(guide)).expect("the guide");
+        // A Windows checkout gives the guide CRLF line endings, while the
+        // migrations stay LF (`.gitattributes`): what is compared is the
+        // text, not how its lines end.
+        let text = text.replace("\r\n", "\n");
         for dialect in ["postgres", "mysql"] {
             let mut files: Vec<_> = std::fs::read_dir(root.join("migrations").join(dialect))
                 .expect("migrations")
