@@ -16,16 +16,17 @@ use crate::helpers::{
     JsonPathAction, JsonPathOutcome, bytes_to_hex_text, get_mono_font_family, is_json_container, parse_hex_text,
     run_jsonpath, value_write_limit,
 };
+#[cfg(not(target_family = "wasm"))]
+use crate::states::MAX_INLINE_VALUE_SIZE;
 use crate::states::{
-    DataFormat, JsonView, MAX_INLINE_VALUE_SIZE, RedisBytesValue, ServerEvent, ViewMode, ZedisGlobalStore,
-    ZedisServerState, i18n_editor, soft_wrap_fits,
+    DataFormat, JsonView, RedisBytesValue, ServerEvent, ViewMode, ZedisGlobalStore, ZedisServerState, i18n_editor,
+    soft_wrap_fits,
 };
 use crate::views::placeholders::Placeholders;
 use bytes::Bytes;
 use gpui::{AnyElement, App, Entity, Image, ObjectFit, SharedString, Subscription, Window, img, px, relative};
 use gpui::{div, hsla, prelude::*};
 use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants};
-use gpui_kit::component::highlighter::Language;
 use gpui_kit::component::input::{
     CompletionProvider, Editor, EditorMode, EditorState, Enter, InputEvent, InputModeKind, RopeExt, TabSize,
 };
@@ -49,9 +50,23 @@ use zedis_core::json::{JsonSyntaxError, format_json, minify_json, numbers_surviv
 
 // Constants for editor configuration
 const DEFAULT_TAB_SIZE: usize = 2;
+/// Named as a string, not through `highlighter::Language`: without the
+/// tree-sitter feature (the browser build) that type is a stub whose every
+/// name is `unknown`, and the page's highlighter (syntect) then found no
+/// grammar for the values.
 const DEFAULT_LANGUAGE: &str = "json";
 /// The language of a value too large to highlight: no grammar, no tree.
 const PLAIN_LANGUAGE: &str = "text";
+/// The largest text shown highlighted. On the desktop, every value the size
+/// gate lets in (`MAX_INLINE_VALUE_SIZE`): tree-sitter reparses what an edit
+/// touched. A page highlights with syntect, which parses the whole document
+/// again after each pause in typing, on the page's one thread — about a
+/// third of a second a megabyte in a release build (64 kB 45 ms, 256 kB
+/// 125 ms, 1 MB 330 ms) — so past 512 kB a value is shown plain there.
+#[cfg(not(target_family = "wasm"))]
+const HIGHLIGHT_MAX_BYTES: u64 = MAX_INLINE_VALUE_SIZE;
+#[cfg(target_family = "wasm")]
+const HIGHLIGHT_MAX_BYTES: u64 = 512 * 1024;
 const HEX_WIDTH_NARROW: usize = 16; // Bytes per line for narrow viewports
 const HEX_WIDTH_MEDIUM: usize = 24; // Bytes per line for medium viewports
 const HEX_WIDTH_WIDE: usize = 32; // Bytes per line for wide viewports
@@ -388,10 +403,9 @@ impl ZedisBytesEditor {
         let soft_wrap = server_state.read(cx).soft_wrap();
 
         // Configure code editor with JSON syntax highlighting
-        let default_language = Language::from_str(DEFAULT_LANGUAGE);
         let editor = cx.new(|cx| {
             EditorState::new(window, cx)
-                .language(default_language.name())
+                .language(DEFAULT_LANGUAGE)
                 .line_number(true)
                 .indent_guides(true)
                 .tab_size(TabSize {
@@ -512,7 +526,7 @@ impl ZedisBytesEditor {
         // textarea engine and a code editor has no equivalent.
         let jsonpath_result_editor = cx.new(|cx| {
             EditorState::new(window, cx)
-                .language(default_language.name())
+                .language(DEFAULT_LANGUAGE)
                 .line_number(true)
                 .searchable(true)
                 .soft_wrap(true)
@@ -1065,13 +1079,12 @@ impl ZedisBytesEditor {
                     // back on only after a small one has replaced it.
                     self.wrap_fits = soft_wrap_fits(value.len());
                     let wrap = self.soft_wrap && self.wrap_fits;
-                    // Past the auto-load cap — a value only "load anyway"
-                    // brings in — the text is shown plain. Every value is
-                    // highlighted as JSON, and for 22 MB of anything else
-                    // the parser's error-recovery tree was 2.3 million nodes,
-                    // some 220 MB. Up to the cap a document keeps its colours
-                    // and its folding.
-                    let plain = value.len() as u64 > MAX_INLINE_VALUE_SIZE;
+                    // Past `HIGHLIGHT_MAX_BYTES` the text is shown plain.
+                    // Every value is highlighted as JSON, and for 22 MB of
+                    // anything else the parser's error-recovery tree was 2.3
+                    // million nodes, some 220 MB. Up to the cap a document
+                    // keeps its colours and its folding.
+                    let plain = value.len() as u64 > HIGHLIGHT_MAX_BYTES;
                     let language =
                         (plain != self.plain_text).then_some(if plain { PLAIN_LANGUAGE } else { DEFAULT_LANGUAGE });
                     self.plain_text = plain;

@@ -59,18 +59,20 @@ use crate::views::{
 };
 use crate::window_setup::*;
 use gpui::{
-    Action, App, Bounds, Entity, MouseButton, Pixels, Point, SharedString, Subscription, Task, Window, div, prelude::*,
+    Action, App, Bounds, Entity, MouseButton, Pixels, Point, ScrollHandle, SharedString, Subscription, Task, Window,
+    div, prelude::*,
 };
 use std::collections::HashMap;
 // Only the custom-drawn title bar path uses this (Linux/FreeBSD keep
 // server-side decorations — see the cfg at the open_window call).
 use gpui_kit::component::{
-    ActiveTheme, IconName, Sizable, Theme, ThemeMode, WindowExt,
+    ActiveTheme, IconName, InteractiveElementExt, Sizable, Theme, ThemeMode, WindowExt,
     button::{Button, ButtonVariants},
     h_flex,
     label::Label,
     menu::ContextMenuExt,
     notification::Notification,
+    scroll::ScrollableMask,
     v_flex,
 };
 #[cfg(not(target_family = "wasm"))]
@@ -160,6 +162,9 @@ pub struct Zedis {
     /// the active tab's content reacts to global route/server broadcasts.
     tabs: Vec<ContentTab>,
     active_tab: usize,
+    /// The tab strip's sideways scroll: eight pills with long connection
+    /// names are wider than a narrow window.
+    tab_scroll: ScrollHandle,
     /// A cmd+click "open in new tab" request awaiting `render` (which has the
     /// `Window` needed to build a `ZedisContent`).
     pending_new_tab: Option<(String, usize)>,
@@ -412,6 +417,7 @@ impl Zedis {
             save_task: None,
             tabs,
             active_tab,
+            tab_scroll: ScrollHandle::new(),
             pending_new_tab: None,
             command_palette,
             recent_keys_palette,
@@ -546,6 +552,8 @@ impl Zedis {
         self.tabs[ix]
             .content
             .update(cx, |content, cx| content.set_active(true, cx));
+        // ⌘1–8 can pick a pill scrolled out of the strip.
+        self.tab_scroll.scroll_to_item(ix);
         self.rebind_palettes(cx);
         if let Some(window) = window {
             // After the click/key event settles (focus may still be on the
@@ -872,6 +880,9 @@ impl Zedis {
     /// carry a context menu / drag-drop / middle-click. Hidden with a single
     /// tab; with more: click activates, × or middle-click closes, drag
     /// reorders, right-click offers close / close-others / close-right.
+    /// Wider than the window, it scrolls sideways — a trackpad as it would,
+    /// a plain mouse wheel through `ScrollableMask::vertical_wheel`, which a
+    /// wheel with only a vertical axis needs to move a horizontal strip.
     fn render_tab_bar(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
         if self.tabs.len() <= 1 {
             return None;
@@ -881,14 +892,16 @@ impl Zedis {
         let foreground = cx.theme().foreground;
         let active_bg = foreground.alpha(0.1);
         let muted = cx.theme().muted_foreground;
-        let strip = h_flex()
-            .w_full()
-            .flex_none()
+        let pills = h_flex()
+            .id("workspace-tabs")
+            .flex_1()
+            .min_w_0()
             .gap_1()
             .px_2()
             .py_1()
-            .border_b_1()
-            .border_color(border)
+            .overflow_x_scroll()
+            .lock_scroll_axis()
+            .track_scroll(&self.tab_scroll)
             .children(self.tabs.iter().enumerate().map(|(ix, tab)| {
                 let title: SharedString = if tab.server_id.is_empty() {
                     home_label.clone()
@@ -978,6 +991,15 @@ impl Zedis {
                             .menu(i18n_common(cx, "tab_close_right"), Box::new(TabAction::CloseRight(ix)))
                     })
             }));
+        let strip = h_flex()
+            .w_full()
+            .flex_none()
+            .relative()
+            .border_b_1()
+            .border_color(border)
+            .child(pills)
+            // Outside the pills, so their indices are the tabs' own.
+            .child(ScrollableMask::vertical_wheel(&self.tab_scroll));
         Some(strip)
     }
 

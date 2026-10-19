@@ -24,3 +24,9 @@ zedis-core = { workspace = true }
 # GPUI Fast in place of the default engine: see `gpui-fast` in the root
 # manifest, which is the only thing that turns this on.
 gpui-fast = ["gpui-kit/gpui-fast"]
+
+[dev-dependencies]
+# A table in a headless window (`text_table`'s column fit): the same
+# test-support builds the app crate's UI tests use.
+gpui = { workspace = true, features = ["test-support"] }
+gpui-kit = { workspace = true, features = ["test-support"] }

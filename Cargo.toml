@@ -389,7 +389,9 @@ gpui_web = { package = "gpui-pre-web", version = "0.3.9" }
 # the component icon assets (`gpui_kit::assets::Assets`). `tree-sitter` turns
 # on the component crate's native highlighter — LanguageConfig /
 # LanguageRegistry, pulling tree-sitter + tree-sitter-json only, not the
-# 30-parser `tree-sitter-languages` bundle; we register Lua ourselves.
+# 30-parser `tree-sitter-languages` bundle; we register Lua ourselves. The
+# browser build cannot have tree-sitter, and `zedis-web` asks for `syntect`
+# (0.8+) instead.
 #
 # Since 0.7.2 its manifest also lists the optional GPUI Fast backend
 # (`gpui-fast-*`: not enabled here, never compiled). A lock file covers
@@ -397,7 +399,7 @@ gpui_web = { package = "gpui-pre-web", version = "0.3.9" }
 # this build does compile — `cocoa =0.26.0` (gpui-pre-macos) and
 # `unicode-properties =0.1.3` (gpui-pre-web, rustybuzz) — so `cargo update`
 # cannot move those two past the pins while gpui-kit carries them.
-gpui-kit = { version = "0.7.3" }
+gpui-kit = { version = "0.8.0" }
 
 [build-dependencies]
 winres = "0.1.12"

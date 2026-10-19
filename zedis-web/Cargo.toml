@@ -19,7 +19,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # No `tree-sitter`: gpui-component drops that dependency on wasm but still
-# compiles the code behind the feature, so enabling it here is 37 errors.
+# compiles the code behind the feature, so enabling it here is 37 errors —
+# the page highlights with `syntect` instead (below).
 gpui = { workspace = true }
 zedis-connection = { workspace = true }
 zedis-core = { workspace = true }
@@ -42,8 +43,11 @@ tracing = { workspace = true }
 zedis-gui = { path = ".." }
 # Only the browser entry point uses the kit: `web_init`, the single-threaded
 # app and the asset source. A native check of this crate builds the transport
-# and its tests, and needs none of it.
-gpui-kit = { workspace = true }
+# and its tests, and needs none of it. `syntect` is the page's highlighter
+# (gpui-kit 0.8): regex-based (`regex-fancy`, pure Rust), so it builds for
+# wasm32 where tree-sitter does not, and it colours the editors with the
+# theme's own highlight names, as the desktop's tree-sitter does.
+gpui-kit = { workspace = true, features = ["syntect"] }
 # `WebPlatform` itself, to pick its canvas font fallback (CJK); see the
 # workspace manifest.
 gpui_web = { workspace = true }

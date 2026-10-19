@@ -29,8 +29,8 @@
 //! which the route switch already does.
 
 use gpui::{
-    AnyElement, App, Bounds, ClipboardItem, Div, Edges, Entity, Hsla, Pixels, SharedString, Window, canvas, div,
-    prelude::*, px,
+    AnyElement, App, Bounds, ClipboardItem, Div, Edges, Entity, Hsla, Pixels, SharedString, TextStyle, Window, canvas,
+    div, prelude::*, px, rems,
 };
 use gpui_kit::component::{
     ActiveTheme, Icon, IconName, StyledExt, WindowExt,
@@ -46,6 +46,12 @@ use zedis_core::string::fast_contains_ignore_case;
 
 /// What the columns leave free at the table's edge, for its scrollbar.
 const EDGE_RESERVE: f32 = 10.;
+/// The rows a double-click on a column's edge measures (`fit_column`): the
+/// first screens of a MONITOR of 10,000 lines say what the column holds.
+const FIT_ROWS: usize = 5_000;
+/// The characters of a cell measured: a column is capped far short of what
+/// this many take, and a 10 kB argument would be shaped whole otherwise.
+const FIT_CHARS: usize = 300;
 
 /// One column: a stable `key` (what exports and sort callers name), the
 /// title to draw, and a width in pixels.
@@ -192,6 +198,10 @@ pub struct ZedisTextTable {
     row_filter: Option<RowPredicate>,
     /// The table width the filling columns were last fitted to.
     fitted_width: Option<Pixels>,
+    /// The text style the cells are drawn in, as the header last found it.
+    /// `fit_column` runs in a click, where the styles the table's ancestors
+    /// push — the theme's font, a panel's `text_sm` — are not on the stack.
+    text_style: Option<TextStyle>,
 }
 
 /// Draw `table` — a `DataTable` over `state` — so that its filling columns
@@ -268,6 +278,7 @@ impl ZedisTextTable {
             cell_render: None,
             row_filter: None,
             fitted_width: None,
+            text_style: None,
         }
     }
 
@@ -576,6 +587,21 @@ impl ZedisTextTable {
     }
 }
 
+/// How wide `text` is drawn on one line in `style` at `size`. Cut at
+/// [`FIT_CHARS`], and a line break drawn as a space, as the cell draws it.
+fn text_width(window: &Window, style: &TextStyle, text: &str, size: Pixels) -> Pixels {
+    let line: String = text
+        .chars()
+        .take(FIT_CHARS)
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    if line.is_empty() {
+        return px(0.);
+    }
+    let run = style.to_run(line.len());
+    window.text_system().shape_line(line.into(), size, &[run], None).width
+}
+
 impl TableDelegate for ZedisTextTable {
     fn columns_count(&self, _cx: &App) -> usize {
         self.gpui_columns.len()
@@ -593,12 +619,47 @@ impl TableDelegate for ZedisTextTable {
         self.set_sort(col_ix, sort);
     }
 
+    /// Fit a column to its widest cell and its title, as a double-click on
+    /// its edge asks — the cells in the style the table was last drawn in,
+    /// so nothing is fitted before its first frame.
+    fn fit_column(&mut self, col_ix: usize, window: &mut Window, cx: &mut Context<TableState<Self>>) -> Option<Pixels> {
+        let style = self.text_style.clone()?;
+        let column = self.columns.get(col_ix)?;
+        let rem = window.rem_size();
+        let cell_size = style.font_size.to_pixels(rem);
+        // The title is drawn `text_sm`, beside the sort arrow when the column
+        // sorts: a 0.75rem icon with 2px on each side.
+        let mut widest = text_width(window, &style, &column.title, rems(0.875).to_pixels(rem));
+        if column.sortable {
+            widest += rems(0.75).to_pixels(rem) + px(4.);
+        }
+        let icon = rems(1.).to_pixels(rem);
+        for row in self.visible_iter().take(FIT_ROWS) {
+            let style_of = self.cell_style.as_ref().map(|provider| provider(col_ix, row, cx));
+            let icon_only = style_of.as_ref().is_some_and(|cell| cell.icon_only);
+            let mut width = if icon_only {
+                px(0.)
+            } else {
+                row.get(col_ix)
+                    .map_or(px(0.), |text| text_width(window, &style, text, cell_size))
+            };
+            if style_of.is_some_and(|cell| cell.icon.is_some()) {
+                width += icon;
+            }
+            widest = widest.max(width);
+        }
+        Some(widest)
+    }
+
     fn render_th(
         &mut self,
         col_ix: usize,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
+        if col_ix == 0 {
+            self.text_style = Some(window.text_style());
+        }
         let column = &self.gpui_columns[col_ix];
         // h_flex (items_center) matches render_td, so header text is
         // vertically centered like the cells.
@@ -722,7 +783,59 @@ impl TableDelegate for ZedisTextTable {
 #[cfg(test)]
 mod tests {
     use super::{ColumnSort, TextColumn, ZedisTextTable};
-    use gpui::{SharedString, px};
+    use gpui::{AnyWindowHandle, AppContext as _, SharedString, TestAppContext, px};
+    use gpui_kit::component::table::TableState;
+    use gpui_kit::test::TestWindowExt;
+
+    /// A double-click on a column's edge fits it to its widest cell, and to
+    /// its title where every cell is shorter — measured in the style the
+    /// table is drawn in.
+    #[gpui::test]
+    fn a_column_fits_its_widest_cell_as_drawn(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        let mut table = ZedisTextTable::new(
+            vec![
+                TextColumn::new("cmd", "Command", 40.),
+                TextColumn::new("rate", "Calls per second", 40.),
+            ],
+            "copied",
+        );
+        let rows = |command: &str| -> Vec<Vec<SharedString>> {
+            vec![
+                vec!["GET".into(), "1".into()],
+                vec![command.to_string().into(), "2".into()],
+            ]
+        };
+        table.set_rows(rows("CLIENT KILL ID 4242 SKIPME no TYPE normal"));
+        let window = cx.add_window(|window, cx| TableState::new(table, window, cx));
+        let any: AnyWindowHandle = window.into();
+        let fit = |cx: &mut TestAppContext, col_ix: usize| {
+            window
+                .update(cx, |table, window, cx| {
+                    let fitted = table.fit_col(col_ix, window, cx);
+                    (fitted, table.col_width(col_ix).expect("a column").as_f32())
+                })
+                .expect("the window is open")
+        };
+        let draw = |cx: &mut TestAppContext| {
+            cx.update_window(any, |_, window, cx| window.render_frame(cx))
+                .expect("the window is open");
+        };
+
+        draw(cx);
+        let (fitted, long) = fit(cx, 0);
+        assert!(fitted);
+        assert!(long > 150., "the long command is far wider than 40px: {long}");
+
+        window
+            .update(cx, |table, _, _| table.delegate_mut().set_rows(rows("SET")))
+            .expect("the window is open");
+        draw(cx);
+        let (_, short) = fit(cx, 0);
+        assert!(short < long, "shorter cells, a narrower column: {short} < {long}");
+        let (_, rate) = fit(cx, 1);
+        assert!(rate > short, "one-digit cells under a long title fit the title: {rate}");
+    }
 
     /// A filling column has what the others leave of the table's width and
     /// never less than its own; the others keep theirs. A panel used to

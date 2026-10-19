@@ -1300,3 +1300,28 @@ fits base64 in one request) opens read-only there and says why
 is sent. The refusal is `BridgeErrorKind::TooLarge`: as a transport failure
 it read as a dropped link, which dropped the pooled client and put
 "connection lost" over a save that only had to be smaller.
+
+## Amended 2026-10-20 — the page highlights with syntect
+
+gpui-kit 0.8 adds a second highlighter beside tree-sitter: `syntect`, with
+bat's syntax collection and the pure-Rust `regex-fancy` engine, so it builds
+for wasm32 where tree-sitter does not. `zedis-web` enables it; the desktop
+keeps tree-sitter (with both enabled, tree-sitter wins — and only the page
+enables syntect, so the desktop build is unchanged). The colours are the
+theme's highlight names in both, and folding in the page follows braces
+rather than a syntax tree.
+
+What it costs, measured on a release bundle: about 0.87 MB more to download
+(brotli 5.52 → 6.39 MB), and a whole-document parse after every pause in
+typing, since syntect has no incremental mode and a page has one thread —
+about a third of a second a megabyte (64 kB 45 ms, 256 kB 125 ms, 1 MB
+330 ms). The bytes editor therefore shows a value over 512 kB plain in the
+page (`HIGHLIGHT_MAX_BYTES`), where the desktop's limit stays the size gate's
+5 MB.
+
+An editor names its language as a string: without tree-sitter,
+`highlighter::Language` is a stub that names everything `unknown`, which is
+why the first build of this coloured the Lua editors and none of the values.
+This replaces the earlier position that the browser has no highlighting and
+that only a hand-written tokenizer could change it: this is the same
+library's highlighter, and the desktop has the colours it gives.
