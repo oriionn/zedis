@@ -1235,3 +1235,36 @@ the transport, behind `states/trash_store.rs` and `stat/persist_web.rs`.
 This is the first feature-shaped surface on the bridge since ADR 10 kept
 features out of it, and it is kept to what a page cannot do itself: hold a
 socket, and remember.
+
+## Amended 2026-10-19 — files, the proto viewers and the terminal's history
+
+**Files.** A page has no save or open panel, but it has the two things a
+browser does with files: a download (a `Blob`'s object URL clicked through
+an `<a download>`) and a pick (a hidden `<input type="file">`, read whole).
+`zedis-web` installs both as seams (`helpers::set_web_download` /
+`set_web_upload`), and the GUI reaches them through one pair of functions
+with a desktop arm and a page arm each — `views::export_to_file` (every
+export) and `views::open_file` (every "read this file") — so a caller is
+written once and asks `saves_files()` / `opens_files()` whether to offer
+itself. `has_file_dialogs()` is left for what needs a *path*: the migration
+window, a path typed or a file dropped into the import box. A picked file is
+read into the tab, so each caller caps it: a value at 1 MiB (the bridge
+refuses a request over axum's 2 MB of JSON, the value base64 inside it), a
+connection export at 5 MiB, a `.proto` schema at 200 KB, an RDB dump for the
+offline analysis at 256 MiB — the desktop still streams that one from disk.
+
+**Proto viewers.** `protox` and `prost-reflect` build for wasm32, so the
+page compiles a viewer's schema from its text, in memory, with the
+well-known `google/protobuf/*.proto` types importable; a path is refused and
+there are no include folders. The viewers are rows of the account's own
+(`protos` beside `favorites`), as they are the desktop user's. The script
+viewers stay out: they run a program.
+
+**The terminal's history** is kept in the browser's `localStorage`, per
+account and with credentials blanked (`redact_command_line`), and still
+never on the bridge, whose tables are read by whoever runs its database.
+
+**Topology stays out.** Its cluster half dials nodes, and the page is handed
+node labels, never addresses — on purpose. A read-only view would need the
+bridge to describe the cluster to the page and the view split at its
+administration seams; that is a change of its own, not a gate.

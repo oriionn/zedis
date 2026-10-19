@@ -17,7 +17,7 @@
 //! Split out of `editor.rs`.
 
 use super::*;
-use crate::helpers::has_file_dialogs;
+use crate::helpers::{has_file_dialogs, opens_files, saves_files};
 
 /// The keystroke gpui-component binds to Replace in its input context, shown
 /// next to the menu entry so the shortcut can be learned from it.
@@ -356,10 +356,11 @@ impl ZedisEditor {
             _ => Vec::new(),
         };
         let bitmap_item = bitmap_candidate && !bitmap_view;
-        // Export and import are a file each way (`has_file_dialogs`).
-        let export_item = has_file_dialogs() && has_bytes_value && !preview;
+        // Export and import are a file each way: a save and an open panel,
+        // or in a page a download and an upload (`saves_files` / `opens_files`).
+        let export_item = saves_files() && has_bytes_value && !preview;
         let diff_with_server_item = has_bytes_value && !preview;
-        let import_item = has_file_dialogs() && has_bytes_value && !preview && !self.readonly;
+        let import_item = opens_files() && has_bytes_value && !preview && !self.readonly;
         let rename_item = !self.readonly;
         // Cross-server copy reads the source and writes a (possibly
         // different, writable) target, so it stays available even when the
@@ -422,10 +423,17 @@ impl ZedisEditor {
                             );
                         }
                         if export_item {
+                            // A page downloads at once, so its item opens
+                            // nothing and says so without the ellipsis.
+                            let export_label = if has_file_dialogs() {
+                                "export_value_tooltip"
+                            } else {
+                                "export_value_download"
+                            };
                             menu = menu.menu_element_with_icon(
                                 CustomIconName::Download,
                                 Box::new(EditorAction::ExportValue),
-                                move |_, cx| Label::new(i18n_editor(cx, "export_value_tooltip")),
+                                move |_, cx| Label::new(i18n_editor(cx, export_label)),
                             );
                         }
                         if import_item {

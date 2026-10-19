@@ -16,16 +16,17 @@ use crate::assets::CustomIconName;
 use crate::connection::get_servers;
 use crate::db::{ProtoConfig, ProtoManager};
 use crate::error::Error;
-use crate::helpers::get_mono_font_family;
-use crate::states::ZedisGlobalStore;
+use crate::helpers::{PickFailure, get_mono_font_family, has_file_dialogs, opens_files};
 use crate::states::i18n_proto_editor;
+use crate::states::{GlobalEvent, ZedisGlobalStore};
 use crate::states::{ZedisServerState, i18n_common};
+use crate::views::open_file;
 use gpui::{App, Entity, SharedString, Subscription, Window, div, prelude::*, px};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::radio::RadioGroup;
 use gpui_kit::component::table::{Column, DataTable, TableDelegate, TableState};
-use gpui_kit::component::{IconName, h_flex};
+use gpui_kit::component::{IconName, Sizable, h_flex};
 use gpui_kit::component::{
     IndexPath,
     alert::Alert,
@@ -41,6 +42,12 @@ use std::sync::Arc;
 use tracing::error;
 use uuid::Uuid;
 use zedis_ui::ZedisDialog;
+
+/// The schema file picker, in a page.
+const SCHEMA_FILE_BUTTON_ID: &str = "proto-editor-choose-schema";
+/// The largest `.proto` file the picker reads: a schema is text, and the
+/// bridge keeps a viewer in one row of at most 256 KB.
+const MAX_SCHEMA_FILE_BYTES: u64 = 200 * 1024;
 
 #[derive(Debug, Clone)]
 struct KeyValueOption {
@@ -251,10 +258,16 @@ impl ZedisProtoEditor {
                 .clean_on_escape()
                 .placeholder(i18n_proto_editor(cx, "includes_placeholder"))
         });
+        // A page has no path to name: the schema is the text itself.
+        let content_placeholder = if has_file_dialogs() {
+            "content_placeholder"
+        } else {
+            "content_placeholder_web"
+        };
         let content_state = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .clean_on_escape()
-                .placeholder(i18n_proto_editor(cx, "content_placeholder"))
+                .placeholder(i18n_proto_editor(cx, content_placeholder))
                 .auto_grow(2, 10)
         });
         let target_message_state = cx.new(|cx| SelectState::new(vec![], None, window, cx));
@@ -309,6 +322,17 @@ impl ZedisProtoEditor {
                 }
             }),
         );
+
+        // In the browser, what this account saved in another browser (ADR
+        // 17). An open form keeps what is typed into it.
+        let global_state = cx.global::<ZedisGlobalStore>().state();
+        subscriptions.push(cx.subscribe(&global_state, |this, _global, event, cx| {
+            if let GlobalEvent::PageDataRefreshed { protos: true, .. } = event {
+                this.protos = Arc::new(ProtoManager::list_protos_with_id());
+                this.needs_table_recreate = Some(true);
+                cx.notify();
+            }
+        }));
 
         let protos = Arc::new(protos);
         let table_state = Self::create_table_state(protos.clone(), servers_for_delegate.clone(), window, cx);
@@ -454,6 +478,40 @@ impl ZedisProtoEditor {
         self.includes_state.update(cx, |state, cx| {
             state.set_value(String::new(), window, cx);
         });
+    }
+    /// Load a picked `.proto` file into the schema box — in a page, where
+    /// there is no path to type instead — and list its messages.
+    fn choose_schema_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = open_file(cx, ".proto", MAX_SCHEMA_FILE_BYTES);
+        cx.spawn_in(window, async move |this, cx| {
+            let Some(picked) = picked.await else {
+                return;
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                let text = picked.map_err(|failure| match failure {
+                    PickFailure::TooLarge { .. } => i18n_proto_editor(cx, "schema_file_too_large").to_string(),
+                    PickFailure::Unreadable(e) => e,
+                });
+                let text = text.and_then(|file| {
+                    String::from_utf8(file.bytes).map_err(|_| i18n_proto_editor(cx, "schema_file_not_text").to_string())
+                });
+                match text {
+                    Ok(text) => {
+                        this.content_state
+                            .update(cx, |state, cx| state.set_value(text, window, cx));
+                        this.update_target_message_select_state(String::new(), window, cx);
+                    }
+                    Err(message) => {
+                        let id = this.content_state.entity_id().to_string();
+                        this.field_errors.update(cx, |errors, _| {
+                            errors.insert(id, message.into());
+                        });
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
     }
     fn update_target_message_select_state(
         &mut self,
@@ -627,21 +685,45 @@ impl ZedisProtoEditor {
                                 }),
                         ),
                     )
-                    .child(
-                        field()
-                            .col_span(2)
-                            .label(i18n_proto_editor(cx, "includes"))
-                            .child(Input::new(&self.includes_state)),
-                    )
+                    // Directories to import from: a page has none.
+                    .when(has_file_dialogs(), |form| {
+                        form.child(
+                            field()
+                                .col_span(2)
+                                .label(i18n_proto_editor(cx, "includes"))
+                                .child(Input::new(&self.includes_state)),
+                        )
+                    })
                     .child(
                         field()
                             .col_span(2)
                             .label(i18n_proto_editor(cx, "content"))
                             .required(true)
                             .child(
-                                Textarea::new(&self.content_state)
+                                v_flex()
                                     .w_full()
-                                    .font_family(get_mono_font_family()),
+                                    .gap_2()
+                                    // A page cannot be given a path: the file
+                                    // itself instead, read into the box.
+                                    .when(!has_file_dialogs() && opens_files(), |column| {
+                                        column.child(
+                                            h_flex().child(
+                                                Button::new(SCHEMA_FILE_BUTTON_ID)
+                                                    .small()
+                                                    .outline()
+                                                    .icon(IconName::FolderOpen)
+                                                    .label(i18n_proto_editor(cx, "choose_schema_file"))
+                                                    .on_click(cx.listener(|this, _, window, cx| {
+                                                        this.choose_schema_file(window, cx)
+                                                    })),
+                                            ),
+                                        )
+                                    })
+                                    .child(
+                                        Textarea::new(&self.content_state)
+                                            .w_full()
+                                            .font_family(get_mono_font_family()),
+                                    ),
                             ),
                     )
                     .child(

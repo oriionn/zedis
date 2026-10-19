@@ -108,7 +108,7 @@ pub use async_connection::{
     open_node_connection_cached, open_seed_connection, open_single_connection, set_redis_connection_timeout,
     set_redis_response_timeout,
 };
-pub use audit::{is_administration_command, redact_secrets};
+pub use audit::{is_administration_command, redact_command_line, redact_secrets};
 pub use bitmap::{BitOpKind, BitmapInfo, bit_field, bit_op, bitmap_info, set_bit};
 pub use bridge::{
     BridgeAccount, BridgeAccountChange, BridgeAccountError, BridgeAccountErrorKind, BridgeAccountResult,

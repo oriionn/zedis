@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_family = "wasm")]
 mod web;
 #[cfg(target_family = "wasm")]
-pub use web::{page_data_generation, refresh_page_data, save_preferences, seed_page_data};
+pub use web::{page_account, page_data_generation, refresh_page_data, save_preferences, seed_page_data};
 
 static ACCOUNT_READ_ONLY: AtomicBool = AtomicBool::new(false);
 

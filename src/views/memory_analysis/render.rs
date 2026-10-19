@@ -18,7 +18,7 @@
 //! `memory_analysis.rs` to keep the scan/analysis half readable.
 
 use super::*;
-use crate::helpers::has_file_dialogs;
+use crate::helpers::{opens_files, saves_files};
 use crate::views::unavailable_chip;
 
 impl ZedisMemoryAnalysis {
@@ -170,7 +170,7 @@ impl ZedisMemoryAnalysis {
                     })
                     // Offline source: pick a local RDB dump and analyze it
                     // without touching the live server.
-                    .when(has_file_dialogs() && !is_running, |this| {
+                    .when(opens_files() && !is_running, |this| {
                         this.child(
                             Button::new("analyze-rdb")
                                 .outline()
@@ -184,7 +184,7 @@ impl ZedisMemoryAnalysis {
                     })
                     // Export the finished tables (prefix groups / top keys).
                     .when(
-                        has_file_dialogs() && !is_running && (self.prefix_count > 0 || self.single_count > 0),
+                        saves_files() && !is_running && (self.prefix_count > 0 || self.single_count > 0),
                         |this| {
                             this.child(
                                 Button::new("memory-analysis-export")

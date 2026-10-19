@@ -52,7 +52,6 @@ mod metrics_history;
 /// too, for what it makes of a commit.
 #[cfg(any(target_family = "wasm", test))]
 mod page_data;
-#[cfg(not(target_family = "wasm"))]
 mod protos;
 #[cfg(not(target_family = "wasm"))]
 mod scripts;
@@ -69,14 +68,12 @@ pub use lua_scripts::*;
 pub use metrics_history::*;
 #[cfg(target_family = "wasm")]
 pub use page_data::{PageChange, PageRefreshed, PageSeed, observe_page_data, refresh_page_data, seed_page_data};
-#[cfg(not(target_family = "wasm"))]
 pub use protos::*;
 #[cfg(not(target_family = "wasm"))]
 pub use scripts::*;
 pub use trash::*;
 
 const SEARCH_HISTORY_TABLE: TableDefinition<&str, &str> = TableDefinition::new("search_history");
-#[cfg(not(target_family = "wasm"))]
 const PROTO_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("proto");
 #[cfg(not(target_family = "wasm"))]
 const SCRIPT_VIEWER_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("script_viewer");
@@ -177,11 +174,9 @@ fn ensure_schema(db: &Database) -> Result<()> {
     }
     {
         write_txn.open_table(SEARCH_HISTORY_TABLE)?;
+        write_txn.open_table(PROTO_TABLE)?;
         #[cfg(not(target_family = "wasm"))]
-        {
-            write_txn.open_table(PROTO_TABLE)?;
-            write_txn.open_table(SCRIPT_VIEWER_TABLE)?;
-        }
+        write_txn.open_table(SCRIPT_VIEWER_TABLE)?;
         write_txn.open_table(CMD_HISTORY_TABLE)?;
         write_txn.open_table(FAVORITES_TABLE)?;
         write_txn.open_table(RECENT_KEYS_TABLE)?;

@@ -284,13 +284,20 @@ impl ZedisTitleBar {
             )
             .separator();
         // What a page keeps of all that is Settings itself, as a dialog over
-        // the page (`open_settings`) and so one item, not a submenu of three.
+        // the page (`open_settings`), and the proto viewers, whose schema a
+        // page compiles from its text; the script viewers run a program and
+        // stay the desktop's.
         #[cfg(target_family = "wasm")]
         let this = this
             .menu_with_icon(
                 format!("{}…", i18n_sidebar(cx, "settings")),
                 Icon::new(IconName::Settings2),
                 Box::new(SettingsAction::Editor),
+            )
+            .menu_with_icon(
+                i18n_sidebar(cx, "proto_settings"),
+                Icon::new(CustomIconName::SwatchBook),
+                Box::new(SettingsAction::Protos),
             )
             .separator();
         // The last item ends the session: the process, or — where this is a

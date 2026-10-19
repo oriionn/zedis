@@ -26,8 +26,9 @@ use crate::{
     constants::EDITOR_KEY_BAR_HEIGHT,
     db::get_favorites_manager,
     helpers::{
-        EditorAction, KeyOpAction, card_background, format_duration, format_duration_units, format_unix_secs,
-        get_mono_font_family, hot_key_label, humanize_keystroke, ttl_secs, unix_ts, validate_ttl, with_hot_key,
+        EditorAction, KeyOpAction, PickFailure, card_background, format_duration, format_duration_units,
+        format_unix_secs, get_mono_font_family, hot_key_label, humanize_keystroke, ttl_secs, unix_ts, validate_ttl,
+        with_hot_key,
     },
     states::{
         ConnectionErrorKind, DataFormat, HINT_EDITOR_GUIDE, KeyType, LinkProblem, MAX_INLINE_VALUE_SIZE, ServerEvent,
@@ -40,15 +41,14 @@ use crate::{
         ZedisExpireAtDialog, ZedisGeoMap, ZedisHashEditor, ZedisHllEditor, ZedisListEditor, ZedisProbabilisticEditor,
         ZedisSetEditor, ZedisStreamEditor, ZedisTimeSeriesEditor, ZedisValueDiff, ZedisVectorSetEditor,
         ZedisZsetEditor, bitmap_eligible, confirm_delete_key, export_to_file, json_invalid_message, key_op_title_key,
-        looks_like_bitmap, looks_like_hll, open_change_log_dialog, open_key_op_dialog,
+        looks_like_bitmap, looks_like_hll, open_change_log_dialog, open_file, open_key_op_dialog,
     },
 };
 #[cfg(not(target_family = "wasm"))]
 use crate::{states::i18n_servers, views::open_connection_diagnostics};
 use bytes::Bytes;
 use gpui::{
-    ClipboardItem, Entity, FocusHandle, Focusable, PathPromptOptions, SharedString, Subscription, Task, Window, div,
-    prelude::*, px,
+    ClipboardItem, Entity, FocusHandle, Focusable, SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt, WindowExt,
@@ -89,7 +89,16 @@ const TTL_INPUT_MAX_WIDTH: f32 = 120.0;
 /// a field this wide and is the field's tooltip instead.
 const TTL_DURATION_EXAMPLE: &str = "1h 30m";
 /// Redis caps a string value at 512 MB; refuse to import anything bigger.
-const MAX_IMPORT_VALUE_BYTES: usize = 512 * 1024 * 1024;
+#[cfg(not(target_family = "wasm"))]
+const MAX_IMPORT_VALUE_BYTES: u64 = 512 * 1024 * 1024;
+#[cfg(not(target_family = "wasm"))]
+const IMPORT_VALUE_TOO_LARGE: &str = "import_value_too_large";
+/// A page writes through the bridge, whose requests stop at 2 MB of JSON —
+/// the value base64 inside it — so a file over 1 MiB could never be saved.
+#[cfg(target_family = "wasm")]
+const MAX_IMPORT_VALUE_BYTES: u64 = 1024 * 1024;
+#[cfg(target_family = "wasm")]
+const IMPORT_VALUE_TOO_LARGE: &str = "import_value_too_large_web";
 
 /// Active side-by-side diff session — captured snapshot of both panes
 /// so the diff view stays stable while the user reads it, even if the
@@ -906,28 +915,13 @@ impl ZedisEditor {
         let Some(target) = self.server_state.read(cx).key() else {
             return;
         };
-        let receiver = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: None,
-        });
+        let picked = open_file(cx, "", MAX_IMPORT_VALUE_BYTES);
         cx.spawn(async move |this, cx| {
-            let Ok(Ok(Some(paths))) = receiver.await else {
+            let Some(picked) = picked.await else {
                 return;
             };
-            let Some(path) = paths.into_iter().next() else {
-                return;
-            };
-            let result = cx.background_spawn(async move { std::fs::read(&path) }).await;
-            let _ = this.update(cx, |this, cx| match result {
-                Ok(bytes) => {
-                    if bytes.len() > MAX_IMPORT_VALUE_BYTES {
-                        this.server_state.update(cx, |state, cx| {
-                            state.emit_error_notification(i18n_editor(cx, "import_value_too_large"), cx);
-                        });
-                        return;
-                    }
+            let _ = this.update(cx, |this, cx| match picked {
+                Ok(file) => {
                     if this.server_state.read(cx).key().as_ref() != Some(&target) {
                         this.server_state.update(cx, |state, cx| {
                             state.emit_warning_notification(i18n_editor(cx, "import_value_key_changed"), cx);
@@ -937,9 +931,14 @@ impl ZedisEditor {
                     // Import-from-file is still a save of this loaded value —
                     // the CAS guard applies the same way as a typed edit.
                     this.server_state
-                        .update(cx, |state, cx| state.update_value_bytes(target, bytes, false, cx));
+                        .update(cx, |state, cx| state.update_value_bytes(target, file.bytes, false, cx));
                 }
-                Err(e) => {
+                Err(PickFailure::TooLarge { .. }) => {
+                    this.server_state.update(cx, |state, cx| {
+                        state.emit_error_notification(i18n_editor(cx, IMPORT_VALUE_TOO_LARGE), cx);
+                    });
+                }
+                Err(PickFailure::Unreadable(e)) => {
                     this.server_state.update(cx, |state, cx| {
                         state.emit_error_notification(
                             format!("{}: {e}", i18n_editor(cx, "import_value_failed")).into(),

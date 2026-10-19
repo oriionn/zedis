@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::connection::Capability;
-use crate::helpers::has_file_dialogs;
+use crate::helpers::saves_files;
 use crate::helpers::{bytes_to_hex_text, clearing_an_applied_filter, get_mono_font_family};
 use crate::{
     assets::CustomIconName,
@@ -1697,9 +1697,7 @@ impl<T: ZedisKvFetcher> Render for ZedisKvTable<T> {
                             // Export loaded rows to CSV — one button on the
                             // shared table covers every collection type.
                             .when(
-                                has_file_dialogs()
-                                    && self.items_count > 0
-                                    && Capability::ExportCsv.allowed(self.readonly),
+                                saves_files() && self.items_count > 0 && Capability::ExportCsv.allowed(self.readonly),
                                 |this| {
                                     this.child(
                                         Button::new("kv-table-export-btn")

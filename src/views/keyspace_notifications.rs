@@ -29,7 +29,7 @@ use crate::connection::{
 };
 use crate::error::Error;
 use crate::helpers::channel;
-use crate::helpers::{build_csv, get_mono_font_family, has_file_dialogs, now_clock};
+use crate::helpers::{build_csv, get_mono_font_family, now_clock, saves_files};
 use crate::states::{
     ServerEvent, ServerView, ZedisGlobalStore, ZedisServerState, back_to_editor_tooltip, content_area_width,
     dialog_button_props, i18n_common, i18n_keyspace_notifications,
@@ -887,7 +887,7 @@ impl ZedisKeyspaceNotifications {
                                 .on_click(cx.listener(|this, _, _w, cx| this.toggle_pause(cx))),
                         )
                     })
-                    .when(has_file_dialogs(), |this| {
+                    .when(saves_files(), |this| {
                         this.child(
                             Button::new("ksn-export")
                                 .ghost()

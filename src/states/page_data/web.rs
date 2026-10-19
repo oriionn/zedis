@@ -19,6 +19,7 @@ use crate::connection::{BridgePageSeed, BridgeScript, bridge_page_data};
 use crate::db::{KeyMetadata, LuaScript, PageChange, PageSeed, TagColor, observe_page_data};
 use crate::states::{GlobalEvent, ZedisGlobalStore};
 use gpui::App;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::{error, info, warn};
 
@@ -31,6 +32,16 @@ static LOCAL_CHANGES: AtomicU64 = AtomicU64::new(0);
 /// preferences. Not a locked account's: everyone signed in to it would
 /// share them, so this page keeps them to itself.
 static ROWS_KEPT: AtomicBool = AtomicBool::new(true);
+
+/// The account this page is signed in as, from its page data.
+static ACCOUNT: OnceLock<String> = OnceLock::new();
+
+/// Whose page this is: what keeps one account's browser-stored data (the
+/// terminal's history) from another's in a browser they share. None when
+/// the page data did not load.
+pub fn page_account() -> Option<&'static str> {
+    ACCOUNT.get().map(String::as_str)
+}
 
 /// The count of this page's changes, taken before a refresh asks.
 pub fn page_data_generation() -> u64 {
@@ -88,6 +99,7 @@ pub fn seed_page_data(seed: BridgePageSeed) {
     ACCOUNT_READ_ONLY.store(seed.read_only, Ordering::Relaxed);
     ROWS_KEPT.store(seed.rows_kept, Ordering::Relaxed);
     let account = seed.account.clone();
+    let _ = ACCOUNT.set(account.clone());
     let seed = local_seed(seed);
     info!(
         account,
@@ -165,6 +177,7 @@ pub fn refresh_page_data(seed: BridgePageSeed, generation: u64, cx: &mut App) ->
             rows = refreshed.rows,
             key_notes = refreshed.key_notes_of.len(),
             scripts = refreshed.scripts,
+            protos = refreshed.protos,
             "page data refreshed from the bridge"
         );
         let state = cx.global::<ZedisGlobalStore>().clone().state();
@@ -173,6 +186,7 @@ pub fn refresh_page_data(seed: BridgePageSeed, generation: u64, cx: &mut App) ->
                 key_notes_of: refreshed.key_notes_of,
                 rows: refreshed.rows,
                 scripts: refreshed.scripts,
+                protos: refreshed.protos,
             })
         });
     }

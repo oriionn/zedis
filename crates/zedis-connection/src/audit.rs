@@ -32,6 +32,8 @@
 /// `MODULE LOAD` destroy nothing and still change what the server is.
 /// `DEBUG` is left to the classifier, whose destructive subcommands are
 /// confirmed and so logged; the rest of it is inspection.
+use std::borrow::Cow;
+
 pub fn is_administration_command(name: &str, args: &[String]) -> bool {
     let sub = args.first().map(|s| s.to_ascii_uppercase());
     let sub = sub.as_deref();
@@ -155,6 +157,44 @@ pub fn redact_secrets(name: &str, args: &[String]) -> Vec<String> {
     out
 }
 
+/// A typed command line with its credentials blanked (`AUTH hunter2` →
+/// `AUTH ***`), through [`redact_secrets`]: what a history kept outside the
+/// process may hold. A line that carries none comes back as it was typed,
+/// quoting and all; one that does not split — an open quote, which the
+/// terminal never sends — comes back whole too.
+pub fn redact_command_line(line: &str) -> Cow<'_, str> {
+    let Some(parts) = shlex::split(line) else {
+        return Cow::Borrowed(line);
+    };
+    let Some((name, args)) = parts.split_first() else {
+        return Cow::Borrowed(line);
+    };
+    let redacted = redact_secrets(name, args);
+    if redacted == args {
+        return Cow::Borrowed(line);
+    }
+    let words: Vec<String> = std::iter::once(name)
+        .chain(redacted.iter())
+        .map(|word| quote_word(word))
+        .collect();
+    Cow::Owned(words.join(" "))
+}
+
+/// A word as the terminal's splitter reads it back: quoted only where it
+/// would otherwise split differently — empty, or holding a space, a quote
+/// or a backslash. Not a shell's quoting: `*` and `~` mean nothing here.
+fn quote_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && !word
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '\\'));
+    if plain {
+        return word.to_string();
+    }
+    let escaped = word.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
 /// The settings whose value is a credential.
 fn is_secret_setting(name: &str) -> bool {
     matches!(
@@ -181,6 +221,43 @@ fn mask(out: &mut [String], index: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A credential is blanked in the line as typed, and a line without one
+    /// comes back untouched, quotes and spacing included.
+    #[test]
+    fn a_typed_line_keeps_everything_but_its_credentials() {
+        assert_eq!(redact_command_line("AUTH hunter2"), "AUTH ***");
+        assert_eq!(redact_command_line("auth alice 'p w'"), "auth *** ***");
+        assert_eq!(
+            redact_command_line("MIGRATE h 6379 \"my key\" 0 5000 AUTH pw"),
+            "MIGRATE h 6379 \"my key\" 0 5000 AUTH ***"
+        );
+        assert_eq!(
+            redact_command_line("CONFIG SET requirepass s3cret"),
+            "CONFIG SET requirepass ***"
+        );
+        assert_eq!(
+            redact_command_line("ACL SETUSER bob on >pw ~* +@all"),
+            "ACL SETUSER bob on >*** ~* +@all"
+        );
+        let plain = "SET  greeting \"hello world\"";
+        assert!(matches!(redact_command_line(plain), Cow::Borrowed(line) if line == plain));
+        assert_eq!(redact_command_line("GET 'unclosed"), "GET 'unclosed");
+    }
+
+    /// What a redacted line quotes, the terminal's splitter reads back as
+    /// the same word.
+    #[test]
+    fn a_quoted_word_splits_back_to_itself() {
+        for word in ["plain", "a b", "it's", "say \"hi\"", "back\\slash", "", "*", "~/x"] {
+            let quoted = quote_word(word);
+            assert_eq!(
+                shlex::split(&quoted),
+                Some(vec![word.to_string()]),
+                "{word:?} as {quoted}"
+            );
+        }
+    }
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|p| p.to_string()).collect()

@@ -13,8 +13,8 @@
 // limitations under the License.
 
 //! The browser's page data on the bridge (ADR 17, step 4): favorites, recent
-//! keys, search history, key tags and notes, and saved Lua scripts, which
-//! `mem_store` kept only for the life of the tab.
+//! keys, search history, proto viewers, key tags and notes, and saved Lua
+//! scripts, which `mem_store` kept only for the life of the tab.
 //!
 //! The managers do not know. They keep writing their rows to `mem_store`,
 //! and a commit observer turns what each commit changed into
@@ -31,11 +31,14 @@ use crate::{KeyMetadata, LuaScript};
 use std::collections::{BTreeSet, HashMap};
 
 /// The tables an account keeps as rows: as `mem_store` names them, and as
-/// the bridge does. Favorites keep the desktop's spelling on disk.
-const ROW_TABLES: [(&str, &str); 3] = [
+/// the bridge does. Favorites keep the desktop's spelling on disk. A proto
+/// viewer is the account's own, as it is the desktop user's: one row each,
+/// its JSON as the row's text.
+const ROW_TABLES: [(&str, &str); 4] = [
     ("favority", "favorites"),
     ("recent_keys", "recent_keys"),
     ("search_history", "search_history"),
+    ("proto", "protos"),
 ];
 const KEY_METADATA: &str = "key_metadata";
 const LUA_SCRIPTS: &str = "lua_script";
@@ -152,7 +155,9 @@ pub struct PageSeed {
 #[cfg(target_family = "wasm")]
 pub fn seed_page_data(seed: PageSeed) -> crate::Result<()> {
     use crate::key_metadata_manager::entries_document;
-    use crate::{FAVORITES_TABLE, KEY_METADATA_TABLE, LUA_SCRIPT_TABLE, RECENT_KEYS_TABLE, SEARCH_HISTORY_TABLE};
+    use crate::{
+        FAVORITES_TABLE, KEY_METADATA_TABLE, LUA_SCRIPT_TABLE, PROTO_TABLE, RECENT_KEYS_TABLE, SEARCH_HISTORY_TABLE,
+    };
     use std::collections::HashMap;
 
     let db = crate::get_database()?;
@@ -163,6 +168,12 @@ pub fn seed_page_data(seed: PageSeed) -> crate::Result<()> {
                 "favorites" => FAVORITES_TABLE,
                 "recent_keys" => RECENT_KEYS_TABLE,
                 "search_history" => SEARCH_HISTORY_TABLE,
+                "protos" => {
+                    write_txn
+                        .open_table(PROTO_TABLE)?
+                        .insert(key.as_str(), value.as_bytes())?;
+                    continue;
+                }
                 _ => continue,
             };
             write_txn.open_table(definition)?.insert(key.as_str(), value.as_str())?;
@@ -193,12 +204,14 @@ pub struct PageRefreshed {
     /// The servers whose key notes changed.
     pub key_notes_of: Vec<String>,
     pub scripts: bool,
+    /// The account's proto viewers.
+    pub protos: bool,
 }
 
 #[cfg(target_family = "wasm")]
 impl PageRefreshed {
     pub fn is_empty(&self) -> bool {
-        !self.rows && self.key_notes_of.is_empty() && !self.scripts
+        !self.rows && self.key_notes_of.is_empty() && !self.scripts && !self.protos
     }
 }
 
@@ -212,9 +225,9 @@ pub fn refresh_page_data(seed: PageSeed) -> crate::Result<PageRefreshed> {
     use crate::key_metadata_manager::entries_document;
     use crate::mem_store::ReadableTable;
     use crate::{
-        FAVORITES_TABLE, KEY_METADATA_TABLE, LUA_SCRIPT_TABLE, LuaScriptManager, RECENT_KEYS_TABLE,
-        SEARCH_HISTORY_TABLE, get_favorites_manager, get_key_metadata_manager, get_recent_keys_manager,
-        get_search_history_manager,
+        FAVORITES_TABLE, KEY_METADATA_TABLE, LUA_SCRIPT_TABLE, LuaScriptManager, PROTO_TABLE, ProtoManager,
+        RECENT_KEYS_TABLE, SEARCH_HISTORY_TABLE, get_favorites_manager, get_key_metadata_manager,
+        get_recent_keys_manager, get_search_history_manager,
     };
     use std::collections::BTreeMap;
 
@@ -250,6 +263,31 @@ pub fn refresh_page_data(seed: PageSeed) -> crate::Result<PageRefreshed> {
                 if current.get(*key).map(String::as_str) != Some(*value) {
                     table.insert(*key, *value)?;
                     refreshed.rows = true;
+                }
+            }
+        }
+
+        // The proto viewers: rows too, kept as bytes.
+        if let Some(rows) = &seed.rows {
+            let wanted: BTreeMap<&str, &[u8]> = rows
+                .iter()
+                .filter(|(table, _, _)| table == "protos")
+                .map(|(_, key, value)| (key.as_str(), value.as_bytes()))
+                .collect();
+            let mut table = write_txn.open_table(PROTO_TABLE)?;
+            let mut current = BTreeMap::new();
+            for row in table.iter()? {
+                let (key, value) = row?;
+                current.insert(key.value().to_string(), value.value().to_vec());
+            }
+            for key in current.keys().filter(|key| !wanted.contains_key(key.as_str())) {
+                table.remove(key.as_str())?;
+                refreshed.protos = true;
+            }
+            for (key, value) in &wanted {
+                if current.get(*key).map(Vec::as_slice) != Some(*value) {
+                    table.insert(*key, *value)?;
+                    refreshed.protos = true;
                 }
             }
         }
@@ -316,6 +354,9 @@ pub fn refresh_page_data(seed: PageSeed) -> crate::Result<PageRefreshed> {
     if refreshed.scripts {
         LuaScriptManager::reload()?;
     }
+    if refreshed.protos {
+        ProtoManager::reload()?;
+    }
     Ok(refreshed)
 }
 
@@ -345,6 +386,7 @@ mod tests {
         assert_eq!(crate::FAVORITES_TABLE.name(), ROW_TABLES[0].0);
         assert_eq!(crate::RECENT_KEYS_TABLE.name(), ROW_TABLES[1].0);
         assert_eq!(crate::SEARCH_HISTORY_TABLE.name(), ROW_TABLES[2].0);
+        assert_eq!(crate::PROTO_TABLE.name(), ROW_TABLES[3].0);
         assert_eq!(crate::KEY_METADATA_TABLE.name(), KEY_METADATA);
         assert_eq!(crate::LUA_SCRIPT_TABLE.name(), LUA_SCRIPTS);
     }
@@ -360,6 +402,15 @@ mod tests {
             }]
         );
         assert!(page_changes("cmd_history", b"srv", None, Some(b"[]")).is_empty());
+        // A proto viewer is a row of its own, its JSON as the text.
+        assert_eq!(
+            page_changes("proto", b"p1", None, Some(br#"{"name":"orders"}"#)),
+            vec![PageChange::Row {
+                table: "protos",
+                key: "p1".to_string(),
+                value: Some(r#"{"name":"orders"}"#.to_string()),
+            }]
+        );
     }
 
     /// A server's notes go one key at a time: only the keys whose tag or

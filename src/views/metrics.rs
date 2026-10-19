@@ -14,7 +14,7 @@
 
 use crate::assets::CustomIconName;
 use crate::connection::{ServerCommand, get_server};
-use crate::helpers::has_file_dialogs;
+use crate::helpers::saves_files;
 use crate::helpers::{build_csv, client_counts, format_unix_millis_with, get_mono_font_family, pacing};
 use crate::states::{RedisMetrics, ServerView, get_metrics_cache, load_persisted_metrics};
 use crate::states::{
@@ -967,7 +967,7 @@ impl Render for ZedisMetrics {
                                                 })),
                                         )
                                     })
-                                    .when(has_file_dialogs(), |this| {
+                                    .when(saves_files(), |this| {
                                         this.child(
                                             Button::new("metrics-export-csv")
                                                 .ghost()

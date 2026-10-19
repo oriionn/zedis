@@ -14,16 +14,24 @@
 
 use super::{PROTO_TABLE, get_database};
 use crate::error::Error;
+#[cfg(target_family = "wasm")]
+use crate::mem_store::{ReadableDatabase, ReadableTable};
 use dashmap::DashMap;
 use prost_reflect::{DescriptorPool, DynamicMessage};
+#[cfg(any(target_family = "wasm", test))]
+use protox::file::{ChainFileResolver, File, FileResolver, GoogleFileResolver};
+#[cfg(not(target_family = "wasm"))]
 use redb::{ReadableDatabase, ReadableTable};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_family = "wasm"))]
 use std::fs;
 use std::path::Path;
 use std::sync::LazyLock;
+#[cfg(not(target_family = "wasm"))]
 use tempfile::TempDir;
 use tracing::{info, warn};
+#[cfg(not(target_family = "wasm"))]
 use zedis_core::fs::resolve_path;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -132,6 +140,7 @@ fn names_a_proto_file(content: &str) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("proto"))
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn parse_protobuf(content: &str, includes: &str) -> Result<(DescriptorPool, Vec<String>)> {
     if content.is_empty() {
         return Err(Error::Invalid {
@@ -165,11 +174,68 @@ fn parse_protobuf(content: &str, includes: &str) -> Result<(DescriptorPool, Vec<
     }
     let file_descriptor_set = protox::compile(files, dirs)?;
     let pool = prost_reflect::DescriptorPool::from_file_descriptor_set(file_descriptor_set)?;
+    Ok(with_message_names(pool))
+}
+
+/// The name a page's inline schema is compiled under.
+#[cfg(any(target_family = "wasm", test))]
+const INLINE_SCHEMA: &str = "main.proto";
+
+/// The schema text itself, as the one file a page has.
+#[cfg(any(target_family = "wasm", test))]
+struct InlineSchema(String);
+
+#[cfg(any(target_family = "wasm", test))]
+impl FileResolver for InlineSchema {
+    fn open_file(&self, name: &str) -> std::result::Result<File, protox::Error> {
+        if name == INLINE_SCHEMA {
+            File::from_source(name, &self.0)
+        } else {
+            Err(protox::Error::file_not_found(name))
+        }
+    }
+}
+
+/// [`parse_protobuf`] in a page: the schema is the text it was handed,
+/// compiled in memory with the well-known `google/protobuf/*.proto` types
+/// beside it and nothing else to import — a page has no directory to look
+/// in, so `includes` names nothing there, and a path to a `.proto` file is
+/// refused rather than read.
+#[cfg(target_family = "wasm")]
+fn parse_protobuf(content: &str, _includes: &str) -> Result<(DescriptorPool, Vec<String>)> {
+    if content.is_empty() {
+        return Err(Error::Invalid {
+            message: "content is empty".to_string(),
+        });
+    }
+    if names_a_proto_file(content) {
+        return Err(Error::Invalid {
+            message: "a page cannot read a .proto file by its path: paste the schema, or choose the file".to_string(),
+        });
+    }
+    compile_inline(content)
+}
+
+/// Compile schema text in memory, the well-known types importable.
+#[cfg(any(target_family = "wasm", test))]
+fn compile_inline(content: &str) -> Result<(DescriptorPool, Vec<String>)> {
+    let mut resolver = ChainFileResolver::new();
+    resolver.add(InlineSchema(content.to_string()));
+    resolver.add(GoogleFileResolver::new());
+    let mut compiler = protox::Compiler::with_file_resolver(resolver);
+    compiler.include_imports(true);
+    compiler.open_file(INLINE_SCHEMA)?;
+    let pool = DescriptorPool::from_file_descriptor_set(compiler.file_descriptor_set())?;
+    Ok(with_message_names(pool))
+}
+
+/// A compiled pool and the full names of the messages it declares.
+fn with_message_names(pool: DescriptorPool) -> (DescriptorPool, Vec<String>) {
     let messages = pool
         .all_messages()
         .map(|message| message.full_name().to_string())
         .collect::<Vec<_>>();
-    Ok((pool, messages))
+    (pool, messages)
 }
 
 pub struct ProtoManager;
@@ -214,6 +280,14 @@ impl ProtoManager {
         info!(count = PROTO_META_CACHE.len(), skipped, "load protos success");
 
         Ok(())
+    }
+    /// Read the viewers again from the table, forgetting every compiled
+    /// schema: the rows were written under the caches (a page's data,
+    /// refreshed from the bridge).
+    pub fn reload() -> Result<()> {
+        PROTO_META_CACHE.clear();
+        PROTO_POOL_CACHE.clear();
+        Self::init()
     }
     pub fn list_protos_with_id() -> Vec<(String, ProtoConfig)> {
         let cache = &PROTO_META_CACHE;
@@ -355,6 +429,27 @@ mod tests {
         let txn = db.begin_read().expect("begin read");
         let table = txn.open_table(PROTO_TABLE).expect("open");
         table.get(id).expect("get").is_some()
+    }
+
+    /// A page's schema is compiled from its text alone, in memory: the
+    /// well-known types import, a value decodes by it, and a file the text
+    /// imports that is not one of those is reported, not looked for.
+    #[test]
+    fn a_schema_compiles_from_its_text_with_the_well_known_types() {
+        let schema = r#"
+            syntax = "proto3";
+            package shop;
+            import "google/protobuf/timestamp.proto";
+            message Order { string id = 1; google.protobuf.Timestamp at = 2; }
+        "#;
+        let (pool, messages) = compile_inline(schema).expect("compiles");
+        assert!(messages.contains(&"shop.Order".to_string()), "{messages:?}");
+        // id = "a1": field 1, length-delimited.
+        let json = proto_to_json(&pool, "shop.Order", &[0x0a, 0x02, b'a', b'1']).expect("decodes");
+        assert!(json.contains("\"a1\""), "{json}");
+
+        let missing = compile_inline("syntax = \"proto3\"; import \"other.proto\";");
+        assert!(missing.is_err());
     }
 
     #[test]

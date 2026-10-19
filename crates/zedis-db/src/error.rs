@@ -45,13 +45,10 @@ pub enum Error {
     RedbCommit { source: store::CommitError },
     #[snafu(display("Redb storage error: {source}"))]
     RedbStorage { source: store::StorageError },
-    #[cfg(not(target_family = "wasm"))]
     #[snafu(display("Protox error: {source}"))]
     Protox { source: protox::Error },
-    #[cfg(not(target_family = "wasm"))]
     #[snafu(display("Prost reflect descriptor error: {source}"))]
     ProstReflectDescriptor { source: prost_reflect::DescriptorError },
-    #[cfg(not(target_family = "wasm"))]
     #[snafu(display("Prost reflect decode error: {source}"))]
     ProstReflectDecode { source: prost_reflect::prost::DecodeError },
     /// The file carries a schema version this build doesn't know — it was
@@ -81,10 +78,11 @@ direct!(
     store::StorageError => RedbStorage,
 );
 
-#[cfg(not(target_family = "wasm"))]
 direct!(
-    store::Error => Redb,
     protox::Error => Protox,
     prost_reflect::DescriptorError => ProstReflectDescriptor,
     prost_reflect::prost::DecodeError => ProstReflectDecode,
 );
+
+#[cfg(not(target_family = "wasm"))]
+direct!(store::Error => Redb);

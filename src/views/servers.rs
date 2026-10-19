@@ -23,8 +23,9 @@ use crate::connection::{
 };
 use crate::error::Error;
 use crate::helpers::{
-    EditorAction, card_background, decrypt_share, format_duration_units, format_unix_secs, get_mono_font_family,
-    has_file_dialogs, is_share_token, resolve_path, resolve_tag_chip, unix_ts,
+    EditorAction, PickFailure, card_background, decrypt_share, format_duration_units, format_unix_secs,
+    get_mono_font_family, has_file_dialogs, is_share_token, opens_files, resolve_path, resolve_tag_chip, saves_files,
+    unix_ts,
 };
 use crate::states::{
     CLONE_SERVER_QUERY, EDIT_SERVER_QUERY, GlobalEvent, NotificationAction, Route, ZedisGlobalStore,
@@ -34,7 +35,7 @@ use crate::states::{
 #[cfg(not(target_family = "wasm"))]
 use crate::views::open_connection_diagnostics;
 use crate::views::placeholders::Placeholders;
-use crate::views::{ZedisExportServersDialog, export_filename, export_to_file_global};
+use crate::views::{ZedisExportServersDialog, export_filename, export_to_file_global, open_file};
 use gpui::{
     Action, Anchor, App, ClipboardItem, Entity, ExternalPaths, FocusHandle, Focusable, SharedString, Subscription,
     Window, div, prelude::*, px,
@@ -502,6 +503,57 @@ impl ImportServersBody {
     }
 }
 
+impl ImportServersBody {
+    /// Load a picked export into the paste box, as a dropped file is.
+    fn choose_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let accept = IMPORT_FILE_EXTENSIONS.map(|ext| format!(".{ext}")).join(",");
+        let picked = open_file(cx, &accept, MAX_IMPORT_FILE_BYTES);
+        cx.spawn_in(window, async move |this, cx| {
+            let Some(picked) = picked.await else {
+                return;
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                let loaded = picked
+                    .map_err(|failure| match failure {
+                        PickFailure::TooLarge { .. } => FileImportError::TooLarge,
+                        PickFailure::Unreadable(e) => FileImportError::ReadFailed(e),
+                    })
+                    .and_then(|file| {
+                        let known = std::path::Path::new(&file.name).extension().is_some_and(|ext| {
+                            IMPORT_FILE_EXTENSIONS
+                                .iter()
+                                .any(|allowed| ext.eq_ignore_ascii_case(allowed))
+                        });
+                        let text = String::from_utf8(file.bytes)
+                            .map_err(|_| FileImportError::ReadFailed("not UTF-8 text".to_string()))?;
+                        Ok(known.then_some(text))
+                    });
+                match loaded {
+                    Ok(Some(text)) => {
+                        this.json_state
+                            .update(cx, |state, cx| state.set_value(SharedString::from(text), window, cx));
+                    }
+                    Ok(None) => {
+                        window
+                            .push_notification(Notification::warning(i18n_servers(cx, "import_drop_unsupported")), cx);
+                    }
+                    Err(e) => {
+                        window.push_notification(
+                            Notification::error(SharedString::from(format!(
+                                "{}: {}",
+                                i18n_servers(cx, "import_error_prefix"),
+                                import_file_error_message(cx, &e)
+                            ))),
+                            cx,
+                        );
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+}
+
 impl Render for ImportServersBody {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if take(&mut self.should_focus) {
@@ -556,6 +608,20 @@ impl Render for ImportServersBody {
                 ))
                 .text_xs(),
             )
+            // A page has no path to paste and no file to drop: a picker in
+            // their place, read with the same extensions and size cap.
+            .when(!has_file_dialogs() && opens_files(), |this| {
+                this.child(
+                    h_flex().child(
+                        Button::new(IMPORT_CHOOSE_FILE_ID)
+                            .small()
+                            .outline()
+                            .icon(IconName::FolderOpen)
+                            .label(i18n_servers(cx, "import_choose_file"))
+                            .on_click(cx.listener(|this, _, window, cx| this.choose_file(window, cx))),
+                    ),
+                )
+            })
             .child(Textarea::new(&self.json_state).appearance(true))
             .when(needs_pass, |this| {
                 this.child(
@@ -567,6 +633,9 @@ impl Render for ImportServersBody {
             })
     }
 }
+
+/// The import dialog's file picker, in a page.
+const IMPORT_CHOOSE_FILE_ID: &str = "servers-import-choose-file";
 
 /// Largest file the paste-a-path import shortcut will read. Connection exports
 /// are KB-sized, so this is a generous ceiling that simply guards against

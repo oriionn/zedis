@@ -24,7 +24,7 @@ use crate::error::Error;
 /// Channels button opens the channel browser (`PUBSUB CHANNELS`), so a channel
 /// can be picked instead of typed.
 use crate::helpers::channel;
-use crate::helpers::{build_csv, format_duration, get_mono_font_family, has_file_dialogs, now_datetime, unix_ts};
+use crate::helpers::{build_csv, format_duration, get_mono_font_family, now_datetime, saves_files, unix_ts};
 use crate::states::{ZedisGlobalStore, ZedisServerState, detect_and_decode, i18n_common, i18n_pubsub_editor};
 use crate::views::{ChannelPick, export_to_file, open_pubsub_channels_dialog, unavailable_chip};
 use gpui::{Entity, SharedString, Subscription, Task, Window, div, prelude::*, px};
@@ -609,7 +609,7 @@ impl ZedisPubsubEditor {
             .child(channels_control)
             .child(subscribe_btn)
             // Exports save a file: not where the build has no save dialog.
-            .when(has_file_dialogs(), |this| {
+            .when(saves_files(), |this| {
                 this.child(div().w(px(1.)).h_5().flex_shrink_0().bg(cx.theme().border))
                     .child(
                         Button::new("pubsub-export-btn")

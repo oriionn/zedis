@@ -34,11 +34,15 @@
 //! The desktop answers `true` to all of them, and a test holds it to that:
 //! nothing here may take a feature away from the app this is built from.
 
-/// Save and open panels: every "export to a file" and "import from a file".
+/// Save and open panels, which hand back a *path*.
 ///
 /// The browser backend answers both prompts with an error (`prompt_for_paths
 /// is not supported on the web`), and the callers treat an error like a
-/// cancelled dialog — so the button did nothing at all.
+/// cancelled dialog — so the button did nothing at all. A button that only
+/// needs the file's bytes asks [`saves_files`] / [`opens_files`] instead,
+/// which a page answers with a download and an upload; this one is left for
+/// what needs the path itself (the migration window, a path typed or
+/// dropped into the import box).
 #[cfg(not(target_family = "wasm"))]
 pub const fn has_file_dialogs() -> bool {
     true
@@ -46,6 +50,32 @@ pub const fn has_file_dialogs() -> bool {
 #[cfg(target_family = "wasm")]
 pub const fn has_file_dialogs() -> bool {
     false
+}
+
+/// Putting a file in the person's hands: every "Export" and "Save". A save
+/// panel on the desktop; in a page, the browser's download, where
+/// `zedis-web` installed one (`views::export_to_file` takes either).
+#[cfg(not(target_family = "wasm"))]
+pub const fn saves_files() -> bool {
+    true
+}
+#[cfg(target_family = "wasm")]
+pub fn saves_files() -> bool {
+    super::web_download().is_some()
+}
+
+/// Taking a file the person picks: an open panel on the desktop; in a page,
+/// the browser's file picker, where `zedis-web` installed one
+/// (`views::open_file` takes either). What only a *path* can do — a dump
+/// streamed from disk, a file dropped on a dialog — still asks
+/// [`has_file_dialogs`].
+#[cfg(not(target_family = "wasm"))]
+pub const fn opens_files() -> bool {
+    true
+}
+#[cfg(target_family = "wasm")]
+pub fn opens_files() -> bool {
+    super::web_upload().is_some()
 }
 
 /// Reading the clipboard when a button asks for it ("Import from clipboard").
@@ -84,6 +114,8 @@ mod tests {
     #[test]
     fn the_desktop_has_all_of_it() {
         assert!(has_file_dialogs());
+        assert!(saves_files());
+        assert!(opens_files());
         assert!(reads_clipboard_on_demand());
         assert!(has_connection_diagnostics());
     }

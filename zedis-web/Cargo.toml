@@ -52,17 +52,23 @@ wasm-bindgen = "0.2.104"
 # `tracing` has nowhere to go in a page without a writer for the console.
 tracing-subscriber = "0.3.23"
 tracing-web = "0.1.3"
-# The rest of the list is the report's download (`download_file`): a `Blob`,
-# its object URL and a link to click.
+# The rest of the list is files: a download (`download_file` — a `Blob`,
+# its object URL and a link to click) and a pick (`pick_file` — a file
+# input, its `File`, read as an array buffer).
 web-sys = { version = "0.3.105", features = [
   "Window",
   "Location",
   "Blob",
   "BlobPropertyBag",
+  "CssStyleDeclaration",
   "Document",
   "Element",
+  "EventTarget",
+  "File",
+  "FileList",
   "HtmlAnchorElement",
   "HtmlElement",
+  "HtmlInputElement",
   "Node",
   "Url",
 ] }

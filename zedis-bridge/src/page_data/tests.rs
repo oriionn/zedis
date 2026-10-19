@@ -149,6 +149,12 @@ async fn rows_are_the_account_s_own() {
         status(row("alice:alice-password", "cmd_history", Some("[]")).await),
         StatusCode::BAD_REQUEST
     );
+    // A proto viewer is a row of the account's own too; a read-only
+    // account keeps its own, as it keeps its favorites.
+    assert_eq!(
+        status(row("ro:ro-password", "protos", Some("{\"name\":\"orders\"}")).await),
+        StatusCode::NO_CONTENT
+    );
 
     let alice = data(&state, "alice:alice-password").await;
     assert_eq!(alice.rows.len(), 1);
@@ -159,7 +165,8 @@ async fn rows_are_the_account_s_own() {
     assert!(data(&state, "bob:bob-password").await.rows.is_empty(), "nobody else's");
     let ro = data(&state, "ro:ro-password").await;
     assert!(ro.read_only);
-    assert_eq!(ro.rows[0].table, "recent_keys");
+    let tables: Vec<&str> = ro.rows.iter().map(|row| row.table.as_str()).collect();
+    assert_eq!(tables, ["protos", "recent_keys"]);
 
     assert_eq!(
         status(row("alice:alice-password", "favorites", None).await),

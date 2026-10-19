@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod app;
+mod command_history;
 mod i18n;
 #[cfg(not(target_family = "wasm"))]
 mod migration;
@@ -23,6 +24,7 @@ pub mod trash_store;
 
 pub use crate::error::ConnectionErrorKind;
 pub use app::*;
+pub use command_history::{command_history, record_command};
 pub use i18n::back_to_editor_tooltip;
 pub use i18n::first_connect_hint;
 pub use i18n::i18n_account;
@@ -95,7 +97,7 @@ pub use page_data::{account_is_read_only, ask_for_fresh_page_data};
 /// The browser entry point loads the page data from the bridge here, before
 /// `init_caches`, and refreshes it while the page is open (ADR 17).
 #[cfg(target_family = "wasm")]
-pub use page_data::{page_data_generation, refresh_page_data, save_preferences, seed_page_data};
+pub use page_data::{page_account, page_data_generation, refresh_page_data, save_preferences, seed_page_data};
 pub use server::ConnectionHealth;
 pub use server::ErrorMessage;
 pub use server::InfoSnapshot;

@@ -58,9 +58,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use zedis_connection::get_servers;
 use zedis_core::fs::write_file_atomic;
 
-/// The tables an account keeps rows in, as the page names them.
-pub const ROW_TABLES: [&str; 4] = ["favorites", "recent_keys", "search_history", "preferences"];
-/// One row: a list of key names, or the preferences file.
+/// The tables an account keeps rows in, as the page names them. `protos` is
+/// one proto viewer a row — a schema and the keys it decodes — the
+/// account's own, as the desktop user's are.
+pub const ROW_TABLES: [&str; 5] = ["favorites", "recent_keys", "search_history", "preferences", "protos"];
+/// One row: a list of key names, the preferences file, a proto viewer.
 pub const MAX_ROW_BYTES: usize = 256 * 1024;
 /// Everything one account keeps, so a page in a loop cannot fill the disk.
 pub const MAX_ACCOUNT_BYTES: usize = 4 * 1024 * 1024;

@@ -35,7 +35,7 @@ use crate::components::KeyTypeBadge;
 use crate::connection::{
     MultiSearchServerResult, get_server, get_server_groups, get_servers, multi_search_exact, multi_search_scan,
 };
-use crate::helpers::{build_csv, has_file_dialogs};
+use crate::helpers::{build_csv, saves_files};
 use crate::states::{
     KeyType, MultiSearchScope, ZedisGlobalStore, i18n_common, i18n_multi_search, update_app_state_and_save_quiet,
 };
@@ -920,7 +920,7 @@ impl Render for ZedisMultiSearch {
                     )
                     .child(div().w(px(72.)).child(Input::new(&self.scan_count_input).small()))
                     .child(div().flex_1())
-                    .when(has_file_dialogs() && !self.rows.is_empty(), |this| {
+                    .when(saves_files() && !self.rows.is_empty(), |this| {
                         this.child(
                             Button::new("multi-search-export-csv")
                                 .small()

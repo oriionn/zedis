@@ -66,7 +66,7 @@ use zedis_connection::{
 #[cfg(target_family = "wasm")]
 use zedis_gui::helpers::pacing::{PAGE_DATA_REFRESH, PAGE_DATA_RETRY, SERVER_LIST_REFRESH, set_unattended, unattended};
 #[cfg(target_family = "wasm")]
-use zedis_gui::helpers::{set_web_command_key, set_web_download};
+use zedis_gui::helpers::{PickDone, PickFailure, PickedFile, set_web_command_key, set_web_download, set_web_upload};
 #[cfg(target_family = "wasm")]
 use zedis_gui::states::{GlobalEvent, ZedisAppState, ZedisGlobalStore};
 
@@ -204,6 +204,7 @@ pub fn run(
         // Before `launch`, which binds the keys and draws their labels.
         set_web_command_key(apple_keyboard);
         set_web_download(download_file);
+        set_web_upload(pick_file);
         // Grayscale antialiasing for every glyph, before the first frame. The
         // web text system asks for subpixel (RGB) antialiasing for the fonts
         // it was handed and grayscale for what the browser draws, so in a
@@ -400,29 +401,30 @@ thread_local! {
 #[cfg(target_family = "wasm")]
 const DOWNLOAD_URL_LIFETIME_MS: i32 = 60_000;
 
-/// Hand the browser a text file to save (ADR 19): a page has no save dialog,
-/// so it is the browser's own download — a `Blob`'s object URL clicked
-/// through an `<a download>`.
+/// Hand the browser a file to save: a page has no save dialog, so it is the
+/// browser's own download — a `Blob`'s object URL clicked through an
+/// `<a download>`. Installed as `set_web_download`, behind every Export.
 #[cfg(target_family = "wasm")]
-fn download_file(name: &str, media_type: &str, contents: &str) {
-    if let Err(e) = start_download(name, media_type, contents) {
+fn download_file(name: &str, media_type: &str, contents: &[u8]) -> Result<(), String> {
+    start_download(name, media_type, contents).map_err(|e| {
         error!(error = ?e, "the browser did not start the download");
-    }
+        js_error_text(&e)
+    })
 }
 
 #[cfg(target_family = "wasm")]
-fn start_download(name: &str, media_type: &str, contents: &str) -> Result<(), wasm_bindgen::JsValue> {
+fn start_download(name: &str, media_type: &str, contents: &[u8]) -> Result<(), wasm_bindgen::JsValue> {
     use wasm_bindgen::JsCast as _;
-    use wasm_bindgen::JsValue;
     use wasm_bindgen::closure::Closure;
+    use web_sys::js_sys::{Array, Uint8Array};
     use web_sys::{Blob, BlobPropertyBag, HtmlAnchorElement, Url};
 
-    let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
-    let document = window.document().ok_or_else(|| JsValue::from_str("no document"))?;
-    let body = document.body().ok_or_else(|| JsValue::from_str("no body"))?;
+    let (window, document, body) = page()?;
     let options = BlobPropertyBag::new();
-    options.set_type(&format!("{media_type};charset=utf-8"));
-    let blob = Blob::new_with_str_sequence_and_options(&JsValue::from(vec![contents.to_string()]), &options)?;
+    options.set_type(media_type);
+    let parts = Array::new();
+    parts.push(&Uint8Array::from(contents));
+    let blob = Blob::new_with_u8_array_sequence_and_options(&parts, &options)?;
     let url = Url::create_object_url_with_blob(&blob)?;
     let anchor: HtmlAnchorElement = document.create_element("a")?.dyn_into()?;
     anchor.set_href(&url);
@@ -437,4 +439,101 @@ fn start_download(name: &str, media_type: &str, contents: &str) -> Result<(), wa
     });
     window.set_timeout_with_callback_and_timeout_and_arguments_0(revoke.unchecked_ref(), DOWNLOAD_URL_LIFETIME_MS)?;
     Ok(())
+}
+
+/// Let the person pick a file: a hidden `<input type="file">`, clicked, and
+/// the chosen file read whole — unless it is over `max_bytes`, which is
+/// refused before anything is read. A picker closed without a choice
+/// answers nothing (`cancel`), which the app reads as cancelled. Installed
+/// as `set_web_upload`, behind every Import.
+#[cfg(target_family = "wasm")]
+fn pick_file(accept: &str, max_bytes: u64, done: PickDone) {
+    let done = Rc::new(RefCell::new(Some(done)));
+    if let Err(e) = start_pick(accept, max_bytes, done.clone()) {
+        error!(error = ?e, "the browser did not open its file picker");
+        if let Some(done) = done.borrow_mut().take() {
+            done(Err(PickFailure::Unreadable(js_error_text(&e))));
+        }
+    }
+}
+
+#[cfg(target_family = "wasm")]
+fn start_pick(accept: &str, max_bytes: u64, done: Rc<RefCell<Option<PickDone>>>) -> Result<(), wasm_bindgen::JsValue> {
+    use wasm_bindgen::JsCast as _;
+    use wasm_bindgen::closure::Closure;
+    use wasm_bindgen_futures::JsFuture;
+    use web_sys::HtmlInputElement;
+    use web_sys::js_sys::Uint8Array;
+
+    let (_, document, body) = page()?;
+    let input: HtmlInputElement = document.create_element("input")?.dyn_into()?;
+    input.set_type("file");
+    input.set_accept(accept);
+    input.style().set_property("display", "none")?;
+    body.append_child(&input)?;
+
+    let on_change = {
+        let input = input.clone();
+        let done = done.clone();
+        Closure::once_into_js(move || {
+            let file = input.files().and_then(|files| files.get(0));
+            input.remove();
+            let Some(done) = done.borrow_mut().take() else {
+                return;
+            };
+            let Some(file) = file else {
+                // Nothing chosen after all: as cancelled.
+                return;
+            };
+            let size = file.size() as u64;
+            if size > max_bytes {
+                done(Err(PickFailure::TooLarge { size }));
+                return;
+            }
+            wasm_bindgen_futures::spawn_local(async move {
+                let read = JsFuture::from(file.array_buffer()).await;
+                done(match read {
+                    Ok(buffer) => Ok(PickedFile {
+                        name: file.name(),
+                        bytes: Uint8Array::new(&buffer).to_vec(),
+                    }),
+                    Err(e) => Err(PickFailure::Unreadable(js_error_text(&e))),
+                });
+            });
+        })
+    };
+    let on_cancel = {
+        let input = input.clone();
+        Closure::once_into_js(move || {
+            input.remove();
+            // Dropping the answer is the cancel.
+            done.borrow_mut().take();
+        })
+    };
+    input.add_event_listener_with_callback("change", on_change.unchecked_ref())?;
+    input.add_event_listener_with_callback("cancel", on_cancel.unchecked_ref())?;
+    input.click();
+    Ok(())
+}
+
+/// The page's window, document and body, for the two above.
+#[cfg(target_family = "wasm")]
+fn page() -> Result<(web_sys::Window, web_sys::Document, web_sys::HtmlElement), wasm_bindgen::JsValue> {
+    use wasm_bindgen::JsValue;
+    let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
+    let document = window.document().ok_or_else(|| JsValue::from_str("no document"))?;
+    let body = document.body().ok_or_else(|| JsValue::from_str("no body"))?;
+    Ok((window, document, body))
+}
+
+/// A thrown JavaScript value as words: an `Error`'s message, else whatever
+/// it prints as.
+#[cfg(target_family = "wasm")]
+fn js_error_text(value: &wasm_bindgen::JsValue) -> String {
+    use wasm_bindgen::JsCast as _;
+    value
+        .dyn_ref::<web_sys::js_sys::Error>()
+        .map(|e| String::from(e.message()))
+        .or_else(|| value.as_string())
+        .unwrap_or_else(|| format!("{value:?}"))
 }

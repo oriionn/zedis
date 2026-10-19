@@ -35,6 +35,8 @@ use crate::views::{ChartParams, ValueLabel, format_timestamp_ms, make_bar_chart,
 /// 1. Top 20 prefix groups by estimated memory (keys containing the separator)
 /// 2. Top 20 single keys by memory / freq / idletime (keys without the separator)
 use crate::views::{export_to_file, open_key_in_editor, search_keys_in_tree};
+#[cfg(target_family = "wasm")]
+use crate::{helpers::PickFailure, views::open_file};
 use gpui::{
     ClipboardItem, Entity, Pixels, SharedString, Subscription, Task, Window, div, prelude::*, px, relative, rems,
 };
@@ -55,7 +57,6 @@ use gpui_kit::component::{
 };
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -78,6 +79,15 @@ use tables::*;
 
 /// Maximum rows kept per table.
 const TOP_N: usize = 20;
+
+/// Where an offline analysis reads its dump from: the reader, and its length
+/// for the progress bar. A path streamed from disk on the desktop, an upload
+/// held in memory in a page.
+type RdbSource = Box<dyn FnOnce() -> Result<(Box<dyn std::io::Read + Send>, u64), String> + Send>;
+
+/// The largest dump a page reads: it is held whole in the tab's memory.
+#[cfg(target_family = "wasm")]
+const MAX_WEB_RDB_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Default table row height (Medium size in gpui-component).
 const TABLE_ROW_HEIGHT: f32 = 32.;
@@ -1135,6 +1145,7 @@ impl ZedisMemoryAnalysis {
     /// Toolbar entry point for the offline analysis: pick a local RDB
     /// dump, then parse it. Extension is not filterable in the native
     /// dialog — a non-RDB pick fails fast on the `REDIS` magic check.
+    #[cfg(not(target_family = "wasm"))]
     fn handle_pick_rdb(&mut self, cx: &mut gpui::Context<Self>) {
         if self.status == AnalysisStatus::Running {
             return;
@@ -1151,7 +1162,60 @@ impl ZedisMemoryAnalysis {
                 if let Ok(Ok(Some(paths))) = result
                     && let Some(path) = paths.into_iter().next()
                 {
-                    this.start_rdb_analysis(path, cx);
+                    let file_name: SharedString = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string())
+                        .into();
+                    // Streamed from disk, so a multi-GB dump is never in
+                    // memory whole.
+                    let open: RdbSource = Box::new(move || {
+                        let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+                        let file_len = file.metadata().map_err(|e| e.to_string())?.len();
+                        Ok((Box::new(std::io::BufReader::new(file)), file_len))
+                    });
+                    this.start_rdb_analysis(file_name, open, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// [`Self::handle_pick_rdb`] in a page: the browser's file picker, the
+    /// dump read whole into the tab — so up to [`MAX_WEB_RDB_BYTES`], with
+    /// the desktop app named for anything larger.
+    #[cfg(target_family = "wasm")]
+    fn handle_pick_rdb(&mut self, cx: &mut gpui::Context<Self>) {
+        if self.status == AnalysisStatus::Running {
+            return;
+        }
+        let picked = open_file(cx, ".rdb", MAX_WEB_RDB_BYTES);
+        cx.spawn(async move |handle, cx| {
+            let Some(picked) = picked.await else {
+                return;
+            };
+            let _ = handle.update(cx, |this, cx| match picked {
+                Ok(file) => {
+                    let len = file.bytes.len() as u64;
+                    let bytes = file.bytes;
+                    let open: RdbSource = Box::new(move || Ok((Box::new(std::io::Cursor::new(bytes)), len)));
+                    this.start_rdb_analysis(file.name.into(), open, cx);
+                }
+                Err(failure) => {
+                    let locale = cx.global::<ZedisGlobalStore>().read(cx).locale().to_string();
+                    let message = match failure {
+                        PickFailure::TooLarge { size } => rust_i18n::t!(
+                            "memory_analysis.rdb_too_large_web",
+                            size = format_memory(size),
+                            limit = format_memory(MAX_WEB_RDB_BYTES),
+                            locale = &locale
+                        )
+                        .to_string(),
+                        PickFailure::Unreadable(e) => e,
+                    };
+                    this.status = AnalysisStatus::Error;
+                    this.scan_error = Some(message.into());
+                    cx.notify();
                 }
             });
         })
@@ -1164,13 +1228,8 @@ impl ZedisMemoryAnalysis {
     /// faithful; live `MEMORY USAGE` overhead is not included), there is
     /// no heat metric, no sampling (ratio 1.0), and per-key TTLs become
     /// "remaining vs now".
-    fn start_rdb_analysis(&mut self, path: PathBuf, cx: &mut gpui::Context<Self>) {
+    fn start_rdb_analysis(&mut self, file_name: SharedString, open: RdbSource, cx: &mut gpui::Context<Self>) {
         self.reset_for_run(true, cx);
-        let file_name: SharedString = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string())
-            .into();
         self.rdb_file = Some(file_name);
         // Offline source has no policy / heat probe; force the rank
         // dropdown back to Size-only.
@@ -1192,14 +1251,10 @@ impl ZedisMemoryAnalysis {
 
         self.analysis_task = Some(cx.spawn(async move |handle, cx| {
             let opened = cx
-                .background_spawn({
-                    let path = path.clone();
-                    async move {
-                        let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-                        let file_len = file.metadata().map_err(|e| e.to_string())?.len();
-                        let parser = RdbParser::new(std::io::BufReader::new(file)).map_err(|e| e.to_string())?;
-                        Ok::<_, String>((parser, file_len))
-                    }
+                .background_spawn(async move {
+                    let (reader, file_len) = open()?;
+                    let parser = RdbParser::new(reader).map_err(|e| e.to_string())?;
+                    Ok::<_, String>((parser, file_len))
                 })
                 .await;
             let (mut parser, file_len) = match opened {

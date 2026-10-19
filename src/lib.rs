@@ -23,9 +23,9 @@ extern crate gpui_kit as gpui;
 compile_error!("`gpui-fast` is a desktop build: zedis-web names the default engine's web platform");
 
 use crate::connection::{get_server, get_servers};
-use crate::db::LuaScriptManager;
+use crate::db::{LuaScriptManager, ProtoManager};
 #[cfg(not(target_family = "wasm"))]
-use crate::db::{ProtoManager, ScriptManager, init_database, open_failure_kind};
+use crate::db::{ScriptManager, init_database, open_failure_kind};
 #[cfg(not(target_family = "wasm"))]
 use crate::helpers::{
     BuildVariant, CrashContext, InstanceMessage, InstanceRole, UpdateAction, claim_instance, get_or_create_config_dir,
@@ -314,12 +314,12 @@ fn activate_from_instance(message: InstanceMessage, cx: &mut App) {
 }
 
 pub fn init_caches() {
-    // Proto descriptors and script viewers are read off disk and run as
-    // processes — the browser build has neither (ADR 9).
-    #[cfg(not(target_family = "wasm"))]
+    // Proto viewers: off disk on the desktop; in a page, the rows the page
+    // data put in the store before this ran.
     if let Err(e) = ProtoManager::init() {
         error!(error = %e, "init protos fail");
     }
+    // Script viewers run as processes — the browser build has none (ADR 9).
     #[cfg(not(target_family = "wasm"))]
     if let Err(e) = ScriptManager::init() {
         error!(error = %e, "init script viewers fail");

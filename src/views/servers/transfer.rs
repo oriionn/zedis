@@ -20,13 +20,16 @@
 use super::*;
 
 /// The export dialogs' main button. It saves a file where the build can put
-/// one in the user's hands; in a page it copies, which is the whole export
-/// there — and the body's own Copy button, now the same thing twice, is left
+/// one in the user's hands — through the save panel, or in a page as a
+/// download; in a page without one it copies, which is the whole export
+/// there, and the body's own Copy button, then the same thing twice, is left
 /// out. "Save to file" in a browser asked for a save panel the platform does
 /// not have and then did nothing.
 fn export_ok_label(cx: &App) -> SharedString {
     if has_file_dialogs() {
         i18n_servers(cx, "export_save_file")
+    } else if saves_files() {
+        i18n_servers(cx, "export_download")
     } else {
         i18n_servers(cx, "export_copy_clipboard")
     }
@@ -34,8 +37,8 @@ fn export_ok_label(cx: &App) -> SharedString {
 
 /// What that button does with the payload.
 fn deliver_export(payload: String, name: &str, labels: &ExportLabels, window: &mut Window, cx: &mut App) {
-    if has_file_dialogs() {
-        // A file (default ~/Downloads, timestamped).
+    if saves_files() {
+        // A file (default ~/Downloads, timestamped), or a download.
         export_to_file_global(
             cx,
             payload.into_bytes(),
@@ -154,7 +157,7 @@ impl ZedisServers {
                         h_flex()
                             .gap_2()
                             .child(toggle_btn)
-                            .when(has_file_dialogs(), |this| this.child(copy_btn)),
+                            .when(saves_files(), |this| this.child(copy_btn)),
                     )
                     .when(include_on, |this| {
                         this.child(Label::new(warning_label.clone()).text_xs().text_color(warning_color))

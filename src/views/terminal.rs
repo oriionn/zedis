@@ -12,26 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::helpers::has_file_dialogs;
+use crate::helpers::saves_files;
 #[cfg(not(target_family = "wasm"))]
-use crate::helpers::{AiEndpoint, suggest_command};
+use crate::helpers::{AiEndpoint, get_download_dir, get_or_create_config_dir, suggest_command, write_file_atomic};
+#[cfg(target_family = "wasm")]
+use crate::helpers::{media_type_for, web_download};
+#[cfg(target_family = "wasm")]
+use crate::views::export_filename_with;
 use crate::{
     connection::{
         DangerKind, ExecReplies, ReplyFormat, ServerDb, TerminalReply, TerminalSession, classify_dangerous_line,
         command_doc_url, get_command_description, get_server, is_write_command, list_commands, requires_write_confirm,
     },
-    db::get_cmd_history_manager,
     error::Error,
-    helpers::{
-        TerminalAction, get_download_dir, get_mono_font_family, get_or_create_config_dir, humanize_keystroke,
-        starts_with_ignore_ascii_case, write_file_atomic,
-    },
+    helpers::{TerminalAction, get_mono_font_family, humanize_keystroke, starts_with_ignore_ascii_case},
     states::{
-        ServerEvent, WriteGate, ZedisGlobalStore, ZedisServerState, i18n_common, i18n_terminal,
-        update_app_state_and_save_quiet,
+        ServerEvent, WriteGate, ZedisGlobalStore, ZedisServerState, command_history, i18n_common, i18n_terminal,
+        record_command, update_app_state_and_save_quiet,
     },
     views::{bridge_danger, confirm_dangerous_command},
 };
+#[cfg(not(target_family = "wasm"))]
 use chrono::Local;
 use gpui::{App, ClipboardItem, Entity, SharedString, Subscription, Task, Window, div, prelude::*, px};
 use gpui_kit::component::{
@@ -48,9 +49,13 @@ use gpui_kit::component::{
     v_flex,
 };
 use rust_i18n::t;
+#[cfg(not(target_family = "wasm"))]
 use std::io;
+#[cfg(not(target_family = "wasm"))]
 use std::path::PathBuf;
-use tracing::{error, info, warn};
+use tracing::error;
+#[cfg(not(target_family = "wasm"))]
+use tracing::info;
 use web_time::Instant;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -357,6 +362,7 @@ fn transcript_entries_for(
 /// Writes the output pane's text to `zedis-terminal-<stamp>.txt` in
 /// Downloads (the config dir when there is none — App Store sandbox) and
 /// returns its path.
+#[cfg(not(target_family = "wasm"))]
 fn write_output_file(text: &str) -> io::Result<PathBuf> {
     let dir = get_download_dir()
         .or_else(|| get_or_create_config_dir().ok())
@@ -364,16 +370,6 @@ fn write_output_file(text: &str) -> io::Result<PathBuf> {
     let path = dir.join(format!("zedis-terminal-{}.txt", Local::now().format("%Y%m%d-%H%M%S")));
     write_file_atomic(&path, text.as_bytes())?;
     Ok(path)
-}
-
-/// The saved command history for `server_id`; an unreadable local
-/// database reads as empty, with the cause in the log rather than a
-/// silently amnesiac ↑ key.
-fn command_history(server_id: &str) -> Vec<String> {
-    get_cmd_history_manager().records(server_id).unwrap_or_else(|e| {
-        warn!(error = %e, "command history unavailable");
-        Vec::new()
-    })
 }
 
 /// Scrollback cap for the rendered output text. The whole text is
@@ -658,6 +654,7 @@ impl ZedisTerminal {
         window.push_notification(Notification::success(i18n_terminal(cx, "output_copied")), cx);
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn save_output(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let locale = cx.global::<ZedisGlobalStore>().read(cx).locale();
         match write_output_file(&self.cmd_output_text) {
@@ -677,6 +674,24 @@ impl ZedisTerminal {
                 window.push_notification(Notification::error(message.to_string()), cx);
             }
         }
+    }
+
+    /// [`Self::save_output`] in a page: the same file, as a download.
+    #[cfg(target_family = "wasm")]
+    fn save_output(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let locale = cx.global::<ZedisGlobalStore>().read(cx).locale();
+        let name = export_filename_with("terminal", "txt");
+        let saved = web_download()
+            .ok_or_else(|| "no download in this page".to_string())
+            .and_then(|download| download(&name, media_type_for(&name), self.cmd_output_text.as_bytes()));
+        let notification = match saved {
+            Ok(()) => Notification::success(t!("terminal.output_saved", path = name, locale = locale).to_string()),
+            Err(e) => {
+                error!(error = %e, "terminal output download failed");
+                Notification::error(t!("terminal.save_output_failed", error = e, locale = locale).to_string())
+            }
+        };
+        window.push_notification(notification, cx);
     }
 
     /// The output pane's right-click commands beyond the editor's own.
@@ -1156,7 +1171,7 @@ impl ZedisTerminal {
                     // A dead link is forgotten by the session, so the next
                     // line reconnects instead of failing the same way.
                     let reply = session.run(&at, &cmd_name, &args).await?;
-                    let _ = get_cmd_history_manager().add_record(server_id.as_str(), line.as_str());
+                    record_command(server_id.as_str(), line.as_str());
                     let selected_db = reply.selected_db();
                     Ok(LineOutcome {
                         reply: LineReply::Value(reply),
@@ -1367,7 +1382,7 @@ impl Render for ZedisTerminal {
                             .on_click(cx.listener(|this, _, window, cx| this.copy_output(window, cx))),
                     )
                     // A file in Downloads, revealed in the file manager.
-                    .when(has_file_dialogs(), |this| {
+                    .when(saves_files(), |this| {
                         this.child(
                             Button::new("term-save-output")
                                 .label(i18n_terminal(cx, "save_output"))
@@ -1413,7 +1428,7 @@ impl Render for ZedisTerminal {
                                     .menu(i18n_terminal(cx, "menu_select_all"), Box::new(SelectAll))
                                     .separator()
                                     .menu(i18n_terminal(cx, "menu_copy_output"), Box::new(TerminalAction::CopyAll));
-                                let menu = if has_file_dialogs() {
+                                let menu = if saves_files() {
                                     menu.menu(i18n_terminal(cx, "menu_save_output"), Box::new(TerminalAction::Save))
                                 } else {
                                     menu

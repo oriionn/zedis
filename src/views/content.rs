@@ -29,9 +29,10 @@ use crate::{
 // the two local-file managers are the bridge's side of the wire (ADR 9).
 #[cfg(target_family = "wasm")]
 use crate::connection::{CommandStatus, ServerCommand};
+use crate::views::ZedisProtoEditor;
 use crate::views::{ZedisKeyspaceNotifications, ZedisMonitor};
 #[cfg(not(target_family = "wasm"))]
-use crate::views::{ZedisProtoEditor, ZedisScriptEditor, ZedisTopology};
+use crate::views::{ZedisScriptEditor, ZedisTopology};
 use gpui::{AnyView, App, Entity, FocusHandle, Focusable, Pixels, Subscription, Window, div, prelude::*, px};
 use gpui_kit::component::{
     resizable::{ResizableState, h_resizable, resizable_panel},
@@ -63,7 +64,6 @@ pub struct ZedisContent {
 
     /// Cached views - lazily initialized and cleared when switching routes
     servers: Option<Entity<ZedisServers>>,
-    #[cfg(not(target_family = "wasm"))]
     proto_editor: Option<Entity<ZedisProtoEditor>>,
     #[cfg(not(target_family = "wasm"))]
     script_editor: Option<Entity<ZedisScriptEditor>>,
@@ -120,7 +120,6 @@ impl ZedisContent {
             self.drop_editor_suite();
         }
         if route != Route::Protos {
-            #[cfg(not(target_family = "wasm"))]
             self.proto_editor.take();
         }
         if route != Route::Scripts {
@@ -340,7 +339,6 @@ impl ZedisContent {
             should_focus: false,
             focus_handle,
             active: true,
-            #[cfg(not(target_family = "wasm"))]
             proto_editor: None,
             #[cfg(not(target_family = "wasm"))]
             script_editor: None,
@@ -450,7 +448,6 @@ impl ZedisContent {
         )
     }
 
-    #[cfg(not(target_family = "wasm"))]
     fn render_proto_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let proto_editor = self
             .proto_editor
@@ -656,7 +653,6 @@ impl Render for ZedisContent {
                 .child(self.render_servers(window, cx))
                 .into_any_element()
             }
-            #[cfg(not(target_family = "wasm"))]
             Route::Protos => {
                 if should_focus {
                     self.focus_handle.focus(window, cx);

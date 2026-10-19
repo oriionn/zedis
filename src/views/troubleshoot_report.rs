@@ -24,10 +24,10 @@ use crate::connection::{
     NodeReply, Part, RedisServer, ServerDb, SlowLogEntry, TroubleshootingSnapshot, get_server, is_subcommand,
     redact_secrets, troubleshooting_snapshot,
 };
-use crate::helpers::{format_unix_secs, has_file_dialogs, now_datetime, web_download};
+use crate::helpers::{format_unix_secs, has_file_dialogs, now_datetime, saves_files};
 use crate::states::{ZedisGlobalStore, ZedisServerState, i18n_sidebar, i18n_troubleshoot};
-use crate::views::export::{export_filename_with, export_to_file};
 use crate::views::status_bar::product_line;
+use crate::views::{export_filename_with, export_to_file};
 use gpui::{App, ClipboardItem, Entity, SharedString, Window, div, prelude::*, px};
 use gpui_kit::component::{
     ActiveTheme, Disableable, IconName, Sizable, WindowExt, button::Button, h_flex, label::Label,
@@ -151,8 +151,9 @@ impl ReportActions {
     }
 
     /// Save the report as Markdown or HTML: through the save dialog where
-    /// there is one, as a browser download in a page.
-    fn save(&mut self, html: bool, window: &mut Window, cx: &mut gpui::Context<Self>) {
+    /// there is one, as a browser download in a page (`export_to_file`
+    /// takes either).
+    fn save(&mut self, html: bool, cx: &mut gpui::Context<Self>) {
         let (written, server_state, server_name) = {
             let body = self.body.read(cx);
             let Some(written) = body.written.clone() else {
@@ -160,35 +161,29 @@ impl ReportActions {
             };
             (written, body.server_state.clone(), body.server_name.clone())
         };
-        let (text, extension, media_type) = if html {
-            (written.report.to_html(), "html", "text/html")
+        let (text, extension) = if html {
+            (written.report.to_html(), "html")
         } else {
-            (written.markdown.to_string(), "md", "text/markdown")
+            (written.markdown.to_string(), "md")
         };
         let name = export_filename_with(&format!("report-{server_name}"), extension);
-        if has_file_dialogs() {
-            export_to_file(
-                cx,
-                server_state,
-                text.into_bytes(),
-                &name,
-                i18n_troubleshoot(cx, "saved"),
-                i18n_troubleshoot(cx, "save_failed"),
-            );
-        } else if let Some(download) = web_download() {
-            download(&name, media_type, &text);
-            window.push_notification(Notification::success(SharedString::from(name)), cx);
-        }
+        export_to_file(
+            cx,
+            server_state,
+            text.into_bytes(),
+            &name,
+            i18n_troubleshoot(cx, "saved"),
+            i18n_troubleshoot(cx, "save_failed"),
+        );
     }
 }
 
 impl Render for ReportActions {
     fn render(&mut self, _window: &mut gpui::Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
         let waiting = self.body.read(cx).written.is_none();
-        // A page has no save dialog: there the file is downloaded at once.
-        let saves_files = has_file_dialogs();
-        let downloads = !saves_files && web_download().is_some();
-        let (markdown_key, html_key) = if saves_files {
+        // A page has no save dialog: there the file is downloaded at once,
+        // and the buttons say so.
+        let (markdown_key, html_key) = if has_file_dialogs() {
             ("save_markdown", "save_html")
         } else {
             ("download_markdown", "download_html")
@@ -204,7 +199,7 @@ impl Render for ReportActions {
                     .disabled(waiting)
                     .on_click(cx.listener(|this, _, window, cx| this.copy_markdown(window, cx))),
             )
-            .when(saves_files || downloads, |row| {
+            .when(saves_files(), |row| {
                 row.child(
                     Button::new(SAVE_MARKDOWN_ID)
                         .outline()
@@ -212,7 +207,7 @@ impl Render for ReportActions {
                         .icon(CustomIconName::Download)
                         .label(i18n_troubleshoot(cx, markdown_key))
                         .disabled(waiting)
-                        .on_click(cx.listener(|this, _, window, cx| this.save(false, window, cx))),
+                        .on_click(cx.listener(|this, _, _, cx| this.save(false, cx))),
                 )
                 .child(
                     Button::new(SAVE_HTML_ID)
@@ -221,7 +216,7 @@ impl Render for ReportActions {
                         .icon(CustomIconName::Download)
                         .label(i18n_troubleshoot(cx, html_key))
                         .disabled(waiting)
-                        .on_click(cx.listener(|this, _, window, cx| this.save(true, window, cx))),
+                        .on_click(cx.listener(|this, _, _, cx| this.save(true, cx))),
                 )
             })
     }

@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use super::value::{DataFormat, RedisBytesValue, ViewMode, ViewerFailure, ViewerKind, detect_format};
+use crate::db::ProtoManager;
 #[cfg(not(target_family = "wasm"))]
-use crate::db::{ProtoManager, ScriptManager};
+use crate::db::ScriptManager;
 use crate::helpers::{configured_time_zone, format_datetime_in, format_datetime_other_zone};
 use crate::{
     connection::{ServerDb, string_get, string_prefix},
@@ -29,7 +30,6 @@ use ruzstd::decoding::StreamingDecoder;
 use serde_json::Value;
 use snap::read::FrameDecoder;
 use std::io::Read;
-#[cfg(not(target_family = "wasm"))]
 use tracing::warn;
 use zedis_core::codec::{base64_text, bson, java, jwt, php, pickle, url};
 
@@ -454,14 +454,26 @@ fn configured_viewer(server_id: &str, key: &str, data: &[u8]) -> ViewerOutcome {
     }
 }
 
+/// [`configured_viewer`] in a page: the account's proto viewers (kept by
+/// the bridge, compiled from their schema text in memory), and no script
+/// viewer — that one is a process.
 #[cfg(target_family = "wasm")]
-fn configured_viewer(_server_id: &str, _key: &str, _data: &[u8]) -> ViewerOutcome {
-    (None, None)
+fn configured_viewer(server_id: &str, key: &str, data: &[u8]) -> ViewerOutcome {
+    let Some(id) = ProtoManager::match_key_to_name(server_id, key) else {
+        return (None, None);
+    };
+    match ProtoManager::decode_data(&id, data) {
+        Ok(decoded) => (Some((DataFormat::Protobuf, SharedString::from(decoded))), None),
+        Err(e) => {
+            warn!(id, key, error = %e, "proto binding could not decode the value, falling back");
+            let rule = ProtoManager::get_proto(&id).map_or(id, |config| config.name);
+            (None, Some(viewer_failure(ViewerKind::Proto, rule, &e.to_string())))
+        }
+    }
 }
 
 /// A viewer's failure as the notice words it: the storage layer's
 /// "Invalid: " is its own classification, not something the viewer said.
-#[cfg(not(target_family = "wasm"))]
 fn viewer_failure(kind: ViewerKind, rule: String, error: &str) -> ViewerFailure {
     ViewerFailure {
         kind,

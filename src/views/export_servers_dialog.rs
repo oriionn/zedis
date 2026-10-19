@@ -22,7 +22,7 @@
 
 use crate::connection::{RedisServer, get_servers};
 use crate::helpers::encrypt_share;
-use crate::helpers::has_file_dialogs;
+use crate::helpers::saves_files;
 use crate::states::{ZedisGlobalStore, i18n_servers};
 use gpui::{App, ClipboardItem, Entity, ScrollHandle, SharedString, Window, div, prelude::*, px};
 use gpui_kit::component::{
@@ -197,13 +197,14 @@ impl Render for ZedisExportServersDialog {
                     .text_xs()
                     .text_color(muted),
             )
-            // In a page the dialog's own button copies, so this one would
-            // be the same thing twice (`servers/transfer.rs`).
+            // Where nothing can save a file the dialog's own button copies,
+            // so this one would be the same thing twice
+            // (`servers/transfer.rs`).
             .child(
                 h_flex()
                     .gap_2()
                     .child(secrets_btn)
-                    .when(has_file_dialogs(), |this| this.child(copy_btn)),
+                    .when(saves_files(), |this| this.child(copy_btn)),
             )
             // Optional share passphrase: filled ⇒ the export (copy and save
             // alike) becomes an encrypted `ZEDIS1.…` token instead of JSON.

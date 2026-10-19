@@ -306,6 +306,8 @@ pub enum GlobalEvent {
         key_notes_of: Vec<String>,
         rows: bool,
         scripts: bool,
+        /// The account's proto viewers, saved in another browser.
+        protos: bool,
     },
 }
 

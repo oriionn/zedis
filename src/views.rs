@@ -59,7 +59,6 @@ mod panel_poll;
 mod persistence;
 mod placeholders;
 mod probabilistic_editor;
-#[cfg(not(target_family = "wasm"))]
 mod proto_editor;
 mod pubsub_channels_dialog;
 mod pubsub_editor;
@@ -118,7 +117,7 @@ pub use danger_confirm::{
 };
 pub use editor::ZedisEditor;
 pub use expire_at_dialog::ZedisExpireAtDialog;
-pub(crate) use export::{export_filename, export_to_file, export_to_file_global};
+pub(crate) use export::{export_filename, export_filename_with, export_to_file, export_to_file_global, open_file};
 pub use export_servers_dialog::ZedisExportServersDialog;
 pub use function_editor::ZedisFunctionEditor;
 pub use geo_map::{GeoMapEvent, ZedisGeoMap};
@@ -161,7 +160,6 @@ pub use monitor::ZedisMonitor;
 pub use multi_search::ZedisMultiSearch;
 pub use persistence::ZedisPersistence;
 pub use probabilistic_editor::ZedisProbabilisticEditor;
-#[cfg(not(target_family = "wasm"))]
 pub use proto_editor::ZedisProtoEditor;
 pub use pubsub_channels_dialog::{ChannelPick, open_pubsub_channels_dialog};
 pub use pubsub_editor::ZedisPubsubEditor;

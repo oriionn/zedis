@@ -45,7 +45,7 @@ mod this_build;
 mod update_info;
 #[cfg(not(target_family = "wasm"))]
 mod updater;
-mod web_download;
+mod web_files;
 mod zip;
 
 pub use action::*;
@@ -78,7 +78,9 @@ pub use single_instance::{
 #[cfg(not(target_family = "wasm"))]
 pub use syntax::{register_editing_rules, register_extra_languages};
 pub use tag::{is_quiet_tag, resolve_tag_chip, resolve_tag_color, theme_color_for_tag};
-pub use this_build::{has_connection_diagnostics, has_file_dialogs, reads_clipboard_on_demand};
+pub use this_build::{
+    has_connection_diagnostics, has_file_dialogs, opens_files, reads_clipboard_on_demand, saves_files,
+};
 pub use update_info::{Delivery, UpdateAsset, UpdateInfo};
 #[cfg(all(not(target_family = "wasm"), target_os = "macos"))]
 pub use updater::relaunch;
@@ -86,7 +88,10 @@ pub use updater::relaunch;
 pub use updater::{
     download_and_verify, fetch_latest_release, focus_installer_ui, install_update, installer_requires_quit,
 };
-pub use web_download::{WebDownload, set_web_download, web_download};
+pub use web_files::{
+    PickDone, PickFailure, PickedFile, WebDownload, WebUpload, media_type_for, set_web_download, set_web_upload,
+    web_download, web_upload,
+};
 // Pure logic lives in `zedis-core`, fs/crypto/time in `zedis-connection`;
 // re-exported here so call sites keep using `crate::helpers::*` unchanged.
 pub use zedis_connection::string::*;

@@ -16,7 +16,7 @@ use crate::assets::CustomIconName;
 use crate::connection::{Capability, MonitorFeeds, ServerDb, get_server, open_monitor_feeds};
 use crate::error::Error;
 use crate::helpers::channel;
-use crate::helpers::{MonitorAction, build_csv, format_clock, get_mono_font_family, group_thousands, has_file_dialogs};
+use crate::helpers::{MonitorAction, build_csv, format_clock, get_mono_font_family, group_thousands, saves_files};
 use crate::states::{
     ConnectionErrorKind, GlobalEvent, NotificationAction, ServerEvent, ServerView, ZedisGlobalStore, ZedisServerState,
     back_to_editor_tooltip, content_area_width, escalate_dangerous_body, i18n_common, i18n_monitor, i18n_status_bar,
@@ -1110,7 +1110,7 @@ impl Render for ZedisMonitor {
                                         })),
                                 )
                             })
-                            .when(has_file_dialogs() && total > 0, |this| {
+                            .when(saves_files() && total > 0, |this| {
                                 this.child(
                                     Button::new("monitor-export")
                                         .outline()
