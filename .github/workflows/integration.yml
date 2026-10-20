@@ -1,6 +1,6 @@
 name: "Integration"
 # Live tests for the connection layer against real servers
-# (crates/zedis-connection/tests/live.rs), one job per server flavour.
+# (crates/zedis-connection/tests/live/), one job per server flavour.
 # scripts/it/up.sh builds the same topology CI and a dev machine use:
 # standalone + TLS + mTLS + sentinel + cluster from one image on the host
 # network, plus an unprivileged sshd on the runner for the tunnel tests.

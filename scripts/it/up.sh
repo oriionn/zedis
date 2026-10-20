@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Starts the Redis topology behind `crates/zedis-connection/tests/live.rs`:
+# Starts the Redis topology behind `crates/zedis-connection/tests/live/`:
 #
 #   standalone  127.0.0.1:16379   plain server (ACL users are created by the tests)
 #   tls         127.0.0.1:16380   TLS-only server with a self-signed CA (.run/tls/ca.crt)
@@ -236,7 +236,7 @@ fi
 # Servers that speak Redis's protocol and are other programs. Not `start`:
 # each has its own image, its own flags, and no redis-cli in sight. Never in
 # the default list — each is a smoke lane of three tests (`dragonfly_*`,
-# `garnet_*` in live.rs), there to notice the day it stops connecting, not a
+# `garnet_*` in tests/live/compatible.rs), there to notice the day it stops connecting, not a
 # topology the suite is held to.
 #
 # The images are pinned here, and bumped by hand: a red lane should mean

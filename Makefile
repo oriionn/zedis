@@ -105,7 +105,7 @@ check-locales:
 check-layering:
 	cargo test --test view_layering
 
-# Live integration tests against real servers (crates/zedis-connection/tests/live.rs).
+# Live integration tests against real servers (crates/zedis-connection/tests/live/).
 # `make it-up` starts the topology (local redis-server, or REDIS_IMAGE=redis:7.2 for docker),
 # `make it` runs the ignored tests with its ZEDIS_IT_* env, `make it-down` stops it.
 it-up:

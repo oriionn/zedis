@@ -677,6 +677,112 @@ first keychain read of the session. Reported, not fixed here (see
    This layer's correctness is the product's — structure changes here wait
    for the matrix to run on them.
 
+#### Step 1: the operations and their live tests (2026-10-21)
+
+An operation here is a `pub fn` of `zedis-connection` that takes a
+`ServerDb` or a `ClusterNode`. There are 210, and every one answers a type
+of its own or a plain value — none hands back a `redis::Value`. 176 are
+called by a live test, two more (`latency_doctor`, `memory_doctor`) only
+through one that is, and `lock_writes` / `unlock_writes` are the bridge's
+seam pair, no command on either side. That leaves 28 with no live test,
+each a gap in the rule CLAUDE.md states (*It gets a live test in the same
+change*):
+
+| Area | Operations | What a test needs |
+|---|---|---|
+| Server-wide, destructive | `flush_db`, `flush_all`, `function_flush`, `script_flush`, `acl_load`, `failover_abort` | a server of its own (the busy or the replication lane's), not the standalone one the other tests share |
+| Functions | `function_list`, `function_dump`, `function_restore`, `function_fcall` | standalone; `function_load` / `function_delete` already are |
+| ACL | `acl_list` | standalone |
+| Cluster membership | `cluster_meet`, `cluster_forget`, `node_migrate_slots` | a node to add and take away again; `node_migrate_slots` is behind `cluster_migrate_slots`' dialects |
+| Keyspace | `publish` | standalone, with a subscription to hear it |
+| Panels | `key_size_distributions`, `sample_memory_usage`, `memory_stats` | standalone (`INFO keysizes` is Redis 8 / Valkey 8.1) |
+| Search | `ft_create`, `ft_alter_add`, `ft_dropindex`, `ft_aggregate`, `ft_profile` | the module lanes; the existing tests build their indexes with raw `FT.CREATE` |
+| Streams | `stream_ack_delete` (`XACKDEL`, Redis 8.2), `stream_nack` (`XNACK`, Redis 8.8) | the `redis-8.10` lane, gated by their floors |
+| JSON | `json_get`, `json_set`, `json_merge` | the module lanes |
+
+Writing them is new tests, not structure: each is a change of its own.
+
+#### Step 2: `tests/live.rs` into `tests/live/` (2026-10-21)
+
+Fifteen modules by feature beside `main.rs`, which keeps the crate's doc,
+the imports and the fixtures (`skip_unless!`, `register`, the server
+builders, `supports`…): `connect`, `transport`, `keys`, `values`,
+`transfer`, `server`, `sessions`, `scripts`, `acl`, `replication`,
+`sentinel`, `cluster`, `cluster_admin`, `stack`, `compatible`. The file's
+own section markers had drifted (the TLS and SSH tests sat under
+*replication*, the logical copy under *redis-stack*), so the grouping is by
+what each test exercises; a helper went with its only user. The three test
+bodies two lanes share (`scan_sees_every_type_it_wrote`,
+`collections_page_and_write_through_their_operations`,
+`check_batch_ttl_conditions`) are `pub(super)` in their feature's module and
+imported by `compatible` and `cluster`. Every other line moved unchanged
+(a line-by-line count of the old file against the new ones differs only in
+the headers, the imports, the `mod` lines, those three `pub(super)` and the
+eight section markers; the Dragonfly and Garnet section's prose became
+`compatible`'s module doc).
+
+The test binary is still `live`, and the 94 test names are the same; what a
+listing prints gains the module (`keys::standalone_scan_sees_…`). CI selects
+by substring — the whole suite on the matrix, `dragonfly` / `garnet` on the
+smoke lanes — and both filters select the same three tests as before. Run
+locally against `scripts/it/up.sh` (Redis 8.6.1, every scenario but SSH,
+ports moved to `IT_PORT_BASE=46379` / `IT_CLUSTER_BASE=47000`): 94 passed,
+of which 18 skipped for a lane that was not there (modules, Dragonfly,
+Garnet, SSH, a foreign flavor) or a Valkey-only floor.
+
+#### Step 3: the seams (read 2026-10-21; nothing moved yet)
+
+Each of the three has seams a move can follow without touching a line of
+logic. They are moves of whole items into submodules, `impl` blocks for a
+type's methods, the shape the views and `states/server` already have.
+
+- **`manager/client.rs`** (1,832 lines, no tests of its own: the operations'
+  live tests cover it) is one `impl RedisClient` of 1,785 lines. By what the
+  methods do:
+  - `client/describe.rs` — what the client is: the identity accessors,
+    `nodes_description`, `build_slot_map`, `build_topology`,
+    `node_label_server`. About 400 lines.
+  - `client/fan_out.rs` — reaching every master: the three
+    `query_async_masters*`, `pipeline_per_key`, `unlike_keys*`,
+    `set_ttl_keys_scattered`, `delete_verb`. About 300.
+  - `client/scan.rs` — `first_scan`, `scan_nodes`, `scan`, `scan_matching`,
+    `scan_values_round`, `sample_scan_memory_usage`. About 500.
+  - What stays: the server and key reads the panels ask for (slow log,
+    hotkeys, command stats, slot stats, `INFO keysizes`, memory usage,
+    object meta, previews, `DBSIZE`, the heartbeat probe). About 550.
+- **`config.rs`** (1,590 lines before its tests):
+  - `config/transfer.rs` — export and import: `to_export_json*`, the JSON,
+    URI, multi-entry and Redis Insight imports, with the URI parsing they
+    use (`URI_SCHEMES` … `keep_first_host`). About 450.
+  - `config/form.rs` — the server form's mapping: `from_form_data` and the
+    `*_from_form_value` / `*_index` helpers. About 180.
+  - `config/store.rs` — the list: `SERVER_CONFIG_MAP`, `get_servers` /
+    `get_server`, the `set_servers_cache` and `save_servers` pairs (both
+    arms together), the secrets' sealing, the redacted TOML. About 300.
+  - What stays: `RedisServer`, its resolvers, secrets and endpoints. The
+    host-field, secret and upgrade-fixture tests go with what they test.
+- **`ssh_tunnel.rs`** (1,413 lines before its tests):
+  - `ssh_tunnel/host_keys.rs` — `ClientHandler`'s key check, the host key
+    prompt and the known_hosts files. About 200.
+  - `ssh_tunnel/target.rs` — `SshTarget` and its resolution from the form
+    and `~/.ssh/config`, ProxyJump included. About 170.
+  - `ssh_tunnel/auth.rs` — key, password and agent authentication, the RSA
+    hash negotiation, the remembered agent key. About 290.
+  - `ssh_tunnel/monitor.rs` — `MONITOR` read through a tunnel. About 120.
+  - What stays: the runtime, the session cache, the forward channel and
+    `TunnelDial`.
+  - Found on the way: `install_crypto_provider`, the insecure certificate
+    verifier and `open_single_sni_tls_connection` are TLS without SSH and
+    sit here only because the tunnel's TLS needed them first. Their place is
+    beside `config/tls.rs`; that is a move across modules (paths inside the
+    crate change, `lib.rs`'s exports do not) and a step of its own.
+
+The order, when the matrix has run on step 2: `ssh_tunnel.rs` first (its
+lane is the one the local topology can run least of, so it most needs the
+matrix), then `config.rs`, then `client.rs`. Each is one change, verified
+like step 2: the line-by-line count, the public paths unchanged, the live
+suite locally, then the matrix.
+
 ### Phase 6 — the shell and the panels
 
 - `status_bar.rs` (2.0k without tests): the tools menu, the server status
@@ -716,13 +822,14 @@ a wire field or a test name CI selects by.
 | 1 | `main.rs` setup functions | done | `3fd44e2` |
 | 1 | `accounts.rs` seams (analysis) | done | `3fd44e2` |
 | 1 | `accounts.rs` split | done | `3fd44e2` |
-| 2 | eleven long functions | done (with the bridge's `main`, phase 1) | seven in `5590760`; the tree's actions, the root's and the migration window's `render` (pending) |
-| 3 | `ZedisServerState` field map | done: groups, where they meet, what `reset` keeps, the order for step 2 | (pending) |
-| 3 | sub-structs | done: seven groups; the panels' three fields, `terminal` and the errors left as fields | (pending) |
-| 3 | `ServerTask` | done: a variant per operation kept; the background refreshes named once | (pending) |
-| 4 | gate inventory | done: 23 of 24 statement gates up to items, seams or modules; the four `cfg!` asks go through `this_build` | (pending) |
-| 5 | operations ↔ live tests check | not started | |
-| 5 | `tests/live.rs` split | not started | |
+| 2 | eleven long functions | done (with the bridge's `main`, phase 1) | seven in `5590760`; the tree's actions, the root's and the migration window's `render` in `e22ca9a` |
+| 3 | `ZedisServerState` field map | done: groups, where they meet, what `reset` keeps, the order for step 2 | `e22ca9a` |
+| 3 | sub-structs | done: seven groups; the panels' three fields, `terminal` and the errors left as fields | `e22ca9a` |
+| 3 | `ServerTask` | done: a variant per operation kept; the background refreshes named once | `e22ca9a` |
+| 4 | gate inventory | done: 23 of 24 statement gates up to items, seams or modules; the four `cfg!` asks go through `this_build` | `b22963a` |
+| 5 | operations ↔ live tests check | done: 210 operations, all typed; 28 without a live test, listed | (pending) |
+| 5 | `tests/live.rs` split | done: fifteen modules and `main.rs`, the 94 names kept | (pending) |
+| 5 | `client.rs`, `config.rs`, `ssh_tunnel.rs` read for seams | read: ten submodules named; the splits wait for the matrix to have run on step 2 | |
 | 6 | status bar, root, panels | not started | |
 | 7 | transport, updater | not started | |
 | 8 | core, db pass | not started | |
