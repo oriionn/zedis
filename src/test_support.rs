@@ -36,10 +36,17 @@ pub(crate) fn isolate_config() {
 /// What a view needs before a test can build it in a window: the component
 /// library and the app state it reads its preferences from — and nothing of
 /// the user's own. Call it before anything else in a UI test.
+///
+/// Motion is reduced, so a dialog's entrance settles on its first frame. A
+/// click is aimed from one frame and lands a few frames later, and the
+/// entrance runs on the wall clock: on a loaded machine the server form's
+/// Save had slid away by then, and the test waited out its thirty seconds
+/// for a save nobody had pressed.
 pub(crate) fn init_ui(cx: &mut TestAppContext) {
     isolate_config();
     cx.update(gpui_kit::component::init);
     cx.update(|cx| {
+        cx.set_reduce_motion(true);
         let app_state = cx.new(|_| ZedisAppState::default());
         cx.set_global(ZedisGlobalStore::new(app_state));
     });

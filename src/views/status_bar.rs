@@ -52,33 +52,16 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use tracing::{debug, info};
 use zedis_ui::ZedisDivider;
 
-/// The server-status tooltip's first line: which product this is, in its own
-/// version.
-///
-/// `version` is the one the version gates are asked. For Redis and Valkey
-/// that is the product's own, and the line is `Redis 8.6.1` / `Valkey 9.0.3`.
-/// A server that only speaks Redis has a second one — a Dragonfly 2.0.2
-/// answers `redis_version:7.4.0` — and was labelled "Redis 7.4.0", the name
-/// and number of another product. Its own comes first, and the Redis it
-/// claims stays beside it because that is what decides which commands the
-/// app expects of it: `Dragonfly 2.0.2 (Redis 7.4.0)`.
-pub(crate) fn product_line(flavor: ServerFlavor, own_version: &str, version: &str) -> String {
-    let label = flavor.label();
-    if own_version.is_empty() || own_version == version {
-        format!("{label} {version}")
-    } else {
-        format!("{label} {own_version} (Redis {version})")
-    }
-}
+mod editor_controls;
+mod server_status;
+mod telemetry;
+mod tools_menu;
 
-/// Fixed mono width for the latency label (value left-aligned, padding
-/// trailing): 5 chars covers "999ms" / "1.23s" / "--". The heartbeat
-/// refreshes the value every 2s and the
-/// telemetry cluster is right-anchored, so a "9ms" ⇄ "10ms" flip would resize
-/// the (now native, center-justified) latency button and shove the Connected
-/// chip beside it on each beat; padding the value to a fixed mono width keeps
-/// the button width constant instead.
-const LATENCY_LABEL_CHARS: usize = 5;
+use editor_controls::VIEWER_MODES;
+pub(crate) use server_status::product_line;
+use server_status::{format_nodes, format_nodes_description};
+use telemetry::format_latency;
+use tools_menu::ToolsMenuGates;
 
 /// The key count, "listed/total": the keys the tree lists of the ones the
 /// database holds.
@@ -90,42 +73,6 @@ fn format_size(dbsize: Option<u64>, listed: usize) -> SharedString {
         "--".to_string()
     }
     .into()
-}
-/// The green of a healthy link — the latency figure and the "Connected"
-/// label. One value could not serve both themes: `#69b083` is 7.7:1 on the
-/// dark bar and 2.6:1 on the light one, so light takes a darker green
-/// (`#1a7f37`, 5.1:1 on white).
-#[inline]
-fn healthy_color(dark: bool) -> Hsla {
-    rgb(if dark { 0x69b083 } else { 0x1a7f37 }).into()
-}
-/// Formats the latency string and determines the color based on the delay.
-#[inline]
-fn format_latency(latency: Option<Duration>, cx: &Context<ZedisStatusBar>) -> (SharedString, Hsla) {
-    let Some(latency) = latency else {
-        return ("--".into(), cx.theme().primary);
-    };
-    let ms = latency.as_millis();
-    let theme = cx.theme();
-    let color = match ms {
-        // Healthy latency uses the same green as the "Connected" label.
-        0..50 => healthy_color(theme.is_dark()),
-        50..500 => theme.yellow,
-        _ => theme.red,
-    };
-    let label = if ms < 1000 {
-        format!("{ms}ms")
-    } else {
-        format!("{:.2}s", ms as f64 / 1000.0)
-    };
-    (label.into(), color)
-}
-
-/// Formats the node count only (`masters / replicas`). Redis version lives
-/// in the nodes tooltip so the bar stays short.
-#[inline]
-fn format_nodes(nodes: (usize, usize)) -> SharedString {
-    format!("{} / {}", nodes.0, nodes.1).into()
 }
 
 /// The design's recessive status-bar text color (t2): `#878d97` dark /
@@ -140,114 +87,7 @@ fn status_text_color(is_dark: bool) -> Hsla {
     }
 }
 
-/// Build the multi-line tooltip body. `replicas` is the dynamic per-replica
-/// state from the most recent `INFO replication` heartbeat — used to splice
-/// `lag X / Ys` onto the matching topology line. Falls back gracefully when
-/// the lag map has nothing for a given replica address (e.g. a fail node).
-///
-/// `version` is shown here (not in the bar label) so the compact
-/// `masters / replicas` chip stays short.
-#[inline]
-fn format_nodes_description(
-    description: Arc<RedisClientDescription>,
-    replicas: &[ReplicaInfo],
-    version: &str,
-    cx: &Context<ZedisStatusBar>,
-) -> SharedString {
-    let t = i18n_sidebar(cx, "server_type");
-    let master_nodes = i18n_sidebar(cx, "master_nodes");
-    let slave_nodes = i18n_sidebar(cx, "slave_nodes");
-    let modules_label = i18n_sidebar(cx, "modules");
-    let topology_label = i18n_sidebar(cx, "topology");
-    let mut messages = Vec::with_capacity(6);
-
-    // One product line: `Valkey 9.0.3` / `Redis 8.6.1`. The version was
-    // read from `valkey_version` when the server is Valkey, so the old
-    // "Valkey: Yes" + "Redis version: 9.0.3" pair labeled a Valkey version
-    // as Redis; the product name needs no translation and says both facts
-    // at once.
-    if !version.is_empty() {
-        messages.push(product_line(description.flavor, &description.flavor_version, version));
-    } else if description.flavor != ServerFlavor::Redis {
-        messages.push(description.flavor.label().to_string());
-    }
-    messages.push(format!("{t}: {}", description.server_type.as_str()));
-    if description.topology.is_empty() {
-        // Fallback for standalone or any client without grouped topology data.
-        messages.push(format!("{master_nodes}: {}", description.master_nodes));
-        if !replicas.is_empty() {
-            // Plain (non-Sentinel) master-replica: node discovery only lists
-            // the configured node, but the heartbeat's `INFO replication`
-            // still reports the attached replicas — render them here with
-            // the same lag/state detail the topology branch shows, instead
-            // of silently dropping them.
-            let mut lines: Vec<String> = vec![format!("{slave_nodes}:")];
-            for lag in replicas {
-                let mut line = format!(
-                    "  ↳ {} replica  lag {} / {}s",
-                    lag.addr,
-                    format_lag_bytes(lag.lag_bytes),
-                    lag.lag_seconds
-                );
-                // Surface non-steady states (wait_bgsave / send_bulk / etc.).
-                if !lag.state.is_empty() && lag.state.as_ref() != "online" {
-                    line.push_str("  ");
-                    line.push_str(lag.state.as_ref());
-                }
-                lines.push(line);
-            }
-            messages.push(lines.join("\n"));
-        } else if !description.slave_nodes.is_empty() {
-            messages.push(format!("{slave_nodes}: {}", description.slave_nodes));
-        }
-    } else {
-        let mut lines: Vec<String> = vec![format!("{topology_label}:")];
-        for tm in description.topology.iter() {
-            let mut header = format!("{} {} master", tm.master.role_marker, tm.master.addr);
-            if !tm.master.annotation.is_empty() {
-                header.push_str("  ");
-                header.push_str(tm.master.annotation.as_ref());
-            }
-            lines.push(header);
-            for r in &tm.replicas {
-                let mut line = format!("  {} {} replica", r.role_marker, r.addr);
-                if let Some(lag) = replicas.iter().find(|i| i.addr == r.addr) {
-                    line.push_str(&format!(
-                        "  lag {} / {}s",
-                        format_lag_bytes(lag.lag_bytes),
-                        lag.lag_seconds
-                    ));
-                    // Surface non-steady states (wait_bgsave / send_bulk / etc.).
-                    // "online" is the silent default and would just be noise.
-                    if !lag.state.is_empty() && lag.state.as_ref() != "online" {
-                        line.push_str("  ");
-                        line.push_str(lag.state.as_ref());
-                    }
-                }
-                lines.push(line);
-            }
-        }
-        messages.push(lines.join("\n"));
-    }
-    if !description.modules.is_empty() {
-        messages.push(format!("{modules_label}: {}", description.modules));
-    }
-    messages.join("\n").into()
-}
-
 // --- Local State ---
-
-/// Everything that decides which Tools-menu entries are enabled: the
-/// module / version / server-type gates, the access mode (Import Keys and
-/// FLUSH need writes), and the probed command matrix.
-struct ToolsMenuGates {
-    supports_search: bool,
-    supports_acl: bool,
-    supports_functions: bool,
-    supports_topology: bool,
-    readonly: bool,
-    features: Arc<ServerFeatures>,
-}
 
 /// Make `db` the database select's committed choice, unless it already is.
 ///
@@ -269,32 +109,6 @@ fn commit_selected_db(
     }
 }
 
-/// One Tools-menu entry, built when the menu opens and moved into the
-/// submenu that draws it.
-struct ToolEntry {
-    label: SharedString,
-    icon: Icon,
-    action: ServerToolsAction,
-    disabled: bool,
-}
-
-/// Inputs for a clickable status-bar metric chip (icon + value → tool page).
-struct MetricChip {
-    id: &'static str,
-    icon: CustomIconName,
-    label: SharedString,
-    label_color: Hsla,
-    icon_color: Hsla,
-    tooltip: SharedString,
-    view: ServerView,
-    /// Set when the destination panel can't work on this server: the chip is
-    /// disabled and this replaces the tooltip.
-    disabled_reason: Option<SharedString>,
-    /// What the number counts — "clients", "slow" — and the colour to say
-    /// it in, when the bar has room for it ([`ZedisStatusBar::shows_units`]).
-    unit: Option<(SharedString, Hsla)>,
-}
-
 /// The content width from which the bar names its counts ("0 / 2 clients"
 /// rather than "0 / 2" beside an icon), and the wider one it needs while the
 /// editor's own controls (Soft Wrap, the format, the Viewer) share the bar.
@@ -308,10 +122,6 @@ const EDITOR_CONTROLS_MIN_WIDTH: f32 = 1120.;
 /// icon, with the editor's controls (folded) on the bar and without them.
 const LINK_LABEL_MIN_WIDTH_WITH_EDITOR: f32 = 860.;
 const LINK_LABEL_MIN_WIDTH: f32 = 810.;
-/// The Viewer menu's width: its longest choice, the tick and the paddings.
-const VIEWER_MENU_WIDTH: f32 = 96.;
-/// The viewers a string can be shown in, in the Viewer picker's order.
-const VIEWER_MODES: [ViewMode; 3] = [ViewMode::Auto, ViewMode::Plain, ViewMode::Hex];
 
 /// What the bar has room for, from the most to the least. A bar that has to
 /// stay one line gives things up in this order, and whole: first the words
@@ -778,933 +588,6 @@ impl ZedisStatusBar {
             }
         }));
     }
-    /// Build the "Tools" dropdown: four submenus by purpose — observability,
-    /// query & scripting, keys & data, administration — then Topology and the
-    /// capability matrix, so the top level stays eight rows however many
-    /// panels the server can open. Items dispatch [`ServerToolsAction`],
-    /// handled centrally on the `Zedis` root; a submenu inherits the
-    /// dropdown's action context, so its items reach the same handlers.
-    ///
-    /// What the server does not have — a module that is not loaded, a
-    /// version below the feature's floor, a command it answers `unknown
-    /// command` to — is left out rather than greyed: it is nothing this user
-    /// can change, the ⌘K palette leaves it out the same way, and Server
-    /// capabilities lists every command with its verdict. What can change
-    /// stays in the menu, disabled with the reason: a command this ACL user
-    /// is denied, and a write on a read-only connection. A submenu with
-    /// nothing left in it is left out too.
-    fn render_tools_menu(
-        this: PopupMenu,
-        gates: &ToolsMenuGates,
-        window: &mut Window,
-        cx: &mut Context<PopupMenu>,
-    ) -> PopupMenu {
-        let ToolsMenuGates {
-            supports_search,
-            supports_acl,
-            supports_functions,
-            supports_topology,
-            readonly,
-            features,
-        } = gates;
-        let features: &ServerFeatures = features;
-        let locale = cx.global::<ZedisGlobalStore>().read(cx).locale().to_string();
-        let tool = |label: SharedString,
-                    icon: Icon,
-                    action: ServerToolsAction,
-                    required: &[ServerCommand],
-                    writes: bool|
-         -> Option<ToolEntry> {
-            let statuses: Vec<(ServerCommand, CommandStatus)> = required
-                .iter()
-                .map(|command| (*command, features.status(*command)))
-                .filter(|(_, status)| !status.is_usable())
-                .collect();
-            if statuses.iter().any(|(_, status)| *status == CommandStatus::Missing) {
-                return None;
-            }
-            // Read-only wins the wording: it is the reason the user can undo.
-            let reason = if writes && *readonly {
-                Some(i18n_common(cx, "disable_in_readonly"))
-            } else {
-                statuses.first().map(|(command, _)| {
-                    t!("features.menu_suffix", command = command.label(), locale = &locale)
-                        .to_string()
-                        .into()
-                })
-            };
-            Some(ToolEntry {
-                label: match &reason {
-                    Some(reason) => format!("{label}  ·  {reason}").into(),
-                    None => label,
-                },
-                icon,
-                action,
-                disabled: reason.is_some(),
-            })
-        };
-
-        // A panel this build does not have is not listed
-        // (`ServerView::in_this_build`): the browser has no `MONITOR`, no
-        // keyspace events, no Pub/Sub and no Topology, and an entry that
-        // opened a page saying so was an entry to nothing.
-        let observability: Vec<ToolEntry> = [
-            ServerView::Monitor
-                .in_this_build()
-                .then(|| {
-                    tool(
-                        i18n_monitor(cx, "title"),
-                        Icon::new(CustomIconName::Radar),
-                        ServerToolsAction::Monitor,
-                        ServerView::Monitor.required_commands(),
-                        false,
-                    )
-                })
-                .flatten(),
-            tool(
-                i18n_server_load(cx, "title"),
-                Icon::new(CustomIconName::Zap),
-                ServerToolsAction::ServerLoad,
-                ServerView::ServerLoad.required_commands(),
-                false,
-            ),
-            // HOTKEYS tracking — Redis 8.6; absent from the menu elsewhere.
-            tool(
-                i18n_hotkeys(cx, "title"),
-                Icon::new(CustomIconName::Flame),
-                ServerToolsAction::Hotkeys,
-                ServerView::Hotkeys.required_commands(),
-                false,
-            ),
-            // `notify-keyspace-events` may be empty: the panel offers a
-            // one-click Enable. Its hard dependency is SUBSCRIBE.
-            ServerView::KeyspaceNotifications
-                .in_this_build()
-                .then(|| {
-                    tool(
-                        i18n_keyspace_notifications(cx, "title"),
-                        Icon::new(CustomIconName::AudioWaveform),
-                        ServerToolsAction::KeyspaceNotifications,
-                        ServerView::KeyspaceNotifications.required_commands(),
-                        false,
-                    )
-                })
-                .flatten(),
-            // RedisTimeSeries only.
-            tool(
-                i18n_timeseries(cx, "explorer_title"),
-                Icon::new(CustomIconName::Activity),
-                ServerToolsAction::TimeSeriesExplorer,
-                ServerView::TimeSeriesExplorer.required_commands(),
-                false,
-            ),
-            // Pub/Sub is the editor suite's channel mode, mirrored here next
-            // to its observability siblings.
-            tool(
-                i18n_key_tree(cx, "pubsub_mode"),
-                Icon::new(CustomIconName::Rss),
-                ServerToolsAction::PubsubMode,
-                &[],
-                false,
-            ),
-            tool(
-                i18n_server_info(cx, "title"),
-                Icon::new(IconName::Info),
-                ServerToolsAction::ServerInfo,
-                ServerView::ServerInfo.required_commands(),
-                false,
-            ),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-
-        let scripting: Vec<ToolEntry> = [
-            tool(
-                i18n_value_search(cx, "title"),
-                Icon::new(IconName::Search),
-                ServerToolsAction::ValueSearch,
-                ServerView::ValueSearch.required_commands(),
-                false,
-            ),
-            // RediSearch / valkey-search, when the module is loaded.
-            supports_search
-                .then(|| {
-                    tool(
-                        i18n_search(cx, "title"),
-                        Icon::new(IconName::Search),
-                        ServerToolsAction::Search,
-                        ServerView::Search.required_commands(),
-                        false,
-                    )
-                })
-                .flatten(),
-            // `FUNCTION`, Redis 7.0+.
-            supports_functions
-                .then(|| {
-                    tool(
-                        i18n_functions(cx, "title"),
-                        Icon::new(IconName::Asterisk),
-                        ServerToolsAction::Functions,
-                        ServerView::Functions.required_commands(),
-                        false,
-                    )
-                })
-                .flatten(),
-            // The saved scripts are local, so the library opens everywhere;
-            // running one needs EVAL and degrades inside.
-            tool(
-                i18n_lua_scripts(cx, "title"),
-                Icon::new(IconName::SquareTerminal),
-                ServerToolsAction::LuaScripts,
-                &[],
-                false,
-            ),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-
-        let mut data: Vec<ToolEntry> = Vec::new();
-        // The recycle bin — the local database's, or the bridge's.
-        data.extend(tool(
-            i18n_trash(cx, "menu"),
-            Icon::new(CustomIconName::FileXCorner),
-            ServerToolsAction::Trash,
-            &[],
-            false,
-        ));
-        // Import opens a window of its own over a file it streams: desktop
-        // only. RESTORE: disabled, not hidden, on a read-only connection so
-        // the user knows where it lives.
-        #[cfg(not(target_family = "wasm"))]
-        data.extend(tool(
-            i18n_status_bar(cx, "import_keys_menu"),
-            Icon::new(CustomIconName::Upload),
-            ServerToolsAction::ImportKeys,
-            &[],
-            true,
-        ));
-        // Export: the migration window on the desktop, a download in a page.
-        if saves_files() {
-            data.extend(tool(
-                i18n_status_bar(cx, "export_keys_menu"),
-                Icon::new(CustomIconName::Download),
-                ServerToolsAction::ExportKeys,
-                &[],
-                false,
-            ));
-        }
-        // A window on the desktop, a dialog in the browser.
-        data.extend(tool(
-            i18n_status_bar(cx, "compare_keys_menu"),
-            Icon::new(CustomIconName::GitCompareArrows),
-            ServerToolsAction::CompareKeys,
-            &[],
-            false,
-        ));
-
-        let mut admin: Vec<ToolEntry> = [
-            // CONFIG GET is the one managed clouds most often take away.
-            tool(
-                i18n_config_editor(cx, "title"),
-                Icon::new(IconName::Settings),
-                ServerToolsAction::Config,
-                ServerView::Config.required_commands(),
-                false,
-            ),
-            // ACL, Redis 6.0+.
-            supports_acl
-                .then(|| {
-                    tool(
-                        i18n_acl(cx, "title"),
-                        Icon::new(IconName::CircleUser),
-                        ServerToolsAction::Acl,
-                        ServerView::Acl.required_commands(),
-                        false,
-                    )
-                })
-                .flatten(),
-            tool(
-                i18n_persistence(cx, "title"),
-                Icon::new(CustomIconName::HardDrive),
-                ServerToolsAction::Persistence,
-                ServerView::Persistence.required_commands(),
-                false,
-            ),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        // FLUSHDB / FLUSHALL go through the same destructive-command confirm
-        // a typed one hits in the terminal: the menu adds an entry point, not
-        // a second policy. Kept apart from the panels below a divider.
-        let flush: Vec<ToolEntry> = [
-            tool(
-                i18n_status_bar(cx, "flush_db_menu"),
-                Icon::new(CustomIconName::Eraser),
-                ServerToolsAction::FlushDb,
-                &[ServerCommand::FlushDb],
-                true,
-            ),
-            tool(
-                i18n_status_bar(cx, "flush_all_menu"),
-                Icon::new(CustomIconName::DatabaseZap),
-                ServerToolsAction::FlushAll,
-                &[ServerCommand::FlushAll],
-                true,
-            ),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        let flush_after = (!admin.is_empty() && !flush.is_empty()).then_some(admin.len());
-        admin.extend(flush);
-
-        let groups = [
-            (
-                Icon::new(IconName::ChartPie),
-                i18n_status_bar(cx, "group_observability"),
-                observability,
-                None,
-            ),
-            (
-                Icon::new(CustomIconName::Braces),
-                i18n_status_bar(cx, "group_scripting"),
-                scripting,
-                None,
-            ),
-            (
-                Icon::new(CustomIconName::Database),
-                i18n_status_bar(cx, "group_data"),
-                data,
-                None,
-            ),
-            (
-                Icon::new(IconName::Settings),
-                i18n_status_bar(cx, "group_admin"),
-                admin,
-                flush_after,
-            ),
-        ];
-        let topology_label = i18n_topology(cx, "title");
-        // The probed command matrix: a count suffix here rather than a badge
-        // in the bar.
-        let unusable = features.unusable().len();
-        let capabilities_label: SharedString = if unusable == 0 {
-            format!("{}…", i18n_features(cx, "dialog_title")).into()
-        } else {
-            format!(
-                "{}…  ·  {}",
-                i18n_features(cx, "dialog_title"),
-                t!("status_bar.capabilities_limited", count = unusable, locale = &locale)
-            )
-            .into()
-        };
-
-        let mut menu = this;
-        for (icon, label, entries, separator_at) in groups {
-            if entries.is_empty() {
-                continue;
-            }
-            menu = menu.submenu_with_icon(Some(icon), label, window, cx, move |mut submenu, _, _| {
-                for (index, entry) in entries.iter().enumerate() {
-                    if separator_at == Some(index) {
-                        submenu = submenu.separator();
-                    }
-                    submenu = submenu.menu_with_icon_and_disabled(
-                        entry.label.clone(),
-                        entry.icon.clone(),
-                        Box::new(entry.action),
-                        entry.disabled,
-                    );
-                }
-                submenu
-            });
-        }
-        // The page adapts to Cluster / Sentinel / Standalone; absent only
-        // while the server type is unknown.
-        if *supports_topology && ServerView::Topology.in_this_build() {
-            menu = menu.menu_with_icon(
-                topology_label,
-                Icon::new(CustomIconName::Network),
-                Box::new(ServerToolsAction::Topology),
-            );
-        }
-        menu.menu_with_icon(
-            capabilities_label,
-            Icon::new(CustomIconName::ListCheck),
-            Box::new(ServerToolsAction::Capabilities),
-        )
-        // Everything the server says about itself, read once, to paste into
-        // a ticket — beside the matrix, the other thing asked of a server
-        // that misbehaves.
-        .menu_with_icon(
-            i18n_troubleshoot(cx, "menu"),
-            // Two `IconName`s are in scope here: the component set's has no
-            // FileText.
-            Icon::new(gpui_kit::assets::IconName::FileText),
-            Box::new(ServerToolsAction::TroubleshootingReport),
-        )
-    }
-    /// Render the server status
-    /// DB-dropdown menu width, hugging the current content: the default
-    /// (`Length::Auto`) follows the narrow "DB N ▾" trigger and clips the
-    /// key counts, while any fixed width leaves blank space when counts
-    /// are small or absent. Sized from the widest count in the current
-    /// snapshot instead.
-    fn db_menu_width(&self) -> Pixels {
-        // px_2 row padding (16) + label column + gap to the check icon (4)
-        // + xsmall check icon (~14) + rounding slack (4).
-        let mut width = 16. + DB_LABEL_COL_W + 4. + 14. + 4.;
-        let max_keys = self.db_key_counts.iter().copied().max().unwrap_or(0);
-        if max_keys > 0 {
-            // gap_3 (12) + the widest grouped count at the mono advance.
-            width += 12. + group_thousands(max_keys).len() as f32 * DB_MENU_CHAR_W;
-        }
-        px(width)
-    }
-
-    fn render_server_status(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let nodes_unit = self
-            .shows_units(window, cx)
-            .then(|| (i18n_status_bar(cx, "unit_nodes"), cx.theme().muted_foreground));
-        let server_state = &self.state.server_state;
-        let is_completed = server_state.scan_finished;
-        // Read live, not from the snapshot: a scan round starts on this
-        // button's own press, which is no server event.
-        let scanning = self.server_state.read(cx).scanning();
-        let nodes_description = server_state.nodes_description.clone();
-        let terminal_tooltip = with_hot_key("terminal", &i18n_status_bar(cx, "toggle_terminal_tooltip"));
-        let readonly_tooltip = i18n_status_bar(cx, "toggle_readonly_tooltip");
-        let tag_text = server_state.tag.clone();
-        let tag_chip = resolve_tag_chip(server_state.tag_color_key.as_deref(), cx.theme().is_dark());
-        let is_replica = server_state.is_replica;
-        let supports_search = server_state.supports_search;
-        let supports_acl = server_state.supports_acl;
-        let supports_functions = server_state.supports_functions;
-        let supports_topology = server_state.supports_topology;
-        let readonly = self.readonly;
-        let features = server_state.features.clone();
-        let gates = ToolsMenuGates {
-            supports_search,
-            supports_acl,
-            supports_functions,
-            supports_topology,
-            readonly,
-            features,
-        };
-        let status_text = status_text_color(cx.theme().is_dark());
-        ZedisDivider::new()
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .when(!tag_text.is_empty() && tag_chip.is_some(), |this| {
-                        let (bg, fg) = tag_chip.unwrap_or_else(|| (gpui::black(), gpui::white()));
-                        this.child(
-                            div()
-                                .px_1p5()
-                                .rounded_sm()
-                                .bg(bg)
-                                .child(Label::new(tag_text).text_xs().text_color(fg)),
-                        )
-                    })
-                    // Quiet outline badge when the connection points at a
-                    // replica (`role:slave`) — without it the only signal is a
-                    // bare `-READONLY` error on the first write.
-                    .when(is_replica, |this| {
-                        let replica_tooltip = i18n_status_bar(cx, "replica_badge_tooltip");
-                        this.child(
-                            div()
-                                .id("zedis-status-bar-replica-badge")
-                                .px_1p5()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(cx.theme().warning)
-                                .tooltip(move |window, cx| Tooltip::new(replica_tooltip.clone()).build(window, cx))
-                                .child(
-                                    Label::new(i18n_status_bar(cx, "replica_badge"))
-                                        .text_xs()
-                                        .text_color(cx.theme().warning),
-                                ),
-                        )
-                    })
-                    .child(
-                        Button::new("zedis-status-bar-server-terminal")
-                            .ghost()
-                            .small()
-                            .tooltip(terminal_tooltip)
-                            .icon(Icon::new(IconName::SquareTerminal).text_color(status_text))
-                            .on_click(cx.listener(|this, _, _window, cx| {
-                                this.server_state.update(cx, |state, cx| {
-                                    state.toggle_terminal(cx);
-                                });
-                            })),
-                    )
-                    .when(self.databases > 1, |this| {
-                        // `appearance(false)`: drop the bordered input chrome so it
-                        // reads as plain "DB N ▾" text that inherits the muted
-                        // status-bar color (matches the design), not a bright box.
-                        // The tooltip names what the per-row numbers are — the
-                        // dropdown shows bare counts with no unit, and on a
-                        // multi-master setup they are sums across nodes.
-                        let db_tooltip = i18n_status_bar(cx, "db_tooltip");
-                        let menu_open = self.db_menu_open;
-                        this.child(
-                            div()
-                                .id("zedis-status-bar-db-select")
-                                .when(!menu_open, |this| {
-                                    this.tooltip(move |window, cx| Tooltip::new(db_tooltip.clone()).build(window, cx))
-                                })
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _window, cx| {
-                                        this.db_menu_open = true;
-                                        cx.notify();
-                                    }),
-                                )
-                                .child(
-                                    Select::new(&self.db_state)
-                                        .small()
-                                        .appearance(false)
-                                        .menu_width(self.db_menu_width()),
-                                ),
-                        )
-                    })
-                    // Clients paused — by this app (remembered), or by anyone
-                    // where the server says so (Valkey 8.1+): the state in
-                    // which every write hangs and nothing else on screen
-                    // explains why. The click lifts it.
-                    .when_some(self.server_state.read(cx).client_pause(), |this, pause| {
-                        let seconds = pause.remaining.as_secs().to_string();
-                        let label = i18n_status_bar(cx, "paused_chip")
-                            .replace("%{actions}", &pause.actions)
-                            .replace("%{seconds}", &seconds);
-                        let tooltip: SharedString = if pause.from_server {
-                            i18n_status_bar(cx, "paused_tooltip_server")
-                                .replace("%{actions}", &pause.actions)
-                                .replace("%{reason}", pause.reason.as_deref().unwrap_or("-"))
-                                .replace("%{seconds}", &seconds)
-                                .into()
-                        } else {
-                            i18n_status_bar(cx, "paused_tooltip_local")
-                                .replace("%{actions}", &pause.actions)
-                                .replace("%{seconds}", &seconds)
-                                .into()
-                        };
-                        this.child(
-                            Button::new("zedis-status-bar-client-pause")
-                                .warning()
-                                .small()
-                                .compact()
-                                .icon(Icon::new(CustomIconName::Clock3))
-                                .label(label)
-                                .tooltip(tooltip)
-                                .on_click(cx.listener(|this, _, _window, cx| {
-                                    this.server_state.update(cx, |state, cx| state.unpause_clients(cx));
-                                })),
-                        )
-                    })
-                    .child({
-                        // A locked entry's lock is a window, not a switch (ADR
-                        // 14): closed, the button asks the lock's question and
-                        // opens it for a while; open, it shows what is left and
-                        // closes it. Any other entry keeps the plain toggle.
-                        let (windowed, remaining) = {
-                            let state = self.server_state.read(cx);
-                            // Not for an account or ACL user that may not
-                            // write at all: there is no window to open.
-                            (
-                                state.write_locked() && !state.strict_readonly(),
-                                state.unlock_remaining(),
-                            )
-                        };
-                        let minutes_left = remaining.map(|left| left.as_secs().div_ceil(60));
-                        let tooltip: SharedString = match (windowed, minutes_left) {
-                            (true, Some(minutes)) => i18n_status_bar(cx, "unlocked_tooltip")
-                                .replace("%{minutes}", &minutes.to_string())
-                                .into(),
-                            (true, None) => i18n_status_bar(cx, "write_locked_tooltip")
-                                .replace("%{minutes}", &(WRITE_UNLOCK_SECS / 60).to_string())
-                                .into(),
-                            (false, _) => readonly_tooltip,
-                        };
-                        Button::new("zedis-status-bar-server-toggle-readonly")
-                            .ghost()
-                            .small()
-                            .tooltip(tooltip)
-                            .when(self.readonly, |this| {
-                                this.icon(Icon::new(CustomIconName::Lock).text_color(status_text))
-                            })
-                            .when(!self.readonly, |this| {
-                                this.icon(Icon::new(CustomIconName::LockOpen).text_color(status_text))
-                            })
-                            .when_some(minutes_left.filter(|_| windowed), |this, minutes| {
-                                this.label(
-                                    i18n_status_bar(cx, "unlocked_chip").replace("%{minutes}", &minutes.to_string()),
-                                )
-                            })
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                if !windowed {
-                                    this.server_state.update(cx, |state, cx| state.toggle_readonly(cx));
-                                    return;
-                                }
-                                if minutes_left.is_some() {
-                                    this.server_state.update(cx, |state, cx| state.lock_writes(cx));
-                                    return;
-                                }
-                                let Ok(server) = get_server(this.server_state.read(cx).server_id()) else {
-                                    return;
-                                };
-                                let server_state = this.server_state.clone();
-                                confirm_dangerous_command(
-                                    &server,
-                                    server_state.read(cx).db(),
-                                    &DangerKind::WriteLocked,
-                                    None,
-                                    window,
-                                    cx,
-                                    move |_, cx| {
-                                        server_state.update(cx, |state, cx| state.unlock_writes(cx));
-                                    },
-                                );
-                            }))
-                    })
-                    .child(
-                        Button::new("zedis-status-bar-tools")
-                            .ghost()
-                            .small()
-                            .icon(Icon::new(IconName::Menu).text_color(status_text))
-                            .tooltip(i18n_status_bar(cx, "tools_tooltip"))
-                            // Status bar sits at the bottom, so open the menu
-                            // upward (its bottom edge anchored to the button).
-                            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |this, window, cx| {
-                                Self::render_tools_menu(this, &gates, window, cx)
-                            }),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new("zedis-status-bar-scan-more")
-                            .ghost()
-                            .small()
-                            .disabled(is_completed)
-                            .loading(scanning && !is_completed)
-                            .tooltip(if is_completed {
-                                i18n_status_bar(cx, "scan_completed")
-                            } else {
-                                i18n_status_bar(cx, "scan_more_keys")
-                            })
-                            .mr_1()
-                            .icon(Icon::new(CustomIconName::ChevronsDown).text_color(status_text))
-                            .on_click(cx.listener(|this, _, _window, cx| {
-                                this.server_state.update(cx, |state, cx| {
-                                    state.scan_next(cx);
-                                });
-                                cx.notify();
-                            })),
-                    )
-                    .child({
-                        // Two bare numbers: the tooltip says which is which.
-                        let key_count_tooltip = i18n_status_bar(cx, "key_count_tooltip");
-                        div()
-                            .id("zedis-status-bar-key-count")
-                            .mr_2()
-                            .tooltip(move |window, cx| Tooltip::new(key_count_tooltip.clone()).build(window, cx))
-                            .child(Label::new(server_state.size.clone()).text_color(status_text))
-                    })
-                    .child(
-                        div()
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .child(Icon::new(CustomIconName::Network).text_color(status_text).mr_1())
-                                    .child(Label::new(server_state.nodes.clone()).text_color(status_text))
-                                    .when_some(nodes_unit, |this, (unit, color)| {
-                                        this.child(Label::new(unit).text_xs().text_color(color).ml_1())
-                                    }),
-                            )
-                            .id("zedis-servers")
-                            .tooltip(move |window, cx| Tooltip::new(nodes_description.clone()).build(window, cx)),
-                    ),
-            )
-    }
-    /// Render the right-hand telemetry cluster: a "Connected" health indicator
-    /// (with one-click reconnect when the link is down) followed by the live
-    /// metric chips — latency / memory / clients / slow log.
-    fn render_telemetry(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let server_state = &self.state.server_state;
-        let shows_units = self.shows_units(window, cx);
-        let unit_color = cx.theme().muted_foreground;
-        let unit = |key: &str| shows_units.then(|| (i18n_status_bar(cx, key), unit_color));
-        // Health icon + label. A chain link (connected) vs a broken one (link
-        // down) carries the state in the *shape*, not just the color — a bare
-        // colored dot was too easy to miss. Colors mirror the latency palette so
-        // the cluster reads as one health unit.
-        //
-        // `Unknown` (still connecting) keeps the intact link at the muted color:
-        // nothing is broken yet, so a red-flavoured "unlink" would over-alarm.
-        let (health_color, health_icon, health_label) = match server_state.health {
-            ConnectionHealth::Connected => (
-                healthy_color(cx.theme().is_dark()),
-                CustomIconName::Link,
-                i18n_status_bar(cx, "conn_connected"),
-            ),
-            ConnectionHealth::Reconnecting => (
-                cx.theme().yellow,
-                CustomIconName::Unlink,
-                i18n_status_bar(cx, "conn_reconnecting"),
-            ),
-            ConnectionHealth::Offline => (
-                cx.theme().red,
-                CustomIconName::Unlink,
-                i18n_status_bar(cx, "conn_offline"),
-            ),
-            ConnectionHealth::Unknown => (
-                cx.theme().muted_foreground,
-                CustomIconName::Link,
-                i18n_status_bar(cx, "conn_connecting"),
-            ),
-        };
-        // When the link is down the icon doubles as a one-click reconnect
-        // affordance. The heartbeat alone leaves `server_status` Idle, so a
-        // plain re-select would no-op — `reconnect()` forces the reload.
-        let is_link_down = matches!(
-            server_state.health,
-            ConnectionHealth::Offline | ConnectionHealth::Reconnecting
-        );
-        // Connected → the icon doubles as a one-click *disconnect*; when down it's
-        // a *reconnect*. `Unknown` (still connecting) stays inert.
-        let is_connected = server_state.health == ConnectionHealth::Connected;
-        let icon_clickable = is_link_down || is_connected;
-        let health_tooltip = if is_link_down {
-            let hint = i18n_status_bar(cx, "conn_reconnect_hint");
-            let reason = i18n_status_bar(cx, server_state.last_connection_error.reason_key());
-            format!("{reason} · {hint}").into()
-        } else if is_connected {
-            format!("{} · {}", health_label, i18n_status_bar(cx, "conn_disconnect_hint")).into()
-        } else {
-            health_label.clone()
-        };
-        // When the link is down the cached latency is stale and misleading
-        // (a green "5ms" beside a red dot), so blank it to a muted "--".
-        // Chips whose panel can't work on this server are disabled with the
-        // reason as tooltip (computed up front: the closure borrows `cx`).
-        let features = server_state.features.clone();
-        let block = |view: ServerView| -> Option<SharedString> {
-            features
-                .first_unusable(view.required_commands())
-                .map(|(command, status)| command_status_label(cx, command, status))
-        };
-        // The memory and clients chips show numbers that are `INFO`'s. For
-        // a user who may not run it they read "--", and the tooltip says why
-        // where it would have named the number.
-        let info_reason = features
-            .first_unusable(&[ServerCommand::Info])
-            .map(|(command, status)| command_status_label(cx, command, status));
-        let stat_hint = |key: &str| info_reason.clone().unwrap_or_else(|| i18n_status_bar(cx, key));
-        let chip_blocks = [
-            (ServerView::Metrics, block(ServerView::Metrics)),
-            (ServerView::MemoryAnalysis, block(ServerView::MemoryAnalysis)),
-            (ServerView::Clients, block(ServerView::Clients)),
-            (ServerView::Slowlog, block(ServerView::Slowlog)),
-        ];
-        let chip_block = |view: ServerView| -> Option<SharedString> {
-            chip_blocks
-                .iter()
-                .find(|(v, _)| *v == view)
-                .and_then(|(_, reason)| reason.clone())
-        };
-        let (latency_text, latency_color) = if server_state.health == ConnectionHealth::Offline {
-            (SharedString::from("--"), cx.theme().muted_foreground)
-        } else {
-            server_state.latency.clone()
-        };
-        // Left-aligned, fixed mono width: the padding trails the value so the
-        // button width stays constant (no resize jogging the Connected chip each
-        // beat) while the number sits at the left edge of its slot.
-        let latency_text: SharedString =
-            format!("{:<width$}", latency_text.as_ref(), width = LATENCY_LABEL_CHARS).into();
-        let status_text = status_text_color(cx.theme().is_dark());
-        let link_label = self.bar_fit(window, cx) < BarFit::LinkIconOnly;
-        ZedisDivider::new()
-            .child(
-                // One native ghost button covering icon + label, so the whole
-                // "Connected" chip is the click target (disconnect when up /
-                // reconnect when down) with the same hover background as the
-                // metric chips and the left-side buttons — the label used to sit
-                // outside the button and wasn't clickable. The icon keeps its own
-                // health color (`.text_color` colors only the label); inert while
-                // still connecting.
-                Button::new("zedis-status-bar-conn-health")
-                    .ghost()
-                    .small()
-                    // Dense status-bar row: small's default px_3 leaves too much
-                    // air between adjacent chips; compact → px_1p5.
-                    .compact()
-                    .disabled(!icon_clickable)
-                    // Where the bar is short of room the icon says it alone,
-                    // and the tooltip still in words.
-                    .icon(
-                        Icon::new(health_icon)
-                            .when(link_label, |icon| icon.mr_1())
-                            .text_color(health_color),
-                    )
-                    .when(link_label, |button| button.label(health_label))
-                    .text_color(status_text)
-                    .tooltip(health_tooltip)
-                    .on_click(cx.listener(move |this, _, _window, cx| {
-                        this.server_state.update(cx, |state, cx| {
-                            if is_connected {
-                                state.disconnect(cx);
-                            } else {
-                                state.reconnect(cx);
-                            }
-                        });
-                    })),
-            )
-            // The link is down because a script has the server: reconnecting
-            // cannot help, the kill can — offered right where the reason is
-            // shown, on a connection a BUSY server still answers.
-            .when(
-                kills_runaway_scripts()
-                    && is_link_down
-                    && server_state.last_connection_error == ConnectionErrorKind::Busy,
-                |this| {
-                    this.child(
-                        Button::new("zedis-status-bar-kill-script")
-                            .danger()
-                            .small()
-                            .compact()
-                            .label(i18n_common(cx, "kill_script_button"))
-                            .tooltip(i18n_common(cx, "kill_script_tooltip"))
-                            .on_click(cx.listener(|this, _, _window, cx| {
-                                this.server_state
-                                    .update(cx, |state, cx| state.kill_running_script(KillTarget::Script, cx));
-                            })),
-                    )
-                },
-            )
-            .child(
-                h_flex()
-                    .items_center()
-                    // Chip internal padding already separates them; gap_1 is
-                    // enough once buttons are compact (gap_2 looked sparse).
-                    .gap_1()
-                    // Whole chip is clickable (icon + value), with a tooltip that
-                    // names both the metric and the destination page.
-                    .child(Self::metric_chip(MetricChip {
-                        disabled_reason: chip_block(ServerView::Metrics),
-                        id: "zedis-status-bar-server-metrics",
-                        unit: None,
-                        icon: CustomIconName::Activity,
-                        label: latency_text,
-                        label_color: latency_color,
-                        icon_color: status_text,
-                        tooltip: SharedString::from(format!(
-                            "{} · {}",
-                            i18n_status_bar(cx, "metric_latency_hint"),
-                            i18n_status_bar(cx, "toggle_metrics_tooltip")
-                        )),
-                        view: ServerView::Metrics,
-                    }))
-                    .child(Self::metric_chip(MetricChip {
-                        disabled_reason: chip_block(ServerView::MemoryAnalysis),
-                        id: "zedis-status-bar-server-memory-analysis",
-                        unit: None,
-                        icon: CustomIconName::MemoryStick,
-                        label: server_state.used_memory.clone(),
-                        label_color: status_text,
-                        icon_color: status_text,
-                        tooltip: SharedString::from(format!(
-                            "{} · {}",
-                            stat_hint("metric_memory_hint"),
-                            i18n_status_bar(cx, "toggle_memory_analysis_tooltip")
-                        )),
-                        view: ServerView::MemoryAnalysis,
-                    }))
-                    .child(Self::metric_chip(MetricChip {
-                        disabled_reason: chip_block(ServerView::Clients),
-                        id: "zedis-status-bar-clients",
-                        unit: unit("unit_clients"),
-                        icon: CustomIconName::AudioWaveform,
-                        label: server_state.clients.clone(),
-                        label_color: status_text,
-                        icon_color: status_text,
-                        tooltip: SharedString::from(format!(
-                            "{} · {}",
-                            // The Metrics page's card says the same: one label.
-                            info_reason
-                                .clone()
-                                .unwrap_or_else(|| i18n_common(cx, "clients_connected_blocked")),
-                            i18n_status_bar(cx, "toggle_clients_tooltip")
-                        )),
-                        view: ServerView::Clients,
-                    }))
-                    .child(Self::metric_chip(MetricChip {
-                        disabled_reason: chip_block(ServerView::Slowlog),
-                        id: "zedis-status-bar-server-slow-logs",
-                        unit: unit("unit_slow"),
-                        icon: CustomIconName::Snail,
-                        label: server_state.slow_log_tips.clone(),
-                        label_color: status_text,
-                        icon_color: status_text,
-                        tooltip: SharedString::from(format!(
-                            "{} · {}",
-                            i18n_status_bar(cx, "slowlog_stat_tooltip"),
-                            i18n_status_bar(cx, "toggle_slowlog_tooltip")
-                        )),
-                        view: ServerView::Slowlog,
-                    })),
-            )
-    }
-
-    /// Icon + value chip that opens a tool page on click. A native ghost
-    /// `Button` (not a hand-rolled div) so the whole chip — icon *and* value —
-    /// is the hit target and gets the same hover-background treatment as the
-    /// terminal / readonly / tools buttons on the left, rather than only
-    /// flipping the cursor. The icon keeps its own color (muted, or the
-    /// latency palette); `.text_color` colors just the value label.
-    fn metric_chip(chip: MetricChip) -> impl IntoElement {
-        let MetricChip {
-            id,
-            icon,
-            label,
-            label_color,
-            icon_color,
-            tooltip,
-            view,
-            disabled_reason,
-            unit,
-        } = chip;
-        // A disabled `Button` still shows its tooltip, so the reason the
-        // panel is unavailable replaces the destination hint.
-        let disabled = disabled_reason.is_some();
-        let tooltip = disabled_reason.unwrap_or(tooltip);
-        Button::new(id)
-            .ghost()
-            .small()
-            // Status-bar metric chips sit edge-to-edge; compact halves the
-            // horizontal padding (px_3 → px_1p5) so the cluster reads dense.
-            .compact()
-            .icon(Icon::new(icon).mr_1().text_color(icon_color))
-            .label(label)
-            .text_color(label_color)
-            .when_some(unit, |this, (unit, color)| {
-                this.child(Label::new(unit).text_xs().text_color(color).ml_1())
-            })
-            .disabled(disabled)
-            .tooltip(tooltip)
-            .on_click(move |_, _window, cx| {
-                cx.global::<ZedisGlobalStore>().clone().update(cx, |state, cx| {
-                    state.toggle_view(view, cx);
-                });
-            })
-    }
 
     /// Whether the bar is wide enough to say what its counts are. Three
     /// bare "n / m" pairs beside three icons were only readable to someone
@@ -1717,152 +600,6 @@ impl ZedisStatusBar {
     /// What the bar has room for at the content's current width.
     fn bar_fit(&self, window: &Window, cx: &App) -> BarFit {
         BarFit::for_width(content_area_width(window, cx).as_f32(), self.show_editor_controls(cx))
-    }
-    fn render_editor_settings(&self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let server_state = &self.state.server_state;
-        let wrap_fits = self
-            .server_state
-            .read(cx)
-            .value()
-            .and_then(|value| value.bytes_value())
-            .is_none_or(|bytes| bytes.soft_wrap_fits());
-        // Custom variant (transparent bg, muted foreground) so the label + check
-        // read in the same recessive status-bar color as everything else — a
-        // plain `.ghost()` paints them at the brighter `secondary_foreground`.
-        let status_text = status_text_color(cx.theme().is_dark());
-        Button::new("soft-wrap")
-            .ghost()
-            .text_color(status_text)
-            .xsmall()
-            // A value too large to wrap is shown unwrapped whatever the
-            // preference: the button says so instead of showing a tick for
-            // something that is not happening.
-            .when(server_state.soft_wrap && wrap_fits, |this| this.icon(IconName::Check))
-            .disabled(!wrap_fits)
-            .tooltip(if wrap_fits {
-                i18n_status_bar(cx, "soft_wrap_tooltip")
-            } else {
-                let locale = cx.global::<ZedisGlobalStore>().read(cx).locale();
-                t!(
-                    "status_bar.soft_wrap_capped_tooltip",
-                    size = humansize::format_size(SOFT_WRAP_MAX_BYTES, humansize::DECIMAL),
-                    locale = locale
-                )
-                .to_string()
-                .into()
-            })
-            .label(i18n_status_bar(cx, "soft_wrap"))
-            .on_click(cx.listener(|this, _, _window, cx| this.toggle_soft_wrap(cx)))
-    }
-
-    /// Soft Wrap on or off, for this server's sessions from now on.
-    fn toggle_soft_wrap(&mut self, cx: &mut Context<Self>) {
-        let soft_wrap = !self.state.server_state.soft_wrap;
-        self.state.server_state.soft_wrap = soft_wrap;
-        self.server_state.update(cx, |state, cx| {
-            state.set_soft_wrap(soft_wrap, cx);
-        });
-        cx.notify();
-
-        let server_id = self.state.server_state.server_id.clone();
-        if let Ok(mut option) = get_session_option(server_id.as_str()) {
-            option.soft_wrap = Some(soft_wrap);
-            save_session_option(server_id.as_str(), option, cx);
-        }
-    }
-    fn render_data_format(&self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(data_format) = self.state.data_format.clone() else {
-            return h_flex().into_any_element();
-        };
-        Button::new("data-format")
-            .ghost()
-            .disabled(true)
-            .text_color(cx.theme().primary)
-            .tooltip(i18n_status_bar(cx, "data_format_tooltip"))
-            .icon(Icon::new(CustomIconName::Binary))
-            .label(data_format)
-            .into_any_element()
-    }
-    fn render_viewer_mode(&self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.state.data_format.is_none() {
-            return h_flex();
-        };
-        let label = i18n_status_bar(cx, "viewer");
-        h_flex().child(Label::new(label).mr_1()).child(
-            Select::new(&self.viewer_mode_state)
-                .appearance(false)
-                // Its own width, not the trigger's: the trigger is as wide
-                // as "Auto", and the menu cut "Plain" to "Pla…".
-                .menu_width(px(VIEWER_MENU_WIDTH)),
-        )
-    }
-
-    /// The editor's controls folded into one button, where the bar is short
-    /// of room for Soft Wrap, the format and the Viewer side by side: the
-    /// format's icon and the viewer the value is shown in, with the format
-    /// named in its tooltip and at the top of its menu, the viewers and Soft
-    /// Wrap below.
-    fn render_folded_editor_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let format = self.state.data_format.clone().unwrap_or_default();
-        let (mode, wrap_fits) = self
-            .server_state
-            .read(cx)
-            .value()
-            .and_then(|value| value.bytes_value())
-            .map(|bytes| (bytes.view_mode.clone(), bytes.soft_wrap_fits()))
-            .unwrap_or((ViewMode::Auto, true));
-        let soft_wrap = self.state.server_state.soft_wrap && wrap_fits;
-        let format_line: SharedString = format!("{}: {format}", i18n_status_bar(cx, "data_format_tooltip")).into();
-        let status_bar = cx.entity().downgrade();
-        Button::new("zedis-status-bar-view")
-            .ghost()
-            .xsmall()
-            .compact()
-            .text_color(status_text_color(cx.theme().is_dark()))
-            .icon(Icon::new(CustomIconName::Binary))
-            .label(mode.as_str())
-            // A menu, not a switch: the caret says so.
-            .dropdown_caret(true)
-            .tooltip(format_line.clone())
-            .dropdown_menu(move |menu, _window, cx| {
-                let mut menu = menu
-                    .min_w(px(VIEWER_MENU_WIDTH * 2.))
-                    .label(format_line.clone())
-                    .separator()
-                    .label(i18n_status_bar(cx, "viewer"));
-                for (ix, choice) in VIEWER_MODES.iter().enumerate() {
-                    let status_bar = status_bar.clone();
-                    menu = menu.item(PopupMenuItem::new(choice.as_str()).checked(*choice == mode).on_click(
-                        move |_, window, cx| {
-                            let _ = status_bar.update(cx, |this, cx| this.choose_viewer(ix, window, cx));
-                        },
-                    ));
-                }
-                let status_bar = status_bar.clone();
-                menu.separator().item(
-                    PopupMenuItem::new(i18n_status_bar(cx, "soft_wrap"))
-                        .checked(soft_wrap)
-                        .disabled(!wrap_fits)
-                        .on_click(move |_, _window, cx| {
-                            let _ = status_bar.update(cx, |this, cx| this.toggle_soft_wrap(cx));
-                        }),
-                )
-            })
-    }
-
-    /// Show the value in the viewer at `ix` of the Viewer picker — from the
-    /// folded menu, keeping the picker in step for when the bar widens.
-    fn choose_viewer(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(choice) = VIEWER_MODES.get(ix) else {
-            return;
-        };
-        self.viewer_mode_state.update(cx, |state, cx| {
-            state.set_selected_index(Some(IndexPath::new(ix)), window, cx);
-        });
-        let name: SharedString = choice.as_str().into();
-        self.server_state.update(cx, |state, cx| {
-            state.update_bytes_value_view_mode(name, cx);
-        });
     }
 
     /// Render the error message
@@ -1889,24 +626,6 @@ impl ZedisStatusBar {
                         .text_align(TextAlign::Right)
                         .truncate(),
                 ),
-        )
-    }
-
-    /// Soft Wrap, the format label and the Viewer picker belong to the
-    /// string/bytes value editor — hidden on tool pages and when no string
-    /// value is selected. (The last two used to stay behind on Metrics or
-    /// Config once a string had been opened, a control for a page that was
-    /// not on screen.)
-    fn show_editor_controls(&self, cx: &App) -> bool {
-        if self.state.data_format.is_none() {
-            return false;
-        }
-        matches!(
-            cx.global::<ZedisGlobalStore>().read(cx).route(),
-            crate::states::Route::Server {
-                view: ServerView::Editor,
-                ..
-            }
         )
     }
 }
@@ -1999,20 +718,178 @@ impl Render for ZedisStatusBar {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::TestAppContext;
+    use crate::test_support::init_ui;
+    use gpui::{AnyWindowHandle, ElementId, TestAppContext, px, size};
+    use gpui_kit::component::Root;
+    use gpui_kit::test::{TestQueryExt, TestWindowExt};
 
-    /// A product is named in its own version; the Redis it claims to speak
-    /// stays beside it only where that is a different number.
-    #[test]
-    fn the_status_tooltip_names_the_product_in_its_own_version() {
-        assert_eq!(product_line(ServerFlavor::Redis, "", "8.6.1"), "Redis 8.6.1");
-        assert_eq!(product_line(ServerFlavor::Valkey, "9.0.3", "9.0.3"), "Valkey 9.0.3");
+    fn open_bar(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<ZedisServerState>) {
+        let server_state = cx.new(|_| ZedisServerState::default());
+        let handle = cx.open_window(size(px(1400.), px(200.)), |window, cx| {
+            let view = cx.new(|cx| ZedisStatusBar::new(server_state.clone(), window, cx));
+            Root::new(view, window, cx)
+        });
+        cx.run_until_parked();
+        server_state.update(cx, |state, cx| state.select("scratch".into(), 0, cx));
+        cx.run_until_parked();
+        (handle.into(), server_state)
+    }
+
+    /// What the open Tools menu lists, top to bottom: its own entries, and
+    /// those of the group whose submenu is open.
+    fn menu_labels(window: &Window) -> (Vec<String>, Vec<String>) {
+        let menu = ElementId::Name("popup-menu".into());
+        let submenu = ElementId::Name("submenu".into());
+        let mut entries: Vec<(bool, f32, String)> = window
+            .elements()
+            .into_iter()
+            .filter(|element| element.path().contains(&menu))
+            .filter_map(|element| {
+                let label = element.label()?.to_string();
+                Some((
+                    element.path().contains(&submenu),
+                    f32::from(element.bounds().origin.y),
+                    label,
+                ))
+            })
+            .collect();
+        entries.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let pick = |inner: bool| entries.iter().filter(|e| e.0 == inner).map(|e| e.2.clone()).collect();
+        (pick(false), pick(true))
+    }
+
+    /// Opens the Tools menu, walks its groups with the arrow key and closes
+    /// it again: the menu's own entries, and each group's in turn.
+    fn walk_tools_menu(cx: &mut TestAppContext, handle: AnyWindowHandle) -> (Vec<String>, Vec<Vec<String>>) {
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("zedis-status-bar-tools", cx);
+        })
+        .expect("the window is open");
+        cx.run_until_parked();
+        let mut top = Vec::new();
+        let mut groups = Vec::new();
+        for _ in 0..4 {
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                let (entries, group) = menu_labels(window);
+                top = entries;
+                groups.push(group);
+                window.press("down", cx);
+            })
+            .expect("the window is open");
+            cx.run_until_parked();
+        }
+        cx.update_window(handle, |_, window, cx| window.press("escape", cx))
+            .expect("the window is open");
+        cx.run_until_parked();
+        (top, groups)
+    }
+
+    /// The bar for an open server: its context on the left (the terminal,
+    /// the read-only switch, the Tools menu, more keys), the link and the
+    /// four chips that open their panels on the right. No Kill button while
+    /// the link is not down with `BUSY`, and none of the editor's controls
+    /// off the editor.
+    #[gpui::test]
+    fn the_bar_draws_the_server_s_context_and_its_telemetry(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let (handle, _server_state) = open_bar(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            for id in [
+                "zedis-status-bar-server-terminal",
+                "zedis-status-bar-server-toggle-readonly",
+                "zedis-status-bar-tools",
+                "zedis-status-bar-scan-more",
+                "zedis-status-bar-conn-health",
+                "zedis-status-bar-server-metrics",
+                "zedis-status-bar-server-memory-analysis",
+                "zedis-status-bar-clients",
+                "zedis-status-bar-server-slow-logs",
+            ] {
+                assert!(window.try_find(id).is_some(), "{id} is drawn");
+            }
+            for id in [
+                "zedis-status-bar-kill-script",
+                "soft-wrap",
+                "data-format",
+                "zedis-status-bar-view",
+            ] {
+                assert!(window.try_find(id).is_none(), "{id} is not drawn");
+            }
+        })
+        .expect("the window is open");
+    }
+
+    /// The Tools menu: four groups by purpose and the two reports beside
+    /// them, each group's panels in its order — and on a read-only
+    /// connection the writes stay listed, with the reason they are off.
+    #[gpui::test]
+    fn the_tools_menu_groups_the_panels_and_says_why_a_write_is_off(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let (handle, server_state) = open_bar(cx);
+        let (top, groups) = walk_tools_menu(cx, handle);
         assert_eq!(
-            product_line(ServerFlavor::Dragonfly, "2.0.2", "7.4.0"),
-            "Dragonfly 2.0.2 (Redis 7.4.0)"
+            top,
+            [
+                "Observability",
+                "Query & Scripting",
+                "Keys & Data",
+                "Administration",
+                "Server capabilities…",
+                "Troubleshooting Report…"
+            ]
         );
-        // A product that names no version of its own keeps the one it claims.
-        assert_eq!(product_line(ServerFlavor::KeyDb, "", "6.3.4"), "KeyDB 6.3.4");
+        assert_eq!(
+            groups,
+            [
+                vec![
+                    "Live Monitor",
+                    "Command Stats",
+                    "Hot Keys",
+                    "Keyspace Notifications",
+                    "Time Series Explorer",
+                    "Pubsub Mode",
+                    "Server Info (INFO)"
+                ],
+                vec!["Value Search", "Lua Scripts"],
+                vec![
+                    "Recycle Bin…",
+                    "Import Keys…",
+                    "Export Loaded Keys…",
+                    "Compare with Another Server…"
+                ],
+                vec![
+                    "Config Management",
+                    "Persistence",
+                    "Flush Current Database…",
+                    "Flush All Databases…"
+                ],
+            ]
+        );
+
+        server_state.update(cx, |state, cx| state.toggle_readonly(cx));
+        cx.run_until_parked();
+        let (_, groups) = walk_tools_menu(cx, handle);
+        assert_eq!(
+            groups[2],
+            [
+                "Recycle Bin…",
+                "Import Keys…  ·  Disabled in read-only mode",
+                "Export Loaded Keys…",
+                "Compare with Another Server…"
+            ]
+        );
+        assert_eq!(
+            groups[3],
+            [
+                "Config Management",
+                "Persistence",
+                "Flush Current Database…  ·  Disabled in read-only mode",
+                "Flush All Databases…  ·  Disabled in read-only mode"
+            ]
+        );
     }
 
     fn db_rows(count: usize) -> Vec<DbInfo> {

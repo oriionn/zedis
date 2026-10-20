@@ -575,7 +575,9 @@ refreshes, in `settle_task` and in the status bar — and that is
 
 Found on the way: `an_entry_comes_back_from_its_form_as_it_went_in` (phase 2)
 waited five seconds for the list's write and ran out once when the whole
-suite ran on a loaded machine; it waits thirty.
+suite ran on a loaded machine; it waits thirty. That was the wrong reading:
+it failed again in phase 6 after the full thirty, with the form still open
+and nothing saved. The click on Save had missed — see phase 6.
 
 ### Phase 4 — the target-gate audit
 
@@ -794,6 +796,43 @@ suite locally, then the matrix.
 - Administration tools: confirm every destructive action goes through
   `confirm_dangerous_command` / the `.danger()` shape.
 
+#### The status bar (2026-10-21)
+
+`status_bar.rs` (2,122 lines with its tests) keeps the view, its snapshot of
+the server, the database select, `BarFit` and `render`; four submodules hold
+the rest, each an `impl ZedisStatusBar` block of whole methods:
+
+| File | What | Lines |
+|---|---|---|
+| `status_bar/tools_menu.rs` | the Tools menu, its gates and entries | 412 |
+| `status_bar/server_status.rs` | the left side: tag, node counts and their tooltip, database, read-only, the key count | 448 |
+| `status_bar/telemetry.rs` | the right side: the link, latency and the metric chips | 350 |
+| `status_bar/editor_controls.rs` | Soft Wrap, the format and the Viewer, side by side or folded | 193 |
+
+The line-by-line count differs only in the headers, the `mod` and `use`
+lines, and `pub(super)` on what the other files reach (five render methods,
+`show_editor_controls`, `format_nodes*`, `format_latency`, `VIEWER_MODES`,
+`ToolsMenuGates` and its fields); `product_line`, which the troubleshooting
+report uses, is re-exported where it was. Its test moved with it.
+
+No test built the bar before. Two UI tests came first: the bar draws the
+server's context and the four chips, and no Kill button or editor control
+it should not (`the_bar_draws_the_server_s_context_and_its_telemetry`); the
+Tools menu, walked group by group with the arrow key, lists the panels in
+their order, and on a read-only connection keeps the writes with the reason
+they are off (`the_tools_menu_groups_the_panels_and_says_why_a_write_is_off`).
+Five ways of breaking the bar (a chip's id, the Kill button's condition, the
+read-only gate, the groups' order, the scan button) each fail one of them.
+
+Found on the way: the server form's test that had waited thirty seconds
+failed again in a full run, after the thirty. Run five times at once it
+failed three, each time with the form still open and the list empty: the
+click on Save had missed. A dialog's entrance animation runs on the wall
+clock, a click is aimed from one frame and lands a few frames on, and on a
+loaded machine the button had moved by then. `init_ui` now reduces motion,
+as gpui-component's own dialog tests do, so the entrance settles on its
+first frame; the same five-at-once run passed ten times in ten.
+
 ### Phase 7 — the browser entry and the helpers
 
 - `zedis-web/src/transport.rs` (1.6k without tests): one module per trait it
@@ -830,7 +869,8 @@ a wire field or a test name CI selects by.
 | 5 | operations ↔ live tests check | done: 210 operations, all typed; 28 without a live test, listed | (pending) |
 | 5 | `tests/live.rs` split | done: fifteen modules and `main.rs`, the 94 names kept | (pending) |
 | 5 | `client.rs`, `config.rs`, `ssh_tunnel.rs` read for seams | read: ten submodules named; the splits wait for the matrix to have run on step 2 | |
-| 6 | status bar, root, panels | not started | |
+| 6 | status bar | done: four submodules, two UI tests first; UI tests reduce motion | (pending) |
+| 6 | root, panels, administration tools | not started | |
 | 7 | transport, updater | not started | |
 | 8 | core, db pass | not started | |
 
