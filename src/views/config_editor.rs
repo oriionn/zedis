@@ -495,40 +495,39 @@ impl ZedisConfigEditor {
         }
     }
 
-    /// Desktop: [`load_config_docs`] already filled the map from rust-embed.
-    /// Browser: the file is not in the wasm; GET it and notify when it lands.
+    /// [`load_config_docs`] already filled the map from rust-embed.
+    #[cfg(not(target_family = "wasm"))]
     fn ensure_config_docs(&mut self, cx: &mut Context<Self>) {
-        #[cfg(not(target_family = "wasm"))]
-        {
-            let _ = (self, cx);
+        let _ = (self, cx);
+    }
+
+    /// The file is not in the wasm: GET it, and notify when it lands.
+    #[cfg(target_family = "wasm")]
+    fn ensure_config_docs(&mut self, cx: &mut Context<Self>) {
+        if !self.config_docs.is_empty() {
+            return;
         }
-        #[cfg(target_family = "wasm")]
-        {
-            if !self.config_docs.is_empty() {
+        let zh = self.config_docs_zh;
+        let path = if zh {
+            "assets/config_docs/zh.json"
+        } else {
+            "assets/config_docs/en.json"
+        };
+        let entity = cx.entity().downgrade();
+        crate::web_fetch::get_bytes(cx, path, move |cx, bytes| {
+            let Some(this) = entity.upgrade() else {
                 return;
-            }
-            let zh = self.config_docs_zh;
-            let path = if zh {
-                "assets/config_docs/zh.json"
-            } else {
-                "assets/config_docs/en.json"
             };
-            let entity = cx.entity().downgrade();
-            crate::web_fetch::get_bytes(cx, path, move |cx, bytes| {
-                let Some(this) = entity.upgrade() else {
+            this.update(cx, |this, cx| {
+                if this.config_docs_zh != zh {
                     return;
-                };
-                this.update(cx, |this, cx| {
-                    if this.config_docs_zh != zh {
-                        return;
-                    }
-                    if let Some(bytes) = bytes {
-                        this.config_docs = super::config_doc::parse_config_docs(path, &bytes);
-                    }
-                    cx.notify();
-                });
+                }
+                if let Some(bytes) = bytes {
+                    this.config_docs = super::config_doc::parse_config_docs(path, &bytes);
+                }
+                cx.notify();
             });
-        }
+        });
     }
 
     fn load_configs(&mut self, cx: &mut Context<Self>) {

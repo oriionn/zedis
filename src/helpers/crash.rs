@@ -24,6 +24,8 @@
 
 #[cfg(not(target_family = "wasm"))]
 use super::logs_dir;
+#[cfg(not(target_family = "wasm"))]
+use super::unix_ts;
 use chrono::Local;
 use std::backtrace::Backtrace;
 #[cfg(not(target_family = "wasm"))]
@@ -36,9 +38,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::error;
 
 /// File name prefix of every report; the logs pruner matches on it.
-#[cfg(not(target_family = "wasm"))]
-use super::unix_ts;
-
 pub const CRASH_REPORT_PREFIX: &str = "crash-";
 #[cfg(not(target_family = "wasm"))]
 const PENDING_MARKER: &str = "crash.pending";
@@ -90,17 +89,25 @@ fn record_panic(context: &CrashContext, info: &PanicHookInfo<'_>) {
     let backtrace = Backtrace::force_capture().to_string();
     error!(message = %message, location = %location, thread = %thread, "panic");
     let report = format_report(context, &message, &location, &thread, &backtrace);
-    #[cfg(not(target_family = "wasm"))]
-    match logs_dir().map(|dir| write_report(&dir, &report)) {
+    leave_report(&report);
+    IN_HOOK.store(false, Ordering::SeqCst);
+}
+
+/// Writes the report where the next launch looks ([`take_pending_crash`]).
+#[cfg(not(target_family = "wasm"))]
+fn leave_report(report: &str) {
+    match logs_dir().map(|dir| write_report(&dir, report)) {
         Some(Ok(path)) => error!(path = %path.display(), "crash report written"),
         Some(Err(e)) => error!(error = %e, "crash report could not be written"),
         None => error!("crash report could not be written: no logs directory"),
     }
-    // No file to leave behind in a tab: the console gets the whole report,
-    // which is where a browser's crash evidence lives anyway.
-    #[cfg(target_family = "wasm")]
+}
+
+/// No file to leave behind in a tab: the console gets the whole report,
+/// which is where a browser's crash evidence lives anyway.
+#[cfg(target_family = "wasm")]
+fn leave_report(report: &str) {
     error!(report = %report, "panic");
-    IN_HOOK.store(false, Ordering::SeqCst);
 }
 
 fn panic_message(info: &PanicHookInfo<'_>) -> String {
@@ -183,6 +190,7 @@ fn take_pending_crash_in(dir: &Path) -> Option<CrashReport> {
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use super::*;
+    use crate::test_support::isolate_config;
 
     struct Scratch(PathBuf);
 
@@ -199,6 +207,19 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// What the hook leaves behind is a file the next launch finds, under
+    /// the logs folder.
+    #[test]
+    fn a_report_the_hook_leaves_is_found_at_the_next_launch() {
+        isolate_config();
+        leave_report("Zedis crash report\nmessage: left by the hook\n");
+        let found = take_pending_crash().expect("the report is pending");
+        assert_eq!(found.summary, "left by the hook");
+        assert!(found.path.starts_with(logs_dir().expect("logs dir")));
+        assert!(take_pending_crash().is_none(), "reported once");
+        let _ = fs::remove_file(found.path);
     }
 
     fn context() -> CrashContext {

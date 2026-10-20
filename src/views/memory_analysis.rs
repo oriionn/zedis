@@ -706,82 +706,81 @@ impl ZedisMemoryAnalysis {
     /// Send the current analysis report to the configured AI endpoint
     /// and render its advice. No-op (with a notification) when the
     /// endpoint is not configured or there is nothing to analyze.
+    #[cfg(not(target_family = "wasm"))]
     fn start_ai_analysis(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
-        #[cfg(not(target_family = "wasm"))]
-        {
-            if self.ai_status == AiStatus::Running {
-                return;
-            }
+        if self.ai_status == AiStatus::Running {
+            return;
+        }
 
-            let store = cx.global::<ZedisGlobalStore>().read(cx);
-            if !store.ai_configured() {
-                window.push_notification(Notification::warning(i18n_memory_analysis(cx, "ai_not_configured")), cx);
-                return;
-            }
-            let endpoint = AiEndpoint {
-                base_url: store.ai_base_url(),
-                api_key: store.ai_api_key(),
-                model: store.ai_model(),
-            };
-            // Ask the model to reply in the app's current UI language.
-            let locale = store.locale().to_string();
+        let store = cx.global::<ZedisGlobalStore>().read(cx);
+        if !store.ai_configured() {
+            window.push_notification(Notification::warning(i18n_memory_analysis(cx, "ai_not_configured")), cx);
+            return;
+        }
+        let endpoint = AiEndpoint {
+            base_url: store.ai_base_url(),
+            api_key: store.ai_api_key(),
+            model: store.ai_model(),
+        };
+        // Ask the model to reply in the app's current UI language.
+        let locale = store.locale().to_string();
 
-            // Build the Markdown report from the freshly computed rows. Only
-            // key names/sizes/TTLs are sent — never key values.
-            let prefix_rows = self.prefix_rows.clone();
-            let single_rows = self.single_rows.clone();
-            if prefix_rows.is_empty() && single_rows.is_empty() && self.ttl_histogram.total() == 0 {
-                window.push_notification(Notification::warning(i18n_memory_analysis(cx, "ai_no_data")), cx);
-                return;
-            }
-            // Offline RDB results: the live server's dbsize / sample ratio
-            // don't describe the file — report exact (unsampled) file data.
-            let (report_dbsize, report_ratio) = if self.rdb_file.is_some() {
-                (None, 1.0)
-            } else {
-                (self.dbsize, self.row_ratio())
-            };
-            let report = build_markdown_report(
-                report_dbsize,
-                &self.policy,
-                report_ratio,
-                &prefix_rows,
-                &single_rows,
-                &self.ttl_histogram,
-                &self.type_rows,
-            );
+        // Build the Markdown report from the freshly computed rows. Only
+        // key names/sizes/TTLs are sent — never key values.
+        let prefix_rows = self.prefix_rows.clone();
+        let single_rows = self.single_rows.clone();
+        if prefix_rows.is_empty() && single_rows.is_empty() && self.ttl_histogram.total() == 0 {
+            window.push_notification(Notification::warning(i18n_memory_analysis(cx, "ai_no_data")), cx);
+            return;
+        }
+        // Offline RDB results: the live server's dbsize / sample ratio
+        // don't describe the file — report exact (unsampled) file data.
+        let (report_dbsize, report_ratio) = if self.rdb_file.is_some() {
+            (None, 1.0)
+        } else {
+            (self.dbsize, self.row_ratio())
+        };
+        let report = build_markdown_report(
+            report_dbsize,
+            &self.policy,
+            report_ratio,
+            &prefix_rows,
+            &single_rows,
+            &self.ttl_histogram,
+            &self.type_rows,
+        );
 
-            self.ai_status = AiStatus::Running;
-            self.ai_output = None;
-            cx.notify();
+        self.ai_status = AiStatus::Running;
+        self.ai_output = None;
+        cx.notify();
 
-            self.ai_task = Some(cx.spawn(async move |handle, cx| {
-                // `analyze_report` is blocking (ureq) — keep it on the
-                // background pool so the UI thread stays responsive.
-                let result = cx
-                    .background_spawn(async move { analyze_report(&endpoint, &report, &locale) })
-                    .await;
-                let _ = handle.update(cx, |this, cx| {
-                    match result {
-                        Ok(markdown) => {
-                            this.ai_status = AiStatus::Done;
-                            this.ai_output = Some(markdown.into());
-                        }
-                        Err(e) => {
-                            error!(error = %e, "AI memory analysis failed");
-                            this.ai_status = AiStatus::Error;
-                            this.ai_output = Some(e.to_string().into());
-                        }
+        self.ai_task = Some(cx.spawn(async move |handle, cx| {
+            // `analyze_report` is blocking (ureq) — keep it on the
+            // background pool so the UI thread stays responsive.
+            let result = cx
+                .background_spawn(async move { analyze_report(&endpoint, &report, &locale) })
+                .await;
+            let _ = handle.update(cx, |this, cx| {
+                match result {
+                    Ok(markdown) => {
+                        this.ai_status = AiStatus::Done;
+                        this.ai_output = Some(markdown.into());
                     }
-                    cx.notify();
-                });
-            }));
-        }
-        #[cfg(target_family = "wasm")]
-        {
-            // No HTTP client in the browser build; the button is not offered.
-            let _ = (window, cx);
-        }
+                    Err(e) => {
+                        error!(error = %e, "AI memory analysis failed");
+                        this.ai_status = AiStatus::Error;
+                        this.ai_output = Some(e.to_string().into());
+                    }
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// No HTTP client in the browser build; the button is not offered.
+    #[cfg(target_family = "wasm")]
+    fn start_ai_analysis(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        let _ = (window, cx);
     }
 
     /// Shared reset for both analysis sources (online SCAN / RDB file):

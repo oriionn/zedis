@@ -14,10 +14,11 @@
 
 //! `persist.rs` for the browser: the page's sample a minute goes to the
 //! bridge, which keeps a week of them and one a minute however many pages
-//! send (ADR 9, amended 2026-10-17). The page's own memory would lose them
-//! at the next reload.
+//! send (ADR 9, amended 2026-10-17), and that hands them back. The page's own
+//! memory would lose them at the next reload.
 
 use super::*;
+use crate::connection::bridge_storage;
 
 /// The desktop's cadence: one sample a minute per server, from this page.
 const METRICS_PERSIST_INTERVAL_MS: i64 = 60_000;
@@ -53,4 +54,31 @@ pub(super) fn maybe_persist_metrics(server_id: &str, metrics: RedisMetrics, cx: 
             }
         })
         .detach();
+}
+
+/// The most samples the bridge hands back in one read (its
+/// `metrics::MAX_POINTS`); a CSV export of the whole range asks for more.
+const MAX_BRIDGE_POINTS: usize = 2_000;
+
+/// The browser's history is the bridge's, which thins it on the way out.
+pub async fn load_persisted_metrics(server_id: &str, duration_ms: i64, max_points: usize) -> Vec<RedisMetrics> {
+    let Some(storage) = bridge_storage() else {
+        return vec![];
+    };
+    let from_ms = unix_ts_millis() - duration_ms;
+    let raw = match storage
+        .metrics_since(server_id.to_string(), from_ms, max_points.min(MAX_BRIDGE_POINTS))
+        .await
+    {
+        Ok(raw) => raw,
+        Err(e) => {
+            warn!(error = %e, "load metrics history failed");
+            return vec![];
+        }
+    };
+    let samples: Vec<RedisMetrics> = raw
+        .iter()
+        .filter_map(|bytes| serde_json::from_slice(bytes).ok())
+        .collect();
+    decimate_samples(samples, max_points)
 }

@@ -243,6 +243,32 @@ fn app_state_path() -> Result<PathBuf> {
     Ok(browser_store_path("zedis.toml"))
 }
 
+/// The form a secret setting is kept in: encrypted under the machine's key.
+/// Should encryption fail, the value is kept as it is.
+#[cfg(not(target_family = "wasm"))]
+fn seal_secret(value: &str) -> String {
+    encrypt(value).unwrap_or_else(|_| value.to_string())
+}
+
+/// No master key in a tab, and nothing is written to disk there either
+/// (`fs` refuses), so the stored form *is* the plain form.
+#[cfg(target_family = "wasm")]
+fn seal_secret(value: &str) -> String {
+    value.to_string()
+}
+
+/// A kept secret read back. One that does not decrypt (hand-edited plain
+/// text in `zedis.toml`) is taken as it is.
+#[cfg(not(target_family = "wasm"))]
+fn unseal_secret(stored: &str) -> String {
+    decrypt(stored).unwrap_or_else(|_| stored.to_string())
+}
+
+#[cfg(target_family = "wasm")]
+fn unseal_secret(stored: &str) -> String {
+    stored.to_string()
+}
+
 /// Notification category for user feedback
 #[derive(Clone, PartialEq, Debug, Deserialize, JsonSchema, Default)]
 pub enum NotificationCategory {
@@ -589,13 +615,22 @@ impl Global for ZedisGlobalStore {}
 
 /// Persists the app state crash-safely: atomic replace plus a rolling
 /// `zedis.toml.bak` of the previous version (see `write_file_atomic_with_backup`).
+#[cfg(not(target_family = "wasm"))]
+pub fn save_app_state(state: &ZedisAppState) -> Result<()> {
+    let path = app_state_path()?;
+    let value = toml::to_string(state)?;
+    write_file_atomic_with_backup(&path, value.as_bytes())?;
+    Ok(())
+}
+
+/// In a page: this browser's `localStorage`, and the account's copy.
+#[cfg(target_family = "wasm")]
 pub fn save_app_state(state: &ZedisAppState) -> Result<()> {
     let path = app_state_path()?;
     // What a tab stores is readable by every script on the origin, and there
     // is no master key in a tab to encrypt it under — so the two secrets this
     // state can hold are not part of what is stored there. They stay in
     // memory for the session, as they did before anything was stored.
-    #[cfg(target_family = "wasm")]
     let state = &ZedisAppState {
         ai_api_key: None,
         http_proxy: None,
@@ -604,7 +639,6 @@ pub fn save_app_state(state: &ZedisAppState) -> Result<()> {
     let value = toml::to_string(state)?;
     write_file_atomic_with_backup(&path, value.as_bytes())?;
     // The account's, on the bridge, as well as this browser's (ADR 17).
-    #[cfg(target_family = "wasm")]
     save_preferences(&value);
     Ok(())
 }
@@ -1106,16 +1140,7 @@ impl ZedisAppState {
     }
 
     pub fn http_proxy(&self) -> String {
-        #[cfg(not(target_family = "wasm"))]
-        let value = self
-            .http_proxy
-            .as_ref()
-            .map(|stored| decrypt(stored).unwrap_or_else(|_| stored.clone()));
-        // No master key in a tab, and nothing is written to disk there
-        // either (`fs` refuses), so the stored form *is* the plain form.
-        #[cfg(target_family = "wasm")]
-        let value = self.http_proxy.clone();
-        value.unwrap_or_default()
+        self.http_proxy.as_deref().map(unseal_secret).unwrap_or_default()
     }
     /// Persist the proxy setting and mirror the plaintext into
     /// `helpers::proxy` so the next HTTP request (updater / AI, background
@@ -1126,15 +1151,12 @@ impl ZedisAppState {
         let value = value.trim().to_string();
         #[cfg(not(target_family = "wasm"))]
         set_configured_proxy(&value);
-        #[cfg(not(target_family = "wasm"))]
         let stored = if value.contains('@') {
-            Some(encrypt(&value).unwrap_or_else(|_| value.clone()))
+            seal_secret(&value)
         } else {
-            Some(value.clone())
+            value.clone()
         };
-        #[cfg(target_family = "wasm")]
-        let stored = Some(value.clone());
-        self.http_proxy = if value.is_empty() { None } else { stored };
+        self.http_proxy = if value.is_empty() { None } else { Some(stored) };
     }
 
     pub fn ai_base_url(&self) -> String {
@@ -1148,23 +1170,13 @@ impl ZedisAppState {
     /// Falls back to the stored value if decryption fails (e.g. a
     /// hand-edited plaintext key in `zedis.toml`).
     pub fn ai_api_key(&self) -> String {
-        #[cfg(not(target_family = "wasm"))]
-        let value = self
-            .ai_api_key
-            .as_ref()
-            .map(|cipher| decrypt(cipher).unwrap_or_else(|_| cipher.clone()));
-        #[cfg(target_family = "wasm")]
-        let value = self.ai_api_key.clone();
-        value.unwrap_or_default()
+        self.ai_api_key.as_deref().map(unseal_secret).unwrap_or_default()
     }
     /// Store the API key, encrypting it before persistence. An empty
     /// value clears it.
     pub fn set_ai_api_key(&mut self, api_key: String) {
         let api_key = api_key.trim();
-        #[cfg(not(target_family = "wasm"))]
-        let stored = encrypt(api_key).unwrap_or_else(|_| api_key.to_string());
-        #[cfg(target_family = "wasm")]
-        let stored = api_key.to_string();
+        let stored = seal_secret(api_key);
         self.ai_api_key = if api_key.is_empty() { None } else { Some(stored) };
     }
     /// Model name passed to the AI endpoint. Empty when unset.
@@ -1744,6 +1756,46 @@ mod tests {
     use gpui::{Subscription, TestAppContext};
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    /// The two secrets the settings hold are kept encrypted — the proxy only
+    /// when it carries credentials — and read back plain. A value that does
+    /// not decrypt (typed into `zedis.toml` by hand) is read as it is, and an
+    /// empty one clears the setting.
+    #[test]
+    fn a_secret_setting_is_kept_encrypted_and_read_back_plain() {
+        isolate_config();
+        let mut state = ZedisAppState::default();
+
+        state.set_ai_api_key("  sk-test  ".to_string());
+        assert_ne!(
+            state.ai_api_key.as_deref(),
+            Some("sk-test"),
+            "the key is kept encrypted"
+        );
+        assert_eq!(state.ai_api_key(), "sk-test");
+        state.set_ai_api_key(String::new());
+        assert_eq!(state.ai_api_key, None);
+
+        state.set_http_proxy("http://user:secret@proxy:3128".to_string());
+        let kept = state.http_proxy.clone().unwrap_or_default();
+        assert!(
+            !kept.contains("secret"),
+            "a proxy's credentials are kept encrypted: {kept}"
+        );
+        assert_eq!(state.http_proxy(), "http://user:secret@proxy:3128");
+        state.set_http_proxy("http://proxy:3128".to_string());
+        assert_eq!(
+            state.http_proxy.as_deref(),
+            Some("http://proxy:3128"),
+            "an address alone stays readable"
+        );
+        assert_eq!(state.http_proxy(), "http://proxy:3128");
+        state.set_http_proxy(String::new());
+        assert_eq!(state.http_proxy, None);
+
+        state.ai_api_key = Some("typed-by-hand".to_string());
+        assert_eq!(state.ai_api_key(), "typed-by-hand");
+    }
 
     /// Recorded `(server_id, db)` of every `ServerSelected` emission.
     type SelectedRecorder = Rc<RefCell<Vec<(String, usize)>>>;

@@ -21,7 +21,7 @@
 //! spot scripts that keep getting flushed out of Redis's cache.
 //! Server cache status is probed via `SCRIPT EXISTS` / `SCRIPT LOAD`.
 
-use crate::helpers::reads_clipboard_on_demand;
+use crate::helpers::{kills_runaway_scripts, reads_clipboard_on_demand};
 use crate::views::unavailable_chip;
 use crate::{
     assets::CustomIconName,
@@ -1008,7 +1008,7 @@ impl ZedisLuaScriptLibrary {
                                 .on_click(cx.listener(|this, _, w, cx| this.confirm_flush(w, cx))),
                         )
                     })
-                    .when(cfg!(not(target_family = "wasm")), |this| {
+                    .when(kills_runaway_scripts(), |this| {
                         this.child(
                             Button::new("lua-kill")
                                 .ghost()

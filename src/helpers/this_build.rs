@@ -108,6 +108,31 @@ pub const fn value_write_limit() -> Option<usize> {
     Some(crate::connection::BRIDGE_MAX_VALUE_BYTES)
 }
 
+/// Stopping a runaway script (`SCRIPT KILL` / `FUNCTION KILL`), which has to
+/// dial around the pool a `BUSY` server has stuck. Only the bridge could do
+/// that on a page's behalf, and it does not yet, so a page draws no Kill
+/// button.
+#[cfg(not(target_family = "wasm"))]
+pub const fn kills_runaway_scripts() -> bool {
+    true
+}
+#[cfg(target_family = "wasm")]
+pub const fn kills_runaway_scripts() -> bool {
+    false
+}
+
+/// Asking the configured AI endpoint for advice. That is a request this
+/// process makes itself, and the browser build carries no HTTP client of
+/// its own (ADR 9).
+#[cfg(not(target_family = "wasm"))]
+pub const fn has_ai_assistant() -> bool {
+    true
+}
+#[cfg(target_family = "wasm")]
+pub const fn has_ai_assistant() -> bool {
+    false
+}
+
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use super::*;
@@ -122,5 +147,7 @@ mod tests {
         assert!(opens_files());
         assert!(reads_clipboard_on_demand());
         assert_eq!(value_write_limit(), None, "the desktop writes a value of any size");
+        assert!(kills_runaway_scripts());
+        assert!(has_ai_assistant());
     }
 }

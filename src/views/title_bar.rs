@@ -225,14 +225,39 @@ impl ZedisTitleBar {
                 Box::new(ShortcutsAction::Toggle),
             )
             .separator();
-        // The application's own chores, none of which a page has: the schema
-        // and viewer settings are desktop panels, About is a window (a tab
-        // is one canvas and cannot open a second), and updates, the logs
-        // folder and the diagnostics bundle are about an installed program
-        // and its files. They used to be listed in the browser too, each of
-        // them silent when picked.
-        #[cfg(not(target_family = "wasm"))]
-        let this = this
+        let this = Self::application_items(this, window, cx);
+        // The last item ends the session: the process, or — where this is a
+        // page signed in to a bridge — the login. A tab cannot quit, and
+        // until this was here it could not sign out either.
+        if signed_in_to_bridge() {
+            this.menu_with_icon(
+                format!("{}…", i18n_sidebar(cx, "account")),
+                Icon::new(gpui_kit::assets::IconName::CircleUser),
+                Box::new(MemuAction::Account),
+            )
+            .menu_with_icon(
+                i18n_sidebar(cx, "sign_out"),
+                Icon::new(CustomIconName::Power),
+                Box::new(MemuAction::SignOut),
+            )
+        } else {
+            this.menu_with_icon(
+                i18n_sidebar(cx, "quit"),
+                Icon::new(CustomIconName::Power),
+                Box::new(MemuAction::Quit),
+            )
+        }
+    }
+
+    /// The application's own chores, none of which a page has: the schema
+    /// and viewer settings are desktop panels, About is a window (a tab
+    /// is one canvas and cannot open a second), and updates, the logs
+    /// folder and the diagnostics bundle are about an installed program
+    /// and its files. They used to be listed in the browser too, each of
+    /// them silent when picked.
+    #[cfg(not(target_family = "wasm"))]
+    fn application_items(this: PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>) -> PopupMenu {
+        this
             // Settings: the configuration sub-views, grouped into one submenu
             // so the top-level menu stays short.
             .submenu_with_icon(
@@ -282,45 +307,26 @@ impl ZedisTitleBar {
                 Icon::new(IconName::Info),
                 Box::new(MemuAction::About),
             )
-            .separator();
-        // What a page keeps of all that is Settings itself, as a dialog over
-        // the page (`open_settings`), and the proto viewers, whose schema a
-        // page compiles from its text; the script viewers run a program and
-        // stay the desktop's.
-        #[cfg(target_family = "wasm")]
-        let this = this
-            .menu_with_icon(
-                format!("{}…", i18n_sidebar(cx, "settings")),
-                Icon::new(IconName::Settings2),
-                Box::new(SettingsAction::Editor),
-            )
-            .menu_with_icon(
-                i18n_sidebar(cx, "proto_settings"),
-                Icon::new(CustomIconName::SwatchBook),
-                Box::new(SettingsAction::Protos),
-            )
-            .separator();
-        // The last item ends the session: the process, or — where this is a
-        // page signed in to a bridge — the login. A tab cannot quit, and
-        // until this was here it could not sign out either.
-        if signed_in_to_bridge() {
-            this.menu_with_icon(
-                format!("{}…", i18n_sidebar(cx, "account")),
-                Icon::new(gpui_kit::assets::IconName::CircleUser),
-                Box::new(MemuAction::Account),
-            )
-            .menu_with_icon(
-                i18n_sidebar(cx, "sign_out"),
-                Icon::new(CustomIconName::Power),
-                Box::new(MemuAction::SignOut),
-            )
-        } else {
-            this.menu_with_icon(
-                i18n_sidebar(cx, "quit"),
-                Icon::new(CustomIconName::Power),
-                Box::new(MemuAction::Quit),
-            )
-        }
+            .separator()
+    }
+
+    /// What a page keeps of all that is Settings itself, as a dialog over
+    /// the page (`open_settings`), and the proto viewers, whose schema a
+    /// page compiles from its text; the script viewers run a program and
+    /// stay the desktop's.
+    #[cfg(target_family = "wasm")]
+    fn application_items(this: PopupMenu, _window: &mut Window, cx: &mut Context<PopupMenu>) -> PopupMenu {
+        this.menu_with_icon(
+            format!("{}…", i18n_sidebar(cx, "settings")),
+            Icon::new(IconName::Settings2),
+            Box::new(SettingsAction::Editor),
+        )
+        .menu_with_icon(
+            i18n_sidebar(cx, "proto_settings"),
+            Icon::new(CustomIconName::SwatchBook),
+            Box::new(SettingsAction::Protos),
+        )
+        .separator()
     }
 }
 

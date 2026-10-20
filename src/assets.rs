@@ -50,12 +50,7 @@ impl AssetSource for Assets {
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-        #[cfg(not(target_family = "wasm"))]
-        let mut files: Vec<SharedString> = ComponentAssets::iter()
-            .filter_map(|p| p.starts_with(path).then(|| p.into()))
-            .collect();
-        #[cfg(target_family = "wasm")]
-        let mut files: Vec<SharedString> = Vec::new();
+        let mut files = kit_files(path);
 
         files.extend(
             Self::iter()
@@ -65,6 +60,20 @@ impl AssetSource for Assets {
 
         Ok(files)
     }
+}
+
+/// The kit's own files under `path`, embedded on the desktop.
+#[cfg(not(target_family = "wasm"))]
+fn kit_files(path: &str) -> Vec<SharedString> {
+    ComponentAssets::iter()
+        .filter_map(|p| p.starts_with(path).then(|| p.into()))
+        .collect()
+}
+
+/// None in the browser: the kit's source fetches them, in front of this one.
+#[cfg(target_family = "wasm")]
+fn kit_files(_path: &str) -> Vec<SharedString> {
+    Vec::new()
 }
 
 /// Register the embedded `assets/themes/*.json` theme sets into the global
@@ -208,6 +217,24 @@ impl From<CustomIconName> for Icon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On the desktop the kit's icons are embedded too, and a listing names
+    /// them beside the app's own.
+    #[test]
+    fn a_listing_names_the_kit_s_icons_beside_ours() {
+        let listed = Assets.list("icons/").expect("list icons");
+        let kit = ComponentAssets::iter()
+            .find(|path| path.starts_with("icons/"))
+            .expect("the kit ships icons");
+        assert!(listed.iter().any(|path| path.as_ref() == kit.as_ref()), "missing {kit}");
+        let ours = Assets::iter()
+            .find(|path| path.starts_with("icons/"))
+            .expect("the app ships icons");
+        assert!(
+            listed.iter().any(|path| path.as_ref() == ours.as_ref()),
+            "missing {ours}"
+        );
+    }
 
     /// Every `.svg` under `assets/icons` is reachable through the embed
     /// glob and is really an SVG. A file added with a name the `path()`

@@ -13,12 +13,12 @@
 // limitations under the License.
 
 //! The Metrics panel's history on disk: one sample a minute per server, a
-//! week of them. Desktop only: in the browser "disk" is the page's memory
+//! week of them, and the reading back. Desktop only: in the browser "disk" is the page's memory
 //! (`mem_store`), gone at the next reload, so the page sends its samples to
 //! the bridge instead (`persist_web.rs`).
 
 use super::*;
-use crate::db::{insert_metrics_sample, prune_metrics_history};
+use crate::db::{insert_metrics_sample, list_metrics_samples, prune_metrics_history};
 
 /// Persist at most one sample per minute per server — the in-memory cache
 /// keeps the 2s-resolution live window, disk only needs trend resolution.
@@ -67,4 +67,23 @@ pub(super) fn maybe_persist_metrics(server_id: &str, metrics: RedisMetrics, cx: 
             }
         })
         .detach();
+}
+
+/// Load persisted history for the trailing `duration_ms`, decimated to at
+/// most `max_points` samples. Blocking (redb read + JSON decode) — call
+/// from a background task, not the render path.
+pub async fn load_persisted_metrics(server_id: &str, duration_ms: i64, max_points: usize) -> Vec<RedisMetrics> {
+    let from_ms = unix_ts_millis() - duration_ms;
+    let raw = match list_metrics_samples(server_id, from_ms) {
+        Ok(raw) => raw,
+        Err(e) => {
+            warn!(error = %e, "load metrics history failed");
+            return vec![];
+        }
+    };
+    let samples: Vec<RedisMetrics> = raw
+        .iter()
+        .filter_map(|bytes| serde_json::from_slice(bytes).ok())
+        .collect();
+    decimate_samples(samples, max_points)
 }

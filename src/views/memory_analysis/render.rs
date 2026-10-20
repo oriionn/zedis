@@ -18,7 +18,7 @@
 //! `memory_analysis.rs` to keep the scan/analysis half readable.
 
 use super::*;
-use crate::helpers::{opens_files, saves_files};
+use crate::helpers::{has_ai_assistant, opens_files, saves_files};
 use crate::views::unavailable_chip;
 
 impl ZedisMemoryAnalysis {
@@ -431,7 +431,7 @@ impl ZedisMemoryAnalysis {
                         .items_center()
                         // AI advice: send the report (key names / sizes / TTLs
                         // only) to the configured OpenAI-compatible endpoint.
-                        .when(cfg!(not(target_family = "wasm")) && has_data, |this| {
+                        .when(has_ai_assistant() && has_data, |this| {
                             this.child(
                                 Button::new("reco-ai-analysis")
                                     .ghost()

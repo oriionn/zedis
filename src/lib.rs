@@ -244,6 +244,21 @@ fn register_embedded_mono_fonts(cx: &mut App) {
     }
 }
 
+/// The large files the app reads after startup: the JetBrains Mono faces,
+/// from the binary. (The command docs are in it too, and were handed over by
+/// [`init_embedded_commands`].)
+#[cfg(not(target_family = "wasm"))]
+fn load_large_assets(cx: &mut App) {
+    register_embedded_mono_fonts(cx);
+}
+
+/// In the browser they are fetched, the command docs with them.
+#[cfg(target_family = "wasm")]
+fn load_large_assets(cx: &mut App) {
+    fetch_mono_fonts(cx);
+    fetch_commands_json(cx);
+}
+
 /// Pull both JetBrains faces, then register them together so Regular/Bold
 /// land in the same `add_fonts` call. A missing file is skipped; an empty
 /// result leaves the fallback family in place.
@@ -295,11 +310,6 @@ fn fetch_commands_json(cx: &App) {
     });
 }
 
-/// Fills the in-memory proto / script / Lua caches from the local database.
-/// Runs synchronously before the window opens — they back the proto/script/
-/// Lua editor tables, and loading them in a post-window background task (the
-/// old placement) raced: an editor restored as the startup route read an
-/// empty cache and showed no rows until the view was recreated.
 /// A second launch reached the running instance: bring the window up and
 /// open its link, if it carried one.
 #[cfg(not(target_family = "wasm"))]
@@ -313,6 +323,11 @@ fn activate_from_instance(message: InstanceMessage, cx: &mut App) {
     }
 }
 
+/// Fills the in-memory proto / script / Lua caches from the local database.
+/// Runs synchronously before the window opens — they back the proto/script/
+/// Lua editor tables, and loading them in a post-window background task (the
+/// old placement) raced: an editor restored as the startup route read an
+/// empty cache and showed no rows until the view was recreated.
 pub fn init_caches() {
     // Proto viewers: off disk on the desktop; in a page, the rows the page
     // data put in the store before this ran.
@@ -340,13 +355,7 @@ pub fn launch(cx: &mut App, app_state: ZedisAppState) {
     // — see the "Bold needs a concrete font family" gotcha in CLAUDE.md.
     // The browser fetches those files after the first frame: they are ~0.5 MiB
     // uncompressed and would sit in the wasm (no zstd inflater there).
-    #[cfg(not(target_family = "wasm"))]
-    register_embedded_mono_fonts(cx);
-    #[cfg(target_family = "wasm")]
-    {
-        fetch_mono_fonts(cx);
-        fetch_commands_json(cx);
-    }
+    load_large_assets(cx);
     // Register the embedded color themes so they appear in the theme menu.
     assets::register_themes(cx);
 
@@ -461,17 +470,7 @@ pub fn launch(cx: &mut App, app_state: ZedisAppState) {
             })
             .detach();
         }
-        MemuAction::OpenLogs => {
-            #[cfg(not(target_family = "wasm"))]
-            match logs_dir() {
-                // `logs_dir` creates the directory, so it exists even before any
-                // log line has been written.
-                Some(logs) => cx.open_with_system(&logs),
-                None => error!("failed to resolve logs directory"),
-            }
-            #[cfg(target_family = "wasm")]
-            warn!("there is no logs folder in the browser build");
-        }
+        MemuAction::OpenLogs => open_logs_folder(cx),
     });
     #[cfg(not(target_family = "wasm"))]
     cx.set_menus(app_menus());
@@ -743,6 +742,22 @@ pub fn launch(cx: &mut App, app_state: ZedisAppState) {
         Ok::<_, anyhow::Error>(())
     })
     .detach();
+}
+
+/// Show the logs folder in the system's file manager.
+#[cfg(not(target_family = "wasm"))]
+fn open_logs_folder(cx: &mut App) {
+    match logs_dir() {
+        // `logs_dir` creates the directory, so it exists even before any
+        // log line has been written.
+        Some(logs) => cx.open_with_system(&logs),
+        None => error!("failed to resolve logs directory"),
+    }
+}
+
+#[cfg(target_family = "wasm")]
+fn open_logs_folder(_cx: &mut App) {
+    warn!("there is no logs folder in the browser build");
 }
 
 /// The native menu bar. Every item is an action that already has a handler

@@ -367,15 +367,13 @@ pub enum ValueSearchTypeFilter {
 /// false in both, which is why the page used to say Ctrl+K to someone whose
 /// hands say ⌘K. There the page tells the entry which keyboard it is on
 /// ([`set_web_command_key`]).
+#[cfg(not(target_family = "wasm"))]
 pub fn uses_command_key() -> bool {
-    #[cfg(target_family = "wasm")]
-    {
-        WEB_COMMAND_KEY.load(Ordering::Relaxed)
-    }
-    #[cfg(not(target_family = "wasm"))]
-    {
-        cfg!(target_os = "macos")
-    }
+    cfg!(target_os = "macos")
+}
+#[cfg(target_family = "wasm")]
+pub fn uses_command_key() -> bool {
+    WEB_COMMAND_KEY.load(Ordering::Relaxed)
 }
 
 #[cfg(target_family = "wasm")]

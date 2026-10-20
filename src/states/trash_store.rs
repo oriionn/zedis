@@ -19,21 +19,21 @@
 //! which. The `DUMP` and the `RESTORE` are Redis's business and go through
 //! `zedis-connection` either way; this moves the bytes in between.
 
-#[cfg(target_family = "wasm")]
-use crate::connection::{BridgeStorage, BridgeTrashEntry, bridge_storage};
-use crate::db::TrashEntry;
-use crate::db::TrashMeta;
 #[cfg(not(target_family = "wasm"))]
 use crate::db::{
-    TRASH_RETENTION_MS, get_trash_entry, insert_trash_entry, list_trash_meta, purge_trash, remove_trash_entry,
+    TRASH_RETENTION_MS, TrashEntry, TrashMeta, get_trash_entry, insert_trash_entry, list_trash_meta, purge_trash,
+    remove_trash_entry,
 };
 use crate::error::Error;
 #[cfg(not(target_family = "wasm"))]
 use crate::helpers::unix_ts_millis;
-#[cfg(target_family = "wasm")]
-use std::sync::Arc;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[cfg(target_family = "wasm")]
+mod web;
+#[cfg(target_family = "wasm")]
+pub use web::{fetch, forget, list, stash};
 
 /// Keep a key that is about to be deleted.
 #[cfg(not(target_family = "wasm"))]
@@ -61,76 +61,4 @@ pub async fn fetch(server_id: &str, id: &str) -> Result<Option<TrashEntry>> {
 #[cfg(not(target_family = "wasm"))]
 pub async fn forget(server_id: &str, id: &str) -> Result<()> {
     Ok(remove_trash_entry(server_id, id)?)
-}
-
-#[cfg(target_family = "wasm")]
-fn storage() -> Result<Arc<dyn BridgeStorage>> {
-    bridge_storage().ok_or_else(|| Error::Invalid {
-        message: "the recycle bin needs the bridge's storage".to_string(),
-    })
-}
-
-#[cfg(target_family = "wasm")]
-fn bridge_error(e: crate::connection::BridgeError) -> Error {
-    Error::Invalid { message: e.to_string() }
-}
-
-/// In the browser the bridge keeps it, and purges it after a day itself.
-#[cfg(target_family = "wasm")]
-pub async fn stash(server_id: &str, entry: TrashEntry) -> Result<()> {
-    storage()?
-        .trash_put(
-            server_id.to_string(),
-            BridgeTrashEntry {
-                key: entry.key,
-                db: entry.db,
-                pttl_ms: entry.pttl_ms,
-                payload: entry.payload,
-                ..BridgeTrashEntry::default()
-            },
-        )
-        .await
-        .map_err(bridge_error)
-}
-
-#[cfg(target_family = "wasm")]
-pub async fn list(server_id: &str) -> Result<Vec<TrashMeta>> {
-    let entries = storage()?
-        .trash_list(server_id.to_string())
-        .await
-        .map_err(bridge_error)?;
-    Ok(entries
-        .into_iter()
-        .map(|entry| TrashMeta {
-            id: entry.id,
-            key: entry.key,
-            db: entry.db,
-            pttl_ms: entry.pttl_ms,
-            deleted_at_ms: entry.deleted_at_ms,
-            deleted_by: Some(entry.deleted_by).filter(|by| !by.is_empty()),
-        })
-        .collect())
-}
-
-#[cfg(target_family = "wasm")]
-pub async fn fetch(server_id: &str, id: &str) -> Result<Option<TrashEntry>> {
-    let entry = storage()?
-        .trash_get(server_id.to_string(), id.to_string())
-        .await
-        .map_err(bridge_error)?;
-    Ok(entry.map(|entry| TrashEntry {
-        key: entry.key,
-        db: entry.db,
-        pttl_ms: entry.pttl_ms,
-        deleted_at_ms: entry.deleted_at_ms,
-        payload: entry.payload,
-    }))
-}
-
-#[cfg(target_family = "wasm")]
-pub async fn forget(server_id: &str, id: &str) -> Result<()> {
-    storage()?
-        .trash_remove(server_id.to_string(), id.to_string())
-        .await
-        .map_err(bridge_error)
 }

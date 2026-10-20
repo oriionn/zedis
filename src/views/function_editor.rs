@@ -19,7 +19,7 @@
 //! `FCALL_RO`. New library and Edit share the same Lua editor; the
 //! only difference is pre-fill and whether `REPLACE` defaults on.
 
-use crate::helpers::reads_clipboard_on_demand;
+use crate::helpers::{kills_runaway_scripts, reads_clipboard_on_demand};
 use crate::views::{bridge_danger, confirm_dangerous_command, unavailable_chip};
 use crate::{
     assets::CustomIconName,
@@ -849,7 +849,7 @@ impl ZedisFunctionEditor {
                     })
                     // Not a write: stopping a runaway FCALL changes no data,
                     // and a read-only ACL user gets the server's answer.
-                    .when(cfg!(not(target_family = "wasm")) && !self.unsupported, |this| {
+                    .when(kills_runaway_scripts() && !self.unsupported, |this| {
                         this.child(
                             Button::new("functions-kill")
                                 .ghost()

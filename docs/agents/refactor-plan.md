@@ -586,6 +586,83 @@ move it up to an item or module gate, or behind a named seam (CLAUDE.md,
 likely to find a desktop arm that was edited to fit the browser; such a find
 is reported, not silently fixed.
 
+#### Done (2026-10-20)
+
+The inventory, by what the gate stands on (`src`, `#[cfg(target_family =
+"wasm")]` only):
+
+| | Before | After |
+|---|---|---|
+| a whole function, const, static or impl | 81 | 87 |
+| an import | 26 | 25 |
+| a module | 5 | 7 |
+| a statement, a `let`, a block or a match arm inside a function | 24 | 1 |
+| total | 136 | 120 |
+
+Of the 120: 71 are the browser arm of a same-signature pair, 25 imports, 7
+modules, 16 items a browser arm needs (its consts, its fetchers, the shortcut
+flag) and one statement, the Topology arm of `content.rs`'s panel match,
+which is the shape CLAUDE.md prescribes for a panel the browser does not have
+and stays. `cfg(not(target_family = "wasm"))`: 253 → 252.
+
+What the 23 statement gates became:
+
+- **Two functions with one signature, desktop first**, where a function's
+  whole body was the two arms: `uses_command_key`, the root's
+  `export_diagnostics` and `persist_window_state`, the config page's
+  `ensure_config_docs`, the memory analysis's `start_ai_analysis`, the
+  terminal's `ask_ai`, `save_app_state`. Projected onto what the desktop
+  compiles (comments and the browser's items dropped, whitespace removed),
+  all seven read exactly as before.
+- **A named seam**, where the arms were statements in a longer body:
+  `kit_files` (the asset list), `leave_report` (the panic hook),
+  `load_large_assets` and `open_logs_folder` (`lib.rs`), `seal_secret` /
+  `unseal_secret` (the AI key and the proxy, four accessors),
+  `proxy_setting_accepted` (Settings), `sharing_fields` (the server form's
+  *Shared* box, an empty list on the desktop) and the title bar's
+  `application_items`. The desktop's differences are those calls and nothing
+  else.
+- **A `web` module**, where the browser's side was state of its own:
+  `i18n_loader/web.rs` (the fetched locale maps — nine gates to two) and
+  `states/trash_store/web.rs` (the bin on the bridge — eight to two). The
+  Metrics history's two loaders joined the writers they belong beside,
+  `stat/persist.rs` and `stat/persist_web.rs`.
+
+The four `cfg!(not(target_family = "wasm"))` in views — the Kill button in
+the status bar, the Lua library and the Functions panel, and the memory
+analysis's AI button — ask `helpers/this_build.rs` now
+(`kills_runaway_scripts`, `has_ai_assistant`), as CLAUDE.md asks of a button
+a build lacks.
+
+Left as they are: item pairs that sit side by side and read as pairs
+(`pacing.rs`, `this_build.rs`, `export.rs`, the compare window's and
+Settings' dialog form). Gathering them into a module would part each desktop
+arm from its twin.
+
+Tests first where the moved code had none: the AI key and the proxy are kept
+encrypted and read back plain (`a_secret_setting_is_kept_encrypted_and_read_back_plain`),
+the desktop saves a proxy it can use (`the_desktop_saves_a_proxy_it_can_use`),
+a listing names the kit's icons beside the app's
+(`a_listing_names_the_kit_s_icons_beside_ours`), the hook's report is found
+at the next launch (`a_report_the_hook_leaves_is_found_at_the_next_launch`),
+and `the_desktop_has_all_of_it` holds the two new answers. The first and the
+third pass on the tree before the change too; each of the seven ways of
+taking a desktop arm out (no encryption, no decryption, only an empty proxy,
+no kit icons, no file for the report, no Kill button, no AI button) fails
+exactly the test that guards it. The wasm build's warnings are the same 43,
+by message and file, as before the change.
+
+**The history check.** For each statement pair, the commit that added the
+browser arm (`git log -S`) was read for desktop lines it changed. One
+desktop arm was edited to fit: `set_ai_api_key` used to encrypt only a key
+it would keep, and since the web build (`dbcb4aa`, 2026-09-18) it encrypts
+first and drops the result when the key is empty — so clearing the key
+reaches the master key, which on a machine with no other secret is the
+first keychain read of the session. Reported, not fixed here (see
+*Progress*). The rest only moved desktop lines into blocks or helpers
+(`platform_info` for `os_info`, `register_embedded_mono_fonts`,
+`when_locale_ready`), each giving the same result.
+
 ### Phase 5 — the connection layer (analysis first)
 
 1. A check that each public operation module (`*_ops`, `keyspace`,
@@ -643,7 +720,7 @@ a wire field or a test name CI selects by.
 | 3 | `ZedisServerState` field map | done: groups, where they meet, what `reset` keeps, the order for step 2 | (pending) |
 | 3 | sub-structs | done: seven groups; the panels' three fields, `terminal` and the errors left as fields | (pending) |
 | 3 | `ServerTask` | done: a variant per operation kept; the background refreshes named once | (pending) |
-| 4 | gate inventory | not started | |
+| 4 | gate inventory | done: 23 of 24 statement gates up to items, seams or modules; the four `cfg!` asks go through `this_build` | (pending) |
 | 5 | operations ↔ live tests check | not started | |
 | 5 | `tests/live.rs` split | not started | |
 | 6 | status bar, root, panels | not started | |
@@ -652,3 +729,8 @@ a wire field or a test name CI selects by.
 
 Findings that are bugs rather than structure are listed here as they turn up,
 and fixed as their own changes.
+
+- Phase 4: `ZedisAppState::set_ai_api_key` encrypts an empty key before
+  dropping it, which reaches the master key (a keychain read where nothing
+  else has needed it). The fix is the order it had before `dbcb4aa`:
+  `if api_key.is_empty() { None } else { Some(seal_secret(api_key)) }`.

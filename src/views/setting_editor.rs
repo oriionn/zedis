@@ -257,6 +257,21 @@ fn config_dir_text() -> String {
     String::new()
 }
 
+/// Whether a proxy typed into Settings may be saved: only one `app_proxy`
+/// can act on.
+#[cfg(not(target_family = "wasm"))]
+fn proxy_setting_accepted(text: &str) -> bool {
+    is_valid_proxy_setting(text)
+}
+
+/// The proxy is for this process's own HTTP (updater, AI), which the browser
+/// build has none of: a page's requests go through the browser's proxy, not a
+/// setting here. Only clearing the field is accepted there.
+#[cfg(target_family = "wasm")]
+fn proxy_setting_accepted(text: &str) -> bool {
+    text.is_empty()
+}
+
 pub struct ZedisSettingEditor {
     /// The section whose settings are on screen.
     section: SettingsSection,
@@ -984,6 +999,16 @@ mod tests {
     use gpui::TestAppContext;
     use gpui_kit::component::Root;
     use gpui_kit::test::TestWindowExt;
+
+    /// The desktop saves any proxy its own HTTP can use, and clearing the
+    /// field; what it cannot act on is refused rather than kept.
+    #[test]
+    fn the_desktop_saves_a_proxy_it_can_use() {
+        assert!(proxy_setting_accepted(""));
+        assert!(proxy_setting_accepted("none"));
+        assert!(proxy_setting_accepted("http://127.0.0.1:8080"));
+        assert!(!proxy_setting_accepted("http:/"));
+    }
 
     /// The page is built in one language — the lists' entries and the
     /// fields' placeholders are made in `new` — so a language change builds

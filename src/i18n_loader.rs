@@ -40,28 +40,22 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::OnceLock;
-#[cfg(target_family = "wasm")]
-use std::sync::{LazyLock, Mutex};
 
 #[cfg(not(target_family = "wasm"))]
 use rust_embed::RustEmbed;
+
+// The browser's arm: the files arrive over HTTP and are kept in a map of
+// their own there.
+#[cfg(target_family = "wasm")]
+mod web;
+#[cfg(target_family = "wasm")]
+pub use web::{install_locale_toml, runtime_backend, when_locale_ready};
 
 #[cfg(not(target_family = "wasm"))]
 #[derive(RustEmbed)]
 #[folder = "locales"]
 #[include = "*.toml"]
 struct LocaleAssets;
-
-/// The eight shipped UI locales. Same set as `SUPPORTED_LOCALES` in app
-/// state; listed here so the browser backend can name them without embedding
-/// the files.
-#[cfg(target_family = "wasm")]
-const WASM_LOCALES: [&str; 8] = ["en", "zh", "de", "es", "fr", "ja", "pt", "ru"];
-
-/// Parsed locale maps, filled by [`install_locale_toml`] after a fetch.
-#[cfg(target_family = "wasm")]
-static INSTALLED: LazyLock<Mutex<HashMap<String, HashMap<String, String>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Per-locale lazy translation store: locale names are known up front, but
 /// each locale's TOML is flattened only on the first `translate()` that asks
@@ -70,11 +64,26 @@ pub struct LazyLocaleBackend {
     locales: Vec<(String, OnceLock<HashMap<String, String>>)>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl LazyLocaleBackend {
-    #[cfg(not(target_family = "wasm"))]
     fn translations(&self, locale: &str) -> Option<&HashMap<String, String>> {
         let (name, cell) = self.locales.iter().find(|(name, _)| name == locale)?;
         Some(cell.get_or_init(|| parse_locale(name)))
+    }
+
+    fn lookup(&self, locale: &str, key: &str) -> Option<Cow<'_, str>> {
+        self.translations(locale)?
+            .get(key)
+            .map(|value| Cow::Borrowed(value.as_str()))
+    }
+
+    fn messages(&self, locale: &str) -> Option<Vec<(Cow<'_, str>, Cow<'_, str>)>> {
+        let messages = self
+            .translations(locale)?
+            .iter()
+            .map(|(key, value)| (Cow::Borrowed(key.as_str()), Cow::Borrowed(value.as_str())))
+            .collect();
+        Some(messages)
     }
 }
 
@@ -87,71 +96,28 @@ impl Backend for LazyLocaleBackend {
     }
 
     fn translate(&self, locale: &str, key: &str) -> Option<Cow<'_, str>> {
-        #[cfg(not(target_family = "wasm"))]
-        {
-            self.translations(locale)?
-                .get(key)
-                .map(|value| Cow::Borrowed(value.as_str()))
-        }
-        #[cfg(target_family = "wasm")]
-        {
-            let _ = self;
-            installed()
-                .get(locale)
-                .and_then(|map| map.get(key).cloned())
-                .map(Cow::Owned)
-        }
+        self.lookup(locale, key)
     }
 
     fn messages_for_locale(&self, locale: &str) -> Option<Vec<(Cow<'_, str>, Cow<'_, str>)>> {
-        #[cfg(not(target_family = "wasm"))]
-        {
-            let messages = self
-                .translations(locale)?
-                .iter()
-                .map(|(key, value)| (Cow::Borrowed(key.as_str()), Cow::Borrowed(value.as_str())))
-                .collect();
-            Some(messages)
-        }
-        #[cfg(target_family = "wasm")]
-        {
-            let _ = self;
-            let messages = installed()
-                .get(locale)?
-                .iter()
-                .map(|(key, value)| (Cow::Owned(key.clone()), Cow::Owned(value.clone())))
-                .collect();
-            Some(messages)
-        }
+        self.messages(locale)
     }
 }
 
 /// Build the runtime translation backend.
 ///
-/// Each file's stem is the locale (`en.toml` -> `en`). On the desktop only
-/// the file *names* are read here; the contents stay compressed until
-/// [`Backend::translate`] first touches that locale. In the browser the names
-/// are the known eight; the contents arrive through [`install_locale_toml`].
+/// Each file's stem is the locale (`en.toml` -> `en`). Only the file *names*
+/// are read here; the contents stay compressed until [`Backend::translate`]
+/// first touches that locale.
+#[cfg(not(target_family = "wasm"))]
 pub fn runtime_backend() -> LazyLocaleBackend {
-    #[cfg(not(target_family = "wasm"))]
-    {
-        let locales = LocaleAssets::iter()
-            .filter_map(|path| {
-                path.strip_suffix(".toml")
-                    .map(|locale| (locale.to_string(), OnceLock::new()))
-            })
-            .collect();
-        LazyLocaleBackend { locales }
-    }
-    #[cfg(target_family = "wasm")]
-    {
-        LazyLocaleBackend {
-            locales: WASM_LOCALES
-                .iter()
-                .map(|name| ((*name).to_string(), OnceLock::new()))
-                .collect(),
-        }
-    }
+    let locales = LocaleAssets::iter()
+        .filter_map(|path| {
+            path.strip_suffix(".toml")
+                .map(|locale| (locale.to_string(), OnceLock::new()))
+        })
+        .collect();
+    LazyLocaleBackend { locales }
 }
 
 /// Parse a v1 rust-i18n document (the whole tree belongs to that locale) and
@@ -209,45 +175,14 @@ fn flatten_keys(prefix: String, value: &Value, out: &mut HashMap<String, String>
     }
 }
 
-/// Parse one fetched locale file and make it visible to `t!`. Idempotent:
-/// a later install of the same name replaces the previous map.
-#[cfg(target_family = "wasm")]
-pub fn install_locale_toml(locale: &str, toml: &str) {
-    let flat = parse_toml(toml);
-    installed().insert(locale.to_string(), flat);
-}
-
 /// Run `on_ready` once `locale` can be translated.
 ///
-/// On the desktop the file is already in the binary, so this is immediate. In
-/// the browser a missing locale is fetched from the bridge and installed
-/// first; a failure still calls `on_ready` so the UI can fall back to English
-/// rather than ignoring the user's choice.
+/// The file is already in the binary, so this is immediate. (In the browser a
+/// missing locale is fetched first.)
+#[cfg(not(target_family = "wasm"))]
 pub fn when_locale_ready(locale: &'static str, cx: &gpui::App, on_ready: impl FnOnce(&gpui::App) + Send + 'static) {
-    #[cfg(not(target_family = "wasm"))]
-    {
-        let _ = locale;
-        on_ready(cx);
-    }
-    #[cfg(target_family = "wasm")]
-    {
-        if installed().contains_key(locale) {
-            on_ready(cx);
-            return;
-        }
-        crate::web_fetch::get_bytes(cx, &format!("locales/{locale}.toml"), move |cx, bytes| {
-            match bytes.and_then(|b| String::from_utf8(b).ok()) {
-                Some(text) => install_locale_toml(locale, &text),
-                None => tracing::warn!(locale, "locale file could not be fetched; falling back to English"),
-            }
-            on_ready(cx);
-        });
-    }
-}
-
-#[cfg(target_family = "wasm")]
-fn installed() -> std::sync::MutexGuard<'static, HashMap<String, HashMap<String, String>>> {
-    INSTALLED.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    let _ = locale;
+    on_ready(cx);
 }
 
 #[cfg(test)]

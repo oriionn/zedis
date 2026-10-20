@@ -55,27 +55,11 @@ impl ZedisServers {
             connection_fields(redis_server, cx),
             safety_fields(redis_server, cx),
             key_tree_fields(redis_server, cx),
+            sharing_fields(redis_server, is_new, cx),
         ]
         .into_iter()
         .flatten()
         .collect();
-        // Only a bridge has accounts, so only the browser's form asks who an
-        // entry is for. Unticked — the default for a new entry, because an
-        // entry carries credentials — it is private to whoever is signed in;
-        // the bridge, not this form, decides whose name that is (ADR 9).
-        #[cfg(target_family = "wasm")]
-        let fields = {
-            let mut fields = fields;
-            let shared = !is_new && redis_server.owner.is_none();
-            fields.push(
-                ZedisFormField::new("shared", i18n_servers(cx, "shared"))
-                    .default_value(shared.to_string())
-                    .placeholder(i18n_servers(cx, "shared_check_label"))
-                    .tab_index(0)
-                    .field_type(ZedisFormFieldType::Checkbox),
-            );
-            fields
-        };
         let title = if is_new {
             i18n_servers(cx, "add_server_title")
         } else {
@@ -497,6 +481,28 @@ fn key_tree_fields(redis_server: &RedisServer, cx: &App) -> Vec<ZedisFormField> 
             ])
             .tab_index(5)
             .field_type(ZedisFormFieldType::RadioGroup),
+    ]
+}
+
+/// Who an entry is for: a question for a bridge, which has accounts.
+#[cfg(not(target_family = "wasm"))]
+fn sharing_fields(_redis_server: &RedisServer, _is_new: bool, _cx: &App) -> Vec<ZedisFormField> {
+    Vec::new()
+}
+
+/// Only a bridge has accounts, so only the browser's form asks who an entry
+/// is for. Unticked — the default for a new entry, because an entry carries
+/// credentials — it is private to whoever is signed in; the bridge, not this
+/// form, decides whose name that is (ADR 9).
+#[cfg(target_family = "wasm")]
+fn sharing_fields(redis_server: &RedisServer, is_new: bool, cx: &App) -> Vec<ZedisFormField> {
+    let shared = !is_new && redis_server.owner.is_none();
+    vec![
+        ZedisFormField::new("shared", i18n_servers(cx, "shared"))
+            .default_value(shared.to_string())
+            .placeholder(i18n_servers(cx, "shared_check_label"))
+            .tab_index(0)
+            .field_type(ZedisFormFieldType::Checkbox),
     ]
 }
 

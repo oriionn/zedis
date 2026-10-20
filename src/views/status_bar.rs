@@ -21,8 +21,8 @@ use crate::{
     },
     constants::STATUS_BAR_HEIGHT,
     helpers::{
-        client_counts, format_lag_bytes, get_mono_font_family, group_thousands, pacing, resolve_tag_chip, saves_files,
-        with_hot_key,
+        client_counts, format_lag_bytes, get_mono_font_family, group_thousands, kills_runaway_scripts, pacing,
+        resolve_tag_chip, saves_files, with_hot_key,
     },
     states::{
         ConnectionErrorKind, ConnectionHealth, ErrorMessage, RedisKeySpaceStats, ReplicaInfo, SOFT_WRAP_MAX_BYTES,
@@ -1571,7 +1571,7 @@ impl ZedisStatusBar {
             // cannot help, the kill can — offered right where the reason is
             // shown, on a connection a BUSY server still answers.
             .when(
-                cfg!(not(target_family = "wasm"))
+                kills_runaway_scripts()
                     && is_link_down
                     && server_state.last_connection_error == ConnectionErrorKind::Busy,
                 |this| {

@@ -607,15 +607,7 @@ impl ZedisSettingEditor {
             cx.subscribe_in(&http_proxy_state, window, |_view, state, event, window, cx| {
                 if let InputEvent::Blur = event {
                     let text = state.read(cx).value().trim().to_string();
-                    // The proxy is for this process's own HTTP (updater, AI),
-                    // which the browser build has none of: a page's requests
-                    // go through the browser's proxy, not a setting here. Only
-                    // clearing the field is accepted there.
-                    #[cfg(not(target_family = "wasm"))]
-                    let valid = is_valid_proxy_setting(&text);
-                    #[cfg(target_family = "wasm")]
-                    let valid = text.is_empty();
-                    if valid {
+                    if proxy_setting_accepted(&text) {
                         update_app_state_and_save_quiet(cx, "save_http_proxy", move |state, _| {
                             state.set_http_proxy(text);
                         });

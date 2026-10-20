@@ -445,91 +445,90 @@ impl Zedis {
     /// Writes the diagnostics bundle (see `helpers::diagnostics`) and reveals
     /// it. The summary is assembled here because only the root knows the
     /// active tab's connection.
+    #[cfg(not(target_family = "wasm"))]
     fn export_diagnostics(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        #[cfg(not(target_family = "wasm"))]
-        {
-            let info = platform_info();
-            let store = cx.global::<ZedisGlobalStore>().read(cx);
-            let mut summary = format!(
-                "Zedis diagnostics\nversion: {VERSION} ({GIT_SHA})\nrenderer: {}\nos: {}-{}\narch: {}\nconfig_dir: {}\nlocale: {}\ntheme: {:?} / {:?}\napp_store_build: {}\ntime: {}\n",
-                BuildVariant::current().renderer(),
-                info.os_type,
-                info.version,
-                info.architecture,
-                get_or_create_config_dir()
-                    .map(|d| d.display().to_string())
-                    .unwrap_or_default(),
-                store.locale(),
-                store.theme(),
-                store.theme_name(),
-                is_app_store_build(),
-                chrono::Local::now().to_rfc3339(),
-            );
-            let app_config = store.redacted_toml().unwrap_or_else(|e| format!("<unavailable: {e}>"));
-            let locale = store.locale().to_string();
-            let state = self.active_content().read(cx).server_state();
-            let state = state.read(cx);
-            if !state.server_id().is_empty() {
-                let features = state.features();
-                let unusable: Vec<String> = features
-                    .unusable()
-                    .iter()
-                    .map(|(c, s)| format!("{} ({s:?})", c.label()))
-                    .collect();
-                summary.push_str(&format!(
-                "\n[active connection]\nserver_id: {}\nredis_version: {}\nserver_type: {}\nflavor: {}\nreadonly: {}\nhealth: {:?}\nlast_error: {:?}\nfeatures_probed: {}\nunusable_commands: {}\n",
-                state.server_id(),
-                state.version(),
-                state.nodes_description().server_type,
-                features.flavor.label(),
-                state.readonly(),
-                state.connection_health(),
-                state.last_connection_error(),
-                features.probed,
-                if unusable.is_empty() {
-                    "none".to_string()
-                } else {
-                    unusable.join(", ")
-                },
-            ));
-            }
-            let servers_config = servers_toml_redacted().unwrap_or_else(|e| format!("<unavailable: {e}>"));
-            let input = DiagnosticsInput {
-                summary,
-                app_config,
-                servers_config,
-            };
-            // Reading the logs and writing the zip is file work: off the UI
-            // thread, and the notice lands when it is done.
-            cx.spawn_in(window, async move |_, cx| {
-                let result = cx.background_spawn(async move { export_diagnostics(&input) }).await;
-                let _ = cx.update(|window, cx| match result {
-                    Ok(path) => {
-                        info!(path = %path.display(), "diagnostics bundle written");
-                        let message = t!(
-                            "sidebar.diagnostics_saved",
-                            path = path.display().to_string(),
-                            locale = &locale
-                        );
-                        window.push_notification(Notification::success(message.to_string()), cx);
-                        cx.reveal_path(&path);
-                    }
-                    Err(e) => {
-                        error!(error = %e, "diagnostics bundle failed");
-                        let message = t!("sidebar.diagnostics_failed", error = e.to_string(), locale = &locale);
-                        window.push_notification(Notification::error(message.to_string()), cx);
-                    }
-                });
-            })
-            .detach();
+        let info = platform_info();
+        let store = cx.global::<ZedisGlobalStore>().read(cx);
+        let mut summary = format!(
+            "Zedis diagnostics\nversion: {VERSION} ({GIT_SHA})\nrenderer: {}\nos: {}-{}\narch: {}\nconfig_dir: {}\nlocale: {}\ntheme: {:?} / {:?}\napp_store_build: {}\ntime: {}\n",
+            BuildVariant::current().renderer(),
+            info.os_type,
+            info.version,
+            info.architecture,
+            get_or_create_config_dir()
+                .map(|d| d.display().to_string())
+                .unwrap_or_default(),
+            store.locale(),
+            store.theme(),
+            store.theme_name(),
+            is_app_store_build(),
+            chrono::Local::now().to_rfc3339(),
+        );
+        let app_config = store.redacted_toml().unwrap_or_else(|e| format!("<unavailable: {e}>"));
+        let locale = store.locale().to_string();
+        let state = self.active_content().read(cx).server_state();
+        let state = state.read(cx);
+        if !state.server_id().is_empty() {
+            let features = state.features();
+            let unusable: Vec<String> = features
+                .unusable()
+                .iter()
+                .map(|(c, s)| format!("{} ({s:?})", c.label()))
+                .collect();
+            summary.push_str(&format!(
+            "\n[active connection]\nserver_id: {}\nredis_version: {}\nserver_type: {}\nflavor: {}\nreadonly: {}\nhealth: {:?}\nlast_error: {:?}\nfeatures_probed: {}\nunusable_commands: {}\n",
+            state.server_id(),
+            state.version(),
+            state.nodes_description().server_type,
+            features.flavor.label(),
+            state.readonly(),
+            state.connection_health(),
+            state.last_connection_error(),
+            features.probed,
+            if unusable.is_empty() {
+                "none".to_string()
+            } else {
+                unusable.join(", ")
+            },
+        ));
         }
-        #[cfg(target_family = "wasm")]
-        {
-            // The bundle is a zip of local files; a tab has neither the files nor
-            // a place to put it. The menu item that reaches this is not offered.
-            let _ = (window, cx);
-            tracing::warn!("the diagnostics bundle is not available in the browser build");
-        }
+        let servers_config = servers_toml_redacted().unwrap_or_else(|e| format!("<unavailable: {e}>"));
+        let input = DiagnosticsInput {
+            summary,
+            app_config,
+            servers_config,
+        };
+        // Reading the logs and writing the zip is file work: off the UI
+        // thread, and the notice lands when it is done.
+        cx.spawn_in(window, async move |_, cx| {
+            let result = cx.background_spawn(async move { export_diagnostics(&input) }).await;
+            let _ = cx.update(|window, cx| match result {
+                Ok(path) => {
+                    info!(path = %path.display(), "diagnostics bundle written");
+                    let message = t!(
+                        "sidebar.diagnostics_saved",
+                        path = path.display().to_string(),
+                        locale = &locale
+                    );
+                    window.push_notification(Notification::success(message.to_string()), cx);
+                    cx.reveal_path(&path);
+                }
+                Err(e) => {
+                    error!(error = %e, "diagnostics bundle failed");
+                    let message = t!("sidebar.diagnostics_failed", error = e.to_string(), locale = &locale);
+                    window.push_notification(Notification::error(message.to_string()), cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The bundle is a zip of local files; a tab has neither the files nor
+    /// a place to put it. The menu item that reaches this is not offered.
+    #[cfg(target_family = "wasm")]
+    fn export_diagnostics(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = (window, cx);
+        tracing::warn!("the diagnostics bundle is not available in the browser build");
     }
 
     /// Switch the active tab: the outgoing tab stops reacting to global
@@ -808,6 +807,7 @@ impl Zedis {
         self.sidebar.update(cx, |sidebar, cx| sidebar.set_health(health, cx));
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn persist_window_state(
         &mut self,
         new_bounds: Bounds<Pixels>,
@@ -816,15 +816,21 @@ impl Zedis {
         cx: &mut Context<Self>,
     ) {
         self.last_bounds = new_bounds;
-        // The browser sizes the page, and a tab has no file to write a
-        // placement to: the comparison above is all there is (ADR 9).
-        #[cfg(target_family = "wasm")]
-        {
-            let _ = (display, maximized, cx);
-            return;
-        }
-        #[cfg(not(target_family = "wasm"))]
         self.save_window_placement(new_bounds, display, maximized, cx);
+    }
+
+    /// The browser sizes the page, and a tab has no file to write a
+    /// placement to: the comparison above is all there is (ADR 9).
+    #[cfg(target_family = "wasm")]
+    fn persist_window_state(
+        &mut self,
+        new_bounds: Bounds<Pixels>,
+        display: Option<(String, Point<Pixels>)>,
+        maximized: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.last_bounds = new_bounds;
+        let _ = (display, maximized, cx);
     }
 
     /// Put the focus in the page before a dialog opens over it.
