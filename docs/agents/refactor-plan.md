@@ -926,6 +926,37 @@ and a session, the write window and a watch with its confirmation and its
 release (`a_session_the_write_window_and_a_watch_are_asked_for_by_their_routes`).
 Seven ways of breaking them each fail one.
 
+#### The updater (2026-10-21)
+
+`helpers/updater.rs` was 1,641 lines; it keeps the hosts and timeouts, the
+requests that try GitHub and then the mirror (`http_get_string`,
+`http_get_string_mirrored`, the mirror's URLs) and the tests, over four
+submodules of whole items:
+
+| File | What | Lines |
+|---|---|---|
+| `updater/check.rs` | whether there is a newer release on this build's channel, and its notes | 384 |
+| `updater/manifest.rs` | `latest.json` and the API's list, each file read off its name, the one this machine installs | 201 |
+| `updater/download.rs` | the installer from either host, capped, kept only when its hash matches | 125 |
+| `updater/install.rs` | handing it to the OS; on macOS the in-place swap | 306 |
+
+The public functions are re-exported where they were (`relaunch` under the
+same macOS gate it has), so `helpers.rs` and `root/desktop.rs` are
+unchanged. The line-by-line count differs only in the headers, the `mod` /
+`use` lines and `pub(super)` on what `check` and the tests reach — every
+field of the four release structs among them — and the signatures rustfmt
+wrapped for it.
+
+Two tests came first, against a server on 127.0.0.1 with the proxy set to
+direct: a download is kept only when its bytes are the ones named, with the
+progress reaching the server's size
+(`a_download_is_kept_only_when_its_bytes_are_the_ones_named`), and a text
+the origin cannot give comes from the mirror, saying so
+(`the_mirror_answers_what_the_origin_cannot`). Four ways of breaking them
+each fail one. The configured proxy is the process's, and the app state's
+secret test sets one, so both hold `test_support::hold_the_proxy`. Linux
+and Windows compile the moved code in CI only; its gates are the ones it had.
+
 ### Phase 8 — core and storage
 
 Low risk, low priority: a pass over `zedis-core` and `zedis-db` for dead code,
@@ -957,8 +988,8 @@ a wire field or a test name CI selects by.
 | 6 | status bar | done: four submodules, two UI tests first; UI tests reduce motion | `2ffdd87` |
 | 6 | root | done: the tab strip into `root/tabs.rs`, `new` into named parts, three UI tests first | `b54fde5` |
 | 6 | panels, administration tools | checked: the grids and loops follow the rules; five confirms listed as findings | `b54fde5` |
-| 7 | transport | done: one submodule per trait, three tests first | (pending) |
-| 7 | updater | not started | |
+| 7 | transport | done: one submodule per trait, three tests first | `2d90e1f` |
+| 7 | updater | done: check, manifest, download, install; two tests first | (pending) |
 | 8 | core, db pass | not started | |
 
 Findings that are bugs rather than structure are listed here as they turn up,

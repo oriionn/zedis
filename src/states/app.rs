@@ -1752,7 +1752,7 @@ mod tests {
     use super::*;
     // Before any test triggers `persist_nav`: a stray background save must
     // never touch the real `zedis.toml`.
-    use crate::test_support::isolate_config;
+    use crate::test_support::{hold_the_proxy, isolate_config};
     use gpui::{Subscription, TestAppContext};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -1764,6 +1764,8 @@ mod tests {
     #[test]
     fn a_secret_setting_is_kept_encrypted_and_read_back_plain() {
         isolate_config();
+        // Setting the proxy sets the process's.
+        let _proxy = hold_the_proxy();
         let mut state = ZedisAppState::default();
 
         state.set_ai_api_key("  sk-test  ".to_string());

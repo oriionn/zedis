@@ -49,7 +49,11 @@
 //! notes and the download all fall back to it when GitHub cannot be reached —
 //! see [`GITEE_API`] for why a mirror does not weaken the checksum story.
 //!
-//! Network + filesystem only; the dialog/toast orchestration lives in `main.rs`.
+//! Network + filesystem only; the dialog/toast orchestration lives in
+//! `root/desktop.rs`. What is here is in four parts — `check` (is there a
+//! newer release, and its notes), `manifest` (which file is this machine's),
+//! `download` and `install` — over the requests in this file, which go to
+//! GitHub first and to the mirror when GitHub cannot be reached.
 
 use super::build_variant::BuildVariant;
 use super::proxy::app_proxy;
@@ -65,14 +69,19 @@ use std::process::Command;
 use std::time::Duration;
 use tracing::{debug, error, info};
 
+mod check;
+mod download;
+mod install;
+mod manifest;
+
+pub use check::fetch_latest_release;
+pub use download::download_and_verify;
+#[cfg(target_os = "macos")]
+pub use install::relaunch;
+pub use install::{focus_installer_ui, install_update, installer_requires_quit};
+
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Always-current manifest, served by GitHub from the latest non-prerelease.
-const MANIFEST_URL: &str = "https://github.com/vicanso/zedis/releases/latest/download/latest.json";
-/// `/releases/latest` returns the most recent non-prerelease, non-draft release.
-const LATEST_RELEASE_API: &str = "https://api.github.com/repos/vicanso/zedis/releases/latest";
-/// Browser fallback when no manifest/asset is available.
-const RELEASES_PAGE: &str = "https://github.com/vicanso/zedis/releases/latest";
 /// The Gitee mirror the release workflow copies every *tagged* release to,
 /// asset for asset. It exists for one audience: networks that cannot reach
 /// GitHub at all, where every check above would only ever fail and the user
@@ -92,28 +101,7 @@ const GITEE_API: &str = "https://gitee.com/api/v5/repos/vicanso/zedis";
 /// The mirror's web root. Attachments do not live under `/api` and need no
 /// token — see [`gitee_download_url`].
 const GITEE_REPO: &str = "https://gitee.com/vicanso/zedis";
-/// The mirror has no per-release page: `/releases/tag/<tag>` and
-/// `/releases/<tag>` both redirect to a repository *archive* (measured
-/// 2026-09-20 against the live mirror), so the list is what a browser can
-/// usefully be pointed at.
-const GITEE_RELEASES_PAGE: &str = "https://gitee.com/vicanso/zedis/releases";
-/// The release list, newest first, for the pre-release channel: tagged
-/// pre-releases and the rolling `nightly` build both live here and never in
-/// `/releases/latest`.
-const RELEASE_LIST_API: &str = "https://api.github.com/repos/vicanso/zedis/releases?per_page=15";
-/// The same list on the mirror, which answers oldest first unless asked.
-const GITEE_RELEASE_LIST_API: &str = "https://gitee.com/api/v5/repos/vicanso/zedis/releases?per_page=15&direction=desc";
-/// How many releases' notes one prompt carries, newest first. A build
-/// further behind than this is shown the latest ten: the prompt is a dialog,
-/// not a reader, and the release page has the rest.
-const MAX_NOTES_RELEASES: usize = 10;
-/// The rolling build publish.yml recreates on every push to main.
-const NIGHTLY_TAG: &str = "nightly";
-/// A nightly published this soon after our own build time is this very
-/// build finishing its uploads, not a newer one.
-const NIGHTLY_GRACE: chrono::TimeDelta = chrono::TimeDelta::minutes(15);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long to spend *reaching* a host, as opposed to how long a transfer
 /// may take. [`DOWNLOAD_TIMEOUT`] is five minutes because a large installer
 /// over a slow link legitimately needs them — but that same budget would
@@ -123,499 +111,7 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 /// Splitting the two abandons an unreachable host in seconds while a slow
 /// one still gets the whole transfer window.
 const REACH_TIMEOUT: Duration = Duration::from_secs(10);
-/// Upper bound on an installer download (guards against a runaway body).
-const MAX_DOWNLOAD: u64 = 512 * 1024 * 1024;
-const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const USER_AGENT: &str = concat!("zedis/", env!("CARGO_PKG_VERSION"));
-
-/// What marks the GPUI Fast build, after the arch in its file names
-/// (`Zedis-<arch>-fast.dmg`, `zedis-windows-<arch>-fast.msi`,
-/// `zedis-<arch>-fast.AppImage.tar.gz`…) and after the kind of its
-/// `latest.json` rows (`dmg-fast`, `msi-fast`, `appimage-fast`…).
-const FAST_SUFFIX: &str = "-fast";
-
-/// `latest.json` shape (see `.github/workflows/publish.yml`).
-#[derive(Debug, Deserialize)]
-struct Manifest {
-    version: String,
-    #[serde(default)]
-    notes: String,
-    #[serde(default)]
-    assets: Vec<ManifestAsset>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ManifestAsset {
-    os: String,
-    arch: String,
-    kind: String,
-    name: String,
-    url: String,
-    #[serde(default)]
-    sha256: String,
-    #[serde(default)]
-    size: u64,
-}
-
-/// Subset of the GitHub "release" object, used for the API fallback and
-/// the pre-release channel.
-#[derive(Debug, Deserialize)]
-struct GithubRelease {
-    tag_name: String,
-    #[serde(default)]
-    html_url: String,
-    #[serde(default)]
-    body: String,
-    #[serde(default)]
-    prerelease: bool,
-    #[serde(default)]
-    draft: bool,
-    /// RFC 3339; for the nightly it is the build's own publish time.
-    #[serde(default)]
-    published_at: String,
-    #[serde(default)]
-    assets: Vec<GithubAsset>,
-}
-
-/// One uploaded file of a release, as the API lists it.
-#[derive(Debug, Deserialize)]
-struct GithubAsset {
-    name: String,
-    browser_download_url: String,
-    #[serde(default)]
-    size: u64,
-}
-
-/// The API's asset list in the manifest's shape, read off the file names
-/// publish.yml gives them ([`asset_identity`]): what a release without a
-/// `latest.json` (the nightly) can still offer to install. No checksum
-/// travels with it, so the download is not verified — the page link stays
-/// beside it.
-fn assets_from_api(assets: &[GithubAsset]) -> Vec<ManifestAsset> {
-    assets
-        .iter()
-        .filter_map(|asset| {
-            let (os, arch, kind) = asset_identity(&asset.name)?;
-            Some(ManifestAsset {
-                os: os.to_string(),
-                arch,
-                kind,
-                name: asset.name.clone(),
-                url: asset.browser_download_url.clone(),
-                sha256: String::new(),
-                size: asset.size,
-            })
-        })
-        .collect()
-}
-
-/// `(os, arch, kind)` of a file publish.yml uploads, with the kinds its
-/// `latest.json` rows use. A GPUI Fast build carries [`FAST_SUFFIX`] after
-/// the arch and is read as the same arch with a kind of its own
-/// (`zedis-windows-x86_64-fast.msi` → `windows`, `x86_64`, `msi-fast`).
-fn asset_identity(name: &str) -> Option<(&'static str, String, String)> {
-    let (os, arch, kind) = file_identity(name)?;
-    Some(match arch.strip_suffix(FAST_SUFFIX) {
-        Some(arch) => (os, arch.to_string(), format!("{kind}{FAST_SUFFIX}")),
-        None => (os, arch.to_string(), kind.to_string()),
-    })
-}
-
-/// [`asset_identity`] before the Fast builds are told apart — which is also
-/// how every release before them reads a Fast file's name: its arch is
-/// `x86_64-fast`, which no machine reports. The names are not one pattern —
-/// the macOS image is `Zedis-<arch>.dmg`, the AppImage
-/// `zedis-<arch>.AppImage.tar.gz`, the rest `zedis-<os>-<arch>.<ext>` with
-/// two-part extensions among them — and reading them all as
-/// `zedis-<os>-<arch>.<kind>` found no macOS or AppImage build at all, so the
-/// nightly never offered an in-app install there.
-fn file_identity(name: &str) -> Option<(&'static str, &str, &'static str)> {
-    if let Some(arch) = name.strip_prefix("Zedis-").and_then(|rest| rest.strip_suffix(".dmg")) {
-        return Some(("macos", arch, "dmg"));
-    }
-    let rest = name.strip_prefix("zedis-")?;
-    if let Some(arch) = rest.strip_suffix(".AppImage.tar.gz") {
-        return Some(("linux", arch, "appimage"));
-    }
-    let (os, file) = rest.split_once('-')?;
-    let os = match os {
-        "macos" => "macos",
-        "windows" => "windows",
-        "linux" => "linux",
-        _ => return None,
-    };
-    // Longest first: `.msi.zip` is not a `.zip`, nor its arch `x86_64.msi`.
-    const KINDS: [(&str, &str); 7] = [
-        (".tar.gz", "tarball"),
-        (".msi.zip", "msizip"),
-        (".msi", "msi"),
-        (".zip", "zip"),
-        (".deb", "deb"),
-        (".rpm", "rpm"),
-        (".dmg", "dmg"),
-    ];
-    KINDS
-        .iter()
-        .find_map(|(suffix, kind)| file.strip_suffix(suffix).map(|arch| (os, arch, *kind)))
-}
-
-/// Decide whether the latest release is newer than the running build.
-///
-/// Prefers the manifest (which yields a verifiable per-arch asset); on any
-/// manifest error falls back to the API (version + page only). Returns
-/// `Ok(None)` when already up to date. Blocking (`ureq`): **must** run on a
-/// background task, never the UI thread.
-pub fn fetch_latest_release(include_prerelease: bool) -> Result<Option<UpdateInfo>> {
-    // The pre-release channel looks at the whole list first; a listing
-    // failure falls through to the stable path rather than to silence.
-    if include_prerelease {
-        match fetch_from_release_list() {
-            Ok(found) => return Ok(found),
-            Err(e) => debug!(error = %e, "update check: release list unavailable, using the stable channel"),
-        }
-    }
-    match fetch_from_manifest() {
-        Ok(found) => Ok(found),
-        Err(e) => {
-            debug!(error = %e, "update check: manifest unavailable, falling back to API");
-            fetch_from_api()
-        }
-    }
-}
-
-fn fetch_from_manifest() -> Result<Option<UpdateInfo>> {
-    // The mirror answers only where GitHub could not, and costs a request
-    // more there because Gitee has no `latest/download` shortcut.
-    let (manifest, from_mirror) = match http_get_string(MANIFEST_URL) {
-        Ok(text) => (serde_json::from_str::<Manifest>(&text)?, false),
-        Err(origin) => {
-            debug!(error = %origin, "update check: manifest unreachable, trying the mirror");
-            (fetch_from_gitee_manifest()?, true)
-        }
-    };
-    let Some(latest) = newer_version(&manifest.version)? else {
-        return Ok(None);
-    };
-    let asset = pick_asset(&manifest.assets);
-    // A page the user cannot reach is worse than no page: when GitHub is
-    // what failed, point the browser at the mirror instead.
-    let page_url = match (from_mirror, manifest.notes.trim().is_empty()) {
-        (true, _) => GITEE_RELEASES_PAGE.to_string(),
-        (false, true) => RELEASES_PAGE.to_string(),
-        (false, false) => manifest.notes.clone(),
-    };
-    Ok(Some(UpdateInfo {
-        notes: fetch_release_notes(&latest),
-        version: latest,
-        current: CURRENT_VERSION.to_string(),
-        page_url,
-        asset,
-    }))
-}
-
-/// Best-effort changelog for the update prompt: latest.json only carries a
-/// release-page URL, so the markdown takes one extra API call. Any failure
-/// (offline API, rate limit) degrades to an empty string — the prompt then
-/// shows version + link only, never an error. Runs at most once per
-/// discovered update, well inside the anonymous API quota.
-///
-/// The call asks for the release *list*, because an update is often more
-/// than one release away: a build three versions behind was shown the last
-/// one's notes alone, and learned nothing of the two it was also about to
-/// install. The single latest release is what is left when the list cannot
-/// be had.
-fn fetch_release_notes(version: &str) -> String {
-    let since_current = || -> Result<String> {
-        let (Ok(latest), Some(current)) = (Version::parse(version), current_version()) else {
-            return Ok(String::new());
-        };
-        let (text, _) = http_get_string_mirrored(RELEASE_LIST_API, GITEE_RELEASE_LIST_API)?;
-        let releases: Vec<GithubRelease> = serde_json::from_str(&text)?;
-        Ok(notes_between(&releases, &current, &latest, false))
-    };
-    match since_current() {
-        Ok(notes) if !notes.is_empty() => return notes,
-        Ok(_) => debug!("update check: the release list does not have this version yet"),
-        Err(e) => debug!(error = %e, "update check: release list unavailable for the notes"),
-    }
-    latest_release_notes(version)
-}
-
-/// The notes of the latest release alone — what the prompt showed before it
-/// read the list, and still shows when the list cannot be had.
-fn latest_release_notes(version: &str) -> String {
-    let fetch = || -> Result<String> {
-        // Both hosts name the same fields (`tag_name`, `body`), so one
-        // deserializer serves either answer — Gitee omits what it has no
-        // equivalent for and every such field is `#[serde(default)]`.
-        let (text, _) = http_get_string_mirrored(LATEST_RELEASE_API, &format!("{GITEE_API}/releases/latest"))?;
-        let release: GithubRelease = serde_json::from_str(&text)?;
-        // The API's "latest" can briefly disagree with the manifest (CDN
-        // caching, mid-publish) — only trust the body when both name the
-        // same version, otherwise the prompt would show the wrong changelog.
-        if release.tag_name.trim_start_matches('v').trim() != version {
-            return Ok(String::new());
-        }
-        Ok(release.body.trim().to_string())
-    };
-    match fetch() {
-        Ok(notes) => notes,
-        Err(e) => {
-            debug!(error = %e, "update check: release notes unavailable");
-            String::new()
-        }
-    }
-}
-
-/// The running build's version, when it parses.
-fn current_version() -> Option<Version> {
-    Version::parse(CURRENT_VERSION).ok()
-}
-
-/// A release's version, read off its tag; the rolling `nightly` has none.
-fn release_version(release: &GithubRelease) -> Option<Version> {
-    Version::parse(release.tag_name.trim_start_matches('v').trim()).ok()
-}
-
-/// What changed between two versions: the notes of every tagged release
-/// newer than `current` and no newer than `latest`, newest first, as one
-/// markdown text. Drafts are never part of it, pre-releases only on the
-/// channel that installs them.
-///
-/// Empty when the list does not have `latest` itself — the list can lag a
-/// release that is still being published, and notes that stop one version
-/// short would pass for the whole changelog.
-fn notes_between(releases: &[GithubRelease], current: &Version, latest: &Version, include_prerelease: bool) -> String {
-    let mut found: Vec<(Version, &str)> = releases
-        .iter()
-        .filter(|release| !release.draft && (include_prerelease || !release.prerelease))
-        .filter_map(|release| {
-            let version = release_version(release)?;
-            (version > *current && version <= *latest).then_some((version, release.body.trim()))
-        })
-        .collect();
-    found.sort_by(|a, b| b.0.cmp(&a.0));
-    if found.first().is_none_or(|(version, _)| version != latest) {
-        return String::new();
-    }
-    found
-        .into_iter()
-        .take(MAX_NOTES_RELEASES)
-        .filter(|(_, body)| !body.is_empty())
-        .map(|(version, body)| titled_notes(&version, body))
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
-/// One release's notes under a heading that says which release they are.
-/// The release workflow's notes open with their own (`## [0.12.3](…) - date`)
-/// and are left as they are; anything else — a hand-written body — is given
-/// one, or several releases' notes would run together.
-fn titled_notes(version: &Version, body: &str) -> String {
-    let names_itself = body
-        .lines()
-        .next()
-        .is_some_and(|first| first.contains(&version.to_string()));
-    if names_itself {
-        body.to_string()
-    } else {
-        format!("## {version}\n\n{body}")
-    }
-}
-
-/// The pre-release channel: walk the release list newest-first and take the
-/// first non-draft entry that is newer than this build — a tagged release
-/// (stable or pre-release, by version) or the `nightly` (by publish time,
-/// which only a build older than it can be behind). Nothing newer → `None`.
-fn fetch_from_release_list() -> Result<Option<UpdateInfo>> {
-    let text = http_get_string(RELEASE_LIST_API)?;
-    let releases: Vec<GithubRelease> = serde_json::from_str(&text)?;
-    let current = current_version();
-    // Every tagged release this build is behind, for the notes of whichever
-    // entry is offered: the list is already here, so it costs no request.
-    let notes_up_to = |latest: &Version| {
-        current
-            .as_ref()
-            .map(|current| notes_between(&releases, current, latest, true))
-            .unwrap_or_default()
-    };
-    for release in releases.iter().filter(|r| !r.draft) {
-        let page_url = if release.html_url.trim().is_empty() {
-            RELEASES_PAGE.to_string()
-        } else {
-            release.html_url.clone()
-        };
-        if release.tag_name == NIGHTLY_TAG {
-            if !nightly_is_newer(&release.published_at, BUILD_TIMESTAMP) {
-                continue;
-            }
-            let published = release.published_at.get(..10).unwrap_or(NIGHTLY_TAG);
-            // The rolling build says only when it was built. It also carries
-            // every tagged release since this one, so their notes follow.
-            let tagged = releases
-                .iter()
-                .filter(|r| !r.draft)
-                .filter_map(release_version)
-                .max()
-                .map(|newest| notes_up_to(&newest))
-                .unwrap_or_default();
-            let notes = [release.body.trim(), tagged.as_str()]
-                .into_iter()
-                .filter(|part| !part.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n\n");
-            return Ok(Some(UpdateInfo {
-                version: format!("{NIGHTLY_TAG} {published}"),
-                current: current_version_label(),
-                page_url,
-                notes,
-                asset: pick_asset(&assets_from_api(&release.assets)),
-            }));
-        }
-        let Some(latest) = newer_version(&release.tag_name)? else {
-            // Newest-first: the first entry that is not newer ends the walk
-            // (an unparsable tag is skipped by `newer_version` the same way).
-            continue;
-        };
-        // A tagged release carries a manifest with checksums; the API's
-        // asset list is the fallback for one that has none yet.
-        let manifest_url = format!(
-            "https://github.com/vicanso/zedis/releases/download/{}/latest.json",
-            release.tag_name
-        );
-        let asset = http_get_string(&manifest_url)
-            .ok()
-            .and_then(|text| serde_json::from_str::<Manifest>(&text).ok())
-            .and_then(|manifest| pick_asset(&manifest.assets))
-            .or_else(|| pick_asset(&assets_from_api(&release.assets)));
-        let combined = release_version(release)
-            .map(|version| notes_up_to(&version))
-            .unwrap_or_default();
-        let notes = if combined.is_empty() {
-            release.body.trim().to_string()
-        } else {
-            combined
-        };
-        return Ok(Some(UpdateInfo {
-            version: latest,
-            current: current_version_label(),
-            page_url,
-            notes,
-            asset,
-        }));
-    }
-    Ok(None)
-}
-
-/// Whether a nightly published at `published_at` is a later build than
-/// the one running (`built_at`, both RFC 3339), beyond the grace window.
-fn nightly_is_newer(published_at: &str, built_at: &str) -> bool {
-    let (Ok(published), Ok(built)) = (
-        chrono::DateTime::parse_from_rfc3339(published_at.trim()),
-        chrono::DateTime::parse_from_rfc3339(built_at.trim()),
-    ) else {
-        return false;
-    };
-    published - built > NIGHTLY_GRACE
-}
-
-/// What the prompt calls the running build: the version, and for a nightly
-/// its build date as well.
-fn current_version_label() -> String {
-    if is_nightly_build() {
-        format!(
-            "{CURRENT_VERSION} ({NIGHTLY_TAG} {})",
-            BUILD_TIMESTAMP.get(..10).unwrap_or_default()
-        )
-    } else {
-        CURRENT_VERSION.to_string()
-    }
-}
-
-fn fetch_from_api() -> Result<Option<UpdateInfo>> {
-    let (text, from_mirror) = http_get_string_mirrored(LATEST_RELEASE_API, &format!("{GITEE_API}/releases/latest"))?;
-    let release: GithubRelease = serde_json::from_str(&text)?;
-    if release.draft || release.prerelease {
-        return Ok(None);
-    }
-    let Some(latest) = newer_version(&release.tag_name)? else {
-        return Ok(None);
-    };
-    // The mirror sends no `html_url`, and a GitHub link is no use to whoever
-    // just failed to reach GitHub.
-    let page_url = match (from_mirror, release.html_url.trim().is_empty()) {
-        (true, _) => GITEE_RELEASES_PAGE.to_string(),
-        (false, true) => RELEASES_PAGE.to_string(),
-        (false, false) => release.html_url,
-    };
-    Ok(Some(UpdateInfo {
-        version: latest,
-        current: CURRENT_VERSION.to_string(),
-        page_url,
-        notes: release.body.trim().to_string(),
-        asset: None,
-    }))
-}
-
-/// `Some(normalized)` if `raw` parses as semver and is strictly newer than the
-/// running build; `None` if equal/older or unparsable (we don't prompt on garbage).
-fn newer_version(raw: &str) -> Result<Option<String>> {
-    let latest_raw = raw.trim_start_matches('v').trim();
-    let (Ok(latest), Ok(current)) = (Version::parse(latest_raw), Version::parse(CURRENT_VERSION)) else {
-        debug!(latest = %raw, current = CURRENT_VERSION, "update check: unparsable version, skipping");
-        return Ok(None);
-    };
-    if latest <= current {
-        return Ok(None);
-    }
-    Ok(Some(latest.to_string()))
-}
-
-/// Pick the installer for this machine and this build: the preferred
-/// packaging for the OS (`dmg` / `msi` / `appimage`), else any asset for the
-/// same `os`/`arch`.
-fn pick_asset(assets: &[ManifestAsset]) -> Option<UpdateAsset> {
-    pick_asset_for(
-        assets,
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        BuildVariant::current(),
-    )
-}
-
-/// [`pick_asset`] for a named machine and variant.
-///
-/// The standard build never takes a GPUI Fast file, and the Fast build
-/// takes only its platform's Fast installer. A release without one (its job
-/// may fail without failing the release) leaves that build no asset, which
-/// the caller turns into a link to the release page: installing the other
-/// build instead would end the Fast install for good, the next check being
-/// the standard build's.
-fn pick_asset_for(assets: &[ManifestAsset], os: &str, arch: &str, variant: BuildVariant) -> Option<UpdateAsset> {
-    let preferred_kind = match os {
-        "macos" => "dmg",
-        "windows" => "msi",
-        "linux" => "appimage",
-        _ => return None,
-    };
-    let mut here = assets.iter().filter(|a| a.os == os && a.arch == arch);
-    let chosen = match variant {
-        BuildVariant::Standard => here
-            .clone()
-            .find(|a| a.kind == preferred_kind)
-            .or_else(|| here.find(|a| !a.kind.ends_with(FAST_SUFFIX)))?,
-        BuildVariant::Fast => {
-            let kind = format!("{preferred_kind}{FAST_SUFFIX}");
-            here.find(|a| a.kind == kind)?
-        }
-    };
-    Some(UpdateAsset {
-        url: chosen.url.clone(),
-        sha256: chosen.sha256.clone(),
-        name: chosen.name.clone(),
-        size: chosen.size,
-    })
-}
 
 /// The mirror's URL for one attachment of `tag` — spelled, not looked up.
 /// Gitee advertises exactly the shape GitHub uses, with no attachment id in
@@ -657,16 +153,6 @@ fn http_get_string_mirrored(url: &str, mirror: &str) -> Result<(String, bool)> {
     }
 }
 
-/// The manifest from the mirror: its `latest` release names the tag, and the
-/// tag spells the attachment URL. Two requests, only ever on the path where
-/// GitHub already failed.
-fn fetch_from_gitee_manifest() -> Result<Manifest> {
-    let text = http_get_string(&format!("{GITEE_API}/releases/latest"))?;
-    let release: GithubRelease = serde_json::from_str(&text)?;
-    let text = http_get_string(&gitee_download_url(&release.tag_name, "latest.json"))?;
-    Ok(serde_json::from_str(&text)?)
-}
-
 fn http_get_string(url: &str) -> Result<String> {
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(REQUEST_TIMEOUT))
@@ -701,400 +187,21 @@ fn http_get_string(url: &str) -> Result<String> {
     Ok(text)
 }
 
-/// One release asset, the manifest's address first and the mirror second.
-///
-/// The manifest spells GitHub URLs, so a network that cannot reach GitHub
-/// would otherwise have found an update it could never download. The bytes
-/// are checked against the manifest's SHA-256 either way, which is what lets
-/// a second *address* not become a second source of truth.
-fn fetch_asset(agent: &ureq::Agent, url: &str) -> Result<ureq::http::Response<ureq::Body>> {
-    let origin = match agent.get(url).header("User-Agent", USER_AGENT).call() {
-        Ok(response) => return Ok(response),
-        Err(e) => e,
-    };
-    let Some(mirror) = gitee_mirror_of(url) else {
-        error!(%url, error = %origin, "update: download request failed");
-        return Err(Error::Invalid {
-            message: format!("download failed: {origin}"),
-        });
-    };
-    debug!(%url, error = %origin, "update: download unreachable, trying the mirror");
-    agent.get(&mirror).header("User-Agent", USER_AGENT).call().map_err(|e| {
-        error!(%url, %mirror, error = %e, "update: download failed on both hosts");
-        Error::Invalid {
-            message: format!("download failed: {origin}; mirror: {e}"),
-        }
-    })
-}
-
-/// Download `asset` to the temp dir and verify its SHA-256 against the manifest.
-/// Returns the path to the verified file. On a checksum mismatch the partial
-/// file is removed and an error returned — the caller must never open it.
-/// Blocking; run on a background task.
-/// Download the asset, verify its checksum, and write it to a temp file.
-///
-/// `on_progress(downloaded, total)` is invoked as bytes stream in (`total` is
-/// the asset's advertised size, may be 0 if unknown), so callers can render a
-/// progress indicator. The body is read in chunks and capped at `MAX_DOWNLOAD`.
-pub fn download_and_verify(asset: &UpdateAsset, mut on_progress: impl FnMut(u64, u64)) -> Result<PathBuf> {
-    info!(name = %asset.name, size = asset.size, "update: downloading installer");
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(DOWNLOAD_TIMEOUT))
-        // Reaching a host and transferring from it are different questions
-        // with very different right answers — see [`REACH_TIMEOUT`].
-        .timeout_resolve(Some(REACH_TIMEOUT))
-        .timeout_connect(Some(REACH_TIMEOUT))
-        .proxy(app_proxy())
-        .build()
-        .new_agent();
-    let resp = fetch_asset(&agent, &asset.url)?;
-    // Prefer the server's Content-Length for the progress total; the manifest's
-    // `size` is only a fallback (it may be 0 / absent), in which case progress
-    // stays indeterminate.
-    let total = resp
-        .headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(asset.size);
-    let mut reader = resp.into_body().into_reader();
-    let mut bytes: Vec<u8> = Vec::with_capacity(total.min(MAX_DOWNLOAD) as usize);
-    let mut buf = [0u8; 64 * 1024];
-    on_progress(0, total);
-    loop {
-        let n = reader.read(&mut buf).map_err(|e| {
-            error!(url = %asset.url, error = %e, "update: reading download body failed");
-            Error::Invalid {
-                message: format!("download read failed: {e}"),
-            }
-        })?;
-        if n == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&buf[..n]);
-        if bytes.len() as u64 > MAX_DOWNLOAD {
-            error!(name = %asset.name, "update: download exceeded size cap");
-            return Err(Error::Invalid {
-                message: format!("download too large for {}", asset.name),
-            });
-        }
-        on_progress(bytes.len() as u64, total);
-    }
-
-    // Verify the checksum before the bytes ever touch a runnable location.
-    if !asset.sha256.is_empty() {
-        let digest = Sha256::digest(&bytes);
-        let got: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-        if !got.eq_ignore_ascii_case(&asset.sha256) {
-            error!(name = %asset.name, expected = %asset.sha256, got = %got, "update: checksum mismatch");
-            return Err(Error::Invalid {
-                message: format!("checksum mismatch for {}", asset.name),
-            });
-        }
-    }
-
-    let path = std::env::temp_dir().join(&asset.name);
-    if let Err(e) = std::fs::write(&path, &bytes) {
-        let _ = std::fs::remove_file(&path);
-        return Err(e.into());
-    }
-    info!(path = %path.display(), "update: installer downloaded and verified");
-    Ok(path)
-}
-
-/// Whether finishing the install needs Zedis to quit — the answer differs per
-/// platform because "installing" means something different on each:
-///
-/// * **macOS** (`.dmg`): the user drags the new `Zedis.app` over the running one
-///   in `/Applications`. The live process has the old bundle's pages mapped, so
-///   replacing it underneath can fault it (bad code signature / `SIGBUS`).
-/// * **Windows** (`.msi`): msiexec cannot replace a running `zedis.exe`; it
-///   raises the "files in use" prompt (or demands a reboot) instead.
-/// * **Linux** (AppImage / tarball): not an installer at all — nothing needs the
-///   process gone, and quitting would strand the user with no new version.
-pub const fn installer_requires_quit() -> bool {
-    cfg!(not(target_os = "linux"))
-}
-
-/// Bring the installer's own UI forward, right before Zedis quits.
-///
-/// On macOS the `.dmg` is handed to LaunchServices, which mounts it and has
-/// **Finder** open the drag-to-Applications window. Quitting gives focus to
-/// whichever app was active before Zedis (a terminal, an editor…) rather than to
-/// Finder, so the window the user is supposed to act on ends up buried behind
-/// everything. `open -a Finder` activates it through LaunchServices — no
-/// AppleScript, so no "wants to control Finder" permission prompt.
-///
-/// Windows' msiexec raises its own foreground window, and Linux never quits
-/// here, so both are no-ops.
-pub fn focus_installer_ui() {
-    #[cfg(target_os = "macos")]
-    if let Err(e) = Command::new("open").args(["-a", "Finder"]).spawn() {
-        debug!(error = %e, "update: could not activate Finder for the installer window");
-    }
-}
-
-/// Hand a downloaded installer to the OS: `open` on macOS (mounts a `.dmg`,
-/// launches a `.pkg`), `start` on Windows (runs the `.msi`), `xdg-open` on Linux.
-/// Blocking; run on a background task.
-pub fn open_installer(path: &Path) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut c = Command::new("open");
-        c.arg(path);
-        c
-    };
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        // `start` needs an (empty) title argument before the file.
-        let mut c = Command::new("cmd");
-        c.args(["/C", "start", ""]).arg(path);
-        c
-    };
-    #[cfg(target_os = "linux")]
-    let mut command = {
-        let mut c = Command::new("xdg-open");
-        c.arg(path);
-        c
-    };
-
-    let open_failed = |e: std::io::Error| {
-        error!(path = %path.display(), error = %e, "update: failed to open installer");
-        Error::Invalid {
-            message: format!("failed to open installer: {e}"),
-        }
-    };
-
-    // macOS / Windows: *wait* for the launcher to return, because the caller
-    // quits right after (see `installer_requires_quit`) and must not race it.
-    // Neither waits for the install itself — `open` returns once LaunchServices
-    // has the disk image, `cmd /C start` once msiexec is launched.
-    #[cfg(not(target_os = "linux"))]
-    {
-        let status = command.status().map_err(open_failed)?;
-        if !status.success() {
-            error!(path = %path.display(), %status, "update: installer launcher exited non-zero");
-            return Err(Error::Invalid {
-                message: format!("failed to open installer: {status}"),
-            });
-        }
-    }
-    // Linux: `xdg-open` can block until the handler it picked exits (some
-    // desktop fallbacks do), and we never quit here — so fire and forget.
-    #[cfg(target_os = "linux")]
-    command.spawn().map_err(open_failed)?;
-
-    Ok(())
-}
-
 // ---- in-place install (macOS) ------------------------------------------
-
-/// Install the verified file. macOS installs in place when possible (see
-/// the module docs); every other outcome and platform degrades to
-/// [`open_installer`]. Blocking (hdiutil and ditto take seconds) — run on
-/// a background task.
-pub fn install_update(installer: &Path) -> Result<Delivery> {
-    #[cfg(target_os = "macos")]
-    {
-        match running_bundle() {
-            Some(target) => match install_over(&target, installer) {
-                Ok(()) => return Ok(Delivery::Replaced),
-                Err(e) => {
-                    tracing::warn!(error = %e, "update: in-place install fell back to the drag window");
-                }
-            },
-            None => info!("update: no running bundle (bare binary); opening the image to install"),
-        }
-    }
-    open_installer(installer)?;
-    Ok(Delivery::HandedToOs)
-}
-
-/// Quit-and-restart after a [`Delivery::Replaced`] install. The restart is
-/// handed to a detached `sh` that waits for this pid to exit and then
-/// `open`s the bundle — the path rides in `$0`, so no quoting happens
-/// inside the script. The caller quits right after; the shell outlives us
-/// as launchd's orphan, so it is never a zombie of ours.
-#[cfg(target_os = "macos")]
-pub fn relaunch() {
-    let Some(bundle) = running_bundle() else {
-        return;
-    };
-    let script = format!(
-        "while /bin/kill -0 {pid} 2>/dev/null; do /bin/sleep 0.1; done; /usr/bin/open \"$0\"",
-        pid = std::process::id()
-    );
-    match Command::new("/bin/sh")
-        .arg("-c")
-        .arg(script)
-        .arg(bundle.as_os_str())
-        .spawn()
-    {
-        Ok(_) => info!(bundle = %bundle.display(), "update: restart requested to finish the update"),
-        Err(e) => tracing::warn!(error = %e, "update: could not spawn the relauncher"),
-    }
-}
-
-/// The identity gate for the in-place swap — must match
-/// `[package.metadata.bundle] identifier` in Cargo.toml (a test guards
-/// the pair).
-#[cfg(target_os = "macos")]
-const BUNDLE_ID: &str = "com.bigtree.zedis";
-
-/// The bundle's name, on the DMG and on disk.
-#[cfg(target_os = "macos")]
-const BUNDLE_NAME: &str = "Zedis.app";
-
-/// The bundle this process runs from — `…/Zedis.app` for the installed
-/// app, `None` under bare `cargo run`. `current_exe` reports the path
-/// recorded at exec time, so after an in-place install it names the *new*
-/// copy at the same location — exactly what a relaunch wants, and why
-/// `replace_bundle` may move the file it points at.
-#[cfg(target_os = "macos")]
-fn running_bundle() -> Option<PathBuf> {
-    bundle_root_of(&std::env::current_exe().ok()?)
-}
-
-/// `…/Foo.app/Contents/MacOS/foo` → `…/Foo.app`.
-#[cfg(target_os = "macos")]
-fn bundle_root_of(exe: &Path) -> Option<PathBuf> {
-    let root = exe.parent()?.parent()?.parent()?;
-    (root.extension().is_some_and(|ext| ext == "app")).then(|| root.to_path_buf())
-}
-
-/// Mount, replace `target`, detach. The volume is detached on every exit —
-/// a failed copy must not leave the image mounted on top of the failure it
-/// just reported.
-#[cfg(target_os = "macos")]
-fn install_over(target: &Path, dmg: &Path) -> Result<()> {
-    let volume = attach(dmg)?;
-    let result = replace_bundle(target, &volume);
-    detach(&volume);
-    result
-}
-
-/// Swap `target` for the bundle on the mounted volume. The old bundle is
-/// renamed aside into the temp directory, never deleted: the running
-/// process keeps every file it might still fault in, and the OS prunes
-/// temp on its own schedule. The rename doubles as the permission gate —
-/// an unwritable `/Applications` fails it before anything has moved. A
-/// failed copy renames the old bundle straight back.
-#[cfg(target_os = "macos")]
-fn replace_bundle(target: &Path, volume: &Path) -> Result<()> {
-    let fresh = volume.join(BUNDLE_NAME);
-    if bundle_plist_value(&fresh, "CFBundleIdentifier").as_deref() != Some(BUNDLE_ID) {
-        return Err(Error::Invalid {
-            message: "the mounted image does not carry our bundle".to_string(),
-        });
-    }
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let aside = std::env::temp_dir().join(format!("zedis-previous-{}-{stamp}.app", std::process::id()));
-    std::fs::rename(target, &aside).map_err(|e| Error::Invalid {
-        message: format!("could not move the old bundle aside: {e}"),
-    })?;
-    let copied = Command::new("/usr/bin/ditto")
-        .arg(fresh.as_os_str())
-        .arg(target.as_os_str())
-        .output();
-    let failure = match &copied {
-        Ok(out) if out.status.success() => {
-            info!(target = %target.display(), "update: installed in place");
-            return Ok(());
-        }
-        Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        Err(e) => e.to_string(),
-    };
-    if let Err(e) = std::fs::rename(&aside, target) {
-        error!(aside = %aside.display(), error = %e, "update: could not restore the old bundle");
-    }
-    Err(Error::Invalid {
-        message: format!("ditto failed: {failure}"),
-    })
-}
-
-/// Mount the image without a Finder window and return its mount point,
-/// parsed from hdiutil's own plist output. `-noverify` because the
-/// image's bytes were already vouched for: `download_and_verify` hashed
-/// the whole file against the manifest, and hdiutil's default pass
-/// re-reads the entire image to answer the same question.
-#[cfg(target_os = "macos")]
-fn attach(dmg: &Path) -> Result<PathBuf> {
-    let out = Command::new("hdiutil")
-        .args(["attach", "-nobrowse", "-noverify", "-plist"])
-        .arg(dmg.as_os_str())
-        .output()
-        .map_err(|e| Error::Invalid { message: e.to_string() })?;
-    if !out.status.success() {
-        return Err(Error::Invalid {
-            message: format!("hdiutil attach: {}", String::from_utf8_lossy(&out.stderr).trim()),
-        });
-    }
-    mount_point_from_plist(&String::from_utf8_lossy(&out.stdout)).ok_or_else(|| Error::Invalid {
-        message: "no mount point in hdiutil's output".to_string(),
-    })
-}
-
-/// The `mount-point` string out of `hdiutil attach -plist` — the one
-/// value needed, scanned without a plist parser. The volume name is ours
-/// and ASCII ("Zedis Installer"), so XML entity escapes cannot occur in
-/// the value.
-#[cfg(target_os = "macos")]
-fn mount_point_from_plist(xml: &str) -> Option<PathBuf> {
-    let after = xml.split("<key>mount-point</key>").nth(1)?;
-    let start = after.find("<string>")? + "<string>".len();
-    let end = start + after[start..].find("</string>")?;
-    Some(PathBuf::from(&after[start..end]))
-}
-
-/// Detach the installer volume, with one retry after a beat — hdiutil
-/// answers "resource busy" while Spotlight is still indexing the fresh
-/// mount. A volume that stays stuck is left with a warning; the user can
-/// eject it from Finder.
-#[cfg(target_os = "macos")]
-fn detach(volume: &Path) {
-    for attempt in 0..2 {
-        if attempt > 0 {
-            std::thread::sleep(Duration::from_secs(1));
-        }
-        let detached = Command::new("hdiutil")
-            .arg("detach")
-            .arg(volume.as_os_str())
-            .output()
-            .is_ok_and(|out| out.status.success());
-        if detached {
-            return;
-        }
-    }
-    tracing::warn!(volume = %volume.display(), "update: installer image left mounted");
-}
-
-/// One string key out of a bundle's Info.plist, via `defaults read`
-/// (which handles both XML and binary plists). `None` for a missing
-/// bundle, key, or a failed spawn — every caller treats those alike.
-#[cfg(target_os = "macos")]
-fn bundle_plist_value(app: &Path, key: &str) -> Option<String> {
-    let out = Command::new("defaults")
-        .arg("read")
-        // Sans extension — `defaults` appends ".plist" itself.
-        .arg(app.join("Contents/Info").as_os_str())
-        .arg(key)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let value = String::from_utf8(out.stdout).ok()?;
-    let value = value.trim();
-    (!value.is_empty()).then(|| value.to_string())
-}
 
 #[cfg(test)]
 mod tests {
+    use super::check::{CURRENT_VERSION, MAX_NOTES_RELEASES, newer_version, nightly_is_newer, notes_between};
+    #[cfg(target_os = "macos")]
+    use super::install::{BUNDLE_ID, BUNDLE_NAME, bundle_root_of, install_over, mount_point_from_plist};
+    use super::manifest::{
+        FAST_SUFFIX, GithubAsset, GithubRelease, ManifestAsset, asset_identity, assets_from_api, file_identity,
+        pick_asset_for,
+    };
     use super::*;
+    use crate::helpers::set_configured_proxy;
+    use crate::test_support::hold_the_proxy;
+    use std::sync::MutexGuard;
 
     /// One spelling serves both hosts: everything after `/releases/download/`
     /// is identical, which is the property that lets the mirror be a second
@@ -1637,5 +744,100 @@ mod tests {
             ("windows", "x86_64", "msi")
         );
         assert!(manifest[0].sha256.is_empty(), "no checksum without a manifest");
+    }
+
+    /// A local server answering every request with `body`, for `requests`
+    /// requests; its base address.
+    fn serve(body: &'static [u8], requests: usize) -> String {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(requests) {
+                let Ok(mut stream) = stream else { continue };
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) {
+                    request.push(byte[0]);
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// Straight to the local server, whatever proxy the machine names, for
+    /// as long as it is held.
+    struct Direct {
+        _held: MutexGuard<'static, ()>,
+    }
+    impl Direct {
+        fn new() -> Self {
+            let held = hold_the_proxy();
+            set_configured_proxy("none");
+            Self { _held: held }
+        }
+    }
+    impl Drop for Direct {
+        fn drop(&mut self) {
+            set_configured_proxy("");
+        }
+    }
+
+    /// An installer is kept only when its bytes are the ones the manifest
+    /// names, and the progress reaches the size the server gave.
+    #[test]
+    fn a_download_is_kept_only_when_its_bytes_are_the_ones_named() {
+        let _direct = Direct::new();
+        let body: &'static [u8] = b"installer bytes";
+        let base = serve(body, 2);
+        let sha256: String = Sha256::digest(body).iter().map(|b| format!("{b:02x}")).collect();
+        let name = format!("zedis-update-test-{}.bin", std::process::id());
+        let asset = UpdateAsset {
+            url: format!("{base}/{name}"),
+            sha256,
+            name: name.clone(),
+            size: 0,
+        };
+        let mut progress = (0, 0);
+        let path = download_and_verify(&asset, |done, total| progress = (done, total)).expect("downloaded");
+        assert_eq!(std::fs::read(&path).expect("read"), body);
+        assert_eq!(progress, (15, 15));
+        let _ = std::fs::remove_file(&path);
+
+        let forged = UpdateAsset {
+            sha256: "00".repeat(32),
+            name: format!("zedis-update-forged-{}.bin", std::process::id()),
+            ..asset
+        };
+        assert!(download_and_verify(&forged, |_, _| {}).is_err(), "a checksum mismatch");
+        assert!(
+            !std::env::temp_dir().join(&forged.name).exists(),
+            "and nothing left to open"
+        );
+    }
+
+    /// A text the origin cannot give comes from the mirror, and the answer
+    /// says which host gave it; a reachable origin is asked alone.
+    #[test]
+    fn the_mirror_answers_what_the_origin_cannot() {
+        let _direct = Direct::new();
+        // Nothing listens on the discard port.
+        let dead = "http://127.0.0.1:9/latest.json";
+        let live = serve(b"{}", 2);
+        let live = format!("{live}/latest.json");
+        assert_eq!(
+            http_get_string_mirrored(dead, &live).expect("mirror"),
+            ("{}".to_string(), true)
+        );
+        assert_eq!(
+            http_get_string_mirrored(&live, dead).expect("origin"),
+            ("{}".to_string(), false)
+        );
     }
 }

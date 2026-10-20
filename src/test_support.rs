@@ -60,6 +60,14 @@ pub(crate) fn hold_the_server_list() -> std::sync::MutexGuard<'static, ()> {
     SERVER_LIST.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Held by a test that sets the configured proxy, which is the process's
+/// too: the updater's tests reach a local server directly, and a proxy
+/// another test set meanwhile would send them to a host that is not there.
+pub(crate) fn hold_the_proxy() -> std::sync::MutexGuard<'static, ()> {
+    static PROXY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    PROXY.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// What a server state said, in the order it said it: each `ServerEvent` as
 /// its `Debug` text, each notice it put up as `notice <category>: <message>`.
 pub(crate) type EventLog = Rc<RefCell<Vec<String>>>;
