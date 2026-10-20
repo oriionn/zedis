@@ -785,6 +785,37 @@ matrix), then `config.rs`, then `client.rs`. Each is one change, verified
 like step 2: the line-by-line count, the public paths unchanged, the live
 suite locally, then the matrix.
 
+#### Step 3, done (2026-10-21)
+
+Done before the matrix had run on step 2, at the user's word: the two go to
+the matrix together when they are pushed. Locally the
+whole topology ran — this time with the SSH scenario, so the tunnel tests
+ran too (Redis 8.6.1, ports at 46379 / 47000) — before and after the three
+splits: 94 passed both times, with the same twenty skips (modules,
+Dragonfly, Garnet, a foreign flavor, the Valkey-only floors).
+
+| File | Now | Submodules |
+|---|---|---|
+| `ssh_tunnel.rs` | 817, with its tests | `host_keys` 225, `target` 191, `auth` 325, `monitor` 142 |
+| `config.rs` | 1,356, with its tests | `transfer` 431, `form` 233, `store` 325 (`tls` was there) |
+| `manager/client.rs` | 534 | `describe` 418, `fan_out` 386, `scan` 579 |
+
+Every path another file used is re-exported where it was (the host key
+prompt, the tunnelled `MONITOR`, the SSH target's resolution; the form's
+indexes, the list's functions with their wasm and native arms, `ImportError`),
+so no file outside the three changed. The URI parsing stayed in `config.rs`,
+the form and the import both reading it. The line-by-line count differs
+only in the headers, the `mod` / `use` lines and `pub(super)` on what the
+core of each file and its tests reach: `authenticate`, `ClientHandler`'s two
+fields and four helpers the SSH tests call; the list's `RedisServers` field
+and three helpers, and two of the form's, for `config.rs`'s tests.
+`client.rs` needed none — every method it lost is called only beside where
+it went — and lost not a line. The wasm build's warnings are the same but
+two, `redact_servers` and `RedisServers`, which now say `config/store.rs`.
+
+Left for a step of its own, as above: the TLS pieces in `ssh_tunnel.rs`
+that have nothing to do with SSH.
+
 ### Phase 6 — the shell and the panels
 
 - `status_bar.rs` (2.0k without tests): the tools menu, the server status
@@ -1008,15 +1039,15 @@ a wire field or a test name CI selects by.
 | 3 | sub-structs | done: seven groups; the panels' three fields, `terminal` and the errors left as fields | `e22ca9a` |
 | 3 | `ServerTask` | done: a variant per operation kept; the background refreshes named once | `e22ca9a` |
 | 4 | gate inventory | done: 23 of 24 statement gates up to items, seams or modules; the four `cfg!` asks go through `this_build` | `b22963a` |
-| 5 | operations ↔ live tests check | done: 210 operations, all typed; 28 without a live test, listed | (pending) |
-| 5 | `tests/live.rs` split | done: fifteen modules and `main.rs`, the 94 names kept | (pending) |
-| 5 | `client.rs`, `config.rs`, `ssh_tunnel.rs` read for seams | read: ten submodules named; the splits wait for the matrix to have run on step 2 | |
+| 5 | operations ↔ live tests check | done: 210 operations, all typed; 28 without a live test, listed | `cb3cb50` |
+| 5 | `tests/live.rs` split | done: fifteen modules and `main.rs`, the 94 names kept | `cb3cb50` |
+| 5 | `client.rs`, `config.rs`, `ssh_tunnel.rs` split | done: ten submodules, the live suite with SSH before and after; the matrix checks it on push | (pending) |
 | 6 | status bar | done: four submodules, two UI tests first; UI tests reduce motion | `2ffdd87` |
 | 6 | root | done: the tab strip into `root/tabs.rs`, `new` into named parts, three UI tests first | `b54fde5` |
 | 6 | panels, administration tools | checked: the grids and loops follow the rules; five confirms listed as findings | `b54fde5` |
 | 7 | transport | done: one submodule per trait, three tests first | `2d90e1f` |
 | 7 | updater | done: check, manifest, download, install; two tests first | `c78ad4e` |
-| 8 | core, db pass | done: two dead helpers gone, no duplication, `KeyMetadata` given its container default | (pending) |
+| 8 | core, db pass | done: two dead helpers gone, no duplication, `KeyMetadata` given its container default | `52facc6` |
 
 Findings that are bugs rather than structure are listed here as they turn up,
 and fixed as their own changes.
