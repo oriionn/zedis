@@ -44,6 +44,8 @@ zedis.example.com {
 
 Create the administrator before the address is given to anyone: until then, whoever has the setup token is the one who does. After ten failed attempts in a quarter of an hour the bridge refuses more from that address (`429`) — counted per account name, and the same for the setup token and invitation codes. Behind a reverse proxy every request comes from the proxy's address, so that count is then per name for everyone; add a rate limit at the proxy as well if the bridge is reachable from outside your own network.
 
+The bridge compresses what it sends by itself: the page's files once, when the image is built (brotli and gzip), and the API's answers as it sends them — zstd where the browser takes it (Chrome 123, Firefox 126, Safari 26.3 on macOS 26.3), gzip otherwise, from a kilobyte up. A proxy in front needs no compression of its own; Caddy's `encode` and nginx's `gzip` pass an answer that is already encoded through unchanged.
+
 ## Sharing a host name with other applications
 
 When the host name is not Zedis's alone, give the bridge a path of its own with `ZEDIS_BRIDGE_BASE_PATH` (or `--base-path`). The page, its files and the API all move under it, nothing outside it answers, and the login cookie is scoped to it — so the other applications on that host never receive it.

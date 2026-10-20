@@ -66,6 +66,12 @@ toml.workspace = true
 # desktop already uses, run off the async workers, on the same rustls + ring.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "any", "postgres", "mysql", "mysql-rsa", "migrate", "macros"] }
+# The API's answers compressed per request (`api::router`): zstd, the quickest
+# of the codings browsers take (Chrome 123, Firefox 126, Safari 26.3 on macOS
+# 26.3), and gzip for every other client. No brotli here: it is the page's
+# files' coding, and those are compressed once, at build time
+# (`scripts/web-bundle.sh`).
+tower-http = { version = "0.7.1", default-features = false, features = ["compression-gzip", "compression-zstd"] }
 
 [dev-dependencies]
 # Paused time for the watch tests (`watch.rs`): a long poll's twenty seconds

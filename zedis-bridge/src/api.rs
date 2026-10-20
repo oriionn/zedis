@@ -46,6 +46,7 @@ use std::path::Path as FsPath;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::Duration;
+use tower_http::compression::{CompressionLayer, predicate::SizeAbove};
 use uuid::Uuid;
 use zedis_connection::string::{decrypt_bytes, encrypt_bytes};
 use zedis_connection::{
@@ -104,6 +105,14 @@ pub struct AppState {
     pub store_probe: Option<Arc<dyn StoreVersions>>,
 }
 
+/// The smallest API answer worth compressing. Below a kilobyte the saving
+/// is a few hundred bytes at most; and the small answers are the ones that
+/// carry a one-time secret — an MCP token, an invitation code — which so
+/// never meets a compressor (a BREACH-style length leak needs that; the
+/// login cookie is also `SameSite=Strict`, so another site cannot make a
+/// signed-in page ask in the first place).
+const COMPRESS_FROM_BYTES: u64 = 1024;
+
 /// The page and the API, under `state.base_path` when there is one.
 ///
 /// A bridge that shares a host name with other applications gets a path of
@@ -152,6 +161,17 @@ pub fn router(state: AppState) -> Router {
     page_data::routes(router, &at)
         // On the API routes only — the page's files need no login.
         .route_layer(middleware::from_fn_with_state(state.clone(), renew_login_cookie))
+        // The API's answers compressed for a client that asks: a value
+        // base64 inside JSON, a page of keys, the page's own data. zstd where
+        // it is accepted — at its default level a tenth of gzip's time for a
+        // smaller result — and gzip for the rest. Routes only: the page's
+        // files are compressed once, at build time, and sent as they are.
+        .route_layer(
+            CompressionLayer::new()
+                .gzip(true)
+                .zstd(true)
+                .compress_when(SizeAbove::new(COMPRESS_FROM_BYTES)),
+        )
         // axum's default is the same number. It is said here because the
         // page sizes what it sends by it — a value it cannot save opens
         // read-only — and two copies of a limit drift apart.
@@ -3031,5 +3051,126 @@ mod online_servers_tests {
         };
         let own = reply.clients.iter().find(|c| c.account == "bob").expect("bob");
         assert_eq!(own.servers.len(), 2, "bob sees his own entry");
+    }
+}
+
+#[cfg(test)]
+mod compression_tests {
+    use super::*;
+    use flate2::read::GzDecoder;
+    use std::io::Read as _;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// What one request answered: the status line, the `content-encoding`
+    /// header if any, and the body as sent.
+    struct Answer {
+        status: String,
+        encoding: Option<String>,
+        body: Vec<u8>,
+    }
+
+    async fn ask(addr: SocketAddr, head: &str, body: &str) -> Answer {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let request = format!(
+            "{head}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.expect("request");
+        let mut reply = Vec::new();
+        stream.read_to_end(&mut reply).await.expect("reply");
+        let split = reply.windows(4).position(|w| w == b"\r\n\r\n").expect("a header block");
+        let head = String::from_utf8_lossy(&reply[..split]).to_string();
+        let encoding = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-encoding: "))
+            .map(str::to_string);
+        let raw = &reply[split + 4..];
+        // A compressed answer's length is not known ahead: it is chunked.
+        let body = if head.lines().any(|line| line == "transfer-encoding: chunked") {
+            dechunk(raw)
+        } else {
+            raw.to_vec()
+        };
+        Answer {
+            status: head.lines().next().unwrap_or_default().to_string(),
+            encoding,
+            body,
+        }
+    }
+
+    /// A chunked body's data: a hex length, its bytes, again, until 0.
+    fn dechunk(mut raw: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        loop {
+            let line_end = raw.windows(2).position(|w| w == b"\r\n").expect("a chunk size");
+            let size = usize::from_str_radix(String::from_utf8_lossy(&raw[..line_end]).trim(), 16).expect("hex");
+            if size == 0 {
+                return body;
+            }
+            let start = line_end + 2;
+            body.extend_from_slice(&raw[start..start + size]);
+            raw = &raw[start + size + 2..];
+        }
+    }
+
+    /// The API's answers are compressed for a client that asks — zstd where
+    /// it is accepted, gzip otherwise, nothing for a coding not offered or an
+    /// answer under a kilobyte — and the page's own files are left as the
+    /// build made them.
+    #[tokio::test]
+    async fn the_api_answers_compressed_and_the_page_is_left_alone() {
+        let state = super::mcp_auth_tests::state("[[users]]\nname = \"ai\"\npassword = \"secret\"\nread_only = true\n");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let basic = format!("authorization: Basic {}\r\n", B64.encode("ai:secret"));
+        let tools = |accept: &str| {
+            format!(
+                "POST /v1/mcp HTTP/1.1\r\nhost: bridge\r\ncontent-type: application/json\r\n\
+                 accept: application/json, text/event-stream\r\n{basic}accept-encoding: {accept}\r\n"
+            )
+        };
+        let list = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+
+        let zstd = ask(addr, &tools("zstd, gzip"), list).await;
+        assert!(zstd.status.contains(" 200 "), "{}", zstd.status);
+        assert_eq!(zstd.encoding.as_deref(), Some("zstd"));
+
+        let gzip = ask(addr, &tools("gzip"), list).await;
+        assert_eq!(gzip.encoding.as_deref(), Some("gzip"));
+        let mut text = String::new();
+        GzDecoder::new(gzip.body.as_slice())
+            .read_to_string(&mut text)
+            .expect("gzip");
+        assert!(text.contains("\"scan_keys\""), "the tool list, whole");
+        assert!(zstd.body.len() < text.len() && gzip.body.len() < text.len());
+
+        let brotli = ask(addr, &tools("br"), list).await;
+        assert_eq!(brotli.encoding, None, "brotli is not offered");
+
+        let small = ask(
+            addr,
+            "GET /v1/health HTTP/1.1\r\nhost: bridge\r\naccept-encoding: zstd\r\n",
+            "",
+        )
+        .await;
+        assert!(small.status.contains(" 200 "), "{}", small.status);
+        assert_eq!(small.encoding, None, "a few bytes are not worth it");
+
+        let page = ask(
+            addr,
+            "GET / HTTP/1.1\r\nhost: bridge\r\naccept-encoding: zstd, gzip\r\n",
+            "",
+        )
+        .await;
+        assert!(page.status.contains(" 200 "), "{}", page.status);
+        assert!(page.body.len() > 1024, "the page is larger than the threshold");
+        assert_eq!(
+            page.encoding, None,
+            "the page's files are compressed at build time, not here"
+        );
+        server.abort();
     }
 }
