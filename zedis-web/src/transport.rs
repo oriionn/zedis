@@ -19,6 +19,11 @@
 //! makes the split pay: under wasm it is the browser's `fetch`, and on the
 //! host it is the native client — which is why this module is not itself
 //! browser-only, and its tests run in an ordinary `cargo test`.
+//!
+//! It carries five of that crate's seams, one submodule each — `commands`
+//! ([`BridgeTransport`]), `storage` ([`BridgeStorage`]), `servers`
+//! ([`BridgeServerStore`]), `accounts` ([`BridgeAccounts`]) and `page_data`
+//! ([`BridgePageData`]) — over the requests this file makes for all of them.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use futures::AsyncReadExt as _;
@@ -41,6 +46,14 @@ use zedis_connection::{
     BridgeTransport, BridgeTrashEntry, DiagReportRow, RedisServer, WatchBatch, WatchItem, WatchKind, WatchOpened,
     describe_commands, get_servers, set_account_read_only_on,
 };
+
+mod accounts;
+mod commands;
+mod page_data;
+mod servers;
+mod storage;
+
+pub use page_data::{PageData, page_seed};
 
 /// Talks to one `zedis-bridge`.
 pub struct HttpBridgeTransport {
@@ -116,65 +129,6 @@ impl HttpBridgeTransport {
         self.server_list_wake.take()
     }
 
-    /// `call`, and once it succeeds the server list read again at once:
-    /// what a deleted account kept to itself was handed over or shared, and
-    /// may be this page's to see now — the administrator's own, by default.
-    fn then_list_servers_again(&self, call: BridgeAccountResult<()>) -> BridgeAccountResult<()> {
-        let wake = self.server_list_wake.sender.clone();
-        Box::pin(async move {
-            let result = call.await;
-            if result.is_ok() {
-                let _ = wake.unbounded_send(());
-            }
-            result
-        })
-    }
-
-    /// `GET /v1/page-data` again, for what other accounts changed: `None`
-    /// when the bridge says it is what `etag` names (a `304`), else the
-    /// answer and its tag.
-    pub fn fetch_page_data(&self, etag: Option<String>) -> BoxFuture<'static, Result<Option<PageData>, BridgeError>> {
-        let client = self.client.clone();
-        let url = format!("{}/v1/page-data", self.base_url);
-        Box::pin(async move {
-            let mut builder = Request::builder().method("GET").uri(&url);
-            if let Some(etag) = &etag {
-                builder = builder.header("if-none-match", etag);
-            }
-            let request = builder
-                .body(AsyncBody::empty())
-                .map_err(|e| BridgeError::transport(format!("could not build the request: {e}")))?;
-            let mut response = client
-                .send(request)
-                .await
-                .map_err(|e| BridgeError::transport(format!("{url} is unreachable: {e}")))?;
-            let status = response.status().as_u16();
-            if status == 304 {
-                return Ok(None);
-            }
-            let tag = response
-                .headers()
-                .get("etag")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string);
-            let mut bytes = Vec::new();
-            response
-                .body_mut()
-                .read_to_end(&mut bytes)
-                .await
-                .map_err(|e| BridgeError::transport(format!("the bridge's reply could not be read: {e}")))?;
-            if status == 401 {
-                sign_in_again();
-            }
-            if status != 200 {
-                return Err(failure(status, &bytes));
-            }
-            let text = String::from_utf8(bytes)
-                .map_err(|e| BridgeError::transport(format!("the page data is not text: {e}")))?;
-            Ok(Some(PageData { json: text, etag: tag }))
-        })
-    }
-
     /// POST `body` to `url` and hand back the status and the raw response.
     async fn post(client: Arc<dyn HttpClient>, url: String, body: String) -> Result<(u16, Vec<u8>), BridgeError> {
         Self::call(client, "POST", url, body).await
@@ -218,86 +172,6 @@ impl HttpBridgeTransport {
         }
         Ok((status, bytes))
     }
-
-    /// The entries this account may see, as the bridge holds them: settings
-    /// and owner, never a secret.
-    pub fn fetch_servers(&self) -> BoxFuture<'static, Result<Vec<RedisServer>, BridgeError>> {
-        let (client, base_url) = (self.client.clone(), self.base_url.clone());
-        Box::pin(Self::list(client, base_url))
-    }
-
-    async fn list(client: Arc<dyn HttpClient>, base_url: String) -> Result<Vec<RedisServer>, BridgeError> {
-        let (status, bytes) = Self::call(client, "GET", format!("{base_url}/v1/servers"), String::new()).await?;
-        if status != 200 {
-            return Err(failure(status, &bytes));
-        }
-        #[derive(Deserialize)]
-        struct Entry {
-            #[serde(flatten)]
-            server: RedisServer,
-            #[serde(default)]
-            secrets_set: Vec<String>,
-            /// Whether the signed-in account is read-only *on this entry*:
-            /// on every entry for a read-only account, on the entries its
-            /// `servers` rules grant as `:ro` otherwise.
-            #[serde(default)]
-            account_read_only: bool,
-        }
-        let list = serde_json::from_slice::<Vec<Entry>>(&bytes)
-            .map_err(|e| BridgeError::transport(format!("the bridge's server list is not JSON: {e}")))?;
-        // Before anything is connected, so the first `get_client` already
-        // knows: on these entries the connection is StrictReadOnly, which is
-        // the one access mode the UI cannot switch off. The bridge refuses
-        // the write regardless — this is what keeps the app from offering a
-        // button whose only possible outcome is a 403.
-        let read_only_on: HashSet<String> = list
-            .iter()
-            .filter(|entry| entry.account_read_only)
-            .map(|entry| entry.server.id.clone())
-            .collect();
-        set_account_read_only_on(read_only_on);
-        Ok(list
-            .into_iter()
-            .map(|entry| show_stored_secrets(entry.server, &entry.secrets_set))
-            .collect())
-    }
-}
-
-/// What a secret field holds in the browser when the bridge has a value for
-/// it: the bridge sends an entry's settings and the *names* of the secrets
-/// that are set, never the secrets (ADR 9), so the form needs something to
-/// show in their place. Eight bullets read as "a hidden value" in a masked
-/// field and a plain one alike, in every locale, which is why it is not a
-/// translated sentence. The three things a user can then do map onto the
-/// three things an edit can mean: leave it (keep what is stored), empty it
-/// (remove the secret), type over it (replace it). It never crosses the
-/// wire — [`split_stored_secrets`] turns it back into a name on the way out.
-const STORED_SECRET: &str = "••••••••";
-
-/// `server` as the form should see it: each secret the bridge holds shown as
-/// the placeholder.
-fn show_stored_secrets(mut server: RedisServer, secrets_set: &[String]) -> RedisServer {
-    for name in secrets_set {
-        if let Some(field) = server.secret_mut(name) {
-            *field = Some(STORED_SECRET.to_string());
-        }
-    }
-    server
-}
-
-/// `server` as the bridge should get it: every field still holding the
-/// placeholder blanked, and named, so the bridge keeps what it has stored.
-fn split_stored_secrets(mut server: RedisServer) -> (RedisServer, Vec<&'static str>) {
-    let mut keep = Vec::new();
-    for name in RedisServer::SECRET_FIELDS {
-        if let Some(field) = server.secret_mut(name)
-            && field.as_deref() == Some(STORED_SECRET)
-        {
-            *field = None;
-            keep.push(name);
-        }
-    }
-    (server, keep)
 }
 
 /// The login is gone — it lapsed, it was closed, or the account's password
@@ -316,43 +190,6 @@ fn sign_in_again() {
 /// the `Unauthorized` error like any other.
 #[cfg(not(target_family = "wasm"))]
 fn sign_in_again() {}
-
-/// The `/v1/exec` body.
-///
-/// Field names are the contract with `zedis-bridge`'s `ExecRequest`; the test
-/// below is what keeps the two from drifting apart silently, since a rename
-/// on either side would otherwise only show up as a 400 at runtime. `desc` is
-/// the one field outside that contract: a readable label per command
-/// (`describe_commands`) for whoever reads the request in the browser's
-/// network panel, where `commands` is only base64. The bridge ignores it.
-fn exec_payload(request: &BridgeRequest) -> serde_json::Value {
-    let mut payload = serde_json::json!({
-        "server": request.server_id,
-        "db": request.db,
-        "commands": request.commands.iter().map(|c| B64.encode(c)).collect::<Vec<_>>(),
-        "desc": describe_commands(&request.commands),
-    });
-    if request.fanout_masters {
-        payload["fanout"] = serde_json::Value::String("masters".to_string());
-        if !request.fanout_nodes.is_empty() {
-            payload["fanout_nodes"] = serde_json::Value::from(request.fanout_nodes.clone());
-        }
-    }
-    if let Some(spec) = request.pipeline {
-        payload["pipeline"] = serde_json::json!({
-            "offset": spec.offset,
-            "count": spec.count,
-            "atomic": spec.atomic,
-        });
-    }
-    if let Some(session) = &request.session {
-        payload["session"] = serde_json::Value::String(session.clone());
-    }
-    if let Some(confirm) = &request.confirm {
-        payload["confirm"] = serde_json::Value::String(confirm.clone());
-    }
-    payload
-}
 
 /// A request the bridge does not take, in the terms the person who made it
 /// can act on: how large it was, and how large one may be.
@@ -403,405 +240,6 @@ fn failure(status: u16, bytes: &[u8]) -> BridgeError {
     BridgeError::new(kind, message)
 }
 
-impl BridgeTransport for HttpBridgeTransport {
-    fn send(&self, request: BridgeRequest) -> BoxFuture<'static, Result<BridgeReply, BridgeError>> {
-        let client = self.client.clone();
-        let url = format!("{}/v1/exec", self.base_url);
-
-        let payload = exec_payload(&request);
-
-        Box::pin(async move {
-            let (status, bytes) = Self::post(client, url, payload.to_string()).await?;
-            if status != 200 {
-                return Err(failure(status, &bytes));
-            }
-            #[derive(Deserialize)]
-            struct Body {
-                replies: Vec<String>,
-                #[serde(default)]
-                nodes: Vec<String>,
-            }
-            let body = serde_json::from_slice::<Body>(&bytes)
-                .map_err(|e| BridgeError::transport(format!("the bridge's reply is not JSON: {e}")))?;
-            let frames = body
-                .replies
-                .iter()
-                .enumerate()
-                .map(|(index, reply)| {
-                    B64.decode(reply.as_bytes())
-                        .map_err(|e| BridgeError::transport(format!("reply {index} is not base64: {e}")))
-                })
-                .collect::<Result<Vec<Vec<u8>>, BridgeError>>()?;
-            Ok(BridgeReply {
-                frames,
-                nodes: body.nodes,
-            })
-        })
-    }
-
-    /// Ask the bridge for a connection of this caller's own — what the
-    /// terminal needs so a `SELECT` typed there does not move the key tree
-    /// (ADR 4).
-    fn open_session(&self, server_id: String, db: usize) -> BoxFuture<'static, Result<String, BridgeError>> {
-        let client = self.client.clone();
-        let url = format!("{}/v1/session", self.base_url);
-        Box::pin(async move {
-            let body = serde_json::json!({ "server": server_id, "db": db }).to_string();
-            let (status, bytes) = Self::post(client, url, body).await?;
-            if status != 200 {
-                return Err(failure(status, &bytes));
-            }
-            #[derive(Deserialize)]
-            struct Body {
-                session: String,
-            }
-            serde_json::from_slice::<Body>(&bytes)
-                .map(|b| b.session)
-                .map_err(|e| BridgeError::transport(format!("the bridge's session reply is not JSON: {e}")))
-        })
-    }
-
-    fn unlock_writes(&self, server_id: String, confirm: String) -> BoxFuture<'static, Result<(), BridgeError>> {
-        let client = self.client.clone();
-        let url = format!("{}/v1/servers/{server_id}/unlock", self.base_url);
-        Box::pin(async move {
-            let body = serde_json::json!({ "confirm": confirm }).to_string();
-            let (status, bytes) = Self::post(client, url, body).await?;
-            if status != 200 {
-                return Err(failure(status, &bytes));
-            }
-            Ok(())
-        })
-    }
-
-    fn lock_writes(&self, server_id: String) -> BoxFuture<'static, Result<(), BridgeError>> {
-        let client = self.client.clone();
-        let url = format!("{}/v1/servers/{server_id}/unlock", self.base_url);
-        Box::pin(async move {
-            let (status, bytes) = Self::call(client, "DELETE", url, String::new()).await?;
-            if status != 204 && status != 200 {
-                return Err(failure(status, &bytes));
-            }
-            Ok(())
-        })
-    }
-
-    /// `POST /v1/logout`, then the page's own way back to the sign-in form.
-    ///
-    /// The bridge answers `204` whether or not it knew the login, and clears
-    /// the cookie either way — the cookie is `HttpOnly`, so nothing here
-    /// could have. Anything else leaves the login standing, and saying so is
-    /// better than a reload that comes back signed in.
-    fn sign_out(&self) -> BoxFuture<'static, Result<(), BridgeError>> {
-        let client = self.client.clone();
-        let url = format!("{}/v1/logout", self.base_url);
-        Box::pin(async move {
-            let (status, bytes) = Self::post(client, url, String::new()).await?;
-            if status != 204 && status != 200 {
-                return Err(failure(status, &bytes));
-            }
-            sign_in_again();
-            Ok(())
-        })
-    }
-
-    fn close_session(&self, session: String) -> BoxFuture<'static, Result<(), BridgeError>> {
-        let client = self.client.clone();
-        let url = format!("{}/v1/session/{session}", self.base_url);
-        Box::pin(async move {
-            let (status, bytes) = Self::call(client, "DELETE", url, String::new()).await?;
-            // 204 is the success; the bridge also treats closing an expired
-            // session as one, so a late release is never an error here.
-            if status != 204 && status != 200 {
-                return Err(failure(status, &bytes));
-            }
-            Ok(())
-        })
-    }
-    fn open_watch(
-        &self,
-        server_id: String,
-        db: usize,
-        kind: WatchKind,
-        channels: Vec<String>,
-        confirm: Option<String>,
-    ) -> BoxFuture<'static, Result<WatchOpened, BridgeError>> {
-        let client = self.client.clone();
-        let url = format!("{}/v1/watch", self.base_url);
-        Box::pin(async move {
-            let mut body = serde_json::json!({
-                "server": server_id,
-                "db": db,
-                "kind": kind.as_str(),
-                "channels": channels,
-            });
-            if let Some(confirm) = confirm {
-                body["confirm"] = serde_json::Value::String(confirm);
-            }
-            let body = body.to_string();
-            let (status, bytes) = Self::post(client, url, body).await?;
-            if status != 200 {
-                return Err(failure(status, &bytes));
-            }
-            #[derive(Deserialize)]
-            struct Failure {
-                node: String,
-                error: String,
-            }
-            #[derive(Deserialize)]
-            struct Body {
-                token: String,
-                #[serde(default)]
-                nodes: Vec<String>,
-                #[serde(default)]
-                failures: Vec<Failure>,
-            }
-            let body = serde_json::from_slice::<Body>(&bytes)
-                .map_err(|e| BridgeError::transport(format!("the bridge's watch reply is not JSON: {e}")))?;
-            Ok(WatchOpened {
-                token: body.token,
-                nodes: body.nodes,
-                failures: body.failures.into_iter().map(|f| (f.node, f.error)).collect(),
-            })
-        })
-    }
-
-    fn poll_watch(&self, token: String) -> BoxFuture<'static, Result<WatchBatch, BridgeError>> {
-        let client = self.client.clone();
-        let url = format!("{}/v1/watch/{token}/poll", self.base_url);
-        Box::pin(async move {
-            let body = serde_json::json!({ "wait_ms": WATCH_WAIT_MS }).to_string();
-            let (status, bytes) = Self::post(client, url, body).await?;
-            if status != 200 {
-                return Err(failure(status, &bytes));
-            }
-            watch_batch(&bytes)
-        })
-    }
-
-    fn release_watch(&self, token: String) {
-        let client = self.client.clone();
-        let url = format!("{}/v1/watch/{token}", self.base_url);
-        start_detached(async move {
-            // Idempotent on the bridge, and nobody is waiting to hear.
-            let _ = Self::call(client, "DELETE", url, String::new()).await;
-        });
-    }
-
-    fn diagnose(&self, server_id: String) -> BoxFuture<'static, Result<Vec<DiagReportRow>, BridgeError>> {
-        let client = self.client.clone();
-        let url = format!("{}/v1/servers/{}/diagnose", self.base_url, segment(&server_id));
-        Box::pin(async move {
-            let (status, bytes) = Self::post(client, url, String::new()).await?;
-            if status != 200 {
-                return Err(failure(status, &bytes));
-            }
-            #[derive(Deserialize)]
-            struct Body {
-                stages: Vec<DiagReportRow>,
-            }
-            serde_json::from_slice::<Body>(&bytes)
-                .map(|body| body.stages)
-                .map_err(|e| BridgeError::transport(format!("the bridge's diagnosis is not JSON: {e}")))
-        })
-    }
-}
-
-/// The recycle bin and the Metrics history, kept on the bridge for the
-/// page (ADR 9, amended 2026-10-17).
-impl BridgeStorage for HttpBridgeTransport {
-    fn trash_put(&self, server_id: String, entry: BridgeTrashEntry) -> BoxFuture<'static, Result<(), BridgeError>> {
-        let client = self.client.clone();
-        let url = format!("{}/v1/servers/{server_id}/trash", self.base_url);
-        Box::pin(async move {
-            let body = serde_json::json!({
-                "key": entry.key,
-                "db": entry.db,
-                "pttl_ms": entry.pttl_ms,
-                "payload": B64.encode(&entry.payload),
-            })
-            .to_string();
-            let (status, bytes) = Self::post(client, url, body).await?;
-            if status != 200 {
-                return Err(failure(status, &bytes));
-            }
-            Ok(())
-        })
-    }
-
-    fn trash_list(&self, server_id: String) -> BoxFuture<'static, Result<Vec<BridgeTrashEntry>, BridgeError>> {
-        let client = self.client.clone();
-        let url = format!("{}/v1/servers/{server_id}/trash", self.base_url);
-        Box::pin(async move {
-            let (status, bytes) = Self::call(client, "GET", url, String::new()).await?;
-            if status != 200 {
-                return Err(failure(status, &bytes));
-            }
-            let entries = serde_json::from_slice::<Vec<TrashBody>>(&bytes)
-                .map_err(|e| BridgeError::transport(format!("the bin's listing is not JSON: {e}")))?;
-            entries.into_iter().map(TrashBody::into_entry).collect()
-        })
-    }
-
-    fn trash_get(
-        &self,
-        server_id: String,
-        id: String,
-    ) -> BoxFuture<'static, Result<Option<BridgeTrashEntry>, BridgeError>> {
-        let client = self.client.clone();
-        let url = format!("{}/v1/servers/{server_id}/trash/{id}", self.base_url);
-        Box::pin(async move {
-            let (status, bytes) = Self::call(client, "GET", url, String::new()).await?;
-            if status != 200 {
-                return Err(failure(status, &bytes));
-            }
-            let entry = serde_json::from_slice::<Option<TrashBody>>(&bytes)
-                .map_err(|e| BridgeError::transport(format!("the bin's entry is not JSON: {e}")))?;
-            entry.map(TrashBody::into_entry).transpose()
-        })
-    }
-
-    fn trash_remove(&self, server_id: String, id: String) -> BoxFuture<'static, Result<(), BridgeError>> {
-        let client = self.client.clone();
-        let url = format!("{}/v1/servers/{server_id}/trash/{id}", self.base_url);
-        Box::pin(async move {
-            let (status, bytes) = Self::call(client, "DELETE", url, String::new()).await?;
-            if status != 204 && status != 200 {
-                return Err(failure(status, &bytes));
-            }
-            Ok(())
-        })
-    }
-
-    fn metrics_put(
-        &self,
-        server_id: String,
-        ts_ms: i64,
-        sample: Vec<u8>,
-    ) -> BoxFuture<'static, Result<(), BridgeError>> {
-        let client = self.client.clone();
-        let url = format!("{}/v1/servers/{server_id}/metrics", self.base_url);
-        Box::pin(async move {
-            let sample = serde_json::from_slice::<serde_json::Value>(&sample)
-                .map_err(|e| BridgeError::transport(format!("the sample is not JSON: {e}")))?;
-            let body = serde_json::json!({ "ts_ms": ts_ms, "sample": sample }).to_string();
-            let (status, bytes) = Self::post(client, url, body).await?;
-            if status != 204 && status != 200 {
-                return Err(failure(status, &bytes));
-            }
-            Ok(())
-        })
-    }
-
-    fn metrics_since(
-        &self,
-        server_id: String,
-        from_ms: i64,
-        max_points: usize,
-    ) -> BoxFuture<'static, Result<Vec<Vec<u8>>, BridgeError>> {
-        let client = self.client.clone();
-        let url = format!(
-            "{}/v1/servers/{server_id}/metrics?from_ms={from_ms}&max_points={max_points}",
-            self.base_url
-        );
-        Box::pin(async move {
-            let (status, bytes) = Self::call(client, "GET", url, String::new()).await?;
-            if status != 200 {
-                return Err(failure(status, &bytes));
-            }
-            #[derive(Deserialize)]
-            struct Body {
-                samples: Vec<serde_json::Value>,
-            }
-            let body = serde_json::from_slice::<Body>(&bytes)
-                .map_err(|e| BridgeError::transport(format!("the metrics history is not JSON: {e}")))?;
-            body.samples
-                .iter()
-                .map(|sample| serde_json::to_vec(sample).map_err(|e| BridgeError::transport(format!("a sample: {e}"))))
-                .collect()
-        })
-    }
-}
-
-/// A bin entry as the bridge answers it.
-#[derive(Deserialize)]
-struct TrashBody {
-    id: String,
-    key: String,
-    #[serde(default)]
-    db: usize,
-    #[serde(default)]
-    pttl_ms: i64,
-    #[serde(default)]
-    deleted_at_ms: i64,
-    #[serde(default)]
-    deleted_by: String,
-    #[serde(default)]
-    payload: Option<String>,
-}
-
-impl TrashBody {
-    fn into_entry(self) -> Result<BridgeTrashEntry, BridgeError> {
-        let payload = match self.payload {
-            Some(payload) => B64
-                .decode(payload)
-                .map_err(|e| BridgeError::transport(format!("a bin payload is not base64: {e}")))?,
-            None => Vec::new(),
-        };
-        Ok(BridgeTrashEntry {
-            id: self.id,
-            key: self.key,
-            db: self.db,
-            pttl_ms: self.pttl_ms,
-            deleted_at_ms: self.deleted_at_ms,
-            deleted_by: self.deleted_by,
-            payload,
-        })
-    }
-}
-
-/// How long a watch's poll may wait on the bridge for something to arrive:
-/// under the bridge's own cap, so the bridge is what decides.
-const WATCH_WAIT_MS: u64 = 15_000;
-
-/// A poll's reply: Pub/Sub messages carry their payload in base64.
-fn watch_batch(bytes: &[u8]) -> Result<WatchBatch, BridgeError> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Item {
-        Message { channel: String, payload: String },
-        Line { node: String, line: String },
-    }
-    #[derive(Deserialize)]
-    struct Body {
-        #[serde(default)]
-        items: Vec<Item>,
-        #[serde(default)]
-        dropped: u64,
-        #[serde(default)]
-        closed: Option<String>,
-    }
-    let body = serde_json::from_slice::<Body>(bytes)
-        .map_err(|e| BridgeError::transport(format!("the bridge's poll reply is not JSON: {e}")))?;
-    let mut items = Vec::with_capacity(body.items.len());
-    for item in body.items {
-        items.push(match item {
-            Item::Message { channel, payload } => WatchItem::Message {
-                channel,
-                payload: B64
-                    .decode(payload)
-                    .map_err(|e| BridgeError::transport(format!("a message's payload is not base64: {e}")))?,
-            },
-            Item::Line { node, line } => WatchItem::Line { node, line },
-        });
-    }
-    Ok(WatchBatch {
-        items,
-        dropped: body.dropped,
-        closed: body.closed,
-    })
-}
-
 /// Start `work` and let it run unwatched: on the page's executor in the
 /// browser…
 #[cfg(target_family = "wasm")]
@@ -813,73 +251,6 @@ fn start_detached(work: impl std::future::Future<Output = ()> + 'static) {
 #[cfg(not(target_family = "wasm"))]
 fn start_detached(work: impl std::future::Future<Output = ()> + Send + 'static) {
     std::thread::spawn(move || futures::executor::block_on(work));
-}
-
-/// Saving the list from a browser is a diff, not a write.
-///
-/// The desktop writes `redis-servers.toml` whole. A tab cannot: its copy of
-/// an existing entry carries settings but no secrets (the bridge's list names
-/// the secrets that are set and sends none of them), so sending the whole
-/// list back would strip every saved password. Instead each entry goes its
-/// own way: one the bridge does not have is posted whole, credentials and
-/// all, for the bridge to stamp and dial; one that differs from the copy the
-/// bridge last answered is put as an edit, its untouched secrets named
-/// rather than sent ([`split_stored_secrets`]); one the list no longer names
-/// is deleted; the rest are left alone. The bridge dials an edit before it
-/// keeps it, so a change that breaks the connection comes back as the
-/// driver's error and the stored entry is unchanged.
-impl BridgeServerStore for HttpBridgeTransport {
-    fn save(&self, servers: Vec<RedisServer>) -> BoxFuture<'static, Result<Vec<RedisServer>, BridgeError>> {
-        let (client, base_url) = (self.client.clone(), self.base_url.clone());
-        Box::pin(async move {
-            // What the bridge last answered, which is what the form was
-            // opened on: an entry that still equals its copy here was not
-            // edited, and only the ones that differ are sent.
-            let before: HashMap<String, RedisServer> = get_servers()
-                .map(|list| list.into_iter().map(|s| (s.id.clone(), s)).collect())
-                .unwrap_or_default();
-            let after: Vec<&str> = servers.iter().map(|s| s.id.as_str()).collect();
-            for server in &servers {
-                let (method, url, body) = match before.get(&server.id) {
-                    Some(cached) if cached == server => continue,
-                    // An edit. The placeholders go back as names: the bridge
-                    // keeps those secrets, and clears or replaces the rest.
-                    Some(_) => {
-                        let (edited, keep_secrets) = split_stored_secrets(server.clone());
-                        let body = serde_json::json!({ "server": edited, "keep_secrets": keep_secrets });
-                        ("PUT", format!("{base_url}/v1/servers/{}", server.id), body)
-                    }
-                    // A new entry, whole, for the bridge to stamp an id on and
-                    // dial. A placeholder here came from duplicating an entry
-                    // whose secret this side never had, so it is dropped — the
-                    // dial then says what is missing instead of a stored
-                    // password of eight bullets failing later.
-                    None => {
-                        let (created, _) = split_stored_secrets(server.clone());
-                        let body = serde_json::json!({ "server": created });
-                        ("POST", format!("{base_url}/v1/servers"), body)
-                    }
-                };
-                let (status, bytes) = Self::call(client.clone(), method, url, body.to_string()).await?;
-                if status != 200 {
-                    return Err(failure(status, &bytes));
-                }
-            }
-            for id in before.keys().filter(|id| !after.contains(&id.as_str())) {
-                let (status, bytes) = Self::call(
-                    client.clone(),
-                    "DELETE",
-                    format!("{base_url}/v1/servers/{id}"),
-                    String::new(),
-                )
-                .await?;
-                if status != 204 && status != 200 {
-                    return Err(failure(status, &bytes));
-                }
-            }
-            Self::list(client, base_url).await
-        })
-    }
 }
 
 /// A path segment as the URL carries it: everything but the unreserved
@@ -897,720 +268,15 @@ fn segment(text: &str) -> String {
     out
 }
 
-/// What a refused account request stands for. The bridge's message travels
-/// with it, for the refusals the page has no words of its own for.
-fn account_failure(status: u16, bytes: &[u8]) -> BridgeAccountError {
-    let kind = match status {
-        400 => BridgeAccountErrorKind::Invalid,
-        403 => BridgeAccountErrorKind::Refused,
-        404 => BridgeAccountErrorKind::NotFound,
-        409 => BridgeAccountErrorKind::Conflict,
-        429 => BridgeAccountErrorKind::TooManyAttempts,
-        _ => BridgeAccountErrorKind::Failed,
-    };
-    BridgeAccountError::new(kind, failure(status, bytes).message)
-}
-
-fn json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
-    serde_json::from_slice(bytes).map_err(|e| e.to_string())
-}
-
-fn nothing(_: &[u8]) -> Result<(), String> {
-    Ok(())
-}
-
-/// The bridge's `TokenView`.
-#[derive(Deserialize)]
-struct TokenBody {
-    name: String,
-    #[serde(default)]
-    expires_at: Option<u64>,
-    #[serde(default)]
-    created_at: u64,
-}
-
-/// The bridge's `AccountView`.
-#[derive(Deserialize)]
-struct AccountBody {
-    name: String,
-    role: String,
-    #[serde(default)]
-    disabled: bool,
-    #[serde(default)]
-    locked: bool,
-    #[serde(default)]
-    has_password: bool,
-    #[serde(default)]
-    servers: Option<Vec<String>>,
-    #[serde(default)]
-    tokens: Vec<TokenBody>,
-    #[serde(default)]
-    created_at: u64,
-}
-
-impl AccountBody {
-    fn into_account(self) -> BridgeAccount {
-        BridgeAccount {
-            name: self.name,
-            // A role this side does not know reads as the least of them.
-            role: BridgeRole::from_name(&self.role).unwrap_or_default(),
-            disabled: self.disabled,
-            locked: self.locked,
-            has_password: self.has_password,
-            servers: self.servers,
-            tokens: self
-                .tokens
-                .into_iter()
-                .map(|token| BridgeToken {
-                    name: token.name,
-                    expires_at: token.expires_at,
-                    created_at: token.created_at,
-                })
-                .collect(),
-            created_at: self.created_at,
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct OwnBody {
-    #[serde(flatten)]
-    account: AccountBody,
-    #[serde(default)]
-    proxy: bool,
-    #[serde(default)]
-    signup: bool,
-}
-
-/// The bridge's `SignupView`.
-#[derive(Deserialize)]
-struct SignupBody {
-    id: String,
-    name: String,
-    #[serde(default)]
-    note: String,
-    #[serde(default)]
-    peer: Option<String>,
-    #[serde(default)]
-    requested_at: u64,
-    #[serde(default)]
-    expires_at: u64,
-    #[serde(default)]
-    name_taken: bool,
-}
-
-impl SignupBody {
-    fn into_signup(self) -> BridgeSignup {
-        BridgeSignup {
-            id: self.id,
-            name: self.name,
-            note: self.note,
-            peer: self.peer,
-            requested_at: self.requested_at,
-            expires_at: self.expires_at,
-            name_taken: self.name_taken,
-        }
-    }
-}
-
-/// The bridge's `InviteView`: its kind flattened, as `kind` plus the fields
-/// of that kind.
-#[derive(Deserialize)]
-struct InviteBody {
-    id: String,
-    kind: String,
-    #[serde(default)]
-    role: Option<String>,
-    #[serde(default)]
-    servers: Option<Vec<String>>,
-    #[serde(default)]
-    proxy: bool,
-    #[serde(default)]
-    account: Option<String>,
-    expires_at: u64,
-    #[serde(default)]
-    created_by: String,
-    #[serde(default)]
-    created_at: u64,
-}
-
-impl InviteBody {
-    fn into_invite(self) -> BridgeInvite {
-        let kind = match (self.kind.as_str(), self.account) {
-            ("reset", Some(account)) => BridgeInviteKind::Reset { account },
-            _ => BridgeInviteKind::Register {
-                role: self.role.as_deref().and_then(BridgeRole::from_name).unwrap_or_default(),
-                servers: self.servers,
-                proxy: self.proxy,
-            },
-        };
-        BridgeInvite {
-            id: self.id,
-            kind,
-            expires_at: self.expires_at,
-            created_by: self.created_by,
-            created_at: self.created_at,
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct NewInviteBody {
-    #[serde(flatten)]
-    invite: InviteBody,
-    code: String,
-}
-
-impl NewInviteBody {
-    fn into_new_invite(self) -> BridgeNewInvite {
-        BridgeNewInvite {
-            invite: self.invite.into_invite(),
-            code: self.code,
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct NewTokenBody {
-    token: String,
-}
-
-#[derive(Deserialize)]
-struct OwnedItemBody {
-    id: String,
-    #[serde(default)]
-    name: String,
-}
-
-/// The bridge's `Owned`.
-#[derive(Deserialize)]
-struct OwnedBody {
-    #[serde(default)]
-    servers: Vec<OwnedItemBody>,
-    #[serde(default)]
-    scripts: Vec<OwnedItemBody>,
-}
-
-impl OwnedBody {
-    fn into_owned(self) -> BridgeOwned {
-        let items = |list: Vec<OwnedItemBody>| {
-            list.into_iter()
-                .map(|item| BridgeOwnedItem {
-                    id: item.id,
-                    name: item.name,
-                })
-                .collect()
-        };
-        BridgeOwned {
-            servers: items(self.servers),
-            scripts: items(self.scripts),
-        }
-    }
-}
-
-/// A page of the audit as the bridge sends it: each line a JSON object.
-#[derive(Deserialize)]
-struct AuditPageBody {
-    #[serde(default)]
-    lines: Vec<serde_json::Value>,
-    #[serde(default)]
-    next: Option<String>,
-    #[serde(default)]
-    stopped_early: bool,
-}
-
-/// `/v1/admin/audit` with what `query` narrows by, each value encoded.
-fn audit_path(query: &BridgeAuditQuery) -> String {
-    let mut params = Vec::new();
-    if let Some(account) = &query.account {
-        params.push(format!("account={}", segment(account)));
-    }
-    if let Some(event) = &query.event {
-        params.push(format!("event={}", segment(event)));
-    }
-    if let Some(server) = &query.server {
-        params.push(format!("server={}", segment(server)));
-    }
-    if let Some(since) = query.since_ms {
-        params.push(format!("since_ms={since}"));
-    }
-    if let Some(before) = &query.before {
-        params.push(format!("before={}", segment(before)));
-    }
-    if params.is_empty() {
-        "/v1/admin/audit".to_string()
-    } else {
-        format!("/v1/admin/audit?{}", params.join("&"))
-    }
-}
-
-/// `GET /v1/clients`, as the bridge answers it.
-#[derive(Deserialize)]
-struct ClientsBody {
-    #[serde(default)]
-    process: String,
-    #[serde(default)]
-    window_secs: u64,
-    #[serde(default)]
-    clients: Vec<ClientBody>,
-}
-
-#[derive(Deserialize)]
-struct ClientBody {
-    account: String,
-    kind: String,
-    #[serde(default)]
-    token: Option<String>,
-    #[serde(default)]
-    peer: Option<String>,
-    #[serde(default)]
-    forwarded_for: Option<String>,
-    #[serde(default)]
-    seen_at: u64,
-    #[serde(default)]
-    servers: Vec<ClientServerBody>,
-}
-
-#[derive(Deserialize)]
-struct ClientServerBody {
-    #[serde(default)]
-    name: String,
-}
-
-#[derive(Deserialize)]
-struct OrphansBody {
-    owner: String,
-    #[serde(flatten)]
-    owned: OwnedBody,
-}
-
-/// What becomes of a deleted account's own, as the bridge reads it.
-fn disposition_json(private: &BridgeDisposition) -> serde_json::Value {
-    match private {
-        BridgeDisposition::HandTo(account) => serde_json::json!({ "action": "hand_to", "account": account }),
-        BridgeDisposition::Share => serde_json::json!({ "action": "share" }),
-        BridgeDisposition::Delete => serde_json::json!({ "action": "delete" }),
-    }
-}
-
-impl HttpBridgeTransport {
-    /// One account request: `method` on `path`, with `body` as JSON, its
-    /// answer read by `read`. Any 2xx is an answer (`204` for a removal).
-    fn account_call<T: Send + 'static>(
-        &self,
-        method: &'static str,
-        path: String,
-        body: Option<serde_json::Value>,
-        read: fn(&[u8]) -> Result<T, String>,
-    ) -> BridgeAccountResult<T> {
-        let client = self.client.clone();
-        let url = format!("{}{path}", self.base_url);
-        Box::pin(async move {
-            let body = body.map(|body| body.to_string()).unwrap_or_default();
-            let (status, bytes) = Self::call(client, method, url, body)
-                .await
-                .map_err(|e| BridgeAccountError::new(BridgeAccountErrorKind::Failed, e.message))?;
-            if !(200..300).contains(&status) {
-                return Err(account_failure(status, &bytes));
-            }
-            read(&bytes).map_err(|e| {
-                BridgeAccountError::new(
-                    BridgeAccountErrorKind::Failed,
-                    format!("the bridge's answer could not be read: {e}"),
-                )
-            })
-        })
-    }
-}
-
-impl BridgeAccounts for HttpBridgeTransport {
-    fn account(&self) -> BridgeAccountResult<BridgeOwnAccount> {
-        self.account_call("GET", "/v1/account".to_string(), None, |bytes| {
-            json::<OwnBody>(bytes).map(|own| BridgeOwnAccount {
-                account: own.account.into_account(),
-                proxy: own.proxy,
-                signup: own.signup,
-            })
-        })
-    }
-
-    fn change_password(&self, current: String, new: String) -> BridgeAccountResult<()> {
-        let body = serde_json::json!({ "current": current, "new": new });
-        self.account_call("POST", "/v1/account/password".to_string(), Some(body), nothing)
-    }
-
-    fn issue_token(
-        &self,
-        account: Option<String>,
-        name: String,
-        expires: Option<String>,
-    ) -> BridgeAccountResult<String> {
-        let path = match &account {
-            None => "/v1/account/tokens".to_string(),
-            Some(account) => format!("/v1/admin/accounts/{}/tokens", segment(account)),
-        };
-        let body = serde_json::json!({ "name": name, "expires": expires });
-        self.account_call("POST", path, Some(body), |bytes| {
-            json::<NewTokenBody>(bytes).map(|made| made.token)
-        })
-    }
-
-    fn revoke_token(&self, account: Option<String>, name: String) -> BridgeAccountResult<()> {
-        let path = match &account {
-            None => format!("/v1/account/tokens/{}", segment(&name)),
-            Some(account) => format!("/v1/admin/accounts/{}/tokens/{}", segment(account), segment(&name)),
-        };
-        self.account_call("DELETE", path, None, nothing)
-    }
-
-    fn accounts(&self) -> BridgeAccountResult<Vec<BridgeAccount>> {
-        self.account_call("GET", "/v1/admin/accounts".to_string(), None, |bytes| {
-            json::<Vec<AccountBody>>(bytes).map(|list| list.into_iter().map(AccountBody::into_account).collect())
-        })
-    }
-
-    fn update_account(&self, name: String, change: BridgeAccountChange) -> BridgeAccountResult<BridgeAccount> {
-        // Only what changes: an absent field is left as it is, and a `null`
-        // `servers` clears the rules — two answers the bridge tells apart.
-        let mut body = serde_json::Map::new();
-        if let Some(role) = change.role {
-            body.insert("role".to_string(), role.as_str().into());
-        }
-        if let Some(servers) = change.servers {
-            body.insert("servers".to_string(), serde_json::json!(servers));
-        }
-        if let Some(disabled) = change.disabled {
-            body.insert("disabled".to_string(), disabled.into());
-        }
-        if let Some(locked) = change.locked {
-            body.insert("locked".to_string(), locked.into());
-        }
-        let path = format!("/v1/admin/accounts/{}", segment(&name));
-        self.account_call("PATCH", path, Some(body.into()), |bytes| {
-            json::<AccountBody>(bytes).map(AccountBody::into_account)
-        })
-    }
-
-    fn owned(&self, name: String) -> BridgeAccountResult<BridgeOwned> {
-        let path = format!("/v1/admin/accounts/{}/owned", segment(&name));
-        self.account_call("GET", path, None, |bytes| {
-            json::<OwnedBody>(bytes).map(OwnedBody::into_owned)
-        })
-    }
-
-    fn delete_account(&self, name: String, private: BridgeDisposition) -> BridgeAccountResult<()> {
-        let path = format!("/v1/admin/accounts/{}", segment(&name));
-        let body = serde_json::json!({ "private": disposition_json(&private) });
-        self.then_list_servers_again(self.account_call("DELETE", path, Some(body), nothing))
-    }
-
-    fn orphans(&self) -> BridgeAccountResult<Vec<BridgeOrphans>> {
-        self.account_call("GET", "/v1/admin/orphans".to_string(), None, |bytes| {
-            json::<Vec<OrphansBody>>(bytes).map(|list| {
-                list.into_iter()
-                    .map(|orphans| BridgeOrphans {
-                        owner: orphans.owner,
-                        owned: orphans.owned.into_owned(),
-                    })
-                    .collect()
-            })
-        })
-    }
-
-    fn audit(&self, query: BridgeAuditQuery) -> BridgeAccountResult<BridgeAuditPage> {
-        self.account_call("GET", audit_path(&query), None, |bytes| {
-            json::<AuditPageBody>(bytes).map(|page| BridgeAuditPage {
-                lines: page.lines.iter().map(serde_json::Value::to_string).collect(),
-                next: page.next,
-                stopped_early: page.stopped_early,
-            })
-        })
-    }
-
-    fn clients(&self) -> BridgeAccountResult<BridgeClients> {
-        self.account_call("GET", "/v1/clients".to_string(), None, |bytes| {
-            json::<ClientsBody>(bytes).map(|body| BridgeClients {
-                process: body.process,
-                window_secs: body.window_secs,
-                clients: body
-                    .clients
-                    .into_iter()
-                    .map(|client| BridgeClient {
-                        account: client.account,
-                        kind: client.kind,
-                        token: client.token,
-                        peer: client.peer,
-                        forwarded_for: client.forwarded_for,
-                        seen_at: client.seen_at,
-                        servers: client.servers.into_iter().map(|server| server.name).collect(),
-                    })
-                    .collect(),
-            })
-        })
-    }
-
-    fn settle_orphans(&self, owner: String, private: BridgeDisposition) -> BridgeAccountResult<()> {
-        let path = format!("/v1/admin/orphans/{}", segment(&owner));
-        let body = serde_json::json!({ "private": disposition_json(&private) });
-        self.then_list_servers_again(self.account_call("POST", path, Some(body), nothing))
-    }
-
-    fn reset_link(&self, name: String) -> BridgeAccountResult<BridgeNewInvite> {
-        let path = format!("/v1/admin/accounts/{}/reset", segment(&name));
-        self.account_call("POST", path, Some(serde_json::json!({})), |bytes| {
-            json::<NewInviteBody>(bytes).map(NewInviteBody::into_new_invite)
-        })
-    }
-
-    fn invites(&self) -> BridgeAccountResult<Vec<BridgeInvite>> {
-        self.account_call("GET", "/v1/admin/invites".to_string(), None, |bytes| {
-            json::<Vec<InviteBody>>(bytes).map(|list| list.into_iter().map(InviteBody::into_invite).collect())
-        })
-    }
-
-    fn create_invite(
-        &self,
-        role: BridgeRole,
-        servers: Option<Vec<String>>,
-        proxy: bool,
-        days: u64,
-    ) -> BridgeAccountResult<BridgeNewInvite> {
-        let body = serde_json::json!({
-            "role": role.as_str(),
-            "servers": servers,
-            "proxy": proxy,
-            "days": days,
-        });
-        self.account_call("POST", "/v1/admin/invites".to_string(), Some(body), |bytes| {
-            json::<NewInviteBody>(bytes).map(NewInviteBody::into_new_invite)
-        })
-    }
-
-    fn revoke_invite(&self, id: String) -> BridgeAccountResult<()> {
-        let path = format!("/v1/admin/invites/{}", segment(&id));
-        self.account_call("DELETE", path, None, nothing)
-    }
-
-    fn signups(&self) -> BridgeAccountResult<Vec<BridgeSignup>> {
-        self.account_call("GET", "/v1/admin/signups".to_string(), None, |bytes| {
-            json::<Vec<SignupBody>>(bytes).map(|list| list.into_iter().map(SignupBody::into_signup).collect())
-        })
-    }
-
-    fn approve_signup(
-        &self,
-        id: String,
-        role: BridgeRole,
-        servers: Option<Vec<String>>,
-    ) -> BridgeAccountResult<BridgeAccount> {
-        let path = format!("/v1/admin/signups/{}/approve", segment(&id));
-        let body = serde_json::json!({ "role": role.as_str(), "servers": servers });
-        self.account_call("POST", path, Some(body), |bytes| {
-            json::<AccountBody>(bytes).map(AccountBody::into_account)
-        })
-    }
-
-    fn reject_signup(&self, id: String) -> BridgeAccountResult<()> {
-        let path = format!("/v1/admin/signups/{}", segment(&id));
-        self.account_call("DELETE", path, None, nothing)
-    }
-
-    fn invite_link(&self, code: &str) -> String {
-        format!("{}/#invite={code}", self.base_url)
-    }
-}
-
-/// The bridge's `GET /v1/page-data`.
-#[derive(Deserialize)]
-struct PageDataBody {
-    account: String,
-    #[serde(default)]
-    read_only: bool,
-    /// Absent from a bridge older than locked accounts: it keeps every
-    /// account's rows.
-    #[serde(default = "rows_kept_by_default")]
-    rows_kept: bool,
-    #[serde(default)]
-    rows: Vec<PageRowBody>,
-    #[serde(default)]
-    key_notes: Vec<KeyNoteBody>,
-    #[serde(default)]
-    scripts: Vec<ScriptBody>,
-}
-
-#[derive(Deserialize)]
-struct PageRowBody {
-    table: String,
-    key: String,
-    value: String,
-}
-
-#[derive(Deserialize)]
-struct KeyNoteBody {
-    server: String,
-    key: String,
-    #[serde(default)]
-    tag: Option<String>,
-    #[serde(default)]
-    note: String,
-    #[serde(default)]
-    by: String,
-    #[serde(default)]
-    at: u64,
-}
-
-#[derive(Deserialize)]
-struct ScriptBody {
-    id: String,
-    #[serde(default)]
-    shared: bool,
-    script: serde_json::Value,
-}
-
-fn rows_kept_by_default() -> bool {
-    true
-}
-
-/// The page data as the bridge answered it again, with its tag for the next
-/// ask.
-pub struct PageData {
-    pub json: String,
-    pub etag: Option<String>,
-}
-
-/// What the page keeps on the bridge, from the `GET /v1/page-data` the page
-/// made before it started the application (`index.html`).
-pub fn page_seed(json: &str) -> Result<BridgePageSeed, String> {
-    let body: PageDataBody = serde_json::from_str(json).map_err(|e| e.to_string())?;
-    Ok(BridgePageSeed {
-        account: body.account,
-        read_only: body.read_only,
-        rows_kept: body.rows_kept,
-        rows: body
-            .rows
-            .into_iter()
-            .map(|row| BridgePageRow {
-                table: row.table,
-                key: row.key,
-                value: row.value,
-            })
-            .collect(),
-        key_notes: body
-            .key_notes
-            .into_iter()
-            .map(|note| BridgeKeyNote {
-                server_id: note.server,
-                key: note.key,
-                tag: note.tag,
-                note: note.note,
-                by: note.by,
-                at: note.at,
-            })
-            .collect(),
-        scripts: body
-            .scripts
-            .into_iter()
-            .map(|script| BridgeScript {
-                id: script.id,
-                json: script.script.to_string(),
-                shared: script.shared,
-            })
-            .collect(),
-    })
-}
-
-impl HttpBridgeTransport {
-    /// Queue a change of the page's data. The queue is drained by one task,
-    /// one request at a time, so two quick changes to one row land in the
-    /// order they were made — two requests in flight at once could arrive
-    /// the other way round, and the older list would be the one kept.
-    fn send_page_write(&self, method: &'static str, path: String, body: String) {
-        let queue = self.page_writes.get_or_init(|| {
-            let (queue, mut writes) = unbounded::<PageWrite>();
-            let (client, base_url) = (self.client.clone(), self.base_url.clone());
-            let pending = self.page_writes_pending.clone();
-            start_detached(async move {
-                while let Some(write) = writes.next().await {
-                    let _answered = Answered(&pending);
-                    let url = format!("{base_url}{}", write.path);
-                    match Self::call(client.clone(), write.method, url, write.body).await {
-                        Ok((status, _)) if (200..300).contains(&status) => {}
-                        Ok((status, bytes)) => tracing::warn!(
-                            status,
-                            path = write.path,
-                            error = failure(status, &bytes).message,
-                            "the bridge did not keep a change of the page's data"
-                        ),
-                        Err(e) => tracing::warn!(
-                            path = write.path,
-                            error = e.message,
-                            "a change of the page's data did not reach the bridge"
-                        ),
-                    }
-                }
-            });
-            queue
-        });
-        self.page_writes_pending.fetch_add(1, Ordering::SeqCst);
-        if queue.unbounded_send(PageWrite { method, path, body }).is_err() {
-            self.page_writes_pending.fetch_sub(1, Ordering::SeqCst);
-            tracing::warn!("the page's data queue is closed; a change was not sent");
-        }
-    }
-}
-
-/// Counts a queued change as answered once its request is, however it ends.
-struct Answered<'a>(&'a AtomicUsize);
-
-impl Drop for Answered<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-impl BridgePageData for HttpBridgeTransport {
-    fn put_row(&self, table: String, key: String, value: Option<String>) {
-        let body = serde_json::json!({ "table": table, "key": key, "value": value });
-        self.send_page_write("PUT", "/v1/page-data/rows".to_string(), body.to_string());
-    }
-
-    fn put_key_note(&self, server_id: String, key: String, tag: Option<String>, note: String) {
-        let body = serde_json::json!({ "key": key, "tag": tag, "note": note });
-        let path = format!("/v1/servers/{}/key-notes", segment(&server_id));
-        self.send_page_write("PUT", path, body.to_string());
-    }
-
-    fn put_script(&self, script: BridgeScript) {
-        let parsed = match serde_json::from_str::<serde_json::Value>(&script.json) {
-            Ok(parsed) => parsed,
-            Err(e) => {
-                tracing::warn!(id = script.id, error = %e, "a script that is not JSON was not sent");
-                return;
-            }
-        };
-        let body = serde_json::json!({ "script": parsed, "shared": script.shared });
-        let path = format!("/v1/scripts/{}", segment(&script.id));
-        self.send_page_write("PUT", path, body.to_string());
-    }
-
-    fn delete_script(&self, id: String) {
-        let path = format!("/v1/scripts/{}", segment(&id));
-        self.send_page_write("DELETE", path, String::new());
-    }
-
-    fn writes_pending(&self) -> bool {
-        self.page_writes_pending.load(Ordering::SeqCst) > 0
-    }
-
-    fn refresh_soon(&self) {
-        let _ = self.page_data_wake.sender.unbounded_send(());
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::accounts::account_failure;
+    use super::commands::{WATCH_WAIT_MS, exec_payload, watch_batch};
+    use super::servers::{STORED_SECRET, show_stored_secrets, split_stored_secrets};
+    use super::storage::TrashBody;
     use super::*;
     use gpui::http_client::FakeHttpClient;
+    use zedis_connection::set_servers_cache;
 
     /// One request a fake bridge was sent: method, address, body.
     type Sent = (String, String, String);
@@ -2364,5 +1030,164 @@ mod tests {
         assert!(entry.payload.is_empty());
         let fetched: TrashBody = serde_json::from_str(r#"{"id":"a1","key":"k","payload":"AAEC"}"#).expect("fetched");
         assert_eq!(fetched.into_entry().expect("entry").payload, [0, 1, 2]);
+    }
+
+    /// The bridge's address for each request a fake bridge was sent, and
+    /// its body read as JSON (`Null` for none).
+    fn routes(seen: &Arc<Mutex<Vec<Sent>>>) -> Vec<(String, String, serde_json::Value)> {
+        seen.lock()
+            .expect("lock")
+            .iter()
+            .map(|(method, url, body)| {
+                let path = url.trim_start_matches("http://bridge:7379/zedis").to_string();
+                let body = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+                (method.clone(), path, body)
+            })
+            .collect()
+    }
+
+    /// Saving the list sends each entry its own way: one the bridge does not
+    /// have is posted whole, one that differs from the copy last answered is
+    /// put with its untouched secrets named and not sent, one the list no
+    /// longer names is deleted, and one that did not change is not sent at
+    /// all — and then the list is read again.
+    #[test]
+    fn the_list_is_saved_entry_by_entry() {
+        let entry = |id: &str, port: u16| RedisServer {
+            id: id.to_string(),
+            name: id.to_string(),
+            host: "redis.internal".to_string(),
+            port,
+            ..Default::default()
+        };
+        set_servers_cache(vec![entry("same", 1), entry("edited", 2), entry("gone", 3)]);
+        let (transport, seen) = transport_recording(200, "[]");
+        let mut edited = entry("edited", 20);
+        edited.password = Some(STORED_SECRET.to_string());
+        let saved = futures::executor::block_on(transport.save(vec![entry("same", 1), edited, entry("new", 4)]));
+        assert!(saved.expect("saved").is_empty(), "the list as the bridge read it back");
+
+        let routes = routes(&seen);
+        let paths: Vec<(&str, &str)> = routes.iter().map(|(m, p, _)| (m.as_str(), p.as_str())).collect();
+        assert_eq!(
+            paths,
+            [
+                ("PUT", "/v1/servers/edited"),
+                ("POST", "/v1/servers"),
+                ("DELETE", "/v1/servers/gone"),
+                ("GET", "/v1/servers"),
+            ]
+        );
+        let put = &routes[0].2;
+        assert_eq!(put["server"]["port"], 20);
+        assert_eq!(put["keep_secrets"], serde_json::json!(["password"]));
+        assert!(put["server"]["password"].is_null(), "a kept secret is named, not sent");
+        assert_eq!(routes[1].2["server"]["id"], "new");
+    }
+
+    /// The recycle bin and the Metrics history are asked for under their
+    /// server: a deleted key's payload goes as base64, a sample as the JSON
+    /// it is, and the history comes back one sample at a time.
+    #[test]
+    fn the_bin_and_the_metrics_are_kept_under_their_server() {
+        let (transport, seen) = transport_recording(200, r#"{"samples":[{"used_memory":1}]}"#);
+        let entry = BridgeTrashEntry {
+            key: "k".to_string(),
+            db: 2,
+            pttl_ms: -1,
+            payload: vec![0, 1, 2],
+            ..BridgeTrashEntry::default()
+        };
+        futures::executor::block_on(async {
+            transport.trash_put("s1".into(), entry).await.expect("put");
+            let _ = transport.trash_list("s1".into()).await;
+            let _ = transport.trash_get("s1".into(), "a1".into()).await;
+            transport.trash_remove("s1".into(), "a1".into()).await.expect("remove");
+            transport
+                .metrics_put("s1".into(), 7, br#"{"x":1}"#.to_vec())
+                .await
+                .expect("sample");
+            let history = transport.metrics_since("s1".into(), 5, 100).await.expect("history");
+            assert_eq!(history, [br#"{"used_memory":1}"#.to_vec()]);
+        });
+
+        let routes = routes(&seen);
+        let paths: Vec<(&str, &str)> = routes.iter().map(|(m, p, _)| (m.as_str(), p.as_str())).collect();
+        assert_eq!(
+            paths,
+            [
+                ("POST", "/v1/servers/s1/trash"),
+                ("GET", "/v1/servers/s1/trash"),
+                ("GET", "/v1/servers/s1/trash/a1"),
+                ("DELETE", "/v1/servers/s1/trash/a1"),
+                ("POST", "/v1/servers/s1/metrics"),
+                ("GET", "/v1/servers/s1/metrics?from_ms=5&max_points=100"),
+            ]
+        );
+        assert_eq!(
+            routes[0].2,
+            serde_json::json!({ "key": "k", "db": 2, "pttl_ms": -1, "payload": "AAEC" })
+        );
+        assert_eq!(routes[4].2, serde_json::json!({ "ts_ms": 7, "sample": { "x": 1 } }));
+    }
+
+    /// A session, the write lock's window and a watch each have their
+    /// route; a watch's confirmation rides along, and a released watch is
+    /// deleted without anyone waiting for the answer.
+    #[test]
+    fn a_session_the_write_window_and_a_watch_are_asked_for_by_their_routes() {
+        let (transport, seen) = transport_recording(200, r#"{"session":"x","token":"t","items":[]}"#);
+        futures::executor::block_on(async {
+            assert_eq!(transport.open_session("s1".into(), 3).await.expect("session"), "x");
+            transport.close_session("x".into()).await.expect("closed");
+            transport
+                .unlock_writes("s1".into(), "prod".into())
+                .await
+                .expect("unlocked");
+            transport.lock_writes("s1".into()).await.expect("locked");
+            let opened = transport
+                .open_watch(
+                    "s1".into(),
+                    0,
+                    WatchKind::Monitor,
+                    vec!["news".into()],
+                    Some("prod".into()),
+                )
+                .await
+                .expect("watch");
+            assert_eq!(opened.token, "t");
+            transport.poll_watch("t".into()).await.expect("poll");
+        });
+        transport.release_watch("t".into());
+        for _ in 0..200 {
+            if seen.lock().expect("lock").len() == 7 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let routes = routes(&seen);
+        let paths: Vec<(&str, &str)> = routes.iter().map(|(m, p, _)| (m.as_str(), p.as_str())).collect();
+        assert_eq!(
+            paths,
+            [
+                ("POST", "/v1/session"),
+                ("DELETE", "/v1/session/x"),
+                ("POST", "/v1/servers/s1/unlock"),
+                ("DELETE", "/v1/servers/s1/unlock"),
+                ("POST", "/v1/watch"),
+                ("POST", "/v1/watch/t/poll"),
+                ("DELETE", "/v1/watch/t"),
+            ]
+        );
+        assert_eq!(routes[0].2, serde_json::json!({ "server": "s1", "db": 3 }));
+        assert_eq!(routes[2].2, serde_json::json!({ "confirm": "prod" }));
+        assert_eq!(
+            routes[4].2,
+            serde_json::json!({
+                "server": "s1", "db": 0, "kind": "monitor", "channels": ["news"], "confirm": "prod"
+            })
+        );
+        assert_eq!(routes[5].2, serde_json::json!({ "wait_ms": WATCH_WAIT_MS }));
     }
 }

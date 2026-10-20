@@ -897,6 +897,35 @@ findings: they are behaviour — Return would answer Cancel — not structure.
 - `helpers/updater.rs` (1.6k): the check, the manifest, the download and the
   install as modules.
 
+#### The transport (2026-10-21)
+
+`zedis-web/src/transport.rs` was 2,368 lines; it keeps `HttpBridgeTransport`,
+the requests every seam makes (`post`, `call`, `failure`, `too_large`,
+`segment`, signing in again, starting work unwatched) and the tests, and
+each trait it carries for `zedis-connection` is a submodule:
+
+| File | Trait | Lines |
+|---|---|---|
+| `transport/commands.rs` | `BridgeTransport`: `/v1/exec`, sessions, the write window, `/v1/watch`, the diagnosis, signing out | 302 |
+| `transport/storage.rs` | `BridgeStorage`: the bin and the Metrics history | 171 |
+| `transport/servers.rs` | `BridgeServerStore`, and the list read with its secrets named | 167 |
+| `transport/accounts.rs` | `BridgeAccounts` and the fourteen views it reads | 555 |
+| `transport/page_data.rs` | `BridgePageData`, `page_seed` and the ordered write queue | 251 |
+
+The line-by-line count differs only in the headers, the `mod` / `use`
+lines, one more `impl HttpBridgeTransport` (three inherent blocks' methods
+went to three modules, and the two left empty went) and `pub(super)` on what
+the tests reach.
+
+Three tests came first, for the parts no test had sent a request through:
+saving the list entry by entry — the unchanged one not sent, the edited one
+put with its kept secret named, the new one posted, the gone one deleted,
+then the list read again (`the_list_is_saved_entry_by_entry`); the bin's and
+the history's routes, bodies and reply (`the_bin_and_the_metrics_are_kept_under_their_server`);
+and a session, the write window and a watch with its confirmation and its
+release (`a_session_the_write_window_and_a_watch_are_asked_for_by_their_routes`).
+Seven ways of breaking them each fail one.
+
 ### Phase 8 — core and storage
 
 Low risk, low priority: a pass over `zedis-core` and `zedis-db` for dead code,
@@ -926,9 +955,10 @@ a wire field or a test name CI selects by.
 | 5 | `tests/live.rs` split | done: fifteen modules and `main.rs`, the 94 names kept | (pending) |
 | 5 | `client.rs`, `config.rs`, `ssh_tunnel.rs` read for seams | read: ten submodules named; the splits wait for the matrix to have run on step 2 | |
 | 6 | status bar | done: four submodules, two UI tests first; UI tests reduce motion | `2ffdd87` |
-| 6 | root | done: the tab strip into `root/tabs.rs`, `new` into named parts, three UI tests first | (pending) |
-| 6 | panels, administration tools | checked: the grids and loops follow the rules; five confirms listed as findings | (pending) |
-| 7 | transport, updater | not started | |
+| 6 | root | done: the tab strip into `root/tabs.rs`, `new` into named parts, three UI tests first | `b54fde5` |
+| 6 | panels, administration tools | checked: the grids and loops follow the rules; five confirms listed as findings | `b54fde5` |
+| 7 | transport | done: one submodule per trait, three tests first | (pending) |
+| 7 | updater | not started | |
 | 8 | core, db pass | not started | |
 
 Findings that are bugs rather than structure are listed here as they turn up,
