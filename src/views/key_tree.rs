@@ -69,10 +69,12 @@ use zedis_ui::{ZedisDialog, ZedisFormField, ZedisFormFieldType, ZedisFormOptions
 
 // Constants for tree layout and behavior
 mod actions;
+mod bar_menus;
 mod build;
 mod delegate;
 mod folder_delete;
 mod render;
+mod row_menu;
 
 use actions::KeyTreeAction;
 

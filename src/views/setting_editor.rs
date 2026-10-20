@@ -58,6 +58,10 @@ use tracing::{error, warn};
 use zedis_ui::ZedisDialog;
 use zedis_ui::{ZedisSelect, ZedisSelectEvent};
 
+mod fields;
+
+use fields::{AiFields, AppearanceFields, DateTimeFields, KeyBehaviorFields, RedisFields, SystemFields};
+
 /// The Settings dialog of the browser build: as wide as the desktop's
 /// window plus the dialog's own padding, as tall as that window when the
 /// page has the room and never shorter than a few rows.
@@ -341,498 +345,50 @@ impl ZedisSettingEditor {
 
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let store = cx.global::<ZedisGlobalStore>().read(cx);
-        let max_key_tree_depth = store.max_key_tree_depth();
-        let auto_expand_threshold = store.auto_expand_threshold();
-        let max_truncate_length = store.max_truncate_length();
-        let redis_connection_timeout = store.redis_connection_timeout();
-        let redis_response_timeout = store.redis_response_timeout();
-        let key_scan_count = store.key_scan_count();
-        let value_search_scan_cap = store.value_search_scan_cap();
-        let value_search_time_budget = store.value_search_time_budget_secs();
-        let value_search_max_matches = store.value_search_max_matches();
         let tray_enabled = store.tray_enabled();
         let show_key_tree_ttl = store.show_key_tree_ttl();
         let soft_delete = store.soft_delete();
         let sidebar_click_new_tab = store.sidebar_click_new_tab();
         let auto_update_check = store.auto_update_check();
         let update_prerelease = store.update_prerelease();
-        let font_rem = store.font_rem_px().unwrap_or(DEFAULT_UI_FONT_SIZE);
-        let ui_font = store.ui_font_family();
-        let mono_font = store.mono_font_family();
-        let locale = store.locale().to_string();
-        let time_zone = store.time_zone();
-        let date_format = store.date_format();
-        let json_view = store.json_view();
-        let ai_base_url = store.ai_base_url();
-        let ai_api_key = store.ai_api_key();
-        let ai_model = store.ai_model();
-        let http_proxy = store.http_proxy();
-
-        let max_key_tree_depth_state = Self::create_input_state(
-            window,
-            cx,
-            "max_key_tree_depth_placeholder",
-            max_key_tree_depth.to_string(),
-            None,
-        );
-        let key_scan_count_state = Self::create_input_state(
-            window,
-            cx,
-            "key_scan_count_placeholder",
-            key_scan_count.to_string(),
-            Some(|s| s.parse::<usize>().is_ok()),
-        );
-        let value_search_scan_cap_state = Self::create_input_state(
-            window,
-            cx,
-            "value_search_scan_cap_placeholder",
-            value_search_scan_cap.to_string(),
-            Some(|s| s.parse::<usize>().is_ok()),
-        );
-        let value_search_time_budget_state = Self::create_input_state(
-            window,
-            cx,
-            "value_search_time_budget_placeholder",
-            value_search_time_budget.to_string(),
-            Some(|s| s.parse::<u64>().is_ok()),
-        );
-        let value_search_max_matches_state = Self::create_input_state(
-            window,
-            cx,
-            "value_search_max_matches_placeholder",
-            value_search_max_matches.to_string(),
-            Some(|s| s.parse::<usize>().is_ok()),
-        );
-        let auto_expand_threshold_state = Self::create_input_state(
-            window,
-            cx,
-            "auto_expand_threshold_placeholder",
-            auto_expand_threshold.to_string(),
-            Some(|s| s.parse::<usize>().is_ok()),
-        );
-        let max_truncate_length_state = Self::create_input_state(
-            window,
-            cx,
-            "max_truncate_length_placeholder",
-            max_truncate_length.to_string(),
-            Some(|s| s.parse::<usize>().is_ok()),
-        );
-        let redis_connection_timeout_state = Self::create_input_state(
-            window,
-            cx,
-            "redis_connection_timeout_placeholder",
-            redis_connection_timeout,
-            None,
-        );
-        let redis_response_timeout_state = Self::create_input_state(
-            window,
-            cx,
-            "redis_response_timeout_placeholder",
-            redis_response_timeout,
-            None,
-        );
-
-        let ai_base_url_state = Self::create_input_state(window, cx, "ai_base_url_placeholder", ai_base_url, None);
-        let ai_api_key_state = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(i18n_settings(cx, "ai_api_key_placeholder"))
-                .default_value(ai_api_key)
-                .masked(true)
-        });
-        let ai_model_state = Self::create_input_state(window, cx, "ai_model_placeholder", ai_model, None);
-        // Empty = follow env/OS system proxy; "none" = always direct; else a
-        // proxy URI. No live validator: `InputState::validate` rejects any
-        // keystroke whose *resulting* text fails, and URI validity isn't
-        // prefix-closed — "http:/" is invalid, so the second slash of
-        // "http://" could never be typed. Validation happens on blur instead.
-        let http_proxy_state = Self::create_input_state(window, cx, "http_proxy_placeholder", http_proxy, None);
-        let font_size_state = cx.new(|cx| {
-            let px = font_rem.clamp(UI_FONT_SIZE_MIN, UI_FONT_SIZE_MAX).round() as i32;
-            InputState::new(window, cx)
-                .placeholder(i18n_settings(cx, "font_size_placeholder"))
-                .default_value(px.to_string())
-                .step(1.0)
-                .min(UI_FONT_SIZE_MIN as f64)
-                .max(UI_FONT_SIZE_MAX as f64)
-        });
-
-        let config_dir = config_dir_text();
-
         let mut subscriptions = Vec::new();
-        subscriptions.push(Self::bind_blur_save(
-            cx,
-            &max_key_tree_depth_state,
-            window,
-            |text, cx| {
-                let value = text.parse::<i64>().unwrap_or_default();
-                update_app_state_and_save(cx, "save_max_key_tree_depth", move |state, _| {
-                    state.set_max_key_tree_depth(value as usize);
-                });
-            },
-        ));
-
-        subscriptions.push(Self::bind_blur_save(
-            cx,
-            &redis_connection_timeout_state,
-            window,
-            |text, cx| {
-                let duration = parse_duration(&text).ok();
-                update_app_state_and_save(cx, "save_redis_connection_timeout", move |state, _| {
-                    state.set_redis_connection_timeout(duration);
-                });
-            },
-        ));
-
-        subscriptions.push(Self::bind_blur_save(
-            cx,
-            &redis_response_timeout_state,
-            window,
-            |text, cx| {
-                let duration = parse_duration(&text).ok();
-                update_app_state_and_save(cx, "save_redis_response_timeout", move |state, _| {
-                    state.set_redis_response_timeout(duration);
-                });
-            },
-        ));
-
-        subscriptions.push(
-            cx.subscribe_in(&max_key_tree_depth_state, window, |_view, state, event, window, cx| {
-                let NumberInputEvent::Step(action) = event;
-                let Ok(current_val) = state.read(cx).value().parse::<u16>() else {
-                    return;
-                };
-                let new_val = match action {
-                    StepAction::Increment => current_val.saturating_add(1),
-                    StepAction::Decrement => current_val.saturating_sub(1),
-                };
-                if new_val != current_val {
-                    state.update(cx, |input, cx| {
-                        input.set_value(new_val.to_string(), window, cx);
-                    });
-                }
-            }),
-        );
-
-        subscriptions.push(cx.subscribe_in(
-            &key_scan_count_state,
-            window,
-            |_view, state, event: &InputEvent, window, cx| {
-                if !matches!(event, InputEvent::Blur) {
-                    return;
-                }
-                let text = state.read(cx).value();
-                let text = text.trim();
-                // Range lives in the setter; write the clamped (or default)
-                // value back so the box matches what SCAN will use. Live
-                // validate stays parse-only: a min of 1000 would reject the
-                // prefixes of 1000 itself.
-                let shown = if text.is_empty() {
-                    update_app_state_and_save(cx, "save_key_scan_count", |state, _| {
-                        state.set_key_scan_count(0);
-                    });
-                    DEFAULT_KEY_SCAN_COUNT
-                } else if let Ok(parsed) = text.parse::<usize>() {
-                    let value = parsed.clamp(MIN_KEY_SCAN_COUNT, MAX_KEY_SCAN_COUNT);
-                    update_app_state_and_save(cx, "save_key_scan_count", move |state, _| {
-                        state.set_key_scan_count(value);
-                    });
-                    value
-                } else {
-                    return;
-                };
-                let shown = shown.to_string();
-                if state.read(cx).value().as_ref() != shown.as_str() {
-                    state.update(cx, |input, cx| input.set_value(shown, window, cx));
-                }
-            },
-        ));
-
-        // Value-search guardrails. Cleared input → 0 → the setter stores
-        // None and the default applies; range clamping lives in the
-        // setters so every write path shares it.
-        subscriptions.push(Self::bind_blur_save(
-            cx,
-            &value_search_scan_cap_state,
-            window,
-            |text, cx| {
-                let value = text.trim().parse::<usize>().unwrap_or_default();
-                update_app_state_and_save(cx, "save_value_search_scan_cap", move |state, _| {
-                    state.set_value_search_scan_cap(value);
-                });
-            },
-        ));
-        subscriptions.push(Self::bind_blur_save(
-            cx,
-            &value_search_time_budget_state,
-            window,
-            |text, cx| {
-                let value = text.trim().parse::<u64>().unwrap_or_default();
-                update_app_state_and_save(cx, "save_value_search_time_budget", move |state, _| {
-                    state.set_value_search_time_budget_secs(value);
-                });
-            },
-        ));
-        subscriptions.push(Self::bind_blur_save(
-            cx,
-            &value_search_max_matches_state,
-            window,
-            |text, cx| {
-                let value = text.trim().parse::<usize>().unwrap_or_default();
-                update_app_state_and_save(cx, "save_value_search_max_matches", move |state, _| {
-                    state.set_value_search_max_matches(value);
-                });
-            },
-        ));
-
-        subscriptions.push(Self::bind_blur_save(
-            cx,
-            &auto_expand_threshold_state,
-            window,
-            |text, cx| {
-                let text = text.trim();
-                if text.is_empty() {
-                    // Cleared input → reset to default.
-                    update_app_state_and_save(cx, "save_auto_expand_threshold", |state, _| {
-                        state.set_auto_expand_threshold(0);
-                    });
-                } else if let Ok(value) = text.parse::<usize>()
-                    && value >= 100
-                {
-                    update_app_state_and_save(cx, "save_auto_expand_threshold", move |state, _| {
-                        state.set_auto_expand_threshold(value);
-                    });
-                }
-            },
-        ));
-
-        subscriptions.push(Self::bind_blur_save(
-            cx,
-            &max_truncate_length_state,
-            window,
-            |text, cx| {
-                let text = text.trim();
-                if text.is_empty() {
-                    // Cleared input → reset to default.
-                    update_app_state_and_save(cx, "save_max_truncate_length", |state, _| {
-                        state.set_max_truncate_length(0);
-                    });
-                } else if let Ok(value) = text.parse::<usize>()
-                    && value >= 10
-                {
-                    update_app_state_and_save(cx, "save_max_truncate_length", move |state, _| {
-                        state.set_max_truncate_length(value);
-                    });
-                }
-            },
-        ));
-
-        let config_dir_state = cx.new(|cx| InputState::new(window, cx).default_value(config_dir));
-
-        // AI credentials have no visual output — persist without the
-        // app-wide window refresh.
-        subscriptions.push(Self::bind_blur_save(cx, &ai_base_url_state, window, |text, cx| {
-            update_app_state_and_save_quiet(cx, "save_ai_base_url", move |state, _| {
-                state.set_ai_base_url(text);
-            });
-        }));
-        subscriptions.push(Self::bind_blur_save(cx, &ai_api_key_state, window, |text, cx| {
-            update_app_state_and_save_quiet(cx, "save_ai_api_key", move |state, _| {
-                state.set_ai_api_key(text);
-            });
-        }));
-        subscriptions.push(Self::bind_blur_save(cx, &ai_model_state, window, |text, cx| {
-            update_app_state_and_save_quiet(cx, "save_ai_model", move |state, _| {
-                state.set_ai_model(text);
-            });
-        }));
-        subscriptions.push(
-            cx.subscribe_in(&http_proxy_state, window, |_view, state, event, window, cx| {
-                if let InputEvent::Blur = event {
-                    let text = state.read(cx).value().trim().to_string();
-                    // The proxy is for this process's own HTTP (updater, AI),
-                    // which the browser build has none of: a page's requests
-                    // go through the browser's proxy, not a setting here. Only
-                    // clearing the field is accepted there.
-                    #[cfg(not(target_family = "wasm"))]
-                    let valid = is_valid_proxy_setting(&text);
-                    #[cfg(target_family = "wasm")]
-                    let valid = text.is_empty();
-                    if valid {
-                        update_app_state_and_save_quiet(cx, "save_http_proxy", move |state, _| {
-                            state.set_http_proxy(text);
-                        });
-                    } else {
-                        // Never persist a value `app_proxy` can't act on; put
-                        // the last saved value back so the box always shows
-                        // what is actually in effect.
-                        let saved = cx.global::<ZedisGlobalStore>().read(cx).http_proxy();
-                        state.update(cx, |input, cx| input.set_value(saved, window, cx));
-                    }
-                }
-            }),
-        );
-
-        subscriptions.push(cx.subscribe_in(
-            &font_size_state,
-            window,
-            |_view, state, event: &InputEvent, window, cx| match event {
-                InputEvent::Change => {
-                    if let Some(px) = parse_font_rem_px(state.read(cx).value().as_ref()) {
-                        persist_font_size(cx, px);
-                    }
-                }
-                InputEvent::Blur => {
-                    let fallback = cx
-                        .global::<ZedisGlobalStore>()
-                        .read(cx)
-                        .font_rem_px()
-                        .unwrap_or(DEFAULT_UI_FONT_SIZE);
-                    let px = clamp_font_rem_px(state.read(cx).value().as_ref(), fallback);
-                    let shown = (px as i32).to_string();
-                    if state.read(cx).value().as_ref() != shown.as_str() {
-                        state.update(cx, |input, cx| input.set_value(shown, window, cx));
-                    }
-                    persist_font_size(cx, px);
-                }
-                _ => {}
-            },
-        ));
-
-        let locale_select = cx.new(|cx| {
-            ZedisSelect::new(
-                LOCALES.iter().map(|(_, label)| label.to_string()).collect(),
-                Some(locale_to_index(&locale)),
-                window,
-                cx,
-            )
-        });
-
-        subscriptions.push(cx.subscribe_in(
-            &locale_select,
-            window,
-            |_view, _select, event: &ZedisSelectEvent, _window, cx| {
-                let ZedisSelectEvent::Change(index) = event;
-                let locale = index_to_locale(*index);
-                save_ui_locale(cx, locale);
-            },
-        ));
-
-        // Time zone + date layout: both mirror into the process-wide slot
-        // right away (`set_datetime_prefs`), so every open panel renders the
-        // new choice on its next frame — no restart, no window reopen.
-        let zone_labels: Vec<String> = TimeZonePref::ALL
-            .iter()
-            .map(|zone| {
-                let key = match zone {
-                    TimeZonePref::Local => "time_zone_local",
-                    TimeZonePref::Utc => "time_zone_utc",
-                };
-                i18n_settings(cx, key).to_string()
-            })
-            .collect();
-        let zone_index = TimeZonePref::ALL.iter().position(|zone| *zone == time_zone);
-        let time_zone_select = cx.new(|cx| ZedisSelect::new(zone_labels, zone_index, window, cx));
-        subscriptions.push(cx.subscribe_in(
-            &time_zone_select,
-            window,
-            |_view, _select, event: &ZedisSelectEvent, _window, cx| {
-                let ZedisSelectEvent::Change(index) = event;
-                let zone = TimeZonePref::ALL.get(*index).copied().unwrap_or_default();
-                update_app_state_and_save(cx, "save_time_zone", move |state, _| {
-                    state.set_time_zone(zone);
-                    set_datetime_prefs(zone, &state.date_format());
-                });
-            },
-        ));
-        // The select shows a fixed sample instant in each layout — the
-        // sample explains a format better than a name would.
-        let format_labels: Vec<String> = DATE_FORMATS.iter().map(date_format_sample).collect();
-        let format_index = DATE_FORMATS.iter().position(|format| format.id == date_format);
-        let date_format_select = cx.new(|cx| ZedisSelect::new(format_labels, format_index, window, cx));
-        subscriptions.push(cx.subscribe_in(
-            &date_format_select,
-            window,
-            |_view, _select, event: &ZedisSelectEvent, _window, cx| {
-                let ZedisSelectEvent::Change(index) = event;
-                let Some(format) = DATE_FORMATS.get(*index) else {
-                    return;
-                };
-                update_app_state_and_save(cx, "save_date_format", move |state, _| {
-                    state.set_date_format(format.id);
-                    set_datetime_prefs(state.time_zone(), format.id);
-                });
-            },
-        ));
-
-        // How a JSON value opens. Read when a key is opened, so the next one
-        // follows the choice.
-        let json_view_labels: Vec<String> = JsonView::ALL
-            .iter()
-            .map(|view| {
-                // The switch's own words, so the two read the same.
-                let key = match view {
-                    JsonView::Text => "json_view_text",
-                    JsonView::Tree => "json_view_tree",
-                };
-                i18n_editor(cx, key).to_string()
-            })
-            .collect();
-        let json_view_index = JsonView::ALL.iter().position(|view| *view == json_view);
-        let json_view_select = cx.new(|cx| ZedisSelect::new(json_view_labels, json_view_index, window, cx));
-        subscriptions.push(cx.subscribe_in(
-            &json_view_select,
-            window,
-            |_view, _select, event: &ZedisSelectEvent, _window, cx| {
-                let ZedisSelectEvent::Change(index) = event;
-                let view = JsonView::ALL.get(*index).copied().unwrap_or_default();
-                update_app_state_and_save(cx, "save_json_view", move |state, _| {
-                    state.set_json_view(view);
-                });
-            },
-        ));
-
-        // UI + monospace font pickers: searchable dropdowns of the installed
-        // families (drop the `.`-prefixed internal ones), each led by a
-        // "default" entry. Changing either applies + persists both.
-        let all_fonts: Vec<String> = cx
-            .text_system()
-            .all_font_names()
-            .into_iter()
-            .filter(|n| !n.starts_with('.'))
-            .collect();
-        // The bundled JetBrains Mono is registered at runtime (`add_fonts`), so
-        // CoreText's enumeration may not list it — offer it explicitly.
-        let mut mono_fonts = all_fonts.clone();
-        if !mono_fonts.iter().any(|f| f == "JetBrains Mono") {
-            mono_fonts.push("JetBrains Mono".to_string());
-            mono_fonts.sort_unstable();
-        }
-        let (ui_labels, ui_font_values, ui_index) = build_font_options(
-            &all_fonts,
-            &ui_font,
-            i18n_settings(cx, "font_system_default").to_string(),
-        );
-        let (mono_labels, mono_font_values, mono_index) = build_font_options(
-            &mono_fonts,
-            &mono_font,
-            i18n_settings(cx, "font_mono_default").to_string(),
-        );
-        let ui_font_select = cx.new(|cx| ZedisSelect::new_searchable(ui_labels, ui_index, window, cx));
-        let mono_font_select = cx.new(|cx| ZedisSelect::new_searchable(mono_labels, mono_index, window, cx));
-        subscriptions.push(
-            cx.subscribe(&ui_font_select, |this, _sel, event: &ZedisSelectEvent, cx| {
-                let ZedisSelectEvent::Change(index) = event;
-                this.ui_font = this.ui_font_values.get(*index).cloned().flatten();
-                this.apply_and_save_fonts(cx);
-            }),
-        );
-        subscriptions.push(
-            cx.subscribe(&mono_font_select, |this, _sel, event: &ZedisSelectEvent, cx| {
-                let ZedisSelectEvent::Change(index) = event;
-                this.mono_font = this.mono_font_values.get(*index).cloned().flatten();
-                this.apply_and_save_fonts(cx);
-            }),
-        );
+        let AppearanceFields {
+            font_size_state,
+            locale_select,
+            ui_font_select,
+            mono_font_select,
+            ui_font_values,
+            mono_font_values,
+            ui_font,
+            mono_font,
+        } = Self::appearance_fields(window, cx, &mut subscriptions);
+        let DateTimeFields {
+            time_zone_select,
+            date_format_select,
+        } = Self::date_time_fields(window, cx, &mut subscriptions);
+        let KeyBehaviorFields {
+            max_key_tree_depth_state,
+            key_scan_count_state,
+            auto_expand_threshold_state,
+            max_truncate_length_state,
+            value_search_scan_cap_state,
+            value_search_time_budget_state,
+            value_search_max_matches_state,
+            json_view_select,
+        } = Self::key_behavior_fields(window, cx, &mut subscriptions);
+        let RedisFields {
+            redis_connection_timeout_state,
+            redis_response_timeout_state,
+        } = Self::redis_fields(window, cx, &mut subscriptions);
+        let AiFields {
+            ai_base_url_state,
+            ai_api_key_state,
+            ai_model_state,
+        } = Self::ai_fields(window, cx, &mut subscriptions);
+        let SystemFields {
+            http_proxy_state,
+            config_dir_state,
+        } = Self::system_fields(window, cx, &mut subscriptions);
 
         Self {
             section: SettingsSection::default(),
@@ -1423,6 +979,7 @@ pub fn open_settings_window(cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::states::ZedisAppState;
     use crate::test_support::init_ui;
     use gpui::TestAppContext;
     use gpui_kit::component::Root;
@@ -1468,6 +1025,219 @@ mod tests {
             assert_eq!(view.section, SettingsSection::System);
         })
         .expect("the window is open");
+    }
+
+    fn open_settings(cx: &mut TestAppContext) -> (gpui::AnyWindowHandle, Entity<ZedisSettingEditor>) {
+        let mut view = None;
+        let handle = cx.open_window(size(px(700.), px(560.)), |window, cx| {
+            let editor = cx.new(|cx| ZedisSettingEditor::new(window, cx));
+            view = Some(editor.clone());
+            Root::new(editor, window, cx)
+        });
+        (handle.into(), view.expect("the window built the page"))
+    }
+
+    type Field = fn(&ZedisSettingEditor) -> Entity<InputState>;
+
+    /// Put `text` in a field and leave it, as a person does: the text
+    /// changes, then the field loses the focus.
+    fn enter(
+        cx: &mut TestAppContext,
+        handle: gpui::AnyWindowHandle,
+        view: &Entity<ZedisSettingEditor>,
+        field: Field,
+        text: &str,
+    ) {
+        cx.update_window(handle, |_, window, cx| {
+            let state = field(view.read(cx));
+            state.update(cx, |input, cx| {
+                input.set_value(text.to_string(), window, cx);
+                cx.emit(InputEvent::Blur);
+            });
+        })
+        .expect("the window is open");
+        cx.run_until_parked();
+    }
+
+    fn shown(cx: &mut TestAppContext, view: &Entity<ZedisSettingEditor>, field: Field) -> String {
+        cx.read(|cx| field(view.read(cx)).read(cx).value().to_string())
+    }
+
+    fn stored<T>(cx: &mut TestAppContext, read: impl FnOnce(&ZedisAppState) -> T) -> T {
+        cx.read(|cx| read(cx.global::<ZedisGlobalStore>().read(cx)))
+    }
+
+    /// What a setting reads after `change`, from the defaults: the setter's
+    /// own clamping, so a test asks only that the field reached it.
+    fn after<T>(change: impl FnOnce(&mut ZedisAppState), read: impl FnOnce(&ZedisAppState) -> T) -> T {
+        let mut state = ZedisAppState::default();
+        change(&mut state);
+        read(&state)
+    }
+
+    /// Every field starts from its setting and saves what it is left with,
+    /// through its setter and its own rule: the scan count shown as the
+    /// count the scan will use, a threshold under its floor not kept, a
+    /// proxy that cannot be used put back to the one in effect, a font size
+    /// set right on leaving.
+    #[gpui::test]
+    fn every_field_starts_from_its_setting_and_saves_when_left(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let (handle, view) = open_settings(cx);
+        let depth: Field = |v| v.max_key_tree_depth_state.clone();
+        let scan_count: Field = |v| v.key_scan_count_state.clone();
+        let connect: Field = |v| v.redis_connection_timeout_state.clone();
+        assert_eq!(
+            shown(cx, &view, depth),
+            stored(cx, |s| s.max_key_tree_depth().to_string())
+        );
+        assert_eq!(
+            shown(cx, &view, scan_count),
+            stored(cx, |s| s.key_scan_count().to_string())
+        );
+        assert_eq!(shown(cx, &view, connect), stored(cx, |s| s.redis_connection_timeout()));
+
+        enter(cx, handle, &view, depth, "7");
+        assert_eq!(stored(cx, |s| s.max_key_tree_depth()), 7);
+
+        enter(cx, handle, &view, scan_count, "1");
+        assert_eq!(stored(cx, |s| s.key_scan_count()), MIN_KEY_SCAN_COUNT);
+        assert_eq!(shown(cx, &view, scan_count), MIN_KEY_SCAN_COUNT.to_string());
+        enter(cx, handle, &view, scan_count, "");
+        assert_eq!(shown(cx, &view, scan_count), DEFAULT_KEY_SCAN_COUNT.to_string());
+        assert_eq!(
+            stored(cx, |s| s.key_scan_count()),
+            after(|s| s.set_key_scan_count(0), |s| s.key_scan_count())
+        );
+
+        enter(cx, handle, &view, |v| v.value_search_scan_cap_state.clone(), "1234");
+        assert_eq!(
+            stored(cx, |s| s.value_search_scan_cap()),
+            after(|s| s.set_value_search_scan_cap(1234), |s| s.value_search_scan_cap())
+        );
+        enter(cx, handle, &view, |v| v.value_search_time_budget_state.clone(), "9");
+        assert_eq!(
+            stored(cx, |s| s.value_search_time_budget_secs()),
+            after(
+                |s| s.set_value_search_time_budget_secs(9),
+                |s| s.value_search_time_budget_secs()
+            )
+        );
+        enter(cx, handle, &view, |v| v.value_search_max_matches_state.clone(), "77");
+        assert_eq!(
+            stored(cx, |s| s.value_search_max_matches()),
+            after(|s| s.set_value_search_max_matches(77), |s| s.value_search_max_matches())
+        );
+
+        let expand: Field = |v| v.auto_expand_threshold_state.clone();
+        let before = stored(cx, |s| s.auto_expand_threshold());
+        enter(cx, handle, &view, expand, "50");
+        assert_eq!(stored(cx, |s| s.auto_expand_threshold()), before, "under its floor");
+        enter(cx, handle, &view, expand, "500");
+        assert_eq!(stored(cx, |s| s.auto_expand_threshold()), 500);
+
+        let truncate: Field = |v| v.max_truncate_length_state.clone();
+        let before = stored(cx, |s| s.max_truncate_length());
+        enter(cx, handle, &view, truncate, "5");
+        assert_eq!(stored(cx, |s| s.max_truncate_length()), before, "under its floor");
+        enter(cx, handle, &view, truncate, "80");
+        assert_eq!(stored(cx, |s| s.max_truncate_length()), 80);
+
+        enter(cx, handle, &view, connect, "15s");
+        assert_eq!(
+            stored(cx, |s| s.redis_connection_timeout()),
+            after(
+                |s| s.set_redis_connection_timeout(parse_duration("15s").ok()),
+                |s| s.redis_connection_timeout()
+            )
+        );
+        enter(cx, handle, &view, |v| v.redis_response_timeout_state.clone(), "20s");
+        assert_eq!(
+            stored(cx, |s| s.redis_response_timeout()),
+            after(
+                |s| s.set_redis_response_timeout(parse_duration("20s").ok()),
+                |s| s.redis_response_timeout()
+            )
+        );
+
+        enter(
+            cx,
+            handle,
+            &view,
+            |v| v.ai_base_url_state.clone(),
+            "https://ai.example/v1",
+        );
+        enter(cx, handle, &view, |v| v.ai_api_key_state.clone(), "sk-test");
+        enter(cx, handle, &view, |v| v.ai_model_state.clone(), "a-model");
+        assert_eq!(
+            stored(cx, |s| (s.ai_base_url(), s.ai_api_key(), s.ai_model())),
+            (
+                "https://ai.example/v1".to_string(),
+                "sk-test".to_string(),
+                "a-model".to_string()
+            )
+        );
+
+        let proxy: Field = |v| v.http_proxy_state.clone();
+        enter(cx, handle, &view, proxy, "http:/");
+        assert_eq!(stored(cx, |s| s.http_proxy()), "");
+        assert_eq!(shown(cx, &view, proxy), "", "put back to the one in effect");
+        enter(cx, handle, &view, proxy, "http://127.0.0.1:8080");
+        assert_eq!(stored(cx, |s| s.http_proxy()), "http://127.0.0.1:8080");
+
+        let font_size: Field = |v| v.font_size_state.clone();
+        enter(cx, handle, &view, font_size, "25");
+        assert_eq!(shown(cx, &view, font_size), "20");
+        assert_eq!(stored(cx, |s| s.font_rem_px()), Some(20.));
+    }
+
+    /// The depth steps by one, and every list saves what is picked in it.
+    #[gpui::test]
+    fn each_list_saves_what_is_picked(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let (handle, view) = open_settings(cx);
+        let pick = |cx: &mut TestAppContext, select: fn(&ZedisSettingEditor) -> Entity<ZedisSelect>, index: usize| {
+            cx.update(|cx| {
+                select(view.read(cx)).update(cx, |_, cx| cx.emit(ZedisSelectEvent::Change(index)));
+            });
+            cx.run_until_parked();
+        };
+
+        let depth = stored(cx, |s| s.max_key_tree_depth());
+        cx.update_window(handle, |_, _, cx| {
+            view.read(cx)
+                .max_key_tree_depth_state
+                .clone()
+                .update(cx, |_, cx| cx.emit(NumberInputEvent::Step(StepAction::Increment)));
+        })
+        .expect("the window is open");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read(|cx| view.read(cx).max_key_tree_depth_state.read(cx).value().to_string()),
+            (depth + 1).to_string()
+        );
+
+        let utc = TimeZonePref::ALL
+            .iter()
+            .position(|zone| *zone == TimeZonePref::Utc)
+            .expect("UTC is offered");
+        pick(cx, |v| v.time_zone_select.clone(), utc);
+        assert_eq!(stored(cx, |s| s.time_zone()), TimeZonePref::Utc);
+        pick(cx, |v| v.date_format_select.clone(), 1);
+        assert_eq!(stored(cx, |s| s.date_format()), DATE_FORMATS[1].id);
+        let tree = JsonView::ALL
+            .iter()
+            .position(|view| *view == JsonView::Tree)
+            .expect("the tree is offered");
+        pick(cx, |v| v.json_view_select.clone(), tree);
+        assert_eq!(stored(cx, |s| s.json_view()), JsonView::Tree);
+        if let Some(Some(font)) = cx.read(|cx| view.read(cx).ui_font_values.get(1).cloned()) {
+            pick(cx, |v| v.ui_font_select.clone(), 1);
+            assert_eq!(stored(cx, |s| s.ui_font_family()), Some(font));
+        }
+        // Last: a language builds the page again.
+        pick(cx, |v| v.locale_select.clone(), 1);
+        assert_eq!(stored(cx, |s| s.locale().to_string()), LOCALES[1].0);
     }
 
     #[test]

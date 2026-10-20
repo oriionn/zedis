@@ -71,6 +71,7 @@ use zedis_core::json::check_json;
 use zedis_ui::{ZedisDialog, ZedisSkeletonLoading};
 
 mod dialogs;
+mod more_menu;
 mod render;
 mod toolbar;
 

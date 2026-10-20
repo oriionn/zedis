@@ -204,6 +204,122 @@ draws (ids, labels, focus after the obvious interaction) if none exists.
 by action family (delete, TTL, export, tags, navigation) into handler methods
 the `on_action` closures call.
 
+Done so far:
+
+- `key_tree/delegate.rs` `render_item`, 685 → 206 lines (what is left is
+  the row's own frame and its facts). The sections went to functions beside
+  it — `load_more_row`, `row_icon`, `ttl_chip`, `depth_guides`, `row_name`
+  (the label with its tooltip), `ttl_slot`, `row_hover_delete`, and
+  `inline_delete_button`, the one delete button the two slots had a copy
+  each of — and the right-click menu to `key_tree/row_menu.rs`: a `RowMenu`
+  of the row's facts whose `build` is the four sections it already had
+  (operations, export, tag and note, copy / rename / star). `id` and
+  `edit_tag_id`, two clones of the same key, are its one `id`. Two UI tests
+  came first: `a_rows_menu_offers_what_the_row_and_the_access_allow` (each
+  item of seven menus clicked, the actions they send compared in order — a
+  key, a key that never expires, a folder, two picks and one, read-only)
+  and `a_key_row_offers_its_delete_on_hover` (where the inline delete is
+  and is not, which hover shows it, what it sends). Each was shown to fail
+  in a worktree with the original code mutated: the never-expiring key's
+  Remove TTL, the TTL slot's hover scope, the delete beside the checkbox,
+  the read-only folder's Refresh. Not compared: pixels — the tests read
+  ids, visibility and dispatched actions.
+- `editor/toolbar.rs` `render_select_key`, 645 → 64 lines: the value's
+  facts read once into a `KeyFacts` (`key_facts`), the controls as methods
+  (`save_button`, `ttl_control`, `reload_button`, `copy_and_favorite`), the
+  name-and-chips strip as `name_and_facts`, and the "…" menu to
+  `editor/more_menu.rs`: a `MoreActions` decided by `more_actions` (what is
+  offered for this key, value and connection) whose `build` is the menu's
+  three groups (the value's actions, its history, the key's). Three UI tests
+  came first: `a_strings_bar_offers_its_controls_and_menus`,
+  `a_read_only_bar_offers_what_reads` and
+  `a_collection_and_a_first_load_offer_less` — which controls are there and
+  which disabled, and every item of the TTL, reload and "…" menus clicked,
+  in order, with the editor inside a view that captures each `EditorAction`
+  and `KeyOpAction` on its way down and stops it, so nothing an item opens
+  opens. Shown to fail with the original mutated: Import on a read-only
+  connection, Remove TTL on a key that never expires, a reload interval
+  dropped, the "…" button enabled during the first load. Not reachable from
+  the tests: the name, encoding and heat strip (plain `div`s, which the test
+  window does not observe) and the two history submenus' contents (their
+  rows are a session's saves). The two history submenus are still two
+  copies that differ in an icon, a label and an action; folding them is a
+  change of its own.
+- `sidebar.rs` `render_server_list`, 554 → 138 lines: what every row is
+  drawn with in a `ListLook` (`list_look`: the colours, the tab gestures'
+  hints, whether the sidebar is the rail), the Home band as `home_band`, a
+  group's header as `group_header`, a connection as `server_row`. What has
+  to run in the list's order — the next monogram of the rail, the
+  connection's link, its `ServerMenu` — stays in the loop and is handed to
+  the row. The file had no test; two came first:
+  `the_list_draws_home_its_rows_and_closes_a_group` (the rows there are, a
+  header's click closing its group, the rail showing every connection and
+  no collapse control) and
+  `a_row_opens_its_connection_and_its_menu_follows_the_link` (a click, ⌘
+  and ⌘⇧ on a row and on Home; the menu's items in order with the link
+  item for each health). The sections are set on the sidebar itself, not
+  through the server list, which is the process's and shared by every test.
+  Shown to fail with the original mutated: Disconnect offered offline, a
+  closed group's rows drawn, ⌘⇧ not forcing a new tab, the collapse control
+  in the rail.
+- `key_tree/render.rs` `render_keyword_input`, 552 → 148 lines: its two
+  menus to `key_tree/bar_menus.rs` — `FilterMenu`, the search box's (the
+  three lists that lead back to a key, read as the menu opens; the query
+  modes; the type, tag and TTL filters; the sort), one method a submenu,
+  and `TreeMoreMenu`, the "…" — and the filter chips (`active_filters`),
+  Clear selection and New key as functions. Three UI tests came first:
+  `the_bar_offers_its_controls_and_both_menus` reads every item of both
+  menus and of every submenu (a submenu opens on hover, under the
+  `"submenu"` scope, and is read item by item from a menu opened afresh),
+  `a_filter_is_a_chip_that_takes_it_off` (and the query modes not pickable
+  with a regex keyword — turned on through the server state, since the tree
+  reads it back on every rebuild), `the_bar_follows_access_picks_and_the_server`.
+  Shown to fail with the original mutated: the query modes pickable under a
+  regex, an auto-refresh interval dropped, New key allowed read-only, the
+  tag chip missing, the keyword kept across servers.
+- `setting_editor.rs` `new`, 534 → 85 lines: one builder a section in
+  `setting_editor/fields.rs` (`appearance_fields`, `date_time_fields`,
+  `key_behavior_fields`, `redis_fields`, `ai_fields`, `system_fields`), each
+  reading its own settings, building its fields and pushing what saves
+  them, and answering a struct `new` destructures into the names its
+  `Self { … }` always used. Not one line of the original is gone. Two UI
+  tests came first, on the wiring rather than on pixels:
+  `every_field_starts_from_its_setting_and_saves_when_left` (each field set
+  and left — `InputEvent::Blur` — and the setting read back, against what
+  the setter itself makes of the value: the scan count clamped and shown
+  clamped, thresholds under their floor not kept, an unusable proxy put
+  back, the font size set right) and `each_list_saves_what_is_picked`.
+  Shown to fail with the original mutated: the scan count unclamped, the
+  date layout not saved, an unusable proxy left in the field, the depth
+  stepping by two.
+- `servers/form.rs` `add_or_update_server_dialog`, 525 → 120 lines: the
+  field list cut at its runs, in its order — `address_fields`,
+  `sentinel_fields` (with the master-name fetch's handler as
+  `fetch_master_names`), `note_fields`, `tls_fields`, `ssh_fields`,
+  `connection_fields`, `safety_fields`, `key_tree_fields` — and joined back
+  in that order, so every tab lists its fields as before; the desktop's
+  Test and Diagnose buttons as functions, their `cfg` moved from the
+  statement to the item. The test that came first is a round trip,
+  `an_entry_comes_back_from_its_form_as_it_went_in`: an entry with every
+  field filled opens in the form and is saved back unchanged, but for the
+  two the store stamps (`updated_at`, `sort_order`). The save writes the
+  file through `unblock`, on a thread the test scheduler does not drive:
+  the first version of the test passed alone and aborted `make test` ("your
+  test is not deterministic") — it now calls `allow_parking` and waits for
+  `ServerListUpdated`. Shown to fail with the original mutated: a field not
+  filled from the entry, Diagnose missing.
+- `servers.rs` `render`, 516 → 158 lines: a group's section as
+  `group_section`, a card as `server_card` (218 lines — one card, kept
+  whole), the toolbar as `toolbar`, what they share in a `PageLook`. The
+  page reads the process's server list, so its test,
+  `the_page_draws_a_card_per_connection_and_its_actions`, adds three entries
+  of its own (`set_servers_cache`, the list put back on drop), narrows the
+  page to them with its search box, and holds `test_support::hold_the_server_list`
+  — a lock every test that changes the list now takes, since a change is a
+  read, a change and a write. Shown to fail with the original mutated: the
+  first card's Up enabled, a card's click not connecting, Clone offered
+  read-only.
+
 ### Phase 3 — the state layer (largest payoff, highest risk)
 
 `ZedisServerState` is the source of truth for one connection and has grown to
@@ -288,7 +404,7 @@ a wire field or a test name CI selects by.
 | 1 | `main.rs` setup functions | done | (pending) |
 | 1 | `accounts.rs` seams (analysis) | done | (pending) |
 | 1 | `accounts.rs` split | done | (pending) |
-| 2 | eleven long functions | not started | |
+| 2 | eleven long functions | 8 of 11 (with the bridge's `main`, phase 1); left: `migration_window` `render`, `key_tree/actions.rs` `render`, `root.rs` `render` | (pending) |
 | 3 | `ZedisServerState` field map | not started | |
 | 4 | gate inventory | not started | |
 | 5 | operations ↔ live tests check | not started | |

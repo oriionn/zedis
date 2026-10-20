@@ -42,3 +42,11 @@ pub(crate) fn init_ui(cx: &mut TestAppContext) {
         cx.set_global(ZedisGlobalStore::new(app_state));
     });
 }
+
+/// Held by a test that changes the server list. The list is the process's,
+/// the tests run on threads of one process, and a change is a read, a
+/// change and a write: two at once lose one another's entries.
+pub(crate) fn hold_the_server_list() -> std::sync::MutexGuard<'static, ()> {
+    static SERVER_LIST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERVER_LIST.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}

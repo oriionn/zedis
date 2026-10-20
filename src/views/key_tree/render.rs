@@ -16,6 +16,7 @@
 //! overlay, the virtualized tree list and the keyword/filter bar.
 //! Split out of `key_tree.rs`.
 
+use super::bar_menus::{FilterMenu, TreeMoreMenu};
 use super::*;
 use gpui::{AnyElement, ClickEvent};
 
@@ -325,292 +326,23 @@ impl ZedisKeyTree {
             }
         };
         let server_id_for_favorites: SharedString = server_id.clone().into();
+        let filter_menu = FilterMenu {
+            server_state_clone,
+            server_id_for_favorites,
+            recent_scope,
+            query_mode,
+            regex_mode,
+            type_filter,
+            module_types,
+            tag_filter_active,
+            show_key_tree_ttl,
+            ttl_filter,
+            sort,
+        };
         let query_mode_dropdown = DropdownButton::new("dropdown")
             .button(Button::new("key-tree-query-mode-btn").ghost().px_2().icon(icon))
             .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, window, cx| {
-                let favorites = get_favorites_manager()
-                    .records(server_id_for_favorites.as_ref())
-                    .unwrap_or_default();
-                let recent_keys = get_recent_keys_manager()
-                    .records(recent_scope.as_str())
-                    .unwrap_or_default();
-                let server_state_for_history = server_state_clone.clone();
-                menu.submenu_with_icon(
-                    Some(Icon::new(CustomIconName::Clock3)),
-                    i18n_key_tree(cx, "search_history"),
-                    window,
-                    cx,
-                    move |submenu, _window, cx| {
-                        let mut submenu = submenu;
-                        let keywords = server_state_for_history.read(cx).search_history();
-                        if keywords.is_empty() {
-                            submenu = submenu.label(i18n_key_tree(cx, "no_search_history"));
-                        } else {
-                            for keyword in keywords {
-                                submenu = submenu
-                                    .menu_element(Box::new(KeyTreeAction::Search(keyword.clone())), move |_, _cx| {
-                                        Label::new(keyword.clone())
-                                    });
-                            }
-                            submenu = submenu.separator().menu_element_with_icon(
-                                CustomIconName::Eraser,
-                                Box::new(KeyTreeAction::Clear),
-                                move |_, cx| Label::new(i18n_key_tree(cx, "clear_history")),
-                            );
-                        }
-                        submenu
-                    },
-                )
-                .submenu_with_icon(
-                    Some(Icon::new(CustomIconName::Activity)),
-                    i18n_key_tree(cx, "recent_keys"),
-                    window,
-                    cx,
-                    move |submenu, _window, cx| {
-                        let mut submenu = submenu;
-                        if recent_keys.is_empty() {
-                            submenu = submenu.label(i18n_key_tree(cx, "no_recent_keys"));
-                        } else {
-                            for key in &recent_keys {
-                                let key_clone = key.clone();
-                                submenu = submenu.menu_element(
-                                    Box::new(KeyTreeAction::SelectRecentKey(key.clone().into())),
-                                    move |_, _cx| Label::new(key_clone.clone()).text_ellipsis(),
-                                );
-                            }
-                            submenu = submenu.separator().menu_element_with_icon(
-                                CustomIconName::Eraser,
-                                Box::new(KeyTreeAction::ClearRecentKeys),
-                                move |_, cx| Label::new(i18n_key_tree(cx, "clear_recent_keys")),
-                            );
-                        }
-                        submenu
-                    },
-                )
-                .submenu_with_icon(
-                    Some(Icon::new(IconName::Star)),
-                    i18n_key_tree(cx, "favorite_keys"),
-                    window,
-                    cx,
-                    move |submenu, _window, cx| {
-                        let mut submenu = submenu;
-                        if favorites.is_empty() {
-                            submenu = submenu.label(i18n_key_tree(cx, "no_favorite_keys"));
-                        } else {
-                            for key in &favorites {
-                                let key_clone = key.clone();
-                                submenu = submenu.menu_element(
-                                    Box::new(KeyTreeAction::SelectFavoriteKey(key.clone().into())),
-                                    move |_, _cx| Label::new(key_clone.clone()).text_ellipsis(),
-                                );
-                            }
-                            submenu = submenu.separator().menu_element_with_icon(
-                                CustomIconName::Eraser,
-                                Box::new(KeyTreeAction::ClearFavorites),
-                                move |_, cx| Label::new(i18n_key_tree(cx, "clear_favorites")),
-                            );
-                        }
-                        submenu
-                    },
-                )
-                .submenu_with_icon(
-                    Some(Icon::new(IconName::Asterisk)),
-                    i18n_key_tree(cx, "query_mode"),
-                    window,
-                    cx,
-                    move |submenu, _window, cx| {
-                        // A regex keyword takes the mode's place, so the
-                        // three are shown and cannot be picked while it is
-                        // on: choosing one changed nothing on screen and
-                        // decided, unseen, what the next search sent.
-                        [
-                            (QueryMode::All, "query_mode_all"),
-                            (QueryMode::Prefix, "query_mode_prefix"),
-                            (QueryMode::Exact, "query_mode_exact"),
-                        ]
-                        .into_iter()
-                        .fold(submenu, |submenu, (mode, label)| {
-                            submenu.menu_with_check_and_disabled(
-                                i18n_key_tree(cx, label),
-                                query_mode == mode,
-                                Box::new(mode),
-                                regex_mode,
-                            )
-                        })
-                    },
-                )
-                .submenu_with_icon(
-                    Some(Icon::new(CustomIconName::Binary)),
-                    i18n_key_tree(cx, "type_filter"),
-                    window,
-                    cx,
-                    {
-                        let module_types = module_types.clone();
-                        move |submenu, _window, _cx| {
-                            let submenu = submenu
-                                .menu_element_with_check(
-                                    type_filter.is_none(),
-                                    Box::new(KeyTypeFilter::All),
-                                    |_, cx| Label::new(i18n_key_tree(cx, "type_filter_all")),
-                                )
-                                .menu_element_with_check(
-                                    type_filter == Some(KeyType::String),
-                                    Box::new(KeyTypeFilter::String),
-                                    |_, _| Label::new("String"),
-                                )
-                                .menu_element_with_check(
-                                    type_filter == Some(KeyType::Hash),
-                                    Box::new(KeyTypeFilter::Hash),
-                                    |_, _| Label::new("Hash"),
-                                )
-                                .menu_element_with_check(
-                                    type_filter == Some(KeyType::List),
-                                    Box::new(KeyTypeFilter::List),
-                                    |_, _| Label::new("List"),
-                                )
-                                .menu_element_with_check(
-                                    type_filter == Some(KeyType::Set),
-                                    Box::new(KeyTypeFilter::Set),
-                                    |_, _| Label::new("Set"),
-                                )
-                                .menu_element_with_check(
-                                    type_filter == Some(KeyType::Zset),
-                                    Box::new(KeyTypeFilter::Zset),
-                                    |_, _| Label::new("Zset"),
-                                )
-                                .menu_element_with_check(
-                                    type_filter == Some(KeyType::Stream),
-                                    Box::new(KeyTypeFilter::Stream),
-                                    |_, _| Label::new("Stream"),
-                                )
-                                // Module types: no `SCAN … TYPE` narrowing exists
-                                // for these — the client-side post-filter over the
-                                // resolved types does the work alone.
-                                .menu_element_with_check(
-                                    type_filter == Some(KeyType::Json),
-                                    Box::new(KeyTypeFilter::Json),
-                                    |_, _| Label::new("JSON"),
-                                )
-                                .menu_element_with_check(
-                                    type_filter == Some(KeyType::TimeSeries),
-                                    Box::new(KeyTypeFilter::TimeSeries),
-                                    |_, cx| Label::new(i18n_timeseries(cx, "title")),
-                                )
-                                .menu_element_with_check(
-                                    type_filter == Some(KeyType::Vectorset),
-                                    Box::new(KeyTypeFilter::Vectorset),
-                                    |_, cx| Label::new(i18n_vector_set(cx, "title")),
-                                )
-                                .menu_element_with_check(
-                                    matches!(type_filter, Some(KeyType::Probabilistic(_))),
-                                    Box::new(KeyTypeFilter::Probabilistic),
-                                    |_, cx| Label::new(i18n_key_tree(cx, "type_probabilistic")),
-                                );
-                            // Module types the loaded keys have, by their raw
-                            // TYPE name — there is nothing to translate.
-                            let mut submenu = submenu;
-                            for id in module_types.iter().copied() {
-                                submenu = submenu.menu_element_with_check(
-                                    type_filter == Some(KeyType::Module(id)),
-                                    Box::new(KeyTypeFilter::Module(id.raw())),
-                                    move |_, _| Label::new(id.name()),
-                                );
-                            }
-                            submenu
-                        }
-                    },
-                )
-                // Tag colour filter (local metadata AND). Always visible so
-                // it is discoverable next to Type / TTL — not only after the
-                // first tag exists and not only under the ⋯ menu.
-                .submenu_with_icon(
-                    Some(Icon::new(CustomIconName::SwatchBook)),
-                    i18n_key_tag(cx, "filter_button_tooltip"),
-                    window,
-                    cx,
-                    move |submenu, _window, _cx| {
-                        let mut submenu = submenu.menu_element_with_check(
-                            tag_filter_active.is_none(),
-                            Box::new(KeyTreeAction::SetTagFilter(SharedString::default())),
-                            move |_, cx| Label::new(i18n_key_tag(cx, "filter_all")),
-                        );
-                        for color in TagColor::ALL {
-                            let label_key = match color {
-                                TagColor::Red => "color_red",
-                                TagColor::Orange => "color_orange",
-                                TagColor::Yellow => "color_yellow",
-                                TagColor::Green => "color_green",
-                                TagColor::Blue => "color_blue",
-                                TagColor::Purple => "color_purple",
-                            };
-                            let color_name: SharedString = color.as_str().into();
-                            submenu = submenu.menu_element_with_check(
-                                tag_filter_active == Some(color),
-                                Box::new(KeyTreeAction::SetTagFilter(color_name)),
-                                move |_, cx| Label::new(i18n_key_tag(cx, label_key)),
-                            );
-                        }
-                        submenu
-                    },
-                )
-                // Local TTL-range filter (AND with type + tag). Only when
-                // tree TTL chips are enabled — otherwise `key_ttls` is empty
-                // and every constrained filter would yield an empty tree.
-                .when(show_key_tree_ttl, |this| {
-                    this.submenu_with_icon(
-                        Some(Icon::new(CustomIconName::Clock3)),
-                        i18n_key_tree(cx, "ttl_filter"),
-                        window,
-                        cx,
-                        move |submenu, _window, _cx| {
-                            let mut submenu = submenu.menu_element_with_check(
-                                matches!(ttl_filter, TtlFilter::All),
-                                Box::new(KeyTreeAction::SetTtlFilter(TtlFilter::All.as_str().into())),
-                                move |_, cx| Label::new(i18n_key_tree(cx, "ttl_filter_all")),
-                            );
-                            for (filter, label_key) in [
-                                (TtlFilter::NoTtl, "ttl_filter_no_ttl"),
-                                (TtlFilter::Expiring, "ttl_filter_expiring"),
-                                (TtlFilter::Lt1h, "ttl_filter_lt_1h"),
-                                (TtlFilter::Lt1d, "ttl_filter_lt_1d"),
-                                (TtlFilter::Lt7d, "ttl_filter_lt_7d"),
-                                (TtlFilter::Gte7d, "ttl_filter_gte_7d"),
-                            ] {
-                                let id: SharedString = filter.as_str().into();
-                                submenu = submenu.menu_element_with_check(
-                                    ttl_filter == filter,
-                                    Box::new(KeyTreeAction::SetTtlFilter(id)),
-                                    move |_, cx| Label::new(i18n_key_tree(cx, label_key)),
-                                );
-                            }
-                            submenu
-                        },
-                    )
-                })
-                // Sibling order. TTL orders read the same cache the TTL
-                // chips do, so they need it enabled too.
-                .submenu_with_icon(
-                    Some(Icon::new(CustomIconName::ListChecvronsDownUp)),
-                    i18n_key_tree(cx, "sort"),
-                    window,
-                    cx,
-                    move |submenu, _window, _cx| {
-                        let mut submenu = submenu;
-                        for option in KeySort::ALL {
-                            if !show_key_tree_ttl && matches!(option, KeySort::TtlAsc | KeySort::TtlDesc) {
-                                continue;
-                            }
-                            let id: SharedString = option.as_str().into();
-                            let label_key = option.i18n_key();
-                            submenu = submenu.menu_element_with_check(
-                                sort == option,
-                                Box::new(KeyTreeAction::SetSort(id)),
-                                move |_, cx| Label::new(i18n_key_tree(cx, label_key)),
-                            );
-                        }
-                        submenu
-                    },
-                )
+                filter_menu.build(menu, window, cx)
             });
         let search_btn = Button::new("key-tree-search-btn")
             .ghost()
@@ -641,93 +373,80 @@ impl ZedisKeyTree {
         let flat_view = self.state.flat_view;
         let regex_mode = self.state.regex_mode;
 
+        let more_menu = TreeMoreMenu {
+            readonly,
+            enabled_multiple_selection,
+            refresh_interval_sec,
+            flat_view,
+            regex_mode,
+        };
         let more_dropdown = Button::new("key-tree-more-dropdown")
             .outline()
             .icon(Icon::new(IconName::Ellipsis))
             .tooltip(i18n_key_tree(cx, "more_tooltip"))
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
-                menu.menu_element_with_icon(
-                    Icon::new(CustomIconName::RotateCw),
-                    Box::new(KeyTreeAction::RefreshAll),
-                    move |_, cx| Label::new(with_hot_key("reload_keys", &i18n_key_tree(cx, "refresh_keys"))),
-                )
-                // Read-class capabilities: allowed on read-only connections
-                // today, but routed through the matrix so a future stricter
-                // mode (e.g. export-restricted compliance) has one switch.
-                .when(Capability::CollapseTree.allowed(readonly), |this| {
-                    this.menu_element_with_icon(
-                        Icon::new(CustomIconName::ListChecvronsDownUp),
-                        Box::new(KeyTreeAction::CollapseAllKeys),
-                        move |_, cx| Label::new(i18n_key_tree(cx, "collapse_keys")),
-                    )
-                })
-                // Multi-select is local UI (enables bulk export); allowed in RO.
-                .when(Capability::ToggleMultiSelect.allowed(readonly), |this| {
-                    let icon = if enabled_multiple_selection {
-                        Icon::new(IconName::Check)
-                    } else {
-                        Icon::new(CustomIconName::ListCheck)
-                    };
-                    this.menu_element_with_icon(icon, Box::new(KeyTreeAction::ToggleMultiSelectMode), move |_, cx| {
-                        Label::new(i18n_key_tree(cx, "toggle_multi_select_mode"))
-                    })
-                })
-                .submenu_with_icon(
-                    Some(Icon::new(CustomIconName::RotateCw)),
-                    i18n_key_tree(cx, "auto_refresh"),
-                    window,
-                    cx,
-                    move |submenu, _window, cx| {
-                        let mut submenu = submenu;
-                        for interval in [0, 1, 5, 10, 30, 60, 120] {
-                            let label = if interval == 0 {
-                                i18n_key_tree(cx, "disable_auto_refresh")
-                            } else {
-                                format!("{}s", interval).into()
-                            };
-                            submenu = submenu.menu_element_with_check(
-                                refresh_interval_sec == interval,
-                                Box::new(KeyTreeAction::AutoRefresh(interval)),
-                                move |_, _cx| Label::new(label.clone()),
-                            )
-                        }
-
-                        submenu
-                    },
-                )
-                .menu_element_with_icon(
-                    Icon::new(CustomIconName::Rss),
-                    Box::new(KeyTreeAction::ChangeChannelMode),
-                    move |_, cx| Label::new(i18n_key_tree(cx, "pubsub_mode")),
-                )
-                .separator()
-                // A check replaces the icon while the mode is on — the same
-                // shape the multi-select entry above uses, since the menu API
-                // carries an icon *or* a check, not both.
-                .menu_element_with_icon(
-                    if flat_view {
-                        Icon::new(IconName::Check)
-                    } else {
-                        Icon::new(CustomIconName::List)
-                    },
-                    Box::new(KeyTreeAction::ToggleFlatView),
-                    move |_, cx| Label::new(i18n_key_tree(cx, "flat_view")),
-                )
-                .menu_element_with_icon(
-                    if regex_mode {
-                        Icon::new(IconName::Check)
-                    } else {
-                        Icon::new(CustomIconName::Regex)
-                    },
-                    Box::new(KeyTreeAction::ToggleRegexMode),
-                    move |_, cx| Label::new(i18n_key_tree(cx, "regex_mode")),
-                )
+                more_menu.build(menu, window, cx)
             });
 
-        // What narrows the tree besides the keyword, one chip each, with the
-        // click that takes it off. The filters are picked three levels down
-        // a menu and used to leave no trace outside it: a tree showing 2 of
-        // 25 keys looked like a tree that had lost 23 (#184).
+        let active_filters = self.active_filters(type_filter, show_key_tree_ttl, ttl_filter, tag_filter_active, cx);
+
+        // A regex that will not compile is reported under the bar, not by
+        // emptying the tree: half a pattern is a normal state while typing.
+        let regex_error = self.state.regex_error.clone();
+        let danger = cx.theme().danger;
+        let bar = h_flex()
+            .flex_shrink_0()
+            .px_2()
+            .h(EDITOR_KEY_BAR_HEIGHT)
+            .items_center()
+            .w_full()
+            .gap_x_2()
+            .child(keyword_input)
+            // How many keys are picked, and the one click that drops them.
+            // Without it a selection built with Shift is invisible until a
+            // right-click, and there is nothing obvious to undo it with.
+            .when(selected_count > 0, |this| {
+                this.child(clear_selection_button(selected_count, cx))
+            })
+            .child(add_key_button(readonly, cx))
+            .child(more_dropdown);
+
+        v_flex()
+            .flex_shrink_0()
+            .w_full()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(bar)
+            .children((!active_filters.is_empty()).then(|| {
+                h_flex()
+                    .w_full()
+                    .px_2()
+                    .pb_1p5()
+                    .gap_1()
+                    .flex_wrap()
+                    .children(active_filters)
+            }))
+            .children(regex_error.map(|message| {
+                div()
+                    .w_full()
+                    .px_2()
+                    .pb_1()
+                    .child(Label::new(message).text_xs().text_color(danger).whitespace_normal())
+            }))
+    }
+
+    /// What narrows the tree besides the keyword, one chip each, with the
+    /// click that takes it off. The filters are picked three levels down
+    /// a menu and used to leave no trace outside it: a tree showing 2 of
+    /// 25 keys looked like a tree that had lost 23 (#184).
+    fn active_filters(
+        &self,
+        type_filter: Option<KeyType>,
+        show_key_tree_ttl: bool,
+        ttl_filter: TtlFilter,
+        tag_filter_active: Option<TagColor>,
+        cx: &Context<Self>,
+    ) -> Vec<AnyElement> {
         let mut active_filters: Vec<AnyElement> = Vec::new();
         if let Some(key_type) = type_filter {
             let label = format!(
@@ -766,75 +485,38 @@ impl ZedisKeyTree {
                 cx,
             ));
         }
-
-        // A regex that will not compile is reported under the bar, not by
-        // emptying the tree: half a pattern is a normal state while typing.
-        let regex_error = self.state.regex_error.clone();
-        let danger = cx.theme().danger;
-        let bar = h_flex()
-            .flex_shrink_0()
-            .px_2()
-            .h(EDITOR_KEY_BAR_HEIGHT)
-            .items_center()
-            .w_full()
-            .gap_x_2()
-            .child(keyword_input)
-            // How many keys are picked, and the one click that drops them.
-            // Without it a selection built with Shift is invisible until a
-            // right-click, and there is nothing obvious to undo it with.
-            .when(selected_count > 0, |this| {
-                let locale = cx.global::<ZedisGlobalStore>().read(cx).locale().to_string();
-                let label = t!("key_tree.selected_count", count = selected_count, locale = &locale).to_string();
-                this.child(
-                    Button::new("key-tree-clear-selection")
-                        .outline()
-                        .label(label)
-                        .icon(IconName::Close)
-                        .tooltip(i18n_key_tree(cx, "clear_selection"))
-                        .on_click(cx.listener(|_this, _, window, cx| {
-                            window.dispatch_action(Box::new(KeyTreeAction::ClearSelection), cx);
-                        })),
-                )
-            })
-            .child({
-                let can_create = Capability::CreateKey.allowed(readonly);
-                Button::new("key-tree-add-btn")
-                    .disabled(!can_create)
-                    .when(!can_create, |this| this.tooltip(i18n_common(cx, "disable_in_readonly")))
-                    .when(can_create, |this| {
-                        this.tooltip(with_hot_key("new_key", &i18n_key_tree(cx, "add_key_tooltip")))
-                    })
-                    .outline()
-                    .icon(CustomIconName::FilePlusCorner)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.handle_add_key(window, cx);
-                    }))
-            })
-            .child(more_dropdown);
-
-        v_flex()
-            .flex_shrink_0()
-            .w_full()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .child(bar)
-            .children((!active_filters.is_empty()).then(|| {
-                h_flex()
-                    .w_full()
-                    .px_2()
-                    .pb_1p5()
-                    .gap_1()
-                    .flex_wrap()
-                    .children(active_filters)
-            }))
-            .children(regex_error.map(|message| {
-                div()
-                    .w_full()
-                    .px_2()
-                    .pb_1()
-                    .child(Label::new(message).text_xs().text_color(danger).whitespace_normal())
-            }))
+        active_filters
     }
+}
+
+/// How many keys are picked, and the one click that drops them.
+fn clear_selection_button(selected_count: usize, cx: &Context<ZedisKeyTree>) -> Button {
+    let locale = cx.global::<ZedisGlobalStore>().read(cx).locale().to_string();
+    let label = t!("key_tree.selected_count", count = selected_count, locale = &locale).to_string();
+    Button::new("key-tree-clear-selection")
+        .outline()
+        .label(label)
+        .icon(IconName::Close)
+        .tooltip(i18n_key_tree(cx, "clear_selection"))
+        .on_click(cx.listener(|_this, _, window, cx| {
+            window.dispatch_action(Box::new(KeyTreeAction::ClearSelection), cx);
+        }))
+}
+
+/// New key, where the connection may write.
+fn add_key_button(readonly: bool, cx: &Context<ZedisKeyTree>) -> Button {
+    let can_create = Capability::CreateKey.allowed(readonly);
+    Button::new("key-tree-add-btn")
+        .disabled(!can_create)
+        .when(!can_create, |this| this.tooltip(i18n_common(cx, "disable_in_readonly")))
+        .when(can_create, |this| {
+            this.tooltip(with_hot_key("new_key", &i18n_key_tree(cx, "add_key_tooltip")))
+        })
+        .outline()
+        .icon(CustomIconName::FilePlusCorner)
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.handle_add_key(window, cx);
+        }))
 }
 
 /// One active filter in the strip under the bar: what it is, and a click on
@@ -904,5 +586,332 @@ pub(super) fn tag_color_label_key(color: TagColor) -> &'static str {
         TagColor::Green => "color_green",
         TagColor::Blue => "color_blue",
         TagColor::Purple => "color_purple",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::states::{KeyTypeFilter, QueryMode};
+    use crate::test_support::init_ui;
+    use gpui::{AnyWindowHandle, MouseButton, TestAppContext, point, size};
+    use gpui_kit::component::Root;
+    use gpui_kit::test::{TestEventExt, TestWindowExt};
+
+    type Sent = Rc<RefCell<Vec<String>>>;
+
+    /// The tree inside a view that takes the actions its bar's menus send
+    /// on their way down and keeps them: what an item sends is known, and
+    /// nothing it would do is done.
+    struct TreeHarness {
+        tree: Entity<ZedisKeyTree>,
+        sent: Sent,
+    }
+
+    impl Render for TreeHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let (tree_actions, modes, types) = (self.sent.clone(), self.sent.clone(), self.sent.clone());
+            div()
+                .size_full()
+                .capture_action(move |action: &KeyTreeAction, _, cx| {
+                    tree_actions.borrow_mut().push(format!("{action:?}"));
+                    cx.stop_propagation();
+                })
+                .capture_action(move |action: &QueryMode, _, cx| {
+                    modes.borrow_mut().push(format!("{action:?}"));
+                    cx.stop_propagation();
+                })
+                .capture_action(move |action: &KeyTypeFilter, _, cx| {
+                    types.borrow_mut().push(format!("{action:?}"));
+                    cx.stop_propagation();
+                })
+                .child(self.tree.clone())
+        }
+    }
+
+    /// A tree on a server the scratch configuration does not know. Selecting
+    /// it resolves the TTL column from the settings, where it is on.
+    fn open_tree(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<ZedisKeyTree>, Entity<ZedisServerState>, Sent) {
+        let server_state = cx.new(|_| ZedisServerState::default());
+        server_state.update(cx, |state, cx| state.select("scratch".into(), 0, cx));
+        cx.run_until_parked();
+        let sent = Sent::default();
+        let mut tree = None;
+        let handle = cx.open_window(size(px(900.), px(720.)), |window, cx| {
+            let view = cx.new(|cx| ZedisKeyTree::new(server_state.clone(), window, cx));
+            tree = Some(view.clone());
+            let harness = cx.new(|_| TreeHarness {
+                tree: view,
+                sent: sent.clone(),
+            });
+            Root::new(harness, window, cx)
+        });
+        cx.run_until_parked();
+        (
+            handle.into(),
+            tree.expect("the window built the tree"),
+            server_state,
+            sent,
+        )
+    }
+
+    fn close_menus(cx: &mut TestAppContext, handle: AnyWindowHandle) {
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let empty = point(px(6.), px(714.));
+            window.pointer_down(empty, MouseButton::Left, cx);
+            window.pointer_up(empty, MouseButton::Left, cx);
+        })
+        .expect("the window is open");
+        cx.run_until_parked();
+    }
+
+    /// Open the menu `open` shows, hover its item `item` and say whether a
+    /// submenu opened; `None` when the menu has no such item.
+    fn hover_item(
+        cx: &mut TestAppContext,
+        handle: AnyWindowHandle,
+        open: &impl Fn(&mut Window, &mut App),
+        item: usize,
+    ) -> Option<bool> {
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            open(window, cx);
+        })
+        .expect("the window is open");
+        cx.run_until_parked();
+        let offered = cx
+            .update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                let offered = window.within("popup-menu").try_find(item).is_some();
+                if offered {
+                    window.within("popup-menu").hover(item, cx);
+                }
+                offered
+            })
+            .expect("the window is open");
+        cx.run_until_parked();
+        offered.then(|| {
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                window.try_find("submenu").is_some()
+            })
+            .expect("the window is open")
+        })
+    }
+
+    fn last_sent(sent: &Sent, item: usize) -> String {
+        let sent = sent.borrow();
+        assert!(sent.len() <= 1, "item {item} sent {sent:?}");
+        sent.first().cloned().unwrap_or_else(|| "-".to_string())
+    }
+
+    /// What the menu `open` shows offers, top to bottom: each item clicked
+    /// in a menu opened afresh — `-` for one that sends nothing, a separator
+    /// or a label — and a submenu's items, read the same way, in brackets.
+    fn menu_items(
+        cx: &mut TestAppContext,
+        handle: AnyWindowHandle,
+        sent: &Sent,
+        open: impl Fn(&mut Window, &mut App),
+    ) -> Vec<String> {
+        let mut items = Vec::new();
+        for item in 0usize..30 {
+            sent.borrow_mut().clear();
+            let Some(submenu) = hover_item(cx, handle, &open, item) else {
+                close_menus(cx, handle);
+                return items;
+            };
+            if !submenu {
+                cx.update_window(handle, |_, window, cx| {
+                    window.within("popup-menu").click(item, cx);
+                })
+                .expect("the window is open");
+                cx.run_until_parked();
+                close_menus(cx, handle);
+                items.push(last_sent(sent, item));
+                continue;
+            }
+            close_menus(cx, handle);
+            let mut subitems = Vec::new();
+            for subitem in 0usize..30 {
+                sent.borrow_mut().clear();
+                hover_item(cx, handle, &open, item);
+                let offered = cx
+                    .update_window(handle, |_, window, cx| {
+                        let mut submenu = window.within("submenu");
+                        let mut nested = submenu.within("popup-menu");
+                        let offered = nested.try_find(subitem).is_some();
+                        if offered {
+                            nested.click(subitem, cx);
+                        }
+                        offered
+                    })
+                    .expect("the window is open");
+                cx.run_until_parked();
+                close_menus(cx, handle);
+                if !offered {
+                    break;
+                }
+                subitems.push(last_sent(sent, subitem));
+            }
+            items.push(format!("[{}]", subitems.join(", ")));
+        }
+        panic!("the menu kept offering items");
+    }
+
+    fn filter_menu(window: &mut Window, cx: &mut App) {
+        window.within("dropdown").click("popup", cx);
+    }
+
+    fn more_menu(window: &mut Window, cx: &mut App) {
+        window.click("key-tree-more-dropdown", cx);
+    }
+
+    /// The bar's controls, and both of its menus item by item: the search
+    /// menu's lists and filters (the TTL ones only with the TTL column),
+    /// and the "…" menu.
+    #[gpui::test]
+    fn the_bar_offers_its_controls_and_both_menus(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let (handle, _, _, sent) = open_tree(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            for id in [
+                "key-tree-query-mode-btn",
+                "key-tree-search-btn",
+                "key-tree-add-btn",
+                "key-tree-more-dropdown",
+            ] {
+                assert!(window.try_find(id).is_some(), "{id}");
+            }
+            assert_eq!(window.find("key-tree-add-btn").disabled(), None);
+            assert!(window.try_find("key-tree-clear-selection").is_none());
+        })
+        .expect("the window is open");
+
+        let sorts: Vec<String> = KeySort::ALL
+            .iter()
+            .map(|sort| format!("SetSort({:?})", sort.as_str()))
+            .collect();
+        let tags: Vec<String> = std::iter::once("SetTagFilter(\"\")".to_string())
+            .chain(TagColor::ALL.iter().map(|c| format!("SetTagFilter({:?})", c.as_str())))
+            .collect();
+        let ttls = [
+            TtlFilter::All,
+            TtlFilter::NoTtl,
+            TtlFilter::Expiring,
+            TtlFilter::Lt1h,
+            TtlFilter::Lt1d,
+            TtlFilter::Lt7d,
+            TtlFilter::Gte7d,
+        ]
+        .map(|filter| format!("SetTtlFilter({:?})", filter.as_str()));
+        assert_eq!(
+            menu_items(cx, handle, &sent, filter_menu),
+            [
+                "[-]".to_string(),
+                "[-]".to_string(),
+                "[-]".to_string(),
+                "[All, Prefix, Exact]".to_string(),
+                "[All, String, Hash, List, Set, Zset, Stream, Json, TimeSeries, Vectorset, Probabilistic]".to_string(),
+                format!("[{}]", tags.join(", ")),
+                format!("[{}]", ttls.join(", ")),
+                format!("[{}]", sorts.join(", ")),
+            ]
+        );
+        assert_eq!(
+            menu_items(cx, handle, &sent, more_menu),
+            [
+                "RefreshAll",
+                "CollapseAllKeys",
+                "ToggleMultiSelectMode",
+                "[AutoRefresh(0), AutoRefresh(1), AutoRefresh(5), AutoRefresh(10), AutoRefresh(30), AutoRefresh(60), AutoRefresh(120)]",
+                "ChangeChannelMode",
+                "-",
+                "ToggleFlatView",
+                "ToggleRegexMode",
+            ]
+        );
+    }
+
+    /// Each filter is a chip under the bar, and a click on the chip takes
+    /// that filter off; with a regex keyword the query modes are shown and
+    /// cannot be picked.
+    #[gpui::test]
+    fn a_filter_is_a_chip_that_takes_it_off(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let (handle, tree, server_state, sent) = open_tree(cx);
+        // The regex switch is the server state's: the tree reads it back on
+        // every rebuild, which the type filter starts.
+        server_state.update(cx, |state, cx| {
+            state.set_regex_keyword(true, cx);
+            state.set_type_filter(Some(KeyType::Hash), cx);
+        });
+        tree.update(cx, |tree, cx| {
+            tree.state.selected_ttl_filter = TtlFilter::Lt1h;
+            tree.state.selected_tag_filter = Some(TagColor::Red);
+            tree.state.regex_mode = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            for id in ["key-tree-filter-type", "key-tree-filter-ttl", "key-tree-filter-tag"] {
+                assert!(window.try_find(id).is_some(), "{id}");
+                window.click(id, cx);
+            }
+        })
+        .expect("the window is open");
+        cx.run_until_parked();
+        assert_eq!(server_state.read_with(cx, |state, _| state.type_filter()), None);
+        tree.read_with(cx, |tree, _| {
+            assert_eq!(tree.state.selected_ttl_filter, TtlFilter::All);
+            assert_eq!(tree.state.selected_tag_filter, None);
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            for id in ["key-tree-filter-type", "key-tree-filter-ttl", "key-tree-filter-tag"] {
+                assert!(window.try_find(id).is_none(), "{id} is off");
+            }
+        })
+        .expect("the window is open");
+        assert_eq!(menu_items(cx, handle, &sent, filter_menu)[3], "[-, -, -]");
+    }
+
+    /// A read-only connection cannot add a key; picked keys bring the chip
+    /// that drops them; and another server empties the keyword.
+    #[gpui::test]
+    fn the_bar_follows_access_picks_and_the_server(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let (handle, tree, server_state, sent) = open_tree(cx);
+        server_state.update(cx, |state, cx| state.toggle_readonly(cx));
+        tree.update(cx, |tree, cx| {
+            tree.key_tree_list_state.update(cx, |list, _| {
+                list.delegate_mut().set_pick("a".into(), true, 0);
+            });
+            cx.notify();
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("key-tree-add-btn").disabled(), Some(true));
+            window.click("key-tree-clear-selection", cx);
+        })
+        .expect("the window is open");
+        cx.run_until_parked();
+        assert_eq!(*sent.borrow(), ["ClearSelection"]);
+
+        cx.update_window(handle, |_, window, cx| {
+            tree.update(cx, |tree, cx| {
+                tree.keyword_state
+                    .update(cx, |state, cx| state.set_value("user:", window, cx))
+            });
+        })
+        .expect("the window is open");
+        server_state.update(cx, |state, cx| state.select("another".into(), 0, cx));
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("the window is open");
+        assert_eq!(tree.read_with(cx, |tree, cx| tree.keyword_state.read(cx).value()), "");
     }
 }

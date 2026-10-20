@@ -16,16 +16,11 @@
 //! the action buttons (copy/save/export/import/history/diff/delete).
 //! Split out of `editor.rs`.
 
+use super::more_menu::MoreActions;
 use super::*;
-use crate::helpers::{has_file_dialogs, opens_files, saves_files};
-
-/// The keystroke gpui-component binds to Replace in its input context, shown
-/// next to the menu entry so the shortcut can be learned from it.
-#[cfg(target_os = "macos")]
-const REPLACE_KEYSTROKE: &str = "cmd-shift-f";
-#[cfg(not(target_os = "macos"))]
-const REPLACE_KEYSTROKE: &str = "ctrl-h";
 use crate::connection::{Capability, ServerCommand};
+use crate::helpers::{opens_files, saves_files};
+use crate::states::RedisValue;
 use gpui::{AnyElement, App};
 
 /// The inline TTL field, while the key bar shows it instead of the TTL button.
@@ -45,6 +40,24 @@ const MONO_ADVANCE_EM: f32 = 0.6;
 /// The one line of the name-and-facts strip that is drawn. What does not fit
 /// on it wraps to a second line, and that one is clipped.
 const KEY_FACTS_LINE_HEIGHT: f32 = 28.;
+
+/// What the bar shows of the selected value, read once a render.
+struct KeyFacts {
+    is_busy: bool,
+    /// The tree knows the key, its value has not landed yet.
+    pending_first_load: bool,
+    ttl: SharedString,
+    size: SharedString,
+    bitmap_candidate: bool,
+    bitmap_view: bool,
+    has_bytes_value: bool,
+    /// Only the value's first bytes are loaded.
+    preview: bool,
+    encoding: Option<SharedString>,
+    heat: HeatMetric,
+    expires_at: Option<SharedString>,
+    key_type: KeyType,
+}
 
 /// The width a key's name is owed before the chips beside it get any: its
 /// own, up to [`KEY_NAME_PRIORITY_CHARS`]. An estimate — the mono advance,
@@ -92,9 +105,70 @@ impl ZedisEditor {
             return h_flex();
         };
 
+        let facts = self.key_facts(server_state.value(), cx);
+        let more = self.more_actions(server_state, &key, &facts, cx);
+        let KeyFacts {
+            is_busy,
+            pending_first_load,
+            ttl,
+            size,
+            encoding,
+            heat,
+            expires_at,
+            key_type,
+            ..
+        } = facts;
+        let mut btns = vec![];
+
+        // Show loading only if busy and not recently selected (avoid flashing)
+        let should_show_loading = is_busy && !self.is_selected_key_recently();
+        let actions_locked = pending_first_load || should_show_loading;
+        let size_el = self.size_chip(size, cx);
+        let object_el = object_chip(encoding, heat, cx);
+
+        btns.extend(self.save_button(pending_first_load, actions_locked, cx));
+
+        // Add TTL button (or input field when in edit mode)
+        if !ttl.is_empty() {
+            btns.push(self.ttl_control(ttl, expires_at, actions_locked, cx));
+        }
+        btns.push(self.reload_button(actions_locked, cx));
+
+        // Lower-frequency actions live behind one "…" menu so the bar
+        // stays compact: bitmap view, value file export / import, diff,
+        // delete.
+        if more.offers_anything() {
+            btns.push(
+                Button::new("zedis-editor-more")
+                    .ghost()
+                    .disabled(actions_locked)
+                    .tooltip(i18n_editor(cx, "more_actions"))
+                    .icon(IconName::Ellipsis)
+                    .dropdown_menu(move |menu, window, cx| more.build(menu, window, cx))
+                    .into_any_element(),
+            );
+        }
+
+        let server_id = server_state.server_id().to_string();
+        h_flex()
+            .px_2()
+            .h(EDITOR_KEY_BAR_HEIGHT)
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .items_center()
+            .gap_2()
+            .w_full()
+            .child(self.copy_and_favorite(&key, server_id, should_show_loading, cx))
+            .child(KeyTypeBadge::new(key_type).into_any_element())
+            .child(name_and_facts(key, size_el, object_el, cx))
+            .children(btns)
+    }
+
+    /// What the bar shows of the selected value — its TTL, size, encoding
+    /// and heat — and what the "…" menu needs to know of it.
+    fn key_facts(&self, value: Option<&RedisValue>, cx: &App) -> KeyFacts {
         let mut is_busy = false;
         let mut pending_first_load = false;
-        let mut btns = vec![];
         let mut ttl = SharedString::default();
         let mut size = SharedString::default();
         let mut bitmap_candidate = false;
@@ -115,7 +189,7 @@ impl ZedisEditor {
 
         let mut key_type = KeyType::Unknown;
         // Extract value information if available
-        if let Some(value) = server_state.value() {
+        if let Some(value) = value {
             is_busy = value.is_busy();
             key_type = value.key_type();
             pending_first_load = value.is_pending_first_load();
@@ -166,13 +240,24 @@ impl ZedisEditor {
                 has_bytes_value = value.bytes_value().is_some();
             }
         }
+        KeyFacts {
+            is_busy,
+            pending_first_load,
+            ttl,
+            size,
+            bitmap_candidate,
+            bitmap_view,
+            has_bytes_value,
+            preview,
+            encoding,
+            heat,
+            expires_at,
+            key_type,
+        }
+    }
 
-        // Show loading only if busy and not recently selected (avoid flashing)
-        let should_show_loading = is_busy && !self.is_selected_key_recently();
-        let actions_locked = pending_first_load || should_show_loading;
-        let size_el = self.size_chip(size, cx);
-        let object_el = object_chip(encoding, heat, cx);
-
+    /// Save, for a string value: primary once the value has been edited.
+    fn save_button(&self, pending_first_load: bool, actions_locked: bool, cx: &Context<Self>) -> Option<AnyElement> {
         // Add save button for string editor if value is modified
         if !pending_first_load && let Some(bytes_editor) = &self.bytes_editor {
             let state = bytes_editor.read(cx);
@@ -186,7 +271,7 @@ impl ZedisEditor {
                 with_hot_key("save", &i18n_editor(cx, "save_data_tooltip")).into()
             };
 
-            btns.push(
+            return Some(
                 Button::new("zedis-editor-save-key")
                     .disabled(self.readonly || !value_modified || actions_locked)
                     .when(value_modified, |this| this.primary())
@@ -200,132 +285,154 @@ impl ZedisEditor {
                     .into_any_element(),
             );
         }
+        None
+    }
 
-        // Add TTL button (or input field when in edit mode)
-        if !ttl.is_empty() {
-            let ttl_btn = if self.ttl_edit_mode {
-                // Show input field with confirmation button. The field is
-                // too narrow for a sentence — "1h 30m, or seconds" was cut
-                // at "or" in every locale — so its placeholder is the
-                // example alone and the sentence is what hovering it says.
-                let hint = i18n_editor(cx, "ttl_duration_hint");
-                div()
-                    .id("zedis-editor-ttl-field")
-                    .flex_none()
-                    .w(px(TTL_INPUT_MAX_WIDTH))
-                    .tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx))
-                    .child(
-                        Input::new(&self.ttl_input_state).id(TTL_INPUT_ID).suffix(
-                            Button::new("zedis-editor-ttl-update-btn")
-                                .icon(Icon::new(IconName::Check))
-                                .on_click(cx.listener(move |this, _event, window, cx| {
-                                    this.handle_update_ttl(window, cx);
-                                })),
-                        ),
-                    )
-                    .into_any_element()
-            } else {
-                // Show TTL button that switches to edit mode on click
-                let action = if self.readonly {
-                    i18n_common(cx, "disable_in_readonly")
-                } else {
-                    with_hot_key("update_ttl", &i18n_editor(cx, "update_ttl_tooltip")).into()
-                };
-                // The button face is a remaining duration ("6.9d"); the exact
-                // expiry instant goes here, in the configured zone and layout,
-                // so nobody has to do that arithmetic by hand.
-                let ttl_tooltip: SharedString = match &expires_at {
-                    Some(at) => format!("{} {at} · {action}", i18n_editor(cx, "expires_at_label")).into(),
-                    None => action,
-                };
-                let button = Button::new("zedis-editor-ttl-btn")
-                    .outline()
-                    .font_family(get_mono_font_family())
-                    .disabled(self.readonly || actions_locked)
-                    .tooltip(ttl_tooltip)
-                    .label(ttl.clone())
-                    .icon(CustomIconName::Clock3)
-                    .on_click(cx.listener(move |this, _event, window, cx| {
-                        this.enter_ttl_edit_mode(window, cx);
-                    }));
-                if self.readonly {
-                    // Nothing to choose between when neither command can run.
-                    button.into_any_element()
-                } else {
-                    // Click keeps doing the common thing (a countdown); the
-                    // caret is where "expire at this instant" lives. Remove
-                    // TTL is only listed while there is one to drop.
-                    let has_expiry = expires_at.is_some();
-                    DropdownButton::new("zedis-editor-ttl")
-                        .button(button)
-                        .dropdown_menu(move |menu, _, _cx| {
-                            let menu = menu
-                                .menu_element_with_icon(
-                                    CustomIconName::Clock3,
-                                    Box::new(EditorAction::EditTtlDuration),
-                                    move |_, cx| Label::new(i18n_editor(cx, "ttl_mode_duration")),
-                                )
-                                .menu_element_with_icon(
-                                    IconName::Calendar,
-                                    Box::new(EditorAction::EditTtlAbsolute),
-                                    move |_, cx| Label::new(i18n_editor(cx, "ttl_mode_absolute")),
-                                );
-                            if has_expiry {
-                                menu.separator().menu_element_with_icon(
-                                    CustomIconName::Clock3,
-                                    Box::new(EditorAction::PersistTtl),
-                                    move |_, cx| Label::new(i18n_editor(cx, "ttl_mode_persist")),
-                                )
-                            } else {
-                                menu
-                            }
-                        })
-                        .into_any_element()
-                }
-            };
-            btns.push(ttl_btn);
-        }
-
-        let reload_tooltip: SharedString = with_hot_key("reload_value", &i18n_editor(cx, "reload_key_tooltip")).into();
-        // reload
-        let auto_refresh_interval_sec = self.auto_refresh_interval_sec;
-        btns.push(
-            DropdownButton::new("zedis-editor-reload-key")
-                .button(
-                    Button::new("zedis-editor-reload-now")
-                        .ghost()
-                        .disabled(actions_locked)
-                        .when(auto_refresh_interval_sec > 0, |this| {
-                            this.label(format!("{}s", auto_refresh_interval_sec))
-                        })
-                        .tooltip(reload_tooltip)
-                        .icon(CustomIconName::RotateCw)
-                        .on_click(cx.listener(move |this, _event, _window, cx| {
-                            this.reload(cx);
-                        })),
+    /// The TTL: a button showing what is left, whose caret offers the other
+    /// ways to set it — or, while it is being edited, the field.
+    fn ttl_control(
+        &self,
+        ttl: SharedString,
+        expires_at: Option<SharedString>,
+        actions_locked: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        if self.ttl_edit_mode {
+            // Show input field with confirmation button. The field is
+            // too narrow for a sentence — "1h 30m, or seconds" was cut
+            // at "or" in every locale — so its placeholder is the
+            // example alone and the sentence is what hovering it says.
+            let hint = i18n_editor(cx, "ttl_duration_hint");
+            div()
+                .id("zedis-editor-ttl-field")
+                .flex_none()
+                .w(px(TTL_INPUT_MAX_WIDTH))
+                .tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx))
+                .child(
+                    Input::new(&self.ttl_input_state).id(TTL_INPUT_ID).suffix(
+                        Button::new("zedis-editor-ttl-update-btn")
+                            .icon(Icon::new(IconName::Check))
+                            .on_click(cx.listener(move |this, _event, window, cx| {
+                                this.handle_update_ttl(window, cx);
+                            })),
+                    ),
                 )
-                .dropdown_menu(move |menu, _, cx| {
-                    let mut menu = menu;
-                    for interval in [0, 1, 5, 10, 30, 60] {
-                        let label = if interval == 0 {
-                            i18n_editor(cx, "disable_auto_refresh")
+                .into_any_element()
+        } else {
+            // Show TTL button that switches to edit mode on click
+            let action = if self.readonly {
+                i18n_common(cx, "disable_in_readonly")
+            } else {
+                with_hot_key("update_ttl", &i18n_editor(cx, "update_ttl_tooltip")).into()
+            };
+            // The button face is a remaining duration ("6.9d"); the exact
+            // expiry instant goes here, in the configured zone and layout,
+            // so nobody has to do that arithmetic by hand.
+            let ttl_tooltip: SharedString = match &expires_at {
+                Some(at) => format!("{} {at} · {action}", i18n_editor(cx, "expires_at_label")).into(),
+                None => action,
+            };
+            let button = Button::new("zedis-editor-ttl-btn")
+                .outline()
+                .font_family(get_mono_font_family())
+                .disabled(self.readonly || actions_locked)
+                .tooltip(ttl_tooltip)
+                .label(ttl.clone())
+                .icon(CustomIconName::Clock3)
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    this.enter_ttl_edit_mode(window, cx);
+                }));
+            if self.readonly {
+                // Nothing to choose between when neither command can run.
+                button.into_any_element()
+            } else {
+                // Click keeps doing the common thing (a countdown); the
+                // caret is where "expire at this instant" lives. Remove
+                // TTL is only listed while there is one to drop.
+                let has_expiry = expires_at.is_some();
+                DropdownButton::new("zedis-editor-ttl")
+                    .button(button)
+                    .dropdown_menu(move |menu, _, _cx| {
+                        let menu = menu
+                            .menu_element_with_icon(
+                                CustomIconName::Clock3,
+                                Box::new(EditorAction::EditTtlDuration),
+                                move |_, cx| Label::new(i18n_editor(cx, "ttl_mode_duration")),
+                            )
+                            .menu_element_with_icon(
+                                IconName::Calendar,
+                                Box::new(EditorAction::EditTtlAbsolute),
+                                move |_, cx| Label::new(i18n_editor(cx, "ttl_mode_absolute")),
+                            );
+                        if has_expiry {
+                            menu.separator().menu_element_with_icon(
+                                CustomIconName::Clock3,
+                                Box::new(EditorAction::PersistTtl),
+                                move |_, cx| Label::new(i18n_editor(cx, "ttl_mode_persist")),
+                            )
                         } else {
-                            format!("{}s", interval).into()
-                        };
-                        menu = menu.menu_element_with_check(
-                            auto_refresh_interval_sec == interval,
-                            Box::new(EditorAction::AutoRefresh(interval as u32)),
-                            move |_, _cx| Label::new(label.clone()),
-                        );
-                    }
-                    menu
-                })
-                .into_any_element(),
-        );
+                            menu
+                        }
+                    })
+                    .into_any_element()
+            }
+        }
+    }
 
-        // Lower-frequency actions live behind one "…" menu so the bar
-        // stays compact: bitmap view, value file export / import, diff,
-        // delete.
+    /// Reload, and its caret: how often the value reloads by itself.
+    fn reload_button(&self, actions_locked: bool, cx: &Context<Self>) -> AnyElement {
+        let reload_tooltip: SharedString = with_hot_key("reload_value", &i18n_editor(cx, "reload_key_tooltip")).into();
+        let auto_refresh_interval_sec = self.auto_refresh_interval_sec;
+        DropdownButton::new("zedis-editor-reload-key")
+            .button(
+                Button::new("zedis-editor-reload-now")
+                    .ghost()
+                    .disabled(actions_locked)
+                    .when(auto_refresh_interval_sec > 0, |this| {
+                        this.label(format!("{}s", auto_refresh_interval_sec))
+                    })
+                    .tooltip(reload_tooltip)
+                    .icon(CustomIconName::RotateCw)
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.reload(cx);
+                    })),
+            )
+            .dropdown_menu(move |menu, _, cx| {
+                let mut menu = menu;
+                for interval in [0, 1, 5, 10, 30, 60] {
+                    let label = if interval == 0 {
+                        i18n_editor(cx, "disable_auto_refresh")
+                    } else {
+                        format!("{}s", interval).into()
+                    };
+                    menu = menu.menu_element_with_check(
+                        auto_refresh_interval_sec == interval,
+                        Box::new(EditorAction::AutoRefresh(interval as u32)),
+                        move |_, _cx| Label::new(label.clone()),
+                    );
+                }
+                menu
+            })
+            .into_any_element()
+    }
+
+    /// What the "…" menu offers for this key and value.
+    fn more_actions(
+        &self,
+        server_state: &ZedisServerState,
+        key: &SharedString,
+        facts: &KeyFacts,
+        cx: &App,
+    ) -> MoreActions {
+        let &KeyFacts {
+            key_type,
+            bitmap_candidate,
+            bitmap_view,
+            has_bytes_value,
+            preview,
+            pending_first_load,
+            ..
+        } = facts;
         // A plain String key gets the counter / append / expiry operations
         // the terminal would otherwise be the only route to; a JSON key the
         // path-level `JSON.*` writes, each only where the server has it.
@@ -378,7 +485,7 @@ impl ZedisEditor {
             && !self.readonly;
         let diff_history: Vec<(i64, usize)> = if diff_editable {
             server_state
-                .value_history_for(&key)
+                .value_history_for(key)
                 .map(|deque| deque.iter().map(|e| (e.at, e.size())).collect())
                 .unwrap_or_default()
         } else {
@@ -394,210 +501,35 @@ impl ZedisEditor {
         // A collection key with edits recorded this session. Shown on a
         // read-only connection too: the log is what was already written.
         let change_log_item = matches!(key_type, KeyType::Hash | KeyType::List | KeyType::Set | KeyType::Zset)
-            && server_state.change_log_for(&key).is_some();
-        if change_log_item
-            || find_replace_item
-            || json_items
-            || rename_item
-            || copy_item
-            || bitmap_item
-            || export_item
-            || import_item
-            || diff_item
-            || delete_item
-            || !key_ops.is_empty()
-        {
-            btns.push(
-                Button::new("zedis-editor-more")
-                    .ghost()
-                    .disabled(actions_locked)
-                    .tooltip(i18n_editor(cx, "more_actions"))
-                    .icon(IconName::Ellipsis)
-                    .dropdown_menu(move |menu, window, cx| {
-                        let mut menu = menu;
-                        if bitmap_item {
-                            menu = menu.menu_element_with_icon(
-                                CustomIconName::Binary,
-                                Box::new(EditorAction::ViewBitmap),
-                                move |_, cx| Label::new(i18n_bitmap(cx, "bitmap")),
-                            );
-                        }
-                        if export_item {
-                            // A page downloads at once, so its item opens
-                            // nothing and says so without the ellipsis.
-                            let export_label = if has_file_dialogs() {
-                                "export_value_tooltip"
-                            } else {
-                                "export_value_download"
-                            };
-                            menu = menu.menu_element_with_icon(
-                                CustomIconName::Download,
-                                Box::new(EditorAction::ExportValue),
-                                move |_, cx| Label::new(i18n_editor(cx, export_label)),
-                            );
-                        }
-                        if import_item {
-                            menu = menu.menu_element_with_icon(
-                                CustomIconName::Upload,
-                                Box::new(EditorAction::ImportValue),
-                                move |_, cx| Label::new(i18n_editor(cx, "import_value_tooltip")),
-                            );
-                        }
-                        if find_replace_item {
-                            let label: SharedString = format!(
-                                "{} ({})",
-                                i18n_editor(cx, "find_replace"),
-                                humanize_keystroke(REPLACE_KEYSTROKE)
-                            )
-                            .into();
-                            menu = menu.menu_element_with_icon(
-                                IconName::Search,
-                                Box::new(EditorAction::FindReplace),
-                                move |_, _cx| Label::new(label.clone()),
-                            );
-                        }
-                        if json_items {
-                            menu = menu.menu_element_with_icon(
-                                CustomIconName::Braces,
-                                Box::new(EditorAction::FormatJson),
-                                move |_, cx| Label::new(i18n_editor(cx, "format_json")),
-                            );
-                            menu = menu.menu_element_with_icon(
-                                CustomIconName::ListChecvronsDownUp,
-                                Box::new(EditorAction::MinifyJson),
-                                move |_, cx| Label::new(i18n_editor(cx, "minify_json")),
-                            );
-                        }
-                        if change_log_item {
-                            menu = menu.menu_element_with_icon(
-                                CustomIconName::ListCheck,
-                                Box::new(EditorAction::ChangeLog),
-                                move |_, cx| Label::new(i18n_editor(cx, "change_log")),
-                            );
-                        }
-                        // Restore submenu: pull any saved version back into the
-                        // editor (the value-history dropdown, moved off the
-                        // toolbar into "more actions"). Same version data as the
-                        // diff submenu below, different action.
-                        if diff_item {
-                            let snap = diff_history.clone();
-                            menu = menu.submenu_with_icon(
-                                Some(Icon::new(IconName::Undo)),
-                                i18n_editor(cx, "history_label"),
-                                window,
-                                cx,
-                                move |submenu, _window, _cx| {
-                                    let mut submenu = submenu;
-                                    let now = unix_ts();
-                                    for (idx, (at, size)) in snap.iter().enumerate() {
-                                        let secs_ago = (now - at).max(0) as u64;
-                                        let rel = format_duration(Duration::from_secs(secs_ago));
-                                        let size_str = format_size(*size as u64, DECIMAL);
-                                        let label = format!("v{} • {} • {}", idx + 1, rel, size_str);
-                                        let idx_u32 = idx as u32;
-                                        submenu = submenu.menu_element(
-                                            Box::new(EditorAction::LoadHistory(idx_u32)),
-                                            move |_w, _cx| Label::new(label.clone()),
-                                        );
-                                    }
-                                    submenu
-                                },
-                            );
-                        }
-                        // Diff submenu: pick any saved version to compare the
-                        // live value against (v1 = most recent, the common case).
-                        if diff_item {
-                            let snap = diff_history.clone();
-                            menu = menu.submenu_with_icon(
-                                Some(Icon::new(CustomIconName::GitCompareArrows)),
-                                i18n_editor(cx, "diff_button"),
-                                window,
-                                cx,
-                                move |submenu, _window, _cx| {
-                                    let mut submenu = submenu;
-                                    let now = unix_ts();
-                                    for (idx, (at, size)) in snap.iter().enumerate() {
-                                        let secs_ago = (now - at).max(0) as u64;
-                                        let rel = format_duration(Duration::from_secs(secs_ago));
-                                        let size_str = format_size(*size as u64, DECIMAL);
-                                        let label = format!("v{} • {} • {}", idx + 1, rel, size_str);
-                                        let idx_u32 = idx as u32;
-                                        submenu = submenu.menu_element(
-                                            Box::new(EditorAction::DiffHistory(idx_u32)),
-                                            move |_w, _cx| Label::new(label.clone()),
-                                        );
-                                    }
-                                    submenu
-                                },
-                            );
-                        }
-                        // Key-level ops (rename / copy / delete) sit below a
-                        // separator from the value-view actions above.
-                        if (rename_item || copy_item || delete_item || diff_with_server_item)
-                            && (bitmap_item || export_item || import_item || diff_item)
-                        {
-                            menu = menu.separator();
-                        }
-                        // Type-native operations, behind their own submenu
-                        // so the key-level actions below stay one flat list.
-                        // Counters and APPEND are ancient; GETEX is 6.2 and
-                        // the JSON writes are a module's, so each appears
-                        // only where it exists.
-                        if !key_ops.is_empty() {
-                            let ops = key_ops.clone();
-                            menu = menu.submenu_with_icon(
-                                Some(Icon::new(CustomIconName::Zap)),
-                                i18n_key_ops(cx, "menu_tooltip"),
-                                window,
-                                cx,
-                                move |submenu, _window, _cx| {
-                                    let mut submenu = submenu;
-                                    for action in &ops {
-                                        let label_key = key_op_title_key(*action);
-                                        submenu = submenu.menu_element(Box::new(*action), move |_, cx| {
-                                            Label::new(i18n_key_ops(cx, label_key))
-                                        });
-                                    }
-                                    submenu
-                                },
-                            );
-                        }
-                        if rename_item {
-                            menu = menu.menu_element_with_icon(
-                                CustomIconName::FilePenLine,
-                                Box::new(EditorAction::Rename),
-                                move |_, cx| Label::new(i18n_editor(cx, "rename")),
-                            );
-                        }
-                        if copy_item {
-                            menu = menu.menu_element_with_icon(
-                                IconName::Copy,
-                                Box::new(EditorAction::CopyTo),
-                                move |_, cx| Label::new(i18n_copy(cx, "copy_to")),
-                            );
-                        }
-                        if diff_with_server_item {
-                            menu = menu.menu_element_with_icon(
-                                CustomIconName::GitCompareArrows,
-                                Box::new(EditorAction::DiffWithServer),
-                                move |_, cx| Label::new(i18n_editor(cx, "diff_with_server")),
-                            );
-                        }
-                        if delete_item {
-                            menu = menu.menu_element_with_icon(
-                                IconName::CircleX,
-                                Box::new(EditorAction::Delete),
-                                move |_, cx| Label::new(i18n_editor(cx, "delete_key_tooltip")),
-                            );
-                        }
-                        menu
-                    })
-                    .into_any_element(),
-            );
+            && server_state.change_log_for(key).is_some();
+        MoreActions {
+            bitmap_item,
+            export_item,
+            import_item,
+            find_replace_item,
+            json_items,
+            change_log_item,
+            diff_item,
+            diff_history,
+            key_ops,
+            rename_item,
+            copy_item,
+            diff_with_server_item,
+            delete_item,
         }
+    }
 
+    /// Copy + favourite share a tight 2px group so the pair reads as
+    /// one cluster (matching the design), independent of the
+    /// toolbar's wider `gap_2` between sections.
+    fn copy_and_favorite(
+        &self,
+        key: &SharedString,
+        server_id: String,
+        should_show_loading: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let content = key.clone();
-        let server_id = server_state.server_id().to_string();
         let is_favorited = get_favorites_manager()
             .records(&server_id)
             .unwrap_or_default()
@@ -614,121 +546,109 @@ impl ZedisEditor {
             i18n_editor(cx, "add_favorite_tooltip")
         };
         let favorite_key = key.clone();
-        let line = px(KEY_FACTS_LINE_HEIGHT);
-        let name_width = key_name_priority_width(key.as_ref(), cx.theme().font_size.as_f32());
         h_flex()
-            .px_2()
-            .h(EDITOR_KEY_BAR_HEIGHT)
-            .border_b_1()
-            .border_color(cx.theme().border)
             .items_center()
-            .gap_2()
-            .w_full()
+            .gap_0p5()
             .child(
-                // Copy + favourite share a tight 2px group so the pair reads as
-                // one cluster (matching the design), independent of the
-                // toolbar's wider `gap_2` between sections.
-                h_flex()
-                    .items_center()
-                    .gap_0p5()
-                    .child(
-                        // Copy key button
-                        Button::new("zedis-editor-copy-key")
-                            .ghost()
-                            .tooltip(i18n_editor(cx, "copy_key_tooltip"))
-                            .loading(should_show_loading)
-                            .icon(IconName::Copy)
-                            .on_click(cx.listener(move |_this, _event, window, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(content.to_string()));
-                                window.push_notification(
-                                    Notification::info(i18n_editor(cx, "copied_key_to_clipboard")),
-                                    cx,
-                                );
-                            })),
-                    )
-                    .child(
-                        Button::new("zedis-editor-favorite-key")
-                            .ghost()
-                            .tooltip(favorite_tooltip)
-                            .icon(favorite_icon)
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                let server_id = this.server_state.read(cx).server_id().to_string();
-                                let key = favorite_key.clone();
-                                // Decided against the stored list, not this
-                                // render's `is_favorited`: a second click
-                                // before the repaint would repeat the first.
-                                cx.spawn(async move |this, cx| {
-                                    let _ = cx
-                                        .background_spawn(async move {
-                                            get_favorites_manager().toggle_record(&server_id, key.as_ref())
-                                        })
-                                        .await;
-                                    // The star is drawn from that list, so
-                                    // repaint once it has changed.
-                                    let _ = this.update(cx, |_, cx| cx.notify());
+                // Copy key button
+                Button::new("zedis-editor-copy-key")
+                    .ghost()
+                    .tooltip(i18n_editor(cx, "copy_key_tooltip"))
+                    .loading(should_show_loading)
+                    .icon(IconName::Copy)
+                    .on_click(cx.listener(move |_this, _event, window, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(content.to_string()));
+                        window.push_notification(Notification::info(i18n_editor(cx, "copied_key_to_clipboard")), cx);
+                    })),
+            )
+            .child(
+                Button::new("zedis-editor-favorite-key")
+                    .ghost()
+                    .tooltip(favorite_tooltip)
+                    .icon(favorite_icon)
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        let server_id = this.server_state.read(cx).server_id().to_string();
+                        let key = favorite_key.clone();
+                        // Decided against the stored list, not this
+                        // render's `is_favorited`: a second click
+                        // before the repaint would repeat the first.
+                        cx.spawn(async move |this, cx| {
+                            let _ = cx
+                                .background_spawn(async move {
+                                    get_favorites_manager().toggle_record(&server_id, key.as_ref())
                                 })
-                                .detach();
-                            })),
-                    ),
+                                .await;
+                            // The star is drawn from that list, so
+                            // repaint once it has changed.
+                            let _ = this.update(cx, |_, cx| cx.notify());
+                        })
+                        .detach();
+                    })),
             )
-            .child(KeyTypeBadge::new(key_type).into_any_element())
-            .child(
-                // The key's name and the facts about it, on one line that
-                // takes what the buttons leave. It wraps, and only its first
-                // line is drawn: a chip that does not fit beside the name
-                // goes to the second line whole and is clipped there, so a
-                // narrow bar loses the heat and encoding, then the size, and
-                // only then starts on the name — never half a chip.
-                h_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .h(line)
-                    .flex_wrap()
-                    .content_start()
-                    .overflow_hidden()
-                    .gap_x_2()
-                    .child(
-                        // Key name. It asks for its own width up to the
-                        // priority length and grows into what is left, which
-                        // keeps the chips against the buttons as before. Its
-                        // width must not come from its content alone: a
-                        // content-sized box here resolved to ~zero, collapsing
-                        // the key to a bare "…" while the row still had room
-                        // to spare. The full name is on hover, since a long
-                        // key is truncated by design.
-                        h_flex()
-                            .id("zedis-editor-key-name")
-                            .h(line)
-                            .flex_grow_1()
-                            .flex_shrink_1()
-                            .flex_basis(px(name_width))
-                            .min_w_0()
-                            .overflow_hidden()
-                            .child(
-                                // A block of the item's width, so the label
-                                // is cut with an ellipsis: as a flex child it
-                                // kept its own width and was clipped bare.
-                                div().flex_1().min_w_0().overflow_hidden().child(
-                                    Label::new(key.clone())
-                                        // Monospace so the key reads like the identifier it is.
-                                        // Bold felt too heavy and Menlo ships no lighter emphasis
-                                        // face (only Regular/Bold), so we keep the regular weight.
-                                        .font_family(get_mono_font_family())
-                                        .text_ellipsis()
-                                        .whitespace_nowrap(),
-                                ),
-                            )
-                            .tooltip(move |window, cx| Tooltip::new(key.clone()).build(window, cx)),
-                    )
-                    .children(
-                        size_el
-                            .into_iter()
-                            .chain(object_el)
-                            .map(|chip| h_flex().h(line).flex_none().child(chip)),
-                    ),
-            )
-            .children(btns)
     }
+}
+
+/// The key's name and the facts about it, on one line that
+/// takes what the buttons leave. It wraps, and only its first
+/// line is drawn: a chip that does not fit beside the name
+/// goes to the second line whole and is clipped there, so a
+/// narrow bar loses the heat and encoding, then the size, and
+/// only then starts on the name — never half a chip.
+fn name_and_facts(
+    key: SharedString,
+    size_el: Option<AnyElement>,
+    object_el: Option<AnyElement>,
+    cx: &App,
+) -> impl IntoElement {
+    let line = px(KEY_FACTS_LINE_HEIGHT);
+    let name_width = key_name_priority_width(key.as_ref(), cx.theme().font_size.as_f32());
+    h_flex()
+        .flex_1()
+        .min_w_0()
+        .h(line)
+        .flex_wrap()
+        .content_start()
+        .overflow_hidden()
+        .gap_x_2()
+        .child(
+            // Key name. It asks for its own width up to the
+            // priority length and grows into what is left, which
+            // keeps the chips against the buttons as before. Its
+            // width must not come from its content alone: a
+            // content-sized box here resolved to ~zero, collapsing
+            // the key to a bare "…" while the row still had room
+            // to spare. The full name is on hover, since a long
+            // key is truncated by design.
+            h_flex()
+                .id("zedis-editor-key-name")
+                .h(line)
+                .flex_grow_1()
+                .flex_shrink_1()
+                .flex_basis(px(name_width))
+                .min_w_0()
+                .overflow_hidden()
+                .child(
+                    // A block of the item's width, so the label
+                    // is cut with an ellipsis: as a flex child it
+                    // kept its own width and was clipped bare.
+                    div().flex_1().min_w_0().overflow_hidden().child(
+                        Label::new(key.clone())
+                            // Monospace so the key reads like the identifier it is.
+                            // Bold felt too heavy and Menlo ships no lighter emphasis
+                            // face (only Regular/Bold), so we keep the regular weight.
+                            .font_family(get_mono_font_family())
+                            .text_ellipsis()
+                            .whitespace_nowrap(),
+                    ),
+                )
+                .tooltip(move |window, cx| Tooltip::new(key.clone()).build(window, cx)),
+        )
+        .children(
+            size_el
+                .into_iter()
+                .chain(object_el)
+                .map(|chip| h_flex().h(line).flex_none().child(chip)),
+        )
 }
 
 /// Storage encoding + heat as one muted mono chip, for the slot next to the
@@ -797,6 +717,7 @@ fn object_chip(encoding: Option<SharedString>, heat: HeatMetric, cx: &App) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui_kit::test::TestWindowExt;
 
     /// A name is owed its own width and no more than the priority length:
     /// a short one leaves the line to the chips, a long one stops asking
@@ -875,6 +796,288 @@ mod tests {
                 editor.read(cx).focus_handle.contains_focused(window, cx),
                 "the focus is somewhere a shortcut can be dispatched from"
             );
+        })
+        .expect("the window is open");
+    }
+
+    type Sent = std::rc::Rc<std::cell::RefCell<Vec<String>>>;
+
+    /// The editor inside a view that takes every `EditorAction` and
+    /// `KeyOpAction` on its way down and keeps it: what a control sends is
+    /// known, and nothing it would open opens.
+    struct BarHarness {
+        editor: Entity<ZedisEditor>,
+        sent: Sent,
+    }
+
+    impl Render for BarHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let editor_actions = self.sent.clone();
+            let key_ops = self.sent.clone();
+            div()
+                .size_full()
+                .capture_action(move |action: &EditorAction, _, cx| {
+                    editor_actions.borrow_mut().push(format!("{action:?}"));
+                    cx.stop_propagation();
+                })
+                .capture_action(move |action: &KeyOpAction, _, cx| {
+                    key_ops.borrow_mut().push(format!("{action:?}"));
+                    cx.stop_propagation();
+                })
+                .child(self.editor.clone())
+        }
+    }
+
+    /// The key `k` holding `value`, in an editor drawn twice: the body builds
+    /// the string editor the bar then reads.
+    fn open_bar(
+        cx: &mut gpui::TestAppContext,
+        value: RedisValue,
+        readonly: bool,
+    ) -> (gpui::AnyWindowHandle, Entity<ZedisEditor>, Sent) {
+        use crate::states::ZedisServerState;
+        use gpui::{AppContext, size};
+        use gpui_kit::component::Root;
+
+        let server_state = cx.new(|_| ZedisServerState::default());
+        server_state.update(cx, |state, cx| state.select_key("k".into(), cx));
+        cx.run_until_parked();
+        server_state.update(cx, |state, _| state.show_value_for_test(value));
+        let sent = Sent::default();
+        let mut editor = None;
+        let handle = cx.open_window(size(px(1280.), px(720.)), |window, cx| {
+            let view = cx.new(|cx| ZedisEditor::new(server_state.clone(), window, cx));
+            editor = Some(view.clone());
+            let harness = cx.new(|_| BarHarness {
+                editor: view,
+                sent: sent.clone(),
+            });
+            Root::new(harness, window, cx)
+        });
+        let editor = editor.expect("the window built the editor");
+        editor.update(cx, |editor, cx| {
+            editor.readonly = readonly;
+            cx.notify();
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+        })
+        .expect("the window is open");
+        (handle.into(), editor, sent)
+    }
+
+    /// What the menu `open` shows offers, top to bottom: each item clicked
+    /// in a menu opened afresh, `-` for one that sends nothing — a separator,
+    /// or a submenu's entry.
+    fn menu_items(
+        cx: &mut gpui::TestAppContext,
+        handle: gpui::AnyWindowHandle,
+        sent: &Sent,
+        open: impl Fn(&mut Window, &mut App),
+    ) -> Vec<String> {
+        use gpui::{MouseButton, point};
+        use gpui_kit::test::TestEventExt;
+
+        let mut items = Vec::new();
+        for item in 0usize..30 {
+            sent.borrow_mut().clear();
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                open(window, cx);
+            })
+            .expect("the window is open");
+            cx.run_until_parked();
+            let offered = cx
+                .update_window(handle, |_, window, cx| {
+                    window.render_frame(cx);
+                    let offered = window.within("popup-menu").try_find(item).is_some();
+                    if offered {
+                        window.within("popup-menu").click(item, cx);
+                    }
+                    offered
+                })
+                .expect("the window is open");
+            cx.run_until_parked();
+            // A click on the empty part of the bar, beside the name, closes
+            // whatever the last one left open.
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                let copy = window.find("zedis-editor-copy-key").bounds();
+                let outside = point(copy.right() + px(200.), copy.center().y);
+                window.pointer_down(outside, MouseButton::Left, cx);
+                window.pointer_up(outside, MouseButton::Left, cx);
+            })
+            .expect("the window is open");
+            cx.run_until_parked();
+            if !offered {
+                return items;
+            }
+            items.push(match sent.borrow().as_slice() {
+                [] => "-".to_string(),
+                [one] => one.clone(),
+                more => panic!("item {item} sent {more:?}"),
+            });
+        }
+        panic!("the menu kept offering items");
+    }
+
+    fn more_menu(window: &mut Window, cx: &mut App) {
+        window.click("zedis-editor-more", cx);
+    }
+
+    fn ttl_menu(window: &mut Window, cx: &mut App) {
+        window.within("zedis-editor-ttl").click("popup", cx);
+    }
+
+    fn reload_menu(window: &mut Window, cx: &mut App) {
+        window.within("zedis-editor-reload-key").click("popup", cx);
+    }
+
+    fn string_value() -> RedisValue {
+        use crate::states::{DataFormat, KeyType, RedisBytesValue, RedisValueData};
+        RedisValue {
+            key_type: KeyType::String,
+            data: Some(RedisValueData::Bytes(std::sync::Arc::new(RedisBytesValue {
+                format: DataFormat::Text,
+                bytes: "hello".into(),
+                text: Some("hello".into()),
+                ..Default::default()
+            }))),
+            expire_at: Some(unix_ts() + 3_600),
+            size: 5,
+            encoding: "embstr".into(),
+            heat: HeatMetric::Freq(3),
+            ..Default::default()
+        }
+    }
+
+    /// The bar of a string key on a writable connection: every control, the
+    /// TTL's own menu, the reload intervals, and the "…" menu in order.
+    #[gpui::test]
+    fn a_strings_bar_offers_its_controls_and_menus(cx: &mut gpui::TestAppContext) {
+        use crate::test_support::init_ui;
+
+        init_ui(cx);
+        let (handle, _, sent) = open_bar(cx, string_value(), false);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            for id in [
+                "zedis-editor-copy-key",
+                "zedis-editor-favorite-key",
+                "zedis-editor-ttl-btn",
+                "zedis-editor-reload-now",
+                "zedis-editor-more",
+            ] {
+                assert!(window.try_find(id).is_some(), "{id}");
+                assert_eq!(window.find(id).disabled(), None, "{id} is not disabled");
+            }
+            // Nothing to save until the value is edited.
+            assert_eq!(window.find("zedis-editor-save-key").disabled(), Some(true));
+        })
+        .expect("the window is open");
+
+        assert_eq!(
+            menu_items(cx, handle, &sent, ttl_menu),
+            ["EditTtlDuration", "EditTtlAbsolute", "-", "PersistTtl"]
+        );
+        assert_eq!(
+            menu_items(cx, handle, &sent, reload_menu),
+            [
+                "AutoRefresh(0)",
+                "AutoRefresh(1)",
+                "AutoRefresh(5)",
+                "AutoRefresh(10)",
+                "AutoRefresh(30)",
+                "AutoRefresh(60)",
+            ]
+        );
+        assert_eq!(
+            menu_items(cx, handle, &sent, more_menu),
+            [
+                "ExportValue",
+                "ImportValue",
+                "FindReplace",
+                "-",
+                "-",
+                "Rename",
+                "CopyTo",
+                "DiffWithServer",
+                "Delete",
+            ]
+        );
+
+        // Last, since its notification is drawn over the bar's right end.
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("zedis-editor-copy-key", cx);
+        })
+        .expect("the window is open");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("k".to_string())
+        );
+    }
+
+    /// The same key on a read-only connection: nothing that writes, and the
+    /// TTL a plain button with nothing to choose between.
+    #[gpui::test]
+    fn a_read_only_bar_offers_what_reads(cx: &mut gpui::TestAppContext) {
+        use crate::test_support::init_ui;
+
+        init_ui(cx);
+        let (handle, _, sent) = open_bar(cx, string_value(), true);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("zedis-editor-save-key").disabled(), Some(true));
+            assert_eq!(window.find("zedis-editor-ttl-btn").disabled(), Some(true));
+            assert!(window.try_find("zedis-editor-ttl").is_none(), "no TTL menu");
+        })
+        .expect("the window is open");
+        assert_eq!(
+            menu_items(cx, handle, &sent, more_menu),
+            ["ExportValue", "-", "CopyTo", "DiffWithServer"]
+        );
+    }
+
+    /// A hash that never expires: no save, no Remove TTL, no value-file
+    /// items; and while the first load is out, nothing to press.
+    #[gpui::test]
+    fn a_collection_and_a_first_load_offer_less(cx: &mut gpui::TestAppContext) {
+        use crate::states::{KeyType, RedisValueStatus};
+        use crate::test_support::init_ui;
+
+        init_ui(cx);
+        let hash = RedisValue {
+            key_type: KeyType::Hash,
+            expire_at: Some(-1),
+            ..Default::default()
+        };
+        let (handle, _, sent) = open_bar(cx, hash, false);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("zedis-editor-save-key").is_none());
+        })
+        .expect("the window is open");
+        assert_eq!(
+            menu_items(cx, handle, &sent, ttl_menu),
+            ["EditTtlDuration", "EditTtlAbsolute"]
+        );
+        assert_eq!(menu_items(cx, handle, &sent, more_menu), ["Rename", "CopyTo", "Delete"]);
+
+        let loading = RedisValue {
+            status: RedisValueStatus::Loading,
+            key_type: KeyType::String,
+            ..Default::default()
+        };
+        let (handle, _, _) = open_bar(cx, loading, false);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("zedis-editor-ttl-btn").is_none(), "no TTL yet");
+            assert!(window.try_find("zedis-editor-save-key").is_none());
+            assert_eq!(window.find("zedis-editor-reload-now").disabled(), Some(true));
+            assert_eq!(window.find("zedis-editor-more").disabled(), Some(true));
         })
         .expect("the window is open");
     }

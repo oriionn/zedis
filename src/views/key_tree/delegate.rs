@@ -13,11 +13,13 @@
 // limitations under the License.
 
 //! `ListDelegate` for the virtualized key tree: row rendering (icon,
-//! tag bar, TTL chip, inline delete) and the right-click context menu.
+//! tag bar, TTL chip, inline delete) and the selection; the right-click
+//! menu is `row_menu`'s.
 
 use super::render::tag_color_label_key;
+use super::row_menu::RowMenu;
 use super::*;
-use gpui::DismissEvent;
+use gpui::{AnyElement, DismissEvent, Div};
 
 /// The selection checkbox of a key row, with the row's index.
 const ROW_CHECKBOX_ID: &str = "ktree-check";
@@ -150,77 +152,11 @@ impl ListDelegate for KeyTreeDelegate {
         _window: &mut Window,
         cx: &mut Context<ListState<Self>>,
     ) -> Option<Self::Item> {
-        // Folder icons use a calm neutral instead of a loud yellow — the folder
-        // name (brighter) already carries the emphasis and the design keeps the
-        // tree quiet.
-        let folder_icon_color = cx.theme().foreground.alpha(0.7);
         let entry = self.items.get(ix.row)?;
-        // Synthetic "Load more" row for an incomplete folder scan — a simple
-        // clickable line indented to the folder's child level. The list's
-        // Select event routes the click to `load_more_prefix` (see
-        // `select_item_by_index`).
         if entry.load_more_prefix.is_some() {
-            let muted = cx.theme().muted_foreground;
-            let loaded_count = entry.children_count;
-            let label = entry.label.clone();
-            return Some(
-                ListItem::new(ix).w_full().py_1p5().px_2().child(
-                    h_flex()
-                        .w_full()
-                        .gap_2()
-                        .items_center()
-                        // Indent to the folder's child level (same formula as
-                        // normal rows) so the row visually belongs to its
-                        // folder — centering it made nested folders' stacked
-                        // "Load more" rows indistinguishable.
-                        .pl(px(TREE_INDENT_BASE) * entry.depth + px(TREE_INDENT_OFFSET))
-                        // Same as kv-table headers: body foreground + bold mono
-                        // (no primary accent). System UI fonts often don't
-                        // paint BOLD without a real family face.
-                        .child(Icon::new(CustomIconName::ChevronsDown).text_color(cx.theme().foreground))
-                        .child(
-                            Label::new(label)
-                                .text_sm()
-                                .font_family(get_mono_font_family())
-                                .font_weight(FontWeight::BOLD)
-                                .text_ellipsis(),
-                        )
-                        // Loaded-so-far count at the right edge, mirroring the
-                        // folder rows' count column (bare number, no wording).
-                        .when(loaded_count > 0, |this| {
-                            this.child(div().flex_1()).child(
-                                Label::new(group_thousands(loaded_count as u64))
-                                    .text_sm()
-                                    .text_color(muted),
-                            )
-                        }),
-                ),
-            );
+            return Some(load_more_row(ix, entry, cx));
         }
-        let icon = if !entry.is_folder {
-            // Key item: plain type label in a fixed-width column so the key
-            // names line up regardless of type (design). The left margin opens
-            // a gap between the folder guide line and the type label without
-            // touching the per-level indent or the type→name spacing.
-            div()
-                .flex_none()
-                .ml(px(8.))
-                .w(px(TYPE_BADGE_COL_WIDTH))
-                .child(KeyTypeBadge::new(entry.key_type).plain(true))
-                .into_any_element()
-        } else if entry.expanded {
-            // Expanded folder: open icon, one brightness step up (paired with
-            // the brighter label below) so open folders are scannable among
-            // collapsed siblings without adding a chevron column.
-            Icon::new(IconName::FolderOpen)
-                .text_color(cx.theme().foreground.alpha(0.9))
-                .into_any_element()
-        } else {
-            // Collapsed folder: Show closed folder icon
-            Icon::new(IconName::Folder)
-                .text_color(folder_icon_color)
-                .into_any_element()
-        };
+        let icon = row_icon(entry, cx);
 
         let is_dark = cx.theme().is_dark();
         let is_folder = entry.is_folder;
@@ -244,58 +180,8 @@ impl ListDelegate for KeyTreeDelegate {
             Hsla::black().alpha(0.03)
         };
 
-        // Folders sit one brightness step below leaves; an *expanded* folder
-        // steps back up to full foreground (with its open icon, see above) so
-        // "which folders are open" reads at a glance.
-        let label_color = if is_folder && !entry.expanded {
-            cx.theme().foreground.alpha(0.85)
-        } else {
-            cx.theme().foreground
-        };
-        // Row label — built up front so the builder chain below just drops it
-        // in. No weight change on selection (a font-weight swap re-rasterizes
-        // the glyphs and reads as a flicker); the fill marks it.
-        // `whitespace_nowrap` is what makes `text_ellipsis` actually truncate:
-        // without it a long folder name wraps to a second line instead
-        // (same pairing as the editor-header key name).
-        let row_label = Label::new(entry.label.clone())
-            .text_color(label_color)
-            .text_ellipsis()
-            .whitespace_nowrap();
-        // TTL text — rendered on a leaf row whose key expires. `< 1h` ⇒ warm
-        // amber accent, anything calmer ⇒ muted gray. A key without a TTL
-        // (`-1`) gets nothing: it used to get "∞", which put the same mark on
-        // every row of most databases and buried the few keys that do expire.
-        // Missing (`-2`, race between SCAN and TTL) renders nothing either.
-        // Gated by the user setting; when off the SCAN loop also skipped the
-        // TTL command (see `RedisClient::scan`).
         let show_ttl = self.server_state.read(cx).show_key_tree_ttl();
-        let ttl_chip: Option<(SharedString, Hsla)> = if is_folder || !show_ttl {
-            None
-        } else {
-            entry.ttl_secs.and_then(|secs| {
-                // `ttl_chip_kind` is the "render a chip?" gate (None ⇒ the -2
-                // SCAN/TTL race, `Perm` ⇒ no expiry: no chip for either); the
-                // colour below is keyed off the raw seconds so the warning
-                // window is exactly "< 1h".
-                if matches!(ttl_chip_kind(secs)?, TtlChipKind::Perm) {
-                    return None;
-                }
-                let label = format_ttl_chip(secs)?;
-                // Three-tier TTL colour (design): seconds left (< 1m) ⇒ red
-                // (about to vanish), minutes left (< 1h) ⇒ warm amber (#cba26a),
-                // anything calmer (≥ 1h) ⇒ muted.
-                let amber: Hsla = rgb(0xcba26a).into();
-                let color = if (0..60).contains(&secs) {
-                    cx.theme().red
-                } else if (60..3600).contains(&secs) {
-                    amber
-                } else {
-                    cx.theme().muted_foreground
-                };
-                Some((label.into(), color))
-            })
-        };
+        let ttl_chip = ttl_chip(entry, show_ttl, cx);
 
         // Full-bleed hover fill applied on the content div below. In dark a grey
         // tint blends into the row, so use a saturated blue that stands out; in
@@ -315,7 +201,6 @@ impl ListDelegate for KeyTreeDelegate {
             false
         };
         let selected_items_count = self.selected_items.len();
-        let id = entry.id.clone();
         let readonly = self.readonly;
         let menu_row = self.menu_row.clone();
         let menu_open_here = menu_row.borrow().as_ref() == Some(&entry.id);
@@ -324,36 +209,15 @@ impl ListDelegate for KeyTreeDelegate {
         // (`-1`), or known to be gone (`-2`); with the TTL column off it is
         // not known, and offered.
         let may_expire = entry.ttl_secs.is_none_or(|secs| secs >= 0);
-        // Pre-resolve client-side annotation visuals before the
-        // ListItem builder chain — we need both the colour (for the
-        // left-edge bar) and the note (for hover tooltip) below, and
-        // theming reads can't borrow `cx` across the chain.
+        // Pre-resolve the tag colour (the left-edge bar) before the ListItem
+        // builder chain: theming reads can't borrow `cx` across the chain.
+        // The note and a folder's tags are `row_name`'s.
         let tag_color = entry.tag.map(|c| theme_color_for_tag(c, cx));
         // Left bar: the key's tag colour, transparent when untagged (so the
         // row is the same width either way). The selected row is marked by
         // its fill alone — it used to take this bar over in the accent
         // colour, which hid the tag of the one key being looked at.
         let row_border = tag_color.unwrap_or(gpui::transparent_black());
-        let note = entry.note.clone();
-        let has_note = !note.is_empty();
-        // A folder's tags as the tooltip lists them ("Red 3 · Blue 1"),
-        // worded in the language chosen now.
-        let folder_tags = (is_folder && !entry.folder_tag_counts.is_empty()).then(|| {
-            let tags = entry
-                .folder_tag_counts
-                .iter()
-                .map(|&(color, count)| format!("{} {count}", i18n_key_tag(cx, tag_color_label_key(color))))
-                .collect::<Vec<_>>()
-                .join(" · ");
-            let locale = cx.global::<ZedisGlobalStore>().read(cx).locale();
-            let line = if entry.tag_mixed {
-                t!("key_tree.folder_tags_mixed", tags = tags, locale = locale)
-            } else {
-                t!("key_tree.folder_tags", tags = tags, locale = locale)
-            };
-            line.to_string()
-        });
-        let edit_tag_id = entry.id.clone();
         let del_id = entry.id.clone();
         // Inline delete only on leaf keys (folders use their context-menu
         // delete), only when writes are allowed, and never beside the
@@ -366,30 +230,16 @@ impl ListDelegate for KeyTreeDelegate {
         // on hover of the whole row. Rows without a chip fall back to row-hover.
         let has_ttl_chip = ttl_chip.is_some();
         let delete_tooltip = i18n_key_tree(cx, "delete_key_tooltip");
-        // Dashed tree connectors: one vertical guide per ancestor level so the
-        // children under an expanded folder read as a connected group. Each
-        // segment bridges the row's `mb_1` gap (bottom −4px) to meet the row
-        // below into a continuous dashed line. Top-level rows (depth 0) have
-        // none.
         let guide_color = cx.theme().muted_foreground.alpha(0.5);
-        let guides: Vec<gpui::AnyElement> = (1..=entry.depth)
-            .map(|level| {
-                div()
-                    .absolute()
-                    .top_0()
-                    .bottom(px(-4.))
-                    // Centered on the ancestor folder's icon (one indent level
-                    // left of the child content) so the line drops from the
-                    // folder; the wider TREE_INDENT_BASE leaves the gap before
-                    // the child's type label.
-                    .left(px((level - 1) as f32 * TREE_INDENT_BASE + TREE_INDENT_OFFSET + 8.0))
-                    .w_0()
-                    .border_l_1()
-                    .border_dashed()
-                    .border_color(guide_color)
-                    .into_any_element()
-            })
-            .collect();
+        let guides = depth_guides(entry.depth, guide_color);
+        let row_menu = RowMenu {
+            id: entry.id.clone(),
+            is_folder,
+            selected,
+            selected_items_count,
+            readonly,
+            may_expire,
+        };
         Some(
             ListItem::new(ix)
                 .font_family(get_mono_font_family())
@@ -426,11 +276,10 @@ impl ListDelegate for KeyTreeDelegate {
                         .when(is_selected_row, |this| this.bg(selected_row_bg))
                         .hover(|s| s.bg(hover_bg))
                         .children(guides)
-                        .context_menu(move |mut menu, _window, cx| {
-                            let id = id.clone();
+                        .context_menu(move |menu, _window, cx| {
                             // This row's tooltip is withheld until the menu
                             // is dismissed (`menu_row`).
-                            menu_row.replace(Some(id.clone()));
+                            menu_row.replace(Some(row_menu.id.clone()));
                             let _ = tree.update(cx, |_, cx| cx.notify());
                             let open = menu_row.clone();
                             let tree = tree.clone();
@@ -439,213 +288,7 @@ impl ListDelegate for KeyTreeDelegate {
                                 let _ = tree.update(cx, |_, cx| cx.notify());
                             })
                             .detach();
-                            let multi_selection_count = if selected { selected_items_count } else { 0 };
-                            // Capability matrix (`connection::Capability`) is the
-                            // source of truth for what survives read-only mode.
-                            if selected && selected_items_count > 1 {
-                                if Capability::DeleteKeys.allowed(readonly) {
-                                    let locale = cx.global::<ZedisGlobalStore>().read(cx).locale();
-                                    let text = t!(
-                                        "key_tree.delete_keys_tooltip",
-                                        count = selected_items_count,
-                                        locale = locale
-                                    );
-                                    menu = menu.menu_element_with_icon(
-                                        CustomIconName::ListX,
-                                        Box::new(KeyTreeAction::DeleteMultipleKeys),
-                                        move |_, _cx| Label::new(text.clone()),
-                                    );
-                                }
-                                if Capability::SetTtl.allowed(readonly) {
-                                    menu = menu.menu_element_with_icon(
-                                        CustomIconName::Clock3,
-                                        Box::new(KeyTreeAction::SetTtlMultipleKeys),
-                                        move |_, cx| Label::new(i18n_key_tree(cx, "set_ttl_tooltip")),
-                                    );
-                                }
-                                if Capability::PersistTtl.allowed(readonly) {
-                                    menu = menu.menu_element_with_icon(
-                                        CustomIconName::Clock3,
-                                        Box::new(KeyTreeAction::PersistMultipleKeys),
-                                        move |_, cx| Label::new(i18n_key_tree(cx, "persist_tooltip")),
-                                    );
-                                }
-                            } else if is_folder {
-                                if Capability::RefreshFolder.allowed(readonly) {
-                                    menu = menu.menu_element_with_icon(
-                                        CustomIconName::RotateCw,
-                                        Box::new(KeyTreeAction::RefreshFolder(id.clone())),
-                                        move |_, cx| Label::new(i18n_key_tree(cx, "refresh_folder_tooltip")),
-                                    );
-                                }
-                                if Capability::DeleteFolder.allowed(readonly) {
-                                    menu = menu.menu_element_with_icon(
-                                        CustomIconName::X,
-                                        Box::new(KeyTreeAction::DeleteFolder(id.clone())),
-                                        move |_, cx| Label::new(i18n_key_tree(cx, "delete_folder_tooltip")),
-                                    );
-                                }
-                                if Capability::SetTtl.allowed(readonly) {
-                                    menu = menu.menu_element_with_icon(
-                                        CustomIconName::Clock3,
-                                        Box::new(KeyTreeAction::SetTtlFolder(id.clone())),
-                                        move |_, cx| Label::new(i18n_key_tree(cx, "set_ttl_tooltip")),
-                                    );
-                                }
-                                if Capability::PersistTtl.allowed(readonly) {
-                                    menu = menu.menu_element_with_icon(
-                                        CustomIconName::Clock3,
-                                        Box::new(KeyTreeAction::PersistFolder(id.clone())),
-                                        move |_, cx| Label::new(i18n_key_tree(cx, "persist_tooltip")),
-                                    );
-                                }
-                            } else {
-                                if Capability::DeleteKey.allowed(readonly) {
-                                    menu = menu.menu_element_with_icon(
-                                        CustomIconName::X,
-                                        Box::new(KeyTreeAction::DeleteKey(id.clone())),
-                                        move |_, cx| Label::new(i18n_key_tree(cx, "delete_key_tooltip")),
-                                    );
-                                }
-                                // What a folder and a selection offer, for one
-                                // key (#226).
-                                if Capability::SetTtl.allowed(readonly) {
-                                    menu = menu.menu_element_with_icon(
-                                        CustomIconName::Clock3,
-                                        Box::new(KeyTreeAction::SetTtlKey(id.clone())),
-                                        move |_, cx| Label::new(i18n_key_tree(cx, "set_ttl_tooltip")),
-                                    );
-                                }
-                                if may_expire && Capability::PersistTtl.allowed(readonly) {
-                                    menu = menu.menu_element_with_icon(
-                                        CustomIconName::Clock3,
-                                        Box::new(KeyTreeAction::PersistKey(id.clone())),
-                                        move |_, cx| Label::new(i18n_key_tree(cx, "persist_title")),
-                                    );
-                                }
-                            }
-                            // Export is a Redis read + a file — always OK where
-                            // a file can be handed over: saved, or downloaded.
-                            if saves_files() && Capability::ExportKeys.allowed(readonly) {
-                                if multi_selection_count > 0 {
-                                    let locale = cx.global::<ZedisGlobalStore>().read(cx).locale();
-                                    let text = t!(
-                                        "key_tree.export_selected_tooltip",
-                                        count = multi_selection_count,
-                                        locale = locale
-                                    );
-                                    menu = menu.menu_element_with_icon(
-                                        CustomIconName::Save,
-                                        Box::new(KeyTreeAction::ExportSelectedKeys),
-                                        move |_, _cx| Label::new(text.clone()),
-                                    );
-                                } else if is_folder {
-                                    let folder_id = id.clone();
-                                    menu = menu.menu_element_with_icon(
-                                        CustomIconName::Save,
-                                        Box::new(KeyTreeAction::ExportFolder(folder_id)),
-                                        move |_, cx| Label::new(i18n_key_tree(cx, "export_folder_tooltip")),
-                                    );
-                                } else {
-                                    let key_id = id.clone();
-                                    menu = menu.menu_element_with_icon(
-                                        CustomIconName::Save,
-                                        Box::new(KeyTreeAction::ExportKey(key_id)),
-                                        move |_, cx| Label::new(i18n_key_tree(cx, "export_key_tooltip")),
-                                    );
-                                }
-                            }
-                            // Import keys lives under Tools (status bar) —
-                            // it targets the current server/db, not a tree
-                            // prefix, so the context menu no longer offers it.
-                            // Tag & note — local redb only, or in the browser
-                            // the bridge's, seen by everyone who sees the
-                            // server and so left only by an account that may
-                            // write there (ADR 17).
-                            // Multi-select → batch colour only (notes preserved).
-                            // Single leaf → full tag + note dialog.
-                            let notes_writable = cx
-                                .global::<ZedisGlobalStore>()
-                                .read(cx)
-                                .selected_server()
-                                .is_none_or(|(server_id, _)| !account_is_read_only_on(server_id.as_ref()));
-                            if Capability::EditLocalMetadata.allowed(readonly) && notes_writable {
-                                if multi_selection_count > 1 {
-                                    let locale = cx.global::<ZedisGlobalStore>().read(cx).locale();
-                                    let text = t!(
-                                        "key_tag.batch_menu_label",
-                                        count = multi_selection_count,
-                                        locale = locale
-                                    );
-                                    menu = menu.menu_element_with_icon(
-                                        CustomIconName::SwatchBook,
-                                        Box::new(KeyTreeAction::BatchTagSelectedKeys),
-                                        move |_, _cx| Label::new(text.clone()),
-                                    );
-                                } else if !is_folder && multi_selection_count == 0 {
-                                    let tag_key = edit_tag_id.clone();
-                                    menu = menu.menu_element_with_icon(
-                                        CustomIconName::FilePenLine,
-                                        Box::new(KeyTreeAction::EditKeyTag(tag_key)),
-                                        move |_, cx| Label::new(i18n_key_tag(cx, "edit_menu_label")),
-                                    );
-                                }
-                            }
-                            // Single-row affordances: copy name / prefix,
-                            // rename, favorite toggle.
-                            if multi_selection_count == 0 {
-                                if Capability::CopyToClipboard.allowed(readonly) {
-                                    if is_folder {
-                                        menu = menu.menu_element_with_icon(
-                                            IconName::Copy,
-                                            Box::new(KeyTreeAction::CopyFolderPrefix(id.clone())),
-                                            move |_, cx| Label::new(i18n_key_tree(cx, "copy_prefix_tooltip")),
-                                        );
-                                    } else {
-                                        menu = menu.menu_element_with_icon(
-                                            IconName::Copy,
-                                            Box::new(KeyTreeAction::CopyKeyName(id.clone())),
-                                            move |_, cx| Label::new(i18n_key_tree(cx, "copy_key_tooltip")),
-                                        );
-                                    }
-                                }
-                                if !is_folder {
-                                    if Capability::RenameKey.allowed(readonly) {
-                                        menu = menu.menu_element_with_icon(
-                                            CustomIconName::FilePenLine,
-                                            Box::new(KeyTreeAction::RenameKey(id.clone())),
-                                            move |_, cx| Label::new(i18n_key_tree(cx, "rename_key_tooltip")),
-                                        );
-                                    }
-                                    if Capability::EditLocalMetadata.allowed(readonly) {
-                                        // Star state comes from the local
-                                        // favorites store, keyed by server.
-                                        let is_favorited = cx
-                                            .global::<ZedisGlobalStore>()
-                                            .read(cx)
-                                            .selected_server()
-                                            .map(|(server_id, _)| {
-                                                get_favorites_manager()
-                                                    .records(server_id.as_ref())
-                                                    .unwrap_or_default()
-                                                    .iter()
-                                                    .any(|k| k.as_str() == id.as_ref())
-                                            })
-                                            .unwrap_or(false);
-                                        let (icon, label_key) = if is_favorited {
-                                            (IconName::StarFill, "remove_favorite_tooltip")
-                                        } else {
-                                            (IconName::Star, "add_favorite_tooltip")
-                                        };
-                                        menu = menu.menu_element_with_icon(
-                                            icon,
-                                            Box::new(KeyTreeAction::ToggleFavoriteKey(id.clone())),
-                                            move |_, cx| Label::new(i18n_editor(cx, label_key)),
-                                        );
-                                    }
-                                }
-                            }
-                            menu
+                            row_menu.build(menu, cx)
                         })
                         .child(
                             div()
@@ -659,32 +302,7 @@ impl ListDelegate for KeyTreeDelegate {
                                 // takes its spot without overlapping it.
                                 .relative()
                                 .child(icon)
-                                .child(
-                                    div()
-                                        .id(("ktree-label", ix.row))
-                                        .flex_1()
-                                        .min_w_0()
-                                        // Hover tooltip: full key / prefix path
-                                        // (visible label is last segment only),
-                                        // plus leaf note or folder tag aggregate —
-                                        // none while the row's menu is open.
-                                        .when(!menu_open_here, |this| {
-                                            this.tooltip({
-                                                let text: SharedString = if has_note {
-                                                    format!("{}\n{}", entry.id, note).into()
-                                                } else if let Some(tags) = &folder_tags {
-                                                    format!("{}\n{tags}", entry.id).into()
-                                                } else {
-                                                    entry.id.clone()
-                                                };
-                                                move |window, cx| {
-                                                    gpui_kit::component::tooltip::Tooltip::new(text.clone())
-                                                        .build(window, cx)
-                                                }
-                                            })
-                                        })
-                                        .child(row_label),
-                                )
+                                .child(row_name(ix, entry, menu_open_here, cx))
                                 // A checkbox of its own, not a picture of one: it
                                 // picks the key whether or not the mode is on (a
                                 // selection made with modifier clicks shows it
@@ -706,73 +324,14 @@ impl ListDelegate for KeyTreeDelegate {
                                     )
                                 })
                                 .when_some(ttl_chip, |this, (chip_label, chip_color)| {
-                                    this.child(
-                                        div()
-                                            // Hover scope limited to this chip slot
-                                            // (its own group): hovering the chip — not
-                                            // the whole row — swaps it for the delete
-                                            // button, so the TTL stays visible when
-                                            // hovering elsewhere on the row.
-                                            .group("ktree-ttl")
-                                            .relative()
-                                            .flex_none()
-                                            .child(
-                                                div()
-                                                    .when(show_inline_delete, |this| {
-                                                        this.group_hover("ktree-ttl", |s| s.invisible())
-                                                    })
-                                                    .child(
-                                                        // Plain TTL text (no chip chrome) —
-                                                        // calm and right-aligned, matching
-                                                        // the design.
-                                                        // One line whatever it
-                                                        // says: a label that wraps
-                                                        // makes the row two lines
-                                                        // tall (#190).
-                                                        Label::new(chip_label)
-                                                            .text_size(px(10.))
-                                                            .w(px(TTL_CHIP_WIDTH))
-                                                            .whitespace_nowrap()
-                                                            .text_right()
-                                                            .text_color(chip_color)
-                                                            .flex_none(),
-                                                    ),
-                                            )
-                                            .when(show_inline_delete, |this| {
-                                                let del_id = del_id.clone();
-                                                let tooltip = delete_tooltip.clone();
-                                                this.child(
-                                                    div()
-                                                        .absolute()
-                                                        .inset_0()
-                                                        .flex()
-                                                        .items_center()
-                                                        // Right-align so the small X hugs the
-                                                        // right edge of the (wider) TTL slot
-                                                        // instead of floating centred with a
-                                                        // big gap to its right.
-                                                        .justify_end()
-                                                        .invisible()
-                                                        .group_hover("ktree-ttl", |s| s.visible())
-                                                        .child(
-                                                            Button::new(("ktree-del", ix.row))
-                                                                .ghost()
-                                                                .xsmall()
-                                                                .icon(CustomIconName::X)
-                                                                .tooltip(tooltip)
-                                                                .on_click(move |_, window, cx| {
-                                                                    cx.stop_propagation();
-                                                                    window.dispatch_action(
-                                                                        Box::new(KeyTreeAction::DeleteKey(
-                                                                            del_id.clone(),
-                                                                        )),
-                                                                        cx,
-                                                                    );
-                                                                }),
-                                                        ),
-                                                )
-                                            }),
-                                    )
+                                    this.child(ttl_slot(
+                                        ix.row,
+                                        chip_label,
+                                        chip_color,
+                                        show_inline_delete,
+                                        &del_id,
+                                        &delete_tooltip,
+                                    ))
                                 })
                                 .when(is_folder && is_scanning, |this| {
                                     // Inline spinner while this folder's lazy
@@ -786,43 +345,8 @@ impl ListDelegate for KeyTreeDelegate {
                                             .text_color(cx.theme().muted_foreground),
                                     )
                                 })
-                                // Row-hover inline delete — used only when the row has
-                                // no TTL chip (chip rows scope the delete to the chip
-                                // slot above). Absolutely positioned (out of flow → no
-                                // reserved width); dispatches the same `DeleteKey`
-                                // action as the context menu (confirm + PROD escalation).
                                 .when(show_inline_delete && !has_ttl_chip, |this| {
-                                    let del_id = del_id.clone();
-                                    let tooltip = delete_tooltip.clone();
-                                    this.child(
-                                        div()
-                                            .absolute()
-                                            .right_0()
-                                            .top_0()
-                                            .bottom_0()
-                                            .w(px(INLINE_DELETE_WIDTH))
-                                            .flex()
-                                            .items_center()
-                                            // Right-align the X to the slot's right edge so it
-                                            // doesn't sit centred with a big gap to its right.
-                                            .justify_end()
-                                            .invisible()
-                                            .group_hover("ktree-row", |s| s.visible())
-                                            .child(
-                                                Button::new(("ktree-del", ix.row))
-                                                    .ghost()
-                                                    .xsmall()
-                                                    .icon(CustomIconName::X)
-                                                    .tooltip(tooltip)
-                                                    .on_click(move |_, window, cx| {
-                                                        cx.stop_propagation();
-                                                        window.dispatch_action(
-                                                            Box::new(KeyTreeAction::DeleteKey(del_id.clone())),
-                                                            cx,
-                                                        );
-                                                    }),
-                                            ),
-                                    )
+                                    this.child(row_hover_delete(ix.row, del_id.clone(), delete_tooltip.clone()))
                                 }),
                         ),
                 ),
@@ -872,13 +396,313 @@ impl ListDelegate for KeyTreeDelegate {
     }
 }
 
+/// Synthetic "Load more" row for an incomplete folder scan — a simple
+/// clickable line indented to the folder's child level. The list's
+/// Select event routes the click to `load_more_prefix` (see
+/// `select_item_by_index`).
+fn load_more_row(ix: IndexPath, entry: &KeyTreeItem, cx: &App) -> ListItem {
+    let muted = cx.theme().muted_foreground;
+    let loaded_count = entry.children_count;
+    let label = entry.label.clone();
+    ListItem::new(ix).w_full().py_1p5().px_2().child(
+        h_flex()
+            .w_full()
+            .gap_2()
+            .items_center()
+            // Indent to the folder's child level (same formula as
+            // normal rows) so the row visually belongs to its
+            // folder — centering it made nested folders' stacked
+            // "Load more" rows indistinguishable.
+            .pl(px(TREE_INDENT_BASE) * entry.depth + px(TREE_INDENT_OFFSET))
+            // Same as kv-table headers: body foreground + bold mono
+            // (no primary accent). System UI fonts often don't
+            // paint BOLD without a real family face.
+            .child(Icon::new(CustomIconName::ChevronsDown).text_color(cx.theme().foreground))
+            .child(
+                Label::new(label)
+                    .text_sm()
+                    .font_family(get_mono_font_family())
+                    .font_weight(FontWeight::BOLD)
+                    .text_ellipsis(),
+            )
+            // Loaded-so-far count at the right edge, mirroring the
+            // folder rows' count column (bare number, no wording).
+            .when(loaded_count > 0, |this| {
+                this.child(div().flex_1()).child(
+                    Label::new(group_thousands(loaded_count as u64))
+                        .text_sm()
+                        .text_color(muted),
+                )
+            }),
+    )
+}
+
+/// A key's type label, or a folder's icon, open or closed.
+fn row_icon(entry: &KeyTreeItem, cx: &App) -> AnyElement {
+    // Folder icons use a calm neutral instead of a loud yellow — the folder
+    // name (brighter) already carries the emphasis and the design keeps the
+    // tree quiet.
+    let folder_icon_color = cx.theme().foreground.alpha(0.7);
+    if !entry.is_folder {
+        // Key item: plain type label in a fixed-width column so the key
+        // names line up regardless of type (design). The left margin opens
+        // a gap between the folder guide line and the type label without
+        // touching the per-level indent or the type→name spacing.
+        div()
+            .flex_none()
+            .ml(px(8.))
+            .w(px(TYPE_BADGE_COL_WIDTH))
+            .child(KeyTypeBadge::new(entry.key_type).plain(true))
+            .into_any_element()
+    } else if entry.expanded {
+        // Expanded folder: open icon, one brightness step up (paired with
+        // the brighter label below) so open folders are scannable among
+        // collapsed siblings without adding a chevron column.
+        Icon::new(IconName::FolderOpen)
+            .text_color(cx.theme().foreground.alpha(0.9))
+            .into_any_element()
+    } else {
+        // Collapsed folder: Show closed folder icon
+        Icon::new(IconName::Folder)
+            .text_color(folder_icon_color)
+            .into_any_element()
+    }
+}
+
+/// TTL text — rendered on a leaf row whose key expires. `< 1h` ⇒ warm
+/// amber accent, anything calmer ⇒ muted gray. A key without a TTL
+/// (`-1`) gets nothing: it used to get "∞", which put the same mark on
+/// every row of most databases and buried the few keys that do expire.
+/// Missing (`-2`, race between SCAN and TTL) renders nothing either.
+/// Gated by the user setting; when off the SCAN loop also skipped the
+/// TTL command (see `RedisClient::scan`).
+fn ttl_chip(entry: &KeyTreeItem, show_ttl: bool, cx: &App) -> Option<(SharedString, Hsla)> {
+    let is_folder = entry.is_folder;
+    if is_folder || !show_ttl {
+        None
+    } else {
+        entry.ttl_secs.and_then(|secs| {
+            // `ttl_chip_kind` is the "render a chip?" gate (None ⇒ the -2
+            // SCAN/TTL race, `Perm` ⇒ no expiry: no chip for either); the
+            // colour below is keyed off the raw seconds so the warning
+            // window is exactly "< 1h".
+            if matches!(ttl_chip_kind(secs)?, TtlChipKind::Perm) {
+                return None;
+            }
+            let label = format_ttl_chip(secs)?;
+            // Three-tier TTL colour (design): seconds left (< 1m) ⇒ red
+            // (about to vanish), minutes left (< 1h) ⇒ warm amber (#cba26a),
+            // anything calmer (≥ 1h) ⇒ muted.
+            let amber: Hsla = rgb(0xcba26a).into();
+            let color = if (0..60).contains(&secs) {
+                cx.theme().red
+            } else if (60..3600).contains(&secs) {
+                amber
+            } else {
+                cx.theme().muted_foreground
+            };
+            Some((label.into(), color))
+        })
+    }
+}
+
+/// Dashed tree connectors: one vertical guide per ancestor level so the
+/// children under an expanded folder read as a connected group. Each
+/// segment bridges the row's `mb_1` gap (bottom −4px) to meet the row
+/// below into a continuous dashed line. Top-level rows (depth 0) have
+/// none.
+fn depth_guides(depth: usize, guide_color: Hsla) -> Vec<AnyElement> {
+    (1..=depth)
+        .map(|level| {
+            div()
+                .absolute()
+                .top_0()
+                .bottom(px(-4.))
+                // Centered on the ancestor folder's icon (one indent level
+                // left of the child content) so the line drops from the
+                // folder; the wider TREE_INDENT_BASE leaves the gap before
+                // the child's type label.
+                .left(px((level - 1) as f32 * TREE_INDENT_BASE + TREE_INDENT_OFFSET + 8.0))
+                .w_0()
+                .border_l_1()
+                .border_dashed()
+                .border_color(guide_color)
+                .into_any_element()
+        })
+        .collect()
+}
+
+/// A row's name — the last segment of its key or prefix — with the whole
+/// path in its tooltip, under it a key's note or a folder's tags; no
+/// tooltip while the row's menu is open.
+fn row_name(ix: IndexPath, entry: &KeyTreeItem, menu_open_here: bool, cx: &App) -> impl IntoElement {
+    let is_folder = entry.is_folder;
+    // Folders sit one brightness step below leaves; an *expanded* folder
+    // steps back up to full foreground (with its open icon, see above) so
+    // "which folders are open" reads at a glance.
+    let label_color = if is_folder && !entry.expanded {
+        cx.theme().foreground.alpha(0.85)
+    } else {
+        cx.theme().foreground
+    };
+    // Row label — built up front so the builder chain below just drops it
+    // in. No weight change on selection (a font-weight swap re-rasterizes
+    // the glyphs and reads as a flicker); the fill marks it.
+    // `whitespace_nowrap` is what makes `text_ellipsis` actually truncate:
+    // without it a long folder name wraps to a second line instead
+    // (same pairing as the editor-header key name).
+    let row_label = Label::new(entry.label.clone())
+        .text_color(label_color)
+        .text_ellipsis()
+        .whitespace_nowrap();
+    let note = entry.note.clone();
+    let has_note = !note.is_empty();
+    // A folder's tags as the tooltip lists them ("Red 3 · Blue 1"),
+    // worded in the language chosen now.
+    let folder_tags = (is_folder && !entry.folder_tag_counts.is_empty()).then(|| {
+        let tags = entry
+            .folder_tag_counts
+            .iter()
+            .map(|&(color, count)| format!("{} {count}", i18n_key_tag(cx, tag_color_label_key(color))))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let locale = cx.global::<ZedisGlobalStore>().read(cx).locale();
+        let line = if entry.tag_mixed {
+            t!("key_tree.folder_tags_mixed", tags = tags, locale = locale)
+        } else {
+            t!("key_tree.folder_tags", tags = tags, locale = locale)
+        };
+        line.to_string()
+    });
+    div()
+        .id(("ktree-label", ix.row))
+        .flex_1()
+        .min_w_0()
+        // Hover tooltip: full key / prefix path
+        // (visible label is last segment only),
+        // plus leaf note or folder tag aggregate —
+        // none while the row's menu is open.
+        .when(!menu_open_here, |this| {
+            this.tooltip({
+                let text: SharedString = if has_note {
+                    format!("{}\n{}", entry.id, note).into()
+                } else if let Some(tags) = &folder_tags {
+                    format!("{}\n{tags}", entry.id).into()
+                } else {
+                    entry.id.clone()
+                };
+                move |window, cx| gpui_kit::component::tooltip::Tooltip::new(text.clone()).build(window, cx)
+            })
+        })
+        .child(row_label)
+}
+
+/// A key's TTL, right-aligned; with the inline delete, the delete takes
+/// its place while the TTL — not the whole row — is hovered, so the TTL
+/// stays readable with the pointer elsewhere on the row.
+fn ttl_slot(
+    row: usize,
+    chip_label: SharedString,
+    chip_color: Hsla,
+    show_inline_delete: bool,
+    del_id: &SharedString,
+    delete_tooltip: &SharedString,
+) -> Div {
+    div()
+        // Hover scope limited to this chip slot
+        // (its own group): hovering the chip — not
+        // the whole row — swaps it for the delete
+        // button, so the TTL stays visible when
+        // hovering elsewhere on the row.
+        .group("ktree-ttl")
+        .relative()
+        .flex_none()
+        .child(
+            div()
+                .when(show_inline_delete, |this| {
+                    this.group_hover("ktree-ttl", |s| s.invisible())
+                })
+                .child(
+                    // Plain TTL text (no chip chrome) —
+                    // calm and right-aligned, matching
+                    // the design.
+                    // One line whatever it
+                    // says: a label that wraps
+                    // makes the row two lines
+                    // tall (#190).
+                    Label::new(chip_label)
+                        .text_size(px(10.))
+                        .w(px(TTL_CHIP_WIDTH))
+                        .whitespace_nowrap()
+                        .text_right()
+                        .text_color(chip_color)
+                        .flex_none(),
+                ),
+        )
+        .when(show_inline_delete, |this| {
+            let del_id = del_id.clone();
+            let tooltip = delete_tooltip.clone();
+            this.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    // Right-align so the small X hugs the
+                    // right edge of the (wider) TTL slot
+                    // instead of floating centred with a
+                    // big gap to its right.
+                    .justify_end()
+                    .invisible()
+                    .group_hover("ktree-ttl", |s| s.visible())
+                    .child(inline_delete_button(row, del_id, tooltip)),
+            )
+        })
+}
+
+/// Row-hover inline delete — used only when the row has
+/// no TTL chip (chip rows scope the delete to the chip
+/// slot above). Absolutely positioned (out of flow → no
+/// reserved width); dispatches the same `DeleteKey`
+/// action as the context menu (confirm + PROD escalation).
+fn row_hover_delete(row: usize, del_id: SharedString, tooltip: SharedString) -> Div {
+    div()
+        .absolute()
+        .right_0()
+        .top_0()
+        .bottom_0()
+        .w(px(INLINE_DELETE_WIDTH))
+        .flex()
+        .items_center()
+        // Right-align the X to the slot's right edge so it
+        // doesn't sit centred with a big gap to its right.
+        .justify_end()
+        .invisible()
+        .group_hover("ktree-row", |s| s.visible())
+        .child(inline_delete_button(row, del_id, tooltip))
+}
+
+/// A key row's inline delete: the menu's `DeleteKey`, with its
+/// confirmation and production escalation.
+fn inline_delete_button(row: usize, del_id: SharedString, tooltip: SharedString) -> Button {
+    Button::new(("ktree-del", row))
+        .ghost()
+        .xsmall()
+        .icon(CustomIconName::X)
+        .tooltip(tooltip)
+        .on_click(move |_, window, cx| {
+            cx.stop_propagation();
+            window.dispatch_action(Box::new(KeyTreeAction::DeleteKey(del_id.clone())), cx);
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::init_ui;
-    use gpui::{TestAppContext, size};
+    use gpui::{AnyWindowHandle, TestAppContext, size};
     use gpui_kit::component::Root;
-    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::test::{TestEventExt, TestWindowExt};
 
     fn leaf(id: &str) -> KeyTreeItem {
         KeyTreeItem {
@@ -1053,5 +877,246 @@ mod tests {
         .expect("the window is open");
         cx.run_until_parked();
         assert_eq!(picks(&list, cx), ["a", "b"]);
+    }
+
+    type Dispatched = Rc<RefCell<Vec<KeyTreeAction>>>;
+
+    /// `items` drawn alone, and every `KeyTreeAction` dispatched from then
+    /// on, in order — what the tree's own handlers would have been asked.
+    fn open_rows(
+        cx: &mut TestAppContext,
+        items: Vec<KeyTreeItem>,
+        readonly: bool,
+    ) -> (AnyWindowHandle, Entity<ListState<KeyTreeDelegate>>, Dispatched) {
+        let dispatched = Dispatched::default();
+        cx.update(|cx| {
+            let dispatched = dispatched.clone();
+            cx.on_action(move |action: &KeyTreeAction, _| dispatched.borrow_mut().push(action.clone()));
+        });
+        let server_state = cx.new(|_| ZedisServerState::default());
+        let mut list = None;
+        let handle = cx.open_window(size(px(480.), px(640.)), |window, cx| {
+            let delegate = KeyTreeDelegate {
+                items,
+                enabled_multiple_selection: false,
+                selected_items: AHashSet::new(),
+                range_anchor: None,
+                range_base: AHashSet::new(),
+                readonly,
+                server_state,
+                menu_row: Default::default(),
+            };
+            let state = cx.new(|cx| ListState::new(delegate, window, cx));
+            list = Some(state.clone());
+            let view = cx.new(|_| RowsHarness { list: state });
+            Root::new(view, window, cx)
+        });
+        (handle.into(), list.expect("the window built the list"), dispatched)
+    }
+
+    /// What the right-click menu of `row` offers, as the actions its items
+    /// send, top to bottom: each item clicked in a menu opened afresh.
+    fn menu_actions(
+        cx: &mut TestAppContext,
+        handle: AnyWindowHandle,
+        row: usize,
+        dispatched: &Dispatched,
+    ) -> Vec<KeyTreeAction> {
+        dispatched.borrow_mut().clear();
+        for item in 0usize..20 {
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                window.right_click(IndexPath::new(row), cx);
+            })
+            .expect("the window is open");
+            cx.run_until_parked();
+            let offered = cx
+                .update_window(handle, |_, window, cx| {
+                    window.render_frame(cx);
+                    let offered = window.within("popup-menu").try_find(item).is_some();
+                    if offered {
+                        window.within("popup-menu").click(item, cx);
+                    } else {
+                        window.press("escape", cx);
+                    }
+                    offered
+                })
+                .expect("the window is open");
+            cx.run_until_parked();
+            if !offered {
+                return dispatched.borrow().clone();
+            }
+            assert_eq!(
+                dispatched.borrow().len(),
+                item + 1,
+                "item {item} of row {row}'s menu sent one action"
+            );
+        }
+        panic!("row {row}'s menu kept offering items");
+    }
+
+    fn pick(list: &Entity<ListState<KeyTreeDelegate>>, ids: &[&str], cx: &mut TestAppContext) {
+        list.update(cx, |state, cx| {
+            let delegate = state.delegate_mut();
+            delegate.clear_selection();
+            for (row, id) in ids.iter().enumerate() {
+                delegate.set_pick((*id).into(), true, row);
+            }
+            cx.notify();
+        });
+    }
+
+    /// What a row's right-click menu offers, by the actions its items send:
+    /// a key, a key that never expires, a folder, two keys picked and one,
+    /// and the same rows on a read-only connection.
+    #[gpui::test]
+    fn a_rows_menu_offers_what_the_row_and_the_access_allow(cx: &mut TestAppContext) {
+        use KeyTreeAction as A;
+        init_ui(cx);
+        let rows = || {
+            vec![
+                leaf("a"),
+                KeyTreeItem {
+                    ttl_secs: Some(-1),
+                    ..leaf("p")
+                },
+                folder("f"),
+                leaf("b"),
+            ]
+        };
+        let id = |id: &str| SharedString::from(id);
+
+        let (handle, list, dispatched) = open_rows(cx, rows(), false);
+        assert_eq!(
+            menu_actions(cx, handle, 0, &dispatched),
+            [
+                A::DeleteKey(id("a")),
+                A::SetTtlKey(id("a")),
+                A::PersistKey(id("a")),
+                A::ExportKey(id("a")),
+                A::EditKeyTag(id("a")),
+                A::CopyKeyName(id("a")),
+                A::RenameKey(id("a")),
+                A::ToggleFavoriteKey(id("a")),
+            ]
+        );
+        // A key known not to expire has no TTL to remove.
+        assert!(!menu_actions(cx, handle, 1, &dispatched).contains(&A::PersistKey(id("p"))));
+        assert_eq!(
+            menu_actions(cx, handle, 2, &dispatched),
+            [
+                A::RefreshFolder(id("f")),
+                A::DeleteFolder(id("f")),
+                A::SetTtlFolder(id("f")),
+                A::PersistFolder(id("f")),
+                A::ExportFolder(id("f")),
+                A::CopyFolderPrefix(id("f")),
+            ]
+        );
+        pick(&list, &["a", "b"], cx);
+        assert_eq!(
+            menu_actions(cx, handle, 0, &dispatched),
+            [
+                A::DeleteMultipleKeys,
+                A::SetTtlMultipleKeys,
+                A::PersistMultipleKeys,
+                A::ExportSelectedKeys,
+                A::BatchTagSelectedKeys,
+            ]
+        );
+        // One pick: the key's own operations, and the export of the
+        // selection rather than of the key.
+        pick(&list, &["a"], cx);
+        assert_eq!(
+            menu_actions(cx, handle, 0, &dispatched),
+            [
+                A::DeleteKey(id("a")),
+                A::SetTtlKey(id("a")),
+                A::PersistKey(id("a")),
+                A::ExportSelectedKeys,
+            ]
+        );
+        // A row outside the picks has its own menu.
+        assert_eq!(menu_actions(cx, handle, 3, &dispatched)[0], A::DeleteKey(id("b")));
+
+        let (handle, _, dispatched) = open_rows(cx, rows(), true);
+        assert_eq!(
+            menu_actions(cx, handle, 0, &dispatched),
+            [
+                A::ExportKey(id("a")),
+                A::EditKeyTag(id("a")),
+                A::CopyKeyName(id("a")),
+                A::ToggleFavoriteKey(id("a")),
+            ]
+        );
+        assert_eq!(
+            menu_actions(cx, handle, 2, &dispatched),
+            [
+                A::RefreshFolder(id("f")),
+                A::ExportFolder(id("f")),
+                A::CopyFolderPrefix(id("f")),
+            ]
+        );
+    }
+
+    /// The inline delete: a writable key row's, shown while the row is
+    /// hovered — or, on a row with a TTL, while the TTL is — and sending
+    /// the menu's `DeleteKey`. Never a folder's, never on a read-only
+    /// connection, never beside the selection checkbox (#196).
+    #[gpui::test]
+    fn a_key_row_offers_its_delete_on_hover(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let rows = || {
+            vec![
+                leaf("a"),
+                KeyTreeItem {
+                    ttl_secs: Some(30),
+                    ..leaf("t")
+                },
+                folder("f"),
+            ]
+        };
+        let (handle, list, dispatched) = open_rows(cx, rows(), false);
+        // The TTL column is a setting the server state resolves on select;
+        // an unknown server takes the global one, which is on.
+        let server_state = list.read_with(cx, |state, _| state.delegate().server_state.clone());
+        server_state.update(cx, |state, cx| state.select("scratch".into(), 0, cx));
+        cx.run_until_parked();
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find(("ktree-del", 2usize)).is_none(), "a folder's");
+            window.hover(IndexPath::new(2), cx);
+            assert!(!window.find(("ktree-del", 0usize)).visible(), "another row hovered");
+            window.hover(IndexPath::new(0), cx);
+            assert!(window.find(("ktree-del", 0usize)).visible(), "the row hovered");
+            // The TTL row keeps its TTL while the row is hovered and gives
+            // the place to the delete only while the TTL is.
+            window.hover(IndexPath::new(1), cx);
+            assert!(!window.find(("ktree-del", 1usize)).visible(), "the TTL row hovered");
+            // The delete is hidden there, so the pointer goes to its place
+            // by hand: what is hovered is the TTL under it.
+            let slot = window.find(("ktree-del", 1usize)).bounds().center();
+            window.pointer_move(slot, None, cx);
+            assert!(window.find(("ktree-del", 1usize)).visible(), "the TTL hovered");
+            window.click(("ktree-del", 1usize), cx);
+        })
+        .expect("the window is open");
+        cx.run_until_parked();
+        assert_eq!(*dispatched.borrow(), [KeyTreeAction::DeleteKey("t".into())]);
+
+        pick(&list, &["a"], cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find(("ktree-del", 0usize)).is_none(), "beside the checkbox");
+        })
+        .expect("the window is open");
+
+        let (handle, _, _) = open_rows(cx, rows(), true);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find(("ktree-del", 0usize)).is_none(), "read-only");
+        })
+        .expect("the window is open");
     }
 }

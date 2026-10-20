@@ -37,8 +37,8 @@ use crate::views::open_connection_diagnostics;
 use crate::views::placeholders::Placeholders;
 use crate::views::{ZedisExportServersDialog, export_filename, export_to_file_global, open_file};
 use gpui::{
-    Action, Anchor, App, ClipboardItem, Entity, ExternalPaths, FocusHandle, Focusable, SharedString, Subscription,
-    Window, div, prelude::*, px,
+    Action, Anchor, AnyElement, App, ClipboardItem, Entity, ExternalPaths, FocusHandle, Focusable, Hsla, SharedString,
+    Subscription, Window, div, prelude::*, px,
 };
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::DropdownMenu;
@@ -837,295 +837,102 @@ impl Render for ZedisServers {
         for (_, group_servers) in groups.iter_mut() {
             sort.apply(group_servers, &last_used);
         }
+        let look = PageLook {
+            may_change,
+            sort,
+            cols,
+            bg,
+            dark,
+            locale,
+            subtitle_font,
+            update_tooltip,
+            move_up_tooltip,
+            move_down_tooltip,
+            ungrouped_label,
+        };
 
         // Build one section per group: header + grid of cards. Each
         // card gets ↑/↓ reorder buttons gated by group-edge position.
         let mut sections: Vec<gpui::AnyElement> = Vec::new();
         let mut card_index_counter: usize = 0;
         for (group_label, group_servers) in &groups {
-            let group_name = match group_label {
-                Some(g) => SharedString::from(g.clone()),
-                None => ungrouped_label.clone(),
-            };
-            let group_count = SharedString::from(group_servers.len().to_string());
-            let group_key = group_label.as_deref().unwrap_or("__none__").to_string();
-            let is_collapsed = cx
-                .global::<ZedisGlobalStore>()
-                .read(cx)
-                .is_server_group_collapsed(&group_key);
-            let toggle_key = group_key.clone();
-            let section_id = SharedString::from(format!("servers-group-{group_key}"));
-            // Skip building the (listener-heavy) cards entirely when
-            // the group is collapsed — but still advance the index
-            // counter so element ids stay stable across toggles.
-            let cards: Vec<gpui::AnyElement> = if is_collapsed {
-                Vec::new()
-            } else {
-                group_servers
-                    .iter()
-                    .enumerate()
-                    .map(|(in_group_index, server)| {
-                        let index = card_index_counter + in_group_index;
-                        let is_first = in_group_index == 0;
-                        let is_last = in_group_index + 1 == group_servers.len();
-                        let single_in_group = group_servers.len() == 1;
-
-                        let select_server_id = server.id.clone();
-                        let update_server = server.clone();
-                        // Server id carried by the footer "⋯" dropdown actions.
-                        let more_server_id: SharedString = server.id.clone().into();
-                        // Moves swap with the card shown beside this one.
-                        let move_up = in_group_index
-                            .checked_sub(1)
-                            .and_then(|above| group_servers.get(above))
-                            .map(|above| (server.id.clone(), above.id.clone()));
-                        let move_down = group_servers
-                            .get(in_group_index + 1)
-                            .map(|below| (server.id.clone(), below.id.clone()));
-
-                        let description = server.description.as_deref().unwrap_or_default();
-                        let updated_at = if let Some(updated_at) = &server.updated_at {
-                            updated_at.substring(0, UPDATED_AT_SUBSTRING_LENGTH).to_string()
-                        } else {
-                            String::new()
-                        };
-                        // Footer shows a localized relative time ("28d ago"); the
-                        // absolute date stays in the hover tooltip.
-                        let updated_relative = server
-                            .updated_at
-                            .as_deref()
-                            .map(|s| format_updated_relative(s, &locale))
-                            .unwrap_or_default();
-                        // One relative-time slot, and "last connected" is the
-                        // more useful of the two — the edit stamp only shows
-                        // for a server never opened on this machine.
-                        let last_used_at = last_used.get(&server.id).copied();
-                        let title = server.name.clone();
-                        let tag_label = server.tag_label().unwrap_or_default().to_string();
-                        let tag_chip = resolve_tag_chip(server.tag_color.as_deref(), dark);
-                        let subtitle = format!("{}:{}", server.host, server.port);
-                        let updated_label = if updated_at.is_empty() {
-                            String::new()
-                        } else {
-                            t!("servers.updated_at_label", date = updated_at, locale = locale).to_string()
-                        };
-
-                        // Reorder ↑/↓ stay top-right, hover-only (design); skip
-                        // entirely when the group has a single member, or when a
-                        // toolbar order is active — the arrows move `sort_order`,
-                        // which the card positions no longer reflect.
-                        let mut hover_actions: Vec<Button> = Vec::new();
-                        if may_change && !single_in_group && sort == ServerSort::Manual {
-                            hover_actions.push(
-                                Button::new(("servers-card-action-up", index))
-                                    .ghost()
-                                    .tooltip(move_up_tooltip.clone())
-                                    .icon(IconName::ChevronUp)
-                                    .disabled(is_first)
-                                    .on_click(cx.listener(move |_this, _, _window, cx| {
-                                        cx.stop_propagation();
-                                        let Some((id, neighbor)) = move_up.clone() else {
-                                            return;
-                                        };
-                                        cx.update_global::<ZedisGlobalStore, ()>(|store, cx| {
-                                            store.update(cx, |state, cx| {
-                                                state.reorder_server(&id, &neighbor, cx);
-                                            });
-                                        });
-                                    })),
-                            );
-                            hover_actions.push(
-                                Button::new(("servers-card-action-down", index))
-                                    .ghost()
-                                    .tooltip(move_down_tooltip.clone())
-                                    .icon(IconName::ChevronDown)
-                                    .disabled(is_last)
-                                    .on_click(cx.listener(move |_this, _, _window, cx| {
-                                        cx.stop_propagation();
-                                        let Some((id, neighbor)) = move_down.clone() else {
-                                            return;
-                                        };
-                                        cx.update_global::<ZedisGlobalStore, ()>(|store, cx| {
-                                            store.update(cx, |state, cx| {
-                                                state.reorder_server(&id, &neighbor, cx);
-                                            });
-                                        });
-                                    })),
-                            );
-                        }
-
-                        // Footer (design): relative update time on the left;
-                        // edit + a "⋯" dropdown (export / delete) on the right.
-                        // Built here so the ZedisCard call just drops it into the
-                        // footer slot.
-                        let (meta, card_actions) = {
-                            let muted = cx.theme().muted_foreground;
-                            // Last connected wins the slot; the edit stamp is the
-                            // fallback for a server never opened here.
-                            let (relative, tip) = match last_used_at {
-                                Some(at) => (
-                                    SharedString::from(format_last_used(at, &locale)),
-                                    SharedString::from(format_unix_secs(at).unwrap_or_default()),
-                                ),
-                                None => (updated_relative.clone().into(), updated_label.clone().into()),
-                            };
-                            let has_time = last_used_at.is_some() || !updated_at.is_empty();
-                            let edit_server = update_server.clone();
-                            let more_id = more_server_id.clone();
-                            // When it was last used (or edited), on the detail
-                            // row; the exact time in its tooltip.
-                            let meta = has_time.then(|| {
-                                div()
-                                    .id(("servers-card-updated", index))
-                                    .child(Label::new(relative.clone()).text_xs().text_color(muted))
-                                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-                            });
-                            (
-                                meta,
-                                // The card's own actions own their clicks so they
-                                // don't bubble to the card's connect-on-click.
-                                h_flex()
-                                    .id(("servers-card-footer-actions", index))
-                                    .items_center()
-                                    .gap_1()
-                                    .on_click(|_, _, cx| cx.stop_propagation())
-                                    .when(may_change, |actions| {
-                                        actions.child(
-                                            Button::new(("servers-card-edit", index))
-                                                .ghost()
-                                                .xsmall()
-                                                .tooltip(update_tooltip.clone())
-                                                .icon(CustomIconName::FilePenLine)
-                                                .on_click(cx.listener(move |this, _, window, cx| {
-                                                    cx.stop_propagation();
-                                                    this.add_or_update_server_dialog(&edit_server, window, cx);
-                                                })),
-                                        )
-                                    })
-                                    .child(
-                                        Button::new(("servers-card-more", index))
-                                            .ghost()
-                                            .xsmall()
-                                            .icon(IconName::Ellipsis)
-                                            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _window, _cx| {
-                                                let clone_id = more_id.clone();
-                                                let exp_id = more_id.clone();
-                                                let del_id = more_id.clone();
-                                                // Export only reads; a read-only
-                                                // account is offered nothing else.
-                                                menu.when(may_change, |menu| {
-                                                    menu.menu_element_with_icon(
-                                                        Icon::new(IconName::Copy),
-                                                        Box::new(ServersCardAction::Clone(clone_id)),
-                                                        |_, cx| Label::new(i18n_servers(cx, "clone_tooltip")),
-                                                    )
-                                                })
-                                                .menu_element_with_icon(
-                                                    Icon::new(IconName::ExternalLink),
-                                                    Box::new(ServersCardAction::Export(exp_id)),
-                                                    |_, cx| Label::new(i18n_servers(cx, "export_tooltip")),
-                                                )
-                                                .when(
-                                                    may_change,
-                                                    |menu| {
-                                                        menu.menu_element_with_icon(
-                                                            Icon::new(CustomIconName::FileXCorner),
-                                                            Box::new(ServersCardAction::Delete(del_id)),
-                                                            |_, cx| Label::new(i18n_servers(cx, "remove_tooltip")),
-                                                        )
-                                                    },
-                                                )
-                                            }),
-                                    ),
-                            )
-                        };
-
-                        let handle_select_server = cx.listener(move |_this, _, _, cx| {
-                            let select_server_id = select_server_id.clone();
-                            cx.update_global::<ZedisGlobalStore, ()>(|store, cx| {
-                                store.update(cx, |state, cx| {
-                                    let db = state.open_db_for(&select_server_id);
-                                    state.connect_server(select_server_id.clone(), db, cx);
-                                });
-                            });
-                        });
-
-                        ZedisCard::new(("servers-card", index))
-                            .icon(Icon::new(CustomIconName::Database))
-                            .title(title)
-                            .subtitle(subtitle)
-                            .subtitle_font(subtitle_font.clone())
-                            .tag(tag_label, tag_chip)
-                            .bg(bg)
-                            .when(!description.is_empty(), |this| {
-                                this.description(description.to_string())
-                            })
-                            .when(!hover_actions.is_empty(), |this| this.hover_only_actions(hover_actions))
-                            .when_some(meta, |this, meta| this.meta(meta))
-                            .trailing(card_actions)
-                            .on_click(Box::new(handle_select_server))
-                            .into_any_element()
-                    })
-                    .collect()
-            };
+            sections.push(group_section(
+                &look,
+                group_label,
+                group_servers,
+                card_index_counter,
+                &last_used,
+                cx,
+            ));
             card_index_counter += group_servers.len();
-            let chevron = if is_collapsed {
-                IconName::ChevronRight
-            } else {
-                IconName::ChevronDown
-            };
-            sections.push(
-                gpui_kit::component::v_flex()
-                    .id(section_id)
-                    .gap_2()
-                    .w_full()
-                    .child(
-                        // px_1 matches the `.m_1()` margin every
-                        // ZedisCard applies, so the group label lines
-                        // up with the cards' left edge. Whole header
-                        // row toggles collapse on click.
-                        h_flex()
-                            .id(SharedString::from(format!("group-header-{group_key}")))
-                            .items_center()
-                            .gap_2()
-                            .h(px(24.))
-                            .px_1()
-                            .cursor_pointer()
-                            .child(Icon::new(chevron).text_color(cx.theme().muted_foreground))
-                            .child(Label::new(group_name).text_sm().text_color(cx.theme().muted_foreground))
-                            // Count as a theme-colored pill badge —
-                            // same chip language as the sidebar tag
-                            // chips, adapts to light/dark via theme
-                            // tokens.
-                            .child(
-                                div().px_1p5().rounded_full().bg(cx.theme().muted).child(
-                                    Label::new(group_count)
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground),
-                                ),
-                            )
-                            // Divider line trailing the group label out to the
-                            // right edge (design).
-                            .child(div().flex_1().h_px().bg(cx.theme().border))
-                            .on_click(cx.listener(move |_this, _, _window, cx| {
-                                let key = toggle_key.clone();
-                                update_app_state_and_save(cx, "toggle_server_group_collapsed", move |state, _| {
-                                    state.toggle_server_group_collapsed(&key);
-                                });
-                            })),
-                    )
-                    .when(!is_collapsed, |this| {
-                        this.child(div().grid().grid_cols(cols).w_full().children(cards))
-                    })
-                    .into_any_element(),
-            );
         }
 
         // Top toolbar (design): "Connections" + total-count badge on the left,
         // a live search box in the middle, and the New / Import / Export
         // actions on the right — the old bottom action cards moved up here.
+        let toolbar = self.toolbar(&all_servers, sort, may_change, cx);
+
+        gpui_kit::component::v_flex()
+            .gap_4()
+            .w_full()
+            .track_focus(&self.focus_handle)
+            // `cmd-f` (the same `EditorAction::Search` the key tree binds) puts the
+            // caret in the toolbar's filter box. Anything else is propagated so the
+            // other editor bindings still reach their own handlers.
+            .on_action(cx.listener(|this, e: &EditorAction, window, cx| match e {
+                EditorAction::Search => {
+                    this.search_state.focus_handle(cx).focus(window, cx);
+                }
+                _ => cx.propagate(),
+            }))
+            // Toolbar order selector.
+            .on_action(cx.listener(|_this, e: &ServersToolbarAction, _window, cx| match e {
+                ServersToolbarAction::SetSort(id) => {
+                    let id = id.to_string();
+                    update_app_state_and_save(cx, "server_sort", move |state, _| {
+                        state.set_server_sort(&id);
+                    });
+                    cx.notify();
+                }
+            }))
+            // Footer "⋯" dropdown actions are dispatched here.
+            .on_action(cx.listener(|this, e: &ServersCardAction, window, cx| match e {
+                ServersCardAction::Export(id) => {
+                    if let Ok(servers) = get_servers()
+                        && let Some(server) = servers.iter().find(|s| s.id == id.as_ref())
+                    {
+                        let server = server.clone();
+                        this.export_server_dialog(&server, window, cx);
+                    }
+                }
+                ServersCardAction::Delete(id) => confirm_remove_server(id, window, cx),
+                ServersCardAction::Clone(id) => {
+                    if let Ok(servers) = get_servers()
+                        && let Some(server) = servers.iter().find(|s| s.id == id.as_ref())
+                    {
+                        let locale = cx.global::<ZedisGlobalStore>().read(cx).locale().to_string();
+                        this.add_or_update_server_dialog(&clone_of(server, &locale), window, cx);
+                    }
+                }
+            }))
+            .child(toolbar)
+            .children(sections)
+            .into_any_element()
+    }
+}
+
+impl ZedisServers {
+    /// The toolbar: "Connections" and how many, the search box, the
+    /// order, and New / Import / Export.
+    fn toolbar(
+        &self,
+        all_servers: &[RedisServer],
+        sort: ServerSort,
+        may_change: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let muted_fg = cx.theme().muted_foreground;
-        let toolbar = h_flex()
+        h_flex()
             .w_full()
             .items_center()
             .gap_3()
@@ -1226,55 +1033,347 @@ impl Render for ZedisServers {
                                 this.export_servers_dialog(window, cx);
                             })),
                     ),
-            );
-
-        gpui_kit::component::v_flex()
-            .gap_4()
-            .w_full()
-            .track_focus(&self.focus_handle)
-            // `cmd-f` (the same `EditorAction::Search` the key tree binds) puts the
-            // caret in the toolbar's filter box. Anything else is propagated so the
-            // other editor bindings still reach their own handlers.
-            .on_action(cx.listener(|this, e: &EditorAction, window, cx| match e {
-                EditorAction::Search => {
-                    this.search_state.focus_handle(cx).focus(window, cx);
-                }
-                _ => cx.propagate(),
-            }))
-            // Toolbar order selector.
-            .on_action(cx.listener(|_this, e: &ServersToolbarAction, _window, cx| match e {
-                ServersToolbarAction::SetSort(id) => {
-                    let id = id.to_string();
-                    update_app_state_and_save(cx, "server_sort", move |state, _| {
-                        state.set_server_sort(&id);
-                    });
-                    cx.notify();
-                }
-            }))
-            // Footer "⋯" dropdown actions are dispatched here.
-            .on_action(cx.listener(|this, e: &ServersCardAction, window, cx| match e {
-                ServersCardAction::Export(id) => {
-                    if let Ok(servers) = get_servers()
-                        && let Some(server) = servers.iter().find(|s| s.id == id.as_ref())
-                    {
-                        let server = server.clone();
-                        this.export_server_dialog(&server, window, cx);
-                    }
-                }
-                ServersCardAction::Delete(id) => confirm_remove_server(id, window, cx),
-                ServersCardAction::Clone(id) => {
-                    if let Ok(servers) = get_servers()
-                        && let Some(server) = servers.iter().find(|s| s.id == id.as_ref())
-                    {
-                        let locale = cx.global::<ZedisGlobalStore>().read(cx).locale().to_string();
-                        this.add_or_update_server_dialog(&clone_of(server, &locale), window, cx);
-                    }
-                }
-            }))
-            .child(toolbar)
-            .children(sections)
-            .into_any_element()
+            )
     }
+}
+
+/// What every card on the page is drawn with, worked out once a render.
+struct PageLook {
+    /// Whether this account may change an entry: a read-only bridge
+    /// account may not.
+    may_change: bool,
+    sort: ServerSort,
+    cols: u16,
+    bg: Hsla,
+    dark: bool,
+    locale: String,
+    subtitle_font: String,
+    update_tooltip: SharedString,
+    move_up_tooltip: SharedString,
+    move_down_tooltip: SharedString,
+    ungrouped_label: SharedString,
+}
+
+/// One group's section: its header, which opens and closes it, and the
+/// grid of its cards. `first_index` is its first card's place on the
+/// page, which the card ids carry.
+fn group_section(
+    look: &PageLook,
+    group_label: &Option<String>,
+    group_servers: &[RedisServer],
+    first_index: usize,
+    last_used: &HashMap<String, i64>,
+    cx: &Context<ZedisServers>,
+) -> AnyElement {
+    let &PageLook {
+        cols,
+        ref ungrouped_label,
+        ..
+    } = look;
+    let group_name = match group_label {
+        Some(g) => SharedString::from(g.clone()),
+        None => ungrouped_label.clone(),
+    };
+    let group_count = SharedString::from(group_servers.len().to_string());
+    let group_key = group_label.as_deref().unwrap_or("__none__").to_string();
+    let is_collapsed = cx
+        .global::<ZedisGlobalStore>()
+        .read(cx)
+        .is_server_group_collapsed(&group_key);
+    let toggle_key = group_key.clone();
+    let section_id = SharedString::from(format!("servers-group-{group_key}"));
+    // Skip building the (listener-heavy) cards entirely when
+    // the group is collapsed — but still advance the index
+    // counter so element ids stay stable across toggles.
+    let cards: Vec<gpui::AnyElement> = if is_collapsed {
+        Vec::new()
+    } else {
+        group_servers
+            .iter()
+            .enumerate()
+            .map(|(in_group_index, server)| {
+                server_card(
+                    look,
+                    group_servers,
+                    in_group_index,
+                    server,
+                    first_index + in_group_index,
+                    last_used,
+                    cx,
+                )
+            })
+            .collect()
+    };
+    let chevron = if is_collapsed {
+        IconName::ChevronRight
+    } else {
+        IconName::ChevronDown
+    };
+    gpui_kit::component::v_flex()
+        .id(section_id)
+        .gap_2()
+        .w_full()
+        .child(
+            // px_1 matches the `.m_1()` margin every
+            // ZedisCard applies, so the group label lines
+            // up with the cards' left edge. Whole header
+            // row toggles collapse on click.
+            h_flex()
+                .id(SharedString::from(format!("group-header-{group_key}")))
+                .items_center()
+                .gap_2()
+                .h(px(24.))
+                .px_1()
+                .cursor_pointer()
+                .child(Icon::new(chevron).text_color(cx.theme().muted_foreground))
+                .child(Label::new(group_name).text_sm().text_color(cx.theme().muted_foreground))
+                // Count as a theme-colored pill badge —
+                // same chip language as the sidebar tag
+                // chips, adapts to light/dark via theme
+                // tokens.
+                .child(
+                    div().px_1p5().rounded_full().bg(cx.theme().muted).child(
+                        Label::new(group_count)
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground),
+                    ),
+                )
+                // Divider line trailing the group label out to the
+                // right edge (design).
+                .child(div().flex_1().h_px().bg(cx.theme().border))
+                .on_click(cx.listener(move |_this, _, _window, cx| {
+                    let key = toggle_key.clone();
+                    update_app_state_and_save(cx, "toggle_server_group_collapsed", move |state, _| {
+                        state.toggle_server_group_collapsed(&key);
+                    });
+                })),
+        )
+        .when(!is_collapsed, |this| {
+            this.child(div().grid().grid_cols(cols).w_full().children(cards))
+        })
+        .into_any_element()
+}
+
+/// One connection's card: its name, address, environment and note, when
+/// it was last used, the arrows that reorder it within its group, edit and
+/// a "…" menu; a click on it connects it.
+fn server_card(
+    look: &PageLook,
+    group_servers: &[RedisServer],
+    in_group_index: usize,
+    server: &RedisServer,
+    index: usize,
+    last_used: &HashMap<String, i64>,
+    cx: &Context<ZedisServers>,
+) -> AnyElement {
+    let &PageLook {
+        may_change,
+        sort,
+        bg,
+        dark,
+        ref locale,
+        ref subtitle_font,
+        ref update_tooltip,
+        ref move_up_tooltip,
+        ref move_down_tooltip,
+        ..
+    } = look;
+    let is_first = in_group_index == 0;
+    let is_last = in_group_index + 1 == group_servers.len();
+    let single_in_group = group_servers.len() == 1;
+
+    let select_server_id = server.id.clone();
+    let update_server = server.clone();
+    // Server id carried by the footer "⋯" dropdown actions.
+    let more_server_id: SharedString = server.id.clone().into();
+    // Moves swap with the card shown beside this one.
+    let move_up = in_group_index
+        .checked_sub(1)
+        .and_then(|above| group_servers.get(above))
+        .map(|above| (server.id.clone(), above.id.clone()));
+    let move_down = group_servers
+        .get(in_group_index + 1)
+        .map(|below| (server.id.clone(), below.id.clone()));
+
+    let description = server.description.as_deref().unwrap_or_default();
+    let updated_at = if let Some(updated_at) = &server.updated_at {
+        updated_at.substring(0, UPDATED_AT_SUBSTRING_LENGTH).to_string()
+    } else {
+        String::new()
+    };
+    // Footer shows a localized relative time ("28d ago"); the
+    // absolute date stays in the hover tooltip.
+    let updated_relative = server
+        .updated_at
+        .as_deref()
+        .map(|s| format_updated_relative(s, locale))
+        .unwrap_or_default();
+    // One relative-time slot, and "last connected" is the
+    // more useful of the two — the edit stamp only shows
+    // for a server never opened on this machine.
+    let last_used_at = last_used.get(&server.id).copied();
+    let title = server.name.clone();
+    let tag_label = server.tag_label().unwrap_or_default().to_string();
+    let tag_chip = resolve_tag_chip(server.tag_color.as_deref(), dark);
+    let subtitle = format!("{}:{}", server.host, server.port);
+    let updated_label = if updated_at.is_empty() {
+        String::new()
+    } else {
+        t!("servers.updated_at_label", date = updated_at, locale = locale).to_string()
+    };
+
+    // Reorder ↑/↓ stay top-right, hover-only (design); skip
+    // entirely when the group has a single member, or when a
+    // toolbar order is active — the arrows move `sort_order`,
+    // which the card positions no longer reflect.
+    let mut hover_actions: Vec<Button> = Vec::new();
+    if may_change && !single_in_group && sort == ServerSort::Manual {
+        hover_actions.push(
+            Button::new(("servers-card-action-up", index))
+                .ghost()
+                .tooltip(move_up_tooltip.clone())
+                .icon(IconName::ChevronUp)
+                .disabled(is_first)
+                .on_click(cx.listener(move |_this, _, _window, cx| {
+                    cx.stop_propagation();
+                    let Some((id, neighbor)) = move_up.clone() else {
+                        return;
+                    };
+                    cx.update_global::<ZedisGlobalStore, ()>(|store, cx| {
+                        store.update(cx, |state, cx| {
+                            state.reorder_server(&id, &neighbor, cx);
+                        });
+                    });
+                })),
+        );
+        hover_actions.push(
+            Button::new(("servers-card-action-down", index))
+                .ghost()
+                .tooltip(move_down_tooltip.clone())
+                .icon(IconName::ChevronDown)
+                .disabled(is_last)
+                .on_click(cx.listener(move |_this, _, _window, cx| {
+                    cx.stop_propagation();
+                    let Some((id, neighbor)) = move_down.clone() else {
+                        return;
+                    };
+                    cx.update_global::<ZedisGlobalStore, ()>(|store, cx| {
+                        store.update(cx, |state, cx| {
+                            state.reorder_server(&id, &neighbor, cx);
+                        });
+                    });
+                })),
+        );
+    }
+
+    // Footer (design): relative update time on the left;
+    // edit + a "⋯" dropdown (export / delete) on the right.
+    // Built here so the ZedisCard call just drops it into the
+    // footer slot.
+    let (meta, card_actions) = {
+        let muted = cx.theme().muted_foreground;
+        // Last connected wins the slot; the edit stamp is the
+        // fallback for a server never opened here.
+        let (relative, tip) = match last_used_at {
+            Some(at) => (
+                SharedString::from(format_last_used(at, locale)),
+                SharedString::from(format_unix_secs(at).unwrap_or_default()),
+            ),
+            None => (updated_relative.clone().into(), updated_label.clone().into()),
+        };
+        let has_time = last_used_at.is_some() || !updated_at.is_empty();
+        let edit_server = update_server.clone();
+        let more_id = more_server_id.clone();
+        // When it was last used (or edited), on the detail
+        // row; the exact time in its tooltip.
+        let meta = has_time.then(|| {
+            div()
+                .id(("servers-card-updated", index))
+                .child(Label::new(relative.clone()).text_xs().text_color(muted))
+                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+        });
+        (
+            meta,
+            // The card's own actions own their clicks so they
+            // don't bubble to the card's connect-on-click.
+            h_flex()
+                .id(("servers-card-footer-actions", index))
+                .items_center()
+                .gap_1()
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .when(may_change, |actions| {
+                    actions.child(
+                        Button::new(("servers-card-edit", index))
+                            .ghost()
+                            .xsmall()
+                            .tooltip(update_tooltip.clone())
+                            .icon(CustomIconName::FilePenLine)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.add_or_update_server_dialog(&edit_server, window, cx);
+                            })),
+                    )
+                })
+                .child(
+                    Button::new(("servers-card-more", index))
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Ellipsis)
+                        .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _window, _cx| {
+                            let clone_id = more_id.clone();
+                            let exp_id = more_id.clone();
+                            let del_id = more_id.clone();
+                            // Export only reads; a read-only
+                            // account is offered nothing else.
+                            menu.when(may_change, |menu| {
+                                menu.menu_element_with_icon(
+                                    Icon::new(IconName::Copy),
+                                    Box::new(ServersCardAction::Clone(clone_id)),
+                                    |_, cx| Label::new(i18n_servers(cx, "clone_tooltip")),
+                                )
+                            })
+                            .menu_element_with_icon(
+                                Icon::new(IconName::ExternalLink),
+                                Box::new(ServersCardAction::Export(exp_id)),
+                                |_, cx| Label::new(i18n_servers(cx, "export_tooltip")),
+                            )
+                            .when(may_change, |menu| {
+                                menu.menu_element_with_icon(
+                                    Icon::new(CustomIconName::FileXCorner),
+                                    Box::new(ServersCardAction::Delete(del_id)),
+                                    |_, cx| Label::new(i18n_servers(cx, "remove_tooltip")),
+                                )
+                            })
+                        }),
+                ),
+        )
+    };
+
+    let handle_select_server = cx.listener(move |_this, _, _, cx| {
+        let select_server_id = select_server_id.clone();
+        cx.update_global::<ZedisGlobalStore, ()>(|store, cx| {
+            store.update(cx, |state, cx| {
+                let db = state.open_db_for(&select_server_id);
+                state.connect_server(select_server_id.clone(), db, cx);
+            });
+        });
+    });
+
+    ZedisCard::new(("servers-card", index))
+        .icon(Icon::new(CustomIconName::Database))
+        .title(title)
+        .subtitle(subtitle)
+        .subtitle_font(subtitle_font.clone())
+        .tag(tag_label, tag_chip)
+        .bg(bg)
+        .when(!description.is_empty(), |this| {
+            this.description(description.to_string())
+        })
+        .when(!hover_actions.is_empty(), |this| this.hover_only_actions(hover_actions))
+        .when_some(meta, |this, meta| this.meta(meta))
+        .trailing(card_actions)
+        .on_click(Box::new(handle_select_server))
+        .into_any_element()
 }
 
 #[cfg(test)]
@@ -1316,6 +1415,231 @@ mod read_only_tests {
         pretend_account_read_only(true);
         servers.update(cx, |_, cx| cx.notify());
         assert!(!offers_to_add(cx, window), "a read-only one is not");
+    }
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::*;
+    use crate::connection::set_servers_cache;
+    use crate::states::pretend_account_read_only;
+    use crate::test_support::{hold_the_server_list, init_ui};
+    use gpui::{AnyWindowHandle, MouseButton, TestAppContext, point, size};
+    use gpui_kit::component::Root;
+    use gpui_kit::test::{TestEventExt, TestWindowExt};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    type Sent = Rc<RefCell<Vec<String>>>;
+
+    /// The page inside a view that takes what its cards' and its toolbar's
+    /// menus send on its way down and keeps it: nothing they ask is done.
+    struct PageHarness {
+        page: Entity<ZedisServers>,
+        sent: Sent,
+    }
+
+    impl Render for PageHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let (cards, toolbar) = (self.sent.clone(), self.sent.clone());
+            div()
+                .size_full()
+                .capture_action(move |action: &ServersCardAction, _, cx| {
+                    cards.borrow_mut().push(format!("{action:?}"));
+                    cx.stop_propagation();
+                })
+                .capture_action(move |action: &ServersToolbarAction, _, cx| {
+                    toolbar.borrow_mut().push(format!("{action:?}"));
+                    cx.stop_propagation();
+                })
+                .child(self.page.clone())
+        }
+    }
+
+    /// The process's server list as it was, put back when the test ends,
+    /// whether it passes or not.
+    struct Restore(Vec<RedisServer>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_servers_cache(std::mem::take(&mut self.0));
+        }
+    }
+
+    /// Three connections only this test has, each named with the word the
+    /// search box narrows the page to: two in a group of their own, one in
+    /// none.
+    fn own_servers() -> Vec<RedisServer> {
+        let server = |id: &str, group: Option<&str>, order: i64| RedisServer {
+            id: id.into(),
+            name: id.into(),
+            host: "127.0.0.1".into(),
+            port: 6379,
+            group: group.map(str::to_string),
+            sort_order: Some(order),
+            ..Default::default()
+        };
+        vec![
+            server("pagetest-a", Some("pagetest-group"), 0),
+            server("pagetest-b", Some("pagetest-group"), 1),
+            server("pagetest-c", None, 2),
+        ]
+    }
+
+    fn open_page(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<ZedisServers>, Sent) {
+        let sent = Sent::default();
+        let mut page = None;
+        let handle: AnyWindowHandle = cx
+            .open_window(size(px(1280.), px(900.)), |window, cx| {
+                let view = cx.new(|cx| ZedisServers::new(window, cx));
+                page = Some(view.clone());
+                let harness = cx.new(|_| PageHarness {
+                    page: view,
+                    sent: sent.clone(),
+                });
+                Root::new(harness, window, cx)
+            })
+            .into();
+        let page = page.expect("the window built the page");
+        cx.update_window(handle, |_, window, cx| {
+            let search = page.read(cx).search_state.clone();
+            search.update(cx, |state, cx| state.set_value("pagetest", window, cx));
+        })
+        .expect("the window is open");
+        cx.run_until_parked();
+        (handle, page, sent)
+    }
+
+    /// What the menu `open` shows offers, top to bottom: each item clicked
+    /// in a menu opened afresh, `-` for one that sends nothing.
+    fn menu_items(
+        cx: &mut TestAppContext,
+        handle: AnyWindowHandle,
+        sent: &Sent,
+        open: impl Fn(&mut Window, &mut App),
+    ) -> Vec<String> {
+        let mut items = Vec::new();
+        for item in 0usize..20 {
+            sent.borrow_mut().clear();
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                open(window, cx);
+            })
+            .expect("the window is open");
+            cx.run_until_parked();
+            let offered = cx
+                .update_window(handle, |_, window, cx| {
+                    window.render_frame(cx);
+                    let offered = window.within("popup-menu").try_find(item).is_some();
+                    if offered {
+                        window.within("popup-menu").click(item, cx);
+                    }
+                    offered
+                })
+                .expect("the window is open");
+            cx.run_until_parked();
+            // A click on the empty page under the cards closes what is open.
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                let empty = point(px(10.), px(890.));
+                window.pointer_down(empty, MouseButton::Left, cx);
+                window.pointer_up(empty, MouseButton::Left, cx);
+            })
+            .expect("the window is open");
+            cx.run_until_parked();
+            if !offered {
+                return items;
+            }
+            let sent = sent.borrow();
+            assert!(sent.len() <= 1, "item {item} sent {sent:?}");
+            items.push(sent.first().cloned().unwrap_or_else(|| "-".to_string()));
+        }
+        panic!("the menu kept offering items");
+    }
+
+    /// A card per connection, the group's two with the arrows that reorder
+    /// them (the first not up, the last not down) and the one alone without;
+    /// each card's edit and "…" (clone, export, delete), a click on it
+    /// connecting it; the toolbar's add, import, export and order. A
+    /// read-only account keeps the export and the order, and nothing else.
+    #[gpui::test]
+    fn the_page_draws_a_card_per_connection_and_its_actions(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let _list = hold_the_server_list();
+        let before = get_servers().unwrap_or_default();
+        let _restore = Restore(before.clone());
+        set_servers_cache(before.into_iter().chain(own_servers()).collect());
+        let (handle, page, sent) = open_page(cx);
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            for index in 0usize..3 {
+                assert!(window.try_find(("servers-card-edit", index)).is_some(), "card {index}");
+                assert!(window.try_find(("servers-card-more", index)).is_some(), "card {index}");
+            }
+            assert!(window.try_find(("servers-card-edit", 3usize)).is_none(), "three cards");
+            assert_eq!(window.find(("servers-card-action-up", 0usize)).disabled(), Some(true));
+            assert_eq!(window.find(("servers-card-action-down", 0usize)).disabled(), None);
+            assert_eq!(window.find(("servers-card-action-up", 1usize)).disabled(), None);
+            assert_eq!(window.find(("servers-card-action-down", 1usize)).disabled(), Some(true));
+            assert!(window.try_find(("servers-card-action-up", 2usize)).is_none(), "alone");
+            for id in [
+                SERVERS_TOOLBAR_ADD_ID,
+                "servers-toolbar-import",
+                "servers-toolbar-export",
+                "servers-toolbar-sort",
+            ] {
+                assert!(window.try_find(id).is_some(), "{id}");
+            }
+        })
+        .expect("the window is open");
+
+        let card_menu =
+            |index: usize| move |window: &mut Window, cx: &mut App| window.click(("servers-card-more", index), cx);
+        assert_eq!(
+            menu_items(cx, handle, &sent, card_menu(0)),
+            [
+                "Clone(\"pagetest-a\")",
+                "Export(\"pagetest-a\")",
+                "Delete(\"pagetest-a\")"
+            ]
+        );
+        let sorts: Vec<String> = ServerSort::ALL
+            .iter()
+            .map(|sort| format!("SetSort({:?})", sort.as_str()))
+            .collect();
+        assert_eq!(
+            menu_items(cx, handle, &sent, |window, cx| window.click("servers-toolbar-sort", cx)),
+            sorts
+        );
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let edit = window.find(("servers-card-edit", 2usize)).bounds();
+            let card = point(edit.left() - px(150.), edit.center().y);
+            window.pointer_down(card, MouseButton::Left, cx);
+            window.pointer_up(card, MouseButton::Left, cx);
+        })
+        .expect("the window is open");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read(|cx| cx.global::<ZedisGlobalStore>().read(cx).selected_server().cloned()),
+            Some(("pagetest-c".to_string(), 0))
+        );
+
+        pretend_account_read_only(true);
+        page.update(cx, |_, cx| cx.notify());
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find(("servers-card-edit", 0usize)).is_none());
+            assert!(window.try_find(("servers-card-action-up", 1usize)).is_none());
+            assert!(window.try_find(SERVERS_TOOLBAR_ADD_ID).is_none());
+            assert!(window.try_find("servers-toolbar-import").is_none());
+            assert!(window.try_find("servers-toolbar-export").is_some());
+        })
+        .expect("the window is open");
+        assert_eq!(menu_items(cx, handle, &sent, card_menu(0)), ["Export(\"pagetest-a\")"]);
+        pretend_account_read_only(false);
     }
 }
 
