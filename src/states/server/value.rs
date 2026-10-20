@@ -1166,14 +1166,14 @@ impl ZedisServerState {
     /// the editor can offer an explicit overwrite.
     pub fn update_value(&mut self, key: SharedString, new_value: SharedString, cx: &mut Context<Self>) {
         let at = self.at();
-        let epoch = self.value_epoch;
+        let epoch = self.open.value_epoch;
 
         // Inspection phase: pull everything we need out of `self.value`
         // before mutating any state, so we can also call
         // `push_value_history` (which needs &mut self) without
         // overlapping borrows.
         let (format, original_size, original_bytes_value, is_redis_json, ttl) = {
-            let Some(value) = self.value.as_ref() else { return };
+            let Some(value) = self.open.value.as_ref() else { return };
             let Some(bv) = value.bytes_value() else { return };
             let ttl = value.ttl().map(|t| t.num_milliseconds()).unwrap_or_default();
             (bv.format, value.size, bv, value.is_redis_json(), ttl)
@@ -1220,7 +1220,7 @@ impl ZedisServerState {
             new_value.clone()
         };
 
-        let Some(value) = self.value.as_mut() else { return };
+        let Some(value) = self.open.value.as_mut() else { return };
         value.status = RedisValueStatus::Updating;
         value.data = Some(RedisValueData::Bytes(Arc::new(RedisBytesValue {
             bytes: Bytes::from(wire_text.to_string().into_bytes()),
@@ -1287,12 +1287,12 @@ impl ZedisServerState {
         // old key's bytes into the other key's editor, and make them its
         // compare-and-set baseline. The failure itself was already reported
         // by the task.
-        if self.value_epoch != epoch {
+        if self.open.value_epoch != epoch {
             return;
         }
         let conflict = matches!(result, Ok(StringWrite::Conflict));
         let mut saved = false;
-        if let Some(value) = self.value.as_mut() {
+        if let Some(value) = self.open.value.as_mut() {
             value.status = RedisValueStatus::Idle;
             match result {
                 Ok(StringWrite::Saved(result_size)) => {
@@ -1333,11 +1333,11 @@ impl ZedisServerState {
     /// save-conflict dialog's explicit "overwrite anyway" re-dispatch.
     pub fn update_value_bytes(&mut self, key: SharedString, new_bytes: Vec<u8>, force: bool, cx: &mut Context<Self>) {
         let at = self.at();
-        let epoch = self.value_epoch;
+        let epoch = self.open.value_epoch;
 
         // See update_value for the borrow-split rationale.
         let (format, original_size, original_bytes_value, ttl) = {
-            let Some(value) = self.value.as_ref() else { return };
+            let Some(value) = self.open.value.as_ref() else { return };
             let Some(bv) = value.bytes_value() else { return };
             let ttl = value.ttl().map(|t| t.num_milliseconds()).unwrap_or_default();
             (bv.format, value.size, bv, ttl)
@@ -1347,7 +1347,7 @@ impl ZedisServerState {
 
         let new_bytes_arc = Bytes::from(new_bytes.clone());
 
-        let Some(value) = self.value.as_mut() else { return };
+        let Some(value) = self.open.value.as_mut() else { return };
         value.status = RedisValueStatus::Updating;
         value.data = Some(RedisValueData::Bytes(Arc::new(RedisBytesValue {
             bytes: new_bytes_arc.clone(),
@@ -1389,7 +1389,7 @@ impl ZedisServerState {
     }
 
     pub fn update_bytes_value_view_mode(&mut self, view_mode: SharedString, cx: &mut Context<Self>) {
-        let Some(value) = self.value.as_mut() else {
+        let Some(value) = self.open.value.as_mut() else {
             return;
         };
         let view_mode = ViewMode::from_name(view_mode.as_str());

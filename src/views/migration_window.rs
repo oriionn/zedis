@@ -47,6 +47,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::error;
 
+mod sections;
+
+use sections::JobLook;
+
 const WINDOW_WIDTH: f32 = 720.0;
 const WINDOW_HEIGHT: f32 = 620.0;
 const PREVIEW_SAMPLE_LIMIT: usize = 40;
@@ -583,67 +587,8 @@ impl Render for ZedisMigrationWindow {
         let muted = theme.muted_foreground;
         let state = self.state.read(cx);
         let phase = state.phase().clone();
-        let progress = state.progress().clone();
-        // Only the lines the panel shows: the log keeps more than that.
-        let log = state.log();
-        let log_lines: Vec<_> = log
-            .range(log.len().saturating_sub(LOG_LINES_SHOWN)..)
-            .cloned()
-            .collect();
         let is_running = matches!(phase, MigrationPhase::Running);
-        let is_finished = matches!(phase, MigrationPhase::Finished);
-        let saved_path = self.chosen_path.clone();
-
-        let progress_text: SharedString = if progress.keys_total > 0 {
-            format!(
-                "{} / {}   {}",
-                progress.keys_done,
-                progress.keys_total,
-                format_size(progress.bytes_done, DECIMAL)
-            )
-            .into()
-        } else {
-            "—".into()
-        };
-
-        let header = div()
-            .px_6()
-            .pt_6()
-            .child(
-                Label::new(self.title_label(cx))
-                    .text_lg()
-                    .font_weight(gpui::FontWeight::BOLD),
-            )
-            .child(
-                div()
-                    .pt_1()
-                    .child(Label::new(self.source_summary(cx)).text_sm().text_color(muted)),
-            )
-            .when_some(self.destination_summary(cx), |this, text| {
-                this.child(div().pt_1().child(Label::new(text).text_sm().text_color(muted)))
-            });
-
-        let status_section = div()
-            .px_6()
-            .pt_4()
-            .child(
-                h_flex()
-                    .gap_4()
-                    .child(Label::new(i18n_migration(cx, "status_label")).text_sm())
-                    .child(Label::new(phase_label(&phase, cx)).text_sm().text_color(muted)),
-            )
-            .child(
-                h_flex()
-                    .gap_4()
-                    .pt_1()
-                    .child(Label::new(i18n_migration(cx, "progress_label")).text_sm())
-                    .child(Label::new(progress_text).text_sm().text_color(muted)),
-            );
-
         let is_import = matches!(self.mode, MigrationWindowMode::Import { .. });
-        // Export: format choice — must be picked before the file dialog,
-        // since choosing a file starts the job immediately. Locked while
-        // running so the worker's format can't be pulled out from under it.
         let filtered_count = self.export_keys(cx).count();
         let total_count = match &self.mode {
             MigrationWindowMode::Export { keys, .. } => keys.len(),
@@ -651,429 +596,24 @@ impl Render for ZedisMigrationWindow {
         };
         let is_copy = self.is_copy();
         let target_is_source = self.target_is_source(cx);
-        let format_section = (!is_import).then(|| {
-            let format_labels = vec![
-                i18n_migration(cx, "format_binary").to_string(),
-                "JSON".to_string(),
-                "CSV".to_string(),
-            ];
-            let destination_labels = vec![
-                i18n_migration(cx, "destination_file").to_string(),
-                i18n_migration(cx, "destination_server").to_string(),
-            ];
-            let destination_index = match self.destination {
-                Destination::File => 0,
-                Destination::Server => 1,
-            };
-            v_flex()
-                .px_6()
-                .pt_3()
-                .gap_2()
-                .child(Label::new(i18n_migration(cx, "destination_label")).text_sm())
-                .child(
-                    RadioGroup::horizontal("migration-destination")
-                        .children(destination_labels)
-                        .selected_index(Some(destination_index))
-                        .disabled(is_running)
-                        .on_click(cx.listener(|this, index, _window, cx| {
-                            let destination = if *index == 1 {
-                                Destination::Server
-                            } else {
-                                Destination::File
-                            };
-                            this.set_destination(destination, cx);
-                        })),
-                )
-                .when(!is_copy, |this| {
-                    this.child(Label::new(i18n_migration(cx, "format_label")).text_sm().mt_1())
-                        .child(
-                            Label::new(i18n_migration(cx, "format_hint"))
-                                .text_xs()
-                                .text_color(muted),
-                        )
-                        .child(
-                            RadioGroup::horizontal("migration-export-format")
-                                .mt(px(4.))
-                                .children(format_labels)
-                                .selected_index(Some(self.export_format.index()))
-                                .disabled(is_running)
-                                .on_click(cx.listener(|this, index, _window, cx| {
-                                    this.export_format = ExportFormat::from_index(*index);
-                                    cx.notify();
-                                })),
-                        )
-                })
-                // Optional prefix filter over the handed-in key list, with a
-                // live matched/total count so the effect is visible before
-                // the job starts.
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .child(Label::new(i18n_migration(cx, "prefix_filter")).text_sm())
-                        .child(
-                            Input::new(&self.prefix_input_state)
-                                .small()
-                                .w(px(220.))
-                                .disabled(is_running),
-                        )
-                        .child(
-                            Label::new(SharedString::from(format!("{filtered_count}/{total_count}")))
-                                .text_xs()
-                                .text_color(muted),
-                        ),
-                )
-        });
-        // Copy to a server: the target, the conflict policy and the dry run
-        // — the import section's shape, with the keys coming from the
-        // source instead of a file.
-        let copy_section = is_copy.then(|| {
-            let selected = self.target_server_id.clone();
-            let mut server_row = h_flex().gap_2().flex_wrap();
-            for (id, name) in &self.servers {
-                let is_selected = selected.as_ref() == Some(id);
-                let id_click = id.clone();
-                let button = Button::new(SharedString::from(format!("migration-target-{id}")))
-                    .small()
-                    .label(name.clone())
-                    .disabled(is_running);
-                let button = if is_selected {
-                    button.primary()
-                } else {
-                    button.outline()
-                };
-                server_row = server_row.child(
-                    button.on_click(cx.listener(move |this, _, _window, cx| this.select_target(id_click.clone(), cx))),
-                );
-            }
-            let conflict_labels = vec![
-                i18n_migration(cx, "conflict_skip").to_string(),
-                i18n_migration(cx, "conflict_overwrite").to_string(),
-                i18n_migration(cx, "conflict_abort").to_string(),
-            ];
-            let preview_summary: SharedString = if self.preview_running {
-                i18n_migration(cx, "preview_copy_running")
-            } else if let Some(err) = &self.preview_error {
-                format!("{}: {err}", i18n_migration(cx, "preview_failed")).into()
-            } else if let Some(p) = &self.preview {
-                if p.cancelled {
-                    i18n_migration(cx, "preview_cancelled")
-                } else {
-                    i18n_migration(cx, "preview_copy_summary")
-                        .replace("{total}", &p.total.to_string())
-                        .replace("{conflicts}", &p.conflicting.to_string())
-                        .replace("{free}", &p.free.to_string())
-                        .into()
-                }
-            } else {
-                i18n_migration(cx, "preview_copy_idle")
-            };
-            let sample_lines: Vec<SharedString> = self
-                .preview
-                .as_ref()
-                .map(|p| p.sample_keys.iter().map(|k| SharedString::from(k.clone())).collect())
-                .unwrap_or_default();
-            v_flex()
-                .px_6()
-                .pt_3()
-                .gap_2()
-                .child(Label::new(i18n_copy(cx, "target_server")).text_sm())
-                .child(server_row)
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .child(Label::new(i18n_copy(cx, "target_db")).text_sm())
-                        .child(
-                            Input::new(&self.target_db_input)
-                                .small()
-                                .w(px(100.))
-                                .disabled(is_running),
-                        )
-                        .when(target_is_source, |this| {
-                            this.child(
-                                Label::new(i18n_migration(cx, "same_target_note"))
-                                    .text_xs()
-                                    .text_color(theme.yellow),
-                            )
-                        }),
-                )
-                .child(Label::new(i18n_migration(cx, "conflict_label")).text_sm().mt_1())
-                .child(
-                    RadioGroup::horizontal("migration-copy-conflict")
-                        .children(conflict_labels)
-                        .selected_index(Some(self.conflict_mode.index()))
-                        .disabled(is_running)
-                        .on_click(cx.listener(|this, index, _window, cx| {
-                            this.set_conflict_mode(ConflictMode::from_index(*index), cx);
-                        })),
-                )
-                .child(Label::new(preview_summary).text_xs().text_color(muted))
-                .when(!sample_lines.is_empty(), |this| {
-                    this.child(
-                        Label::new(i18n_migration(cx, "preview_sample_label"))
-                            .text_xs()
-                            .text_color(muted),
-                    )
-                    .child({
-                        let long = sample_lines.len() > 5;
-                        let block = v_flex()
-                            .border_1()
-                            .border_color(theme.border)
-                            .rounded(px(4.))
-                            .px_2()
-                            .py_1()
-                            .children(
-                                sample_lines
-                                    .into_iter()
-                                    .map(|k| Label::new(k).text_xs().text_color(theme.danger_foreground)),
-                            );
-                        if long {
-                            block.h(px(100.)).overflow_y_scrollbar().into_any_element()
-                        } else {
-                            block.into_any_element()
-                        }
-                    })
-                })
-                .child(
-                    Label::new(i18n_copy(cx, "version_note"))
-                        .text_xs()
-                        .text_color(theme.yellow),
-                )
-        });
-        let conflict_section = is_import.then(|| {
-            let selected = self.conflict_mode.index();
-            let labels = vec![
-                i18n_migration(cx, "conflict_skip").to_string(),
-                i18n_migration(cx, "conflict_overwrite").to_string(),
-                i18n_migration(cx, "conflict_abort").to_string(),
-            ];
-            let path_label: SharedString = self
-                .chosen_path
-                .as_ref()
-                .map(|p| p.display().to_string().into())
-                .unwrap_or_else(|| i18n_migration(cx, "no_file_chosen"));
-            let preview_summary: SharedString = if self.preview_running {
-                i18n_migration(cx, "preview_running")
-            } else if let Some(err) = &self.preview_error {
-                format!("{}: {err}", i18n_migration(cx, "preview_failed")).into()
-            } else if let Some(p) = &self.preview {
-                if p.cancelled {
-                    i18n_migration(cx, "preview_cancelled")
-                } else {
-                    i18n_migration(cx, "preview_summary")
-                        .replace("{total}", &p.total.to_string())
-                        .replace("{conflicts}", &p.conflicting.to_string())
-                        .replace("{free}", &p.free.to_string())
-                        .into()
-                }
-            } else {
-                i18n_migration(cx, "preview_idle")
-            };
-
-            let sample_lines: Vec<SharedString> = self
-                .preview
-                .as_ref()
-                .map(|p| p.sample_keys.iter().map(|k| SharedString::from(k.clone())).collect())
-                .unwrap_or_default();
-
-            v_flex()
-                .px_6()
-                .pt_3()
-                .gap_2()
-                .child(Label::new(i18n_migration(cx, "conflict_label")).text_sm())
-                .child(
-                    Label::new(i18n_migration(cx, "conflict_hint"))
-                        .text_xs()
-                        .text_color(muted),
-                )
-                .child(
-                    RadioGroup::horizontal("migration-conflict-mode")
-                        .mt(px(4.))
-                        .children(labels)
-                        .selected_index(Some(selected))
-                        .on_click(cx.listener(|this, index, _window, cx| {
-                            this.set_conflict_mode(ConflictMode::from_index(*index), cx);
-                        })),
-                )
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .child(Label::new(i18n_migration(cx, "file_label")).text_sm())
-                        .child(Label::new(path_label).text_xs().text_color(muted).text_ellipsis()),
-                )
-                .child(Label::new(preview_summary).text_xs().text_color(muted))
-                .when(!sample_lines.is_empty(), |this| {
-                    this.child(
-                        Label::new(i18n_migration(cx, "preview_sample_label"))
-                            .text_xs()
-                            .text_color(muted),
-                    )
-                    .child({
-                        // Same Scrollable/`max_h` pitfall as the update dialog:
-                        // a fixed height scrolls, `max_h` silently clips.
-                        let long = sample_lines.len() > 5;
-                        let block = v_flex()
-                            .border_1()
-                            .border_color(theme.border)
-                            .rounded(px(4.))
-                            .px_2()
-                            .py_1()
-                            .children(
-                                sample_lines
-                                    .into_iter()
-                                    .map(|k| Label::new(k).text_xs().text_color(theme.danger_foreground)),
-                            );
-                        if long {
-                            block.h(px(100.)).overflow_y_scrollbar().into_any_element()
-                        } else {
-                            block.into_any_element()
-                        }
-                    })
-                })
-        });
-
-        // v_flex, not div: a Block container would kill the child's flex
-        // sizing (see the CLAUDE.md gotcha), and the list box grows with
-        // the window via flex_1 instead of a fixed height.
-        let log_section = gpui_kit::component::v_flex()
-            .px_6()
-            .pt_4()
-            .flex_1()
-            .min_h_0()
-            .child(Label::new(i18n_migration(cx, "log_label")).text_sm().text_color(muted))
-            .child(
-                div()
-                    .mt_1()
-                    .flex_1()
-                    .w_full()
-                    .min_h_0()
-                    .border_1()
-                    .border_color(theme.border)
-                    .rounded(px(4.))
-                    .px_2()
-                    .py_1()
-                    .overflow_y_scrollbar()
-                    .children(log_lines.iter().map(|line| {
-                        let color = match line.status {
-                            LogStatus::Ok => theme.foreground,
-                            LogStatus::Skipped => muted,
-                            LogStatus::Failed => theme.danger_foreground,
-                        };
-                        let mut text = format!("{}    {}", format_size(line.bytes, DECIMAL), line.key);
-                        if let Some(msg) = &line.message {
-                            text.push_str("    — ");
-                            text.push_str(msg);
-                        }
-                        Label::new(SharedString::from(text)).text_xs().text_color(color)
-                    })),
-            );
-
-        let footer = {
-            let mut row = gpui_kit::component::h_flex().gap_2().justify_end().px_6().py_4();
-            row = row.child(
-                Button::new("migration-close")
-                    .ghost()
-                    .label(i18n_migration(cx, "close"))
-                    .on_click(cx.listener(|this, _, window, cx| this.handle_close(window, cx))),
-            );
-            if is_finished
-                && !is_copy
-                && let Some(_path) = &saved_path
-            {
-                row = row.child(
-                    Button::new("migration-reveal")
-                        .outline()
-                        .label(i18n_migration(cx, "reveal_in_finder"))
-                        .on_click(cx.listener(|this, _, _window, cx| this.handle_reveal(cx))),
-                );
-            }
-            if is_running || self.preview_running {
-                row = row.child(
-                    Button::new("migration-cancel")
-                        .danger()
-                        .label(i18n_migration(cx, "cancel"))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if this.preview_running {
-                                this.preview_cancel.store(true, Ordering::Release);
-                            } else {
-                                this.handle_cancel(cx);
-                            }
-                        })),
-                );
-            } else if is_import {
-                let has_file = self.chosen_path.is_some();
-                let pick_label = if has_file {
-                    i18n_migration(cx, "pick_file_again")
-                } else {
-                    i18n_migration(cx, "pick_file")
-                };
-                row = row
-                    .child(
-                        Button::new("migration-pick")
-                            .outline()
-                            .label(pick_label)
-                            .on_click(cx.listener(|this, _, window, cx| this.handle_pick_and_start(window, cx))),
-                    )
-                    .child(
-                        Button::new("migration-preview")
-                            .outline()
-                            .disabled(!has_file)
-                            .label(i18n_migration(cx, "preview_conflicts"))
-                            .on_click(cx.listener(|this, _, _, cx| this.handle_preview(cx))),
-                    )
-                    .child(
-                        Button::new("migration-start")
-                            .primary()
-                            .disabled(!has_file)
-                            .label(i18n_migration(cx, "start_import"))
-                            .on_click(cx.listener(|this, _, _, cx| this.handle_start_import(cx))),
-                    );
-            } else if is_copy {
-                let can_copy = self.target_server_id.is_some() && !target_is_source && filtered_count > 0;
-                let label_key = if matches!(phase, MigrationPhase::Idle) {
-                    "start_copy"
-                } else {
-                    "start_copy_again"
-                };
-                row = row
-                    .child(
-                        Button::new("migration-preview")
-                            .outline()
-                            .disabled(!can_copy)
-                            .label(i18n_migration(cx, "preview_conflicts"))
-                            .on_click(cx.listener(|this, _, _, cx| this.handle_preview(cx))),
-                    )
-                    .child(
-                        Button::new("migration-start")
-                            .primary()
-                            .disabled(!can_copy)
-                            .label(i18n_migration(cx, label_key))
-                            .on_click(cx.listener(|this, _, _, cx| this.start_copy(cx))),
-                    );
-            } else {
-                let (idle_key, again_key, disabled) = match &self.mode {
-                    MigrationWindowMode::Export { .. } => {
-                        ("save_and_export", "save_and_export_again", filtered_count == 0)
-                    }
-                    MigrationWindowMode::Import { .. } => ("pick_file", "pick_file_again", false),
-                };
-                let label_key = if matches!(phase, MigrationPhase::Idle) {
-                    idle_key
-                } else {
-                    again_key
-                };
-                row = row.child(
-                    Button::new("migration-start")
-                        .primary()
-                        .disabled(disabled)
-                        .label(i18n_migration(cx, label_key))
-                        .on_click(cx.listener(|this, _, window, cx| this.handle_pick_and_start(window, cx))),
-                );
-            }
-            row
+        let look = JobLook {
+            phase,
+            is_running,
+            is_import,
+            is_copy,
+            target_is_source,
+            filtered_count,
+            total_count,
+            muted,
         };
+
+        let header = self.header(&look, cx);
+        let status_section = self.status_section(&look, cx);
+        let format_section = (!is_import).then(|| self.export_section(&look, cx));
+        let copy_section = is_copy.then(|| self.copy_section(&look, cx));
+        let conflict_section = is_import.then(|| self.import_section(&look, cx));
+        let log_section = self.log_section(&look, cx);
+        let footer = self.footer(&look, cx);
 
         div()
             .size_full()
@@ -1178,4 +718,289 @@ pub fn open_migration_import_window(server_id: SharedString, server_name: Shared
         title,
         cx,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connection::{RedisServer, set_servers_cache};
+    use crate::test_support::{hold_the_server_list, init_ui};
+    use gpui::{AnyWindowHandle, ElementId, TestAppContext};
+    use gpui_kit::test::{TestQueryExt, TestWindowExt};
+
+    /// The process's server list as it was, put back when the test ends,
+    /// whether it passes or not.
+    struct Restore(Vec<RedisServer>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_servers_cache(std::mem::take(&mut self.0));
+        }
+    }
+
+    /// The server list as these tests need it, alone: the source and one
+    /// other connection to copy to.
+    fn own_servers() -> Restore {
+        let restore = Restore(get_servers().unwrap_or_default());
+        let server = |id: &str| RedisServer {
+            id: id.into(),
+            name: id.into(),
+            host: "127.0.0.1".into(),
+            port: 6379,
+            ..Default::default()
+        };
+        set_servers_cache(vec![server("migtest-a"), server("migtest-b")]);
+        restore
+    }
+
+    fn export_mode(preset: Option<CopyPreset>) -> MigrationWindowMode {
+        MigrationWindowMode::Export {
+            server_id: "migtest-a".into(),
+            server_name: "migtest-a".into(),
+            db: 0,
+            keys: vec!["user:1".into(), "user:2".into(), "order:1".into()],
+            source: ExportSource::Selection,
+            preset,
+        }
+    }
+
+    fn open(cx: &mut TestAppContext, mode: MigrationWindowMode) -> (AnyWindowHandle, Entity<ZedisMigrationWindow>) {
+        let mut view = None;
+        let handle = cx.open_window(size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), |window, cx| {
+            let migration = cx.new(|cx| ZedisMigrationWindow::new(mode, window, cx));
+            view = Some(migration.clone());
+            Root::new(migration, window, cx)
+        });
+        cx.run_until_parked();
+        (handle.into(), view.expect("the window built the view"))
+    }
+
+    /// `act` on a frame drawn afresh, and what follows from it run.
+    fn frame<T>(cx: &mut TestAppContext, handle: AnyWindowHandle, act: impl FnOnce(&mut Window, &mut App) -> T) -> T {
+        let out = cx
+            .update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                act(window, cx)
+            })
+            .expect("the window is open");
+        cx.run_until_parked();
+        out
+    }
+
+    fn type_into(cx: &mut TestAppContext, handle: AnyWindowHandle, input: &Entity<InputState>, text: &str) {
+        frame(cx, handle, |window, cx| {
+            input.update(cx, |state, cx| state.set_value(text, window, cx));
+        });
+    }
+
+    fn label(window: &Window, id: &'static str) -> Option<String> {
+        window.find(id).label().map(str::to_string)
+    }
+
+    /// How many choices the radio group `group` offers, none when it is not
+    /// drawn: the group's own id is not something a test can find, only the
+    /// radios under it are.
+    fn radios(window: &Window, group: &'static str) -> usize {
+        let group = ElementId::from(group);
+        window
+            .elements()
+            .iter()
+            .filter(|element| element.path().contains(&group))
+            .count()
+    }
+
+    /// An export goes to a file — in the format picked, of the keys the
+    /// prefix lets through, nothing to save when it lets none — or, the
+    /// other destination, to another server: no format then, the targets,
+    /// the conflict policy and a dry run, neither offered while the target
+    /// is the source on its own database. A dry run on its way has a Cancel
+    /// that stops it, in place of the buttons that would start another.
+    #[gpui::test]
+    fn an_export_goes_to_a_file_or_to_another_server(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let _list = hold_the_server_list();
+        let _restore = own_servers();
+        let (handle, view) = open(cx, export_mode(None));
+
+        frame(cx, handle, |window, cx| {
+            assert_eq!(radios(window, "migration-destination"), 2);
+            assert_eq!(radios(window, "migration-export-format"), 3);
+            assert_eq!(radios(window, "migration-copy-conflict"), 0);
+            assert_eq!(radios(window, "migration-conflict-mode"), 0);
+            assert_eq!(
+                window.within("migration-destination").find(0usize).checked(),
+                Some(true)
+            );
+            assert_eq!(
+                window.within("migration-export-format").find(0usize).checked(),
+                Some(true)
+            );
+            for absent in [
+                "migration-target-migtest-b",
+                "migration-preview",
+                "migration-pick",
+                "migration-cancel",
+                "migration-reveal",
+            ] {
+                assert!(window.try_find(absent).is_none(), "{absent}");
+            }
+            assert!(window.try_find("migration-close").is_some());
+            assert_eq!(window.find("migration-start").disabled(), None);
+            assert_eq!(
+                label(window, "migration-start").as_deref(),
+                Some(i18n_migration(cx, "save_and_export").as_ref())
+            );
+            window.within("migration-export-format").click(2usize, cx);
+        });
+        assert_eq!(view.read_with(cx, |view, _| view.export_format.index()), 2);
+
+        let prefix = view.read_with(cx, |view, _| view.prefix_input_state.clone());
+        type_into(cx, handle, &prefix, "zzz");
+        frame(cx, handle, |window, _| {
+            assert_eq!(window.find("migration-start").disabled(), Some(true), "no key passes");
+        });
+        type_into(cx, handle, &prefix, "order");
+        frame(cx, handle, |window, cx| {
+            assert_eq!(window.find("migration-start").disabled(), None, "one key passes");
+            window.within("migration-destination").click(1usize, cx);
+        });
+
+        frame(cx, handle, |window, cx| {
+            assert_eq!(radios(window, "migration-export-format"), 0, "a copy has no format");
+            assert_eq!(radios(window, "migration-copy-conflict"), 3);
+            assert_eq!(
+                window.within("migration-copy-conflict").find(0usize).checked(),
+                Some(true)
+            );
+            assert!(window.try_find("migration-target-migtest-a").is_some());
+            assert!(window.try_find("migration-target-migtest-b").is_some());
+            assert_eq!(window.find("migration-preview").disabled(), None);
+            assert_eq!(window.find("migration-start").disabled(), None);
+            assert_eq!(
+                label(window, "migration-start").as_deref(),
+                Some(i18n_migration(cx, "start_copy").as_ref())
+            );
+            window.click("migration-target-migtest-a", cx);
+        });
+        frame(cx, handle, |window, _| {
+            assert_eq!(window.find("migration-preview").disabled(), Some(true), "onto itself");
+            assert_eq!(window.find("migration-start").disabled(), Some(true), "onto itself");
+        });
+        let target_db = view.read_with(cx, |view, _| view.target_db_input.clone());
+        type_into(cx, handle, &target_db, "1");
+        frame(cx, handle, |window, cx| {
+            assert_eq!(window.find("migration-preview").disabled(), None, "another database");
+            assert_eq!(window.find("migration-start").disabled(), None, "another database");
+            window.within("migration-copy-conflict").click(2usize, cx);
+        });
+        assert_eq!(view.read_with(cx, |view, _| view.conflict_mode.index()), 2);
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        view.update(cx, |view, cx| {
+            view.preview_cancel = cancel.clone();
+            view.preview_running = true;
+            cx.notify();
+        });
+        frame(cx, handle, |window, cx| {
+            assert!(window.try_find("migration-preview").is_none());
+            assert!(window.try_find("migration-start").is_none());
+            window.click("migration-cancel", cx);
+        });
+        assert!(cancel.load(Ordering::Acquire), "Cancel stops the dry run");
+
+        view.update(cx, |view, cx| {
+            view.preview_running = false;
+            cx.notify();
+        });
+        frame(cx, handle, |window, cx| {
+            window.within("migration-destination").click(0usize, cx)
+        });
+        frame(cx, handle, |window, _| {
+            assert_eq!(
+                window.within("migration-export-format").find(2usize).checked(),
+                Some(true)
+            );
+            assert_eq!(radios(window, "migration-copy-conflict"), 0);
+        });
+    }
+
+    /// A copy handed its target opens on it: the server, the database and
+    /// the conflict policy the caller chose.
+    #[gpui::test]
+    fn a_copy_handed_its_target_opens_on_it(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let _list = hold_the_server_list();
+        let _restore = own_servers();
+        let preset = CopyPreset {
+            target_id: "migtest-b".into(),
+            target_db: 3,
+            conflict: ConflictMode::from_index(1),
+        };
+        let (handle, view) = open(cx, export_mode(Some(preset)));
+        frame(cx, handle, |window, _| {
+            assert_eq!(
+                window.within("migration-destination").find(1usize).checked(),
+                Some(true)
+            );
+            assert_eq!(
+                window.within("migration-copy-conflict").find(1usize).checked(),
+                Some(true)
+            );
+            assert_eq!(radios(window, "migration-export-format"), 0);
+        });
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.target_server_id.as_deref(), Some("migtest-b"));
+            assert_eq!(view.target_db(cx), 3);
+        });
+    }
+
+    /// An import asks for its file before it can preview or start; its
+    /// conflict policy is picked beside them, and Esc closes the window.
+    #[gpui::test]
+    fn an_import_asks_for_its_file_before_it_previews_or_starts(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let mode = MigrationWindowMode::Import {
+            server_id: "migtest-a".into(),
+            server_name: "migtest-a".into(),
+            db: 0,
+        };
+        let (handle, view) = open(cx, mode);
+        frame(cx, handle, |window, cx| {
+            assert_eq!(radios(window, "migration-destination"), 0);
+            assert_eq!(radios(window, "migration-export-format"), 0);
+            assert_eq!(radios(window, "migration-copy-conflict"), 0);
+            assert_eq!(radios(window, "migration-conflict-mode"), 3);
+            for absent in ["migration-cancel", "migration-reveal"] {
+                assert!(window.try_find(absent).is_none(), "{absent}");
+            }
+            assert_eq!(
+                window.within("migration-conflict-mode").find(0usize).checked(),
+                Some(true)
+            );
+            assert_eq!(window.find("migration-pick").disabled(), None);
+            assert_eq!(
+                label(window, "migration-pick").as_deref(),
+                Some(i18n_migration(cx, "pick_file").as_ref())
+            );
+            assert_eq!(window.find("migration-preview").disabled(), Some(true));
+            assert_eq!(window.find("migration-start").disabled(), Some(true));
+            window.within("migration-conflict-mode").click(1usize, cx);
+        });
+        assert_eq!(view.read_with(cx, |view, _| view.conflict_mode.index()), 1);
+
+        view.update(cx, |view, cx| {
+            view.chosen_path = Some(PathBuf::from("keys.zedis-dump"));
+            cx.notify();
+        });
+        frame(cx, handle, |window, cx| {
+            assert_eq!(
+                label(window, "migration-pick").as_deref(),
+                Some(i18n_migration(cx, "pick_file_again").as_ref())
+            );
+            assert_eq!(window.find("migration-preview").disabled(), None);
+            assert_eq!(window.find("migration-start").disabled(), None);
+            window.press("escape", cx);
+        });
+        assert!(cx.update_window(handle, |_, _, _| ()).is_err(), "Esc closes the window");
+    }
 }

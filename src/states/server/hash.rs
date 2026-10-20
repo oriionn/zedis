@@ -162,8 +162,8 @@ impl ZedisServerState {
             return;
         }
         // The value generation this write belongs to — see `value_epoch`.
-        let epoch = self.value_epoch;
-        let Some((key, value)) = self.try_get_mut_key_value() else {
+        let epoch = self.open.value_epoch;
+        let Some((key, value)) = self.open.try_get_mut_key_value() else {
             return;
         };
         let key_str = key.to_string();
@@ -185,10 +185,10 @@ impl ZedisServerState {
             move |this, result, cx| {
                 // Another value is on screen now (a key switch, a reload):
                 // its rows and status are not this write's to touch.
-                if this.value_epoch != epoch {
+                if this.open.value_epoch != epoch {
                     return;
                 }
-                if let Some(value) = this.value.as_mut() {
+                if let Some(value) = this.open.value.as_mut() {
                     value.status = RedisValueStatus::Idle;
                 }
 
@@ -238,8 +238,8 @@ impl ZedisServerState {
         // The field's value before the write, when it is on a loaded page. An
         // overwrite of an unloaded field is logged as an operation instead:
         // its old value is not known here, and guessing "added" would lie.
-        let log_key = self.key.clone();
-        let loaded_old = self.value.as_ref().and_then(|v| v.hash_value()).and_then(|h| {
+        let log_key = self.open.key.clone();
+        let loaded_old = self.open.value.as_ref().and_then(|v| v.hash_value()).and_then(|h| {
             h.values
                 .iter()
                 .find(|(f, _)| f.raw().as_ref() == field.as_bytes())
@@ -268,7 +268,7 @@ impl ZedisServerState {
                     };
                     this.record_changes(log_key, vec![entry]);
                 }
-                if let Some(RedisValueData::Hash(hash_data)) = this.value.as_mut().and_then(|v| v.data.as_mut()) {
+                if let Some(RedisValueData::Hash(hash_data)) = this.open.value.as_mut().and_then(|v| v.data.as_mut()) {
                     let hash = Arc::make_mut(hash_data);
                     hash.size += count;
                     let loaded = hash
@@ -341,8 +341,8 @@ impl ZedisServerState {
         let atomic = self.hsetex_available();
         let field_ttl = FieldTtl::from_editor(ttl);
 
-        let log_key = self.key.clone();
-        let log_old_value = self.value.as_ref().and_then(|v| v.hash_value()).and_then(|h| {
+        let log_key = self.open.key.clone();
+        let log_old_value = self.open.value.as_ref().and_then(|v| v.hash_value()).and_then(|h| {
             h.values
                 .iter()
                 .find(|(f, _)| f.raw() == old_field.raw())
@@ -445,7 +445,7 @@ impl ZedisServerState {
     /// * `keyword` - The search keyword to filter field names (will be wrapped with wildcards)
     /// * `cx` - GPUI context for UI updates
     pub fn filter_hash_value(&mut self, keyword: SharedString, cx: &mut Context<Self>) {
-        let Some(value) = self.value.as_mut() else {
+        let Some(value) = self.open.value.as_mut() else {
             return;
         };
         let Some(hash) = value.hash_value() else {
@@ -462,7 +462,7 @@ impl ZedisServerState {
         // A new scan: a page of the previous keyword still in flight is
         // dropped by the generation, so it cannot hold this one back either.
         value.status = RedisValueStatus::Idle;
-        self.next_value_epoch();
+        self.open.next_epoch();
 
         // Trigger load with the new filter
         self.load_more_hash_value(cx);
@@ -477,8 +477,8 @@ impl ZedisServerState {
     /// * `cx` - GPUI context for spawning async tasks and UI updates
     pub fn remove_hash_value(&mut self, remove_field: KvElement, cx: &mut Context<Self>) {
         let remove_field_clone = remove_field.clone();
-        let log_key = self.key.clone();
-        let log_old = self.value.as_ref().and_then(|v| v.hash_value()).and_then(|h| {
+        let log_key = self.open.key.clone();
+        let log_old = self.open.value.as_ref().and_then(|v| v.hash_value()).and_then(|h| {
             h.values
                 .iter()
                 .find(|(f, _)| f.raw() == remove_field.raw())
@@ -514,9 +514,9 @@ impl ZedisServerState {
         if remove_fields.is_empty() {
             return;
         }
-        let log_key = self.key.clone();
+        let log_key = self.open.key.clone();
         let log_removed: Vec<(String, Option<String>)> = {
-            let loaded = self.value.as_ref().and_then(|v| v.hash_value());
+            let loaded = self.open.value.as_ref().and_then(|v| v.hash_value());
             remove_fields
                 .iter()
                 .map(|field| {
@@ -564,7 +564,7 @@ impl ZedisServerState {
     /// # Arguments
     /// * `cx` - GPUI context for spawning async tasks and UI updates
     pub fn load_more_hash_value(&mut self, cx: &mut Context<Self>) {
-        let Some((key, value)) = self.try_get_mut_key_value() else {
+        let Some((key, value)) = self.open.try_get_mut_key_value() else {
             return;
         };
 
@@ -580,7 +580,7 @@ impl ZedisServerState {
 
         let at = self.at();
         let supports_field_ttl = self.supports_hash_field_ttl();
-        let epoch = self.value_epoch;
+        let epoch = self.open.value_epoch;
         cx.emit(ServerEvent::ValuePaginationStarted);
 
         self.spawn_with_arg(
@@ -610,12 +610,13 @@ impl ZedisServerState {
                 // A page of another value — another key, a reload, an older
                 // filter — would append its fields and carry its cursor on
                 // over this one.
-                if this.value_epoch != epoch {
+                if this.open.value_epoch != epoch {
                     return;
                 }
                 let mut should_load_more = false;
                 if let Ok((new_cursor, new_values, new_ttls)) = result
-                    && let Some(RedisValueData::Hash(hash_data)) = this.value.as_mut().and_then(|v| v.data.as_mut())
+                    && let Some(RedisValueData::Hash(hash_data)) =
+                        this.open.value.as_mut().and_then(|v| v.data.as_mut())
                 {
                     let hash = Arc::make_mut(hash_data);
                     hash.cursor = new_cursor;
@@ -639,7 +640,7 @@ impl ZedisServerState {
                 cx.emit(ServerEvent::ValuePaginationFinished);
 
                 // Reset status to idle
-                if let Some(value) = this.value.as_mut() {
+                if let Some(value) = this.open.value.as_mut() {
                     value.status = RedisValueStatus::Idle;
                 }
                 cx.notify();

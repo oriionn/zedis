@@ -112,8 +112,8 @@ impl ZedisServerState {
             return;
         }
         // The value generation this write belongs to — see `value_epoch`.
-        let epoch = self.value_epoch;
-        let Some((key, value)) = self.try_get_mut_key_value() else {
+        let epoch = self.open.value_epoch;
+        let Some((key, value)) = self.open.try_get_mut_key_value() else {
             return;
         };
         let key_str = key.to_string();
@@ -135,10 +135,10 @@ impl ZedisServerState {
             move |this, result, cx| {
                 // Another value is on screen now (a key switch, a reload):
                 // its rows and status are not this write's to touch.
-                if this.value_epoch != epoch {
+                if this.open.value_epoch != epoch {
                     return;
                 }
-                if let Some(value) = this.value.as_mut() {
+                if let Some(value) = this.open.value.as_mut() {
                     value.status = RedisValueStatus::Idle;
                 }
 
@@ -163,7 +163,7 @@ impl ZedisServerState {
         let new_value = KvElement::from_raw(new_value);
         let old_value_clone = old_value.clone();
         let new_value_clone = new_value.clone();
-        let log_key = self.key.clone();
+        let log_key = self.open.key.clone();
         let log_old = old_value.text().to_string();
         let log_new = new_value.text().to_string();
 
@@ -204,7 +204,7 @@ impl ZedisServerState {
     /// * `cx` - GPUI context for spawning async tasks and UI updates
     pub fn add_set_value(&mut self, new_value: SharedString, cx: &mut Context<Self>) {
         let val_clone = KvElement::from_text(&new_value);
-        let log_key = self.key.clone();
+        let log_key = self.open.key.clone();
         let log_member = new_value.to_string();
 
         self.exec_set_op(
@@ -222,7 +222,9 @@ impl ZedisServerState {
                 }
                 if !added {
                     this.emit_warning_notification(i18n_set_editor(cx, "add_value_exists_tips"), cx);
-                } else if let Some(RedisValueData::Set(set_data)) = this.value.as_mut().and_then(|v| v.data.as_mut()) {
+                } else if let Some(RedisValueData::Set(set_data)) =
+                    this.open.value.as_mut().and_then(|v| v.data.as_mut())
+                {
                     let set = Arc::make_mut(set_data);
                     set.size += 1;
                     // Only append to UI if scan is complete to maintain consistency
@@ -250,7 +252,7 @@ impl ZedisServerState {
     /// * `keyword` - The search keyword to filter members (will be wrapped with wildcards)
     /// * `cx` - GPUI context for UI updates
     pub fn filter_set_value(&mut self, keyword: SharedString, cx: &mut Context<Self>) {
-        let Some(value) = self.value.as_mut() else {
+        let Some(value) = self.open.value.as_mut() else {
             return;
         };
         let Some(set) = value.set_value() else {
@@ -267,7 +269,7 @@ impl ZedisServerState {
         // A new scan: a page of the previous keyword still in flight is
         // dropped by the generation, so it cannot hold this one back either.
         value.status = RedisValueStatus::Idle;
-        self.next_value_epoch();
+        self.open.next_epoch();
 
         // Trigger load with the new filter
         self.load_more_set_value(cx);
@@ -281,7 +283,7 @@ impl ZedisServerState {
     /// # Arguments
     /// * `cx` - GPUI context for spawning async tasks and UI updates
     pub fn load_more_set_value(&mut self, cx: &mut Context<Self>) {
-        let Some((key, value)) = self.try_get_mut_key_value() else {
+        let Some((key, value)) = self.open.try_get_mut_key_value() else {
             return;
         };
 
@@ -295,7 +297,7 @@ impl ZedisServerState {
         cx.notify();
 
         let at = self.at();
-        let epoch = self.value_epoch;
+        let epoch = self.open.value_epoch;
         cx.emit(ServerEvent::ValuePaginationStarted);
 
         let keyword_clone = keyword.clone().unwrap_or_default();
@@ -315,13 +317,13 @@ impl ZedisServerState {
                 // A page of another value — another key, a reload, an older
                 // filter — would append its members and carry its cursor on
                 // over this one.
-                if this.value_epoch != epoch {
+                if this.open.value_epoch != epoch {
                     return;
                 }
                 let mut should_load_more = false;
 
                 if let Ok((new_cursor, new_values)) = result
-                    && let Some(RedisValueData::Set(set_data)) = this.value.as_mut().and_then(|v| v.data.as_mut())
+                    && let Some(RedisValueData::Set(set_data)) = this.open.value.as_mut().and_then(|v| v.data.as_mut())
                 {
                     let set = Arc::make_mut(set_data);
                     set.cursor = new_cursor;
@@ -346,7 +348,7 @@ impl ZedisServerState {
                 cx.emit(ServerEvent::ValuePaginationFinished);
 
                 // Reset status to idle
-                if let Some(value) = this.value.as_mut() {
+                if let Some(value) = this.open.value.as_mut() {
                     value.status = RedisValueStatus::Idle;
                 }
                 cx.notify();
@@ -369,7 +371,7 @@ impl ZedisServerState {
     /// * `cx` - GPUI context for spawning async tasks and UI updates
     pub fn remove_set_value(&mut self, remove_value: KvElement, cx: &mut Context<Self>) {
         let val_clone = remove_value.clone();
-        let log_key = self.key.clone();
+        let log_key = self.open.key.clone();
         let log_member = remove_value.text().to_string();
 
         self.exec_set_op(
@@ -402,7 +404,7 @@ impl ZedisServerState {
         if remove_values.is_empty() {
             return;
         }
-        let log_key = self.key.clone();
+        let log_key = self.open.key.clone();
         let log_members: Vec<String> = remove_values.iter().map(|m| m.text().to_string()).collect();
         let gone: HashSet<Bytes> = remove_values.iter().map(|v| v.raw().clone()).collect();
         self.exec_set_op(

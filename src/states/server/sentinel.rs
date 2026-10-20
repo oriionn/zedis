@@ -42,7 +42,7 @@ impl ZedisServerState {
     /// The monitored masters as the sentinels describe them (quorum, timing,
     /// down flags); empty until [`Self::load_sentinel_masters`] answers.
     pub fn sentinel_masters(&self) -> &[SentinelMaster] {
-        &self.sentinel_masters
+        self.facts.sentinel_masters()
     }
 
     /// `SENTINEL MASTERS` from the first reachable sentinel; emits
@@ -57,7 +57,7 @@ impl ZedisServerState {
             },
             move |this, result, cx| {
                 if let Ok(masters) = result {
-                    this.sentinel_masters = masters;
+                    this.facts.set_sentinel_masters(masters);
                     cx.emit(ServerEvent::SentinelInfoUpdated);
                     cx.notify();
                 }
@@ -332,7 +332,8 @@ impl ZedisServerState {
     /// After a connect: the sentinel monitors several masters and the entry
     /// named none, so the first was taken — say which, once per connect.
     pub(crate) fn note_sentinel_master_choice(&mut self, cx: &mut Context<Self>) {
-        let names = &self.nodes_description.sentinel_master_names;
+        let description = self.facts.nodes_description();
+        let names = &description.sentinel_master_names;
         if names.len() < 2 {
             return;
         }
@@ -343,12 +344,7 @@ impl ZedisServerState {
         if configured {
             return;
         }
-        let Some(current) = self
-            .nodes_description
-            .topology
-            .first()
-            .map(|m| m.master.master_name.clone())
-        else {
+        let Some(current) = description.topology.first().map(|m| m.master.master_name.clone()) else {
             return;
         };
         let locale = self.locale(cx);

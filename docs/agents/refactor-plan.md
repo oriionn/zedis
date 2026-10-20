@@ -32,7 +32,7 @@ route instead.
 | `src/views` | 81.0k | 113 files; grouped below |
 | `zedis-connection` | 33.1k | + `tests/live.rs` 8.4k in one file |
 | `zedis-bridge` | 22.7k | `api.rs` 3.2k (2.2k without tests) |
-| `src/states` | 19.6k | `ZedisServerState`: 76 fields, 323 public methods over 20 files, 76 `ServerTask` variants |
+| `src/states` | 19.6k | `ZedisServerState`: 76 fields, 282 methods (231 not private) over 16 files, 76 `ServerTask` variants |
 | `zedis-core` | 12.6k | |
 | `src/helpers` | 6.6k | `updater.rs` 1.6k |
 | `zedis-db` | 5.7k | |
@@ -319,12 +319,63 @@ Done so far:
   read, a change and a write. Shown to fail with the original mutated: the
   first card's Up enabled, a card's click not connecting, Clone offered
   read-only.
+- `key_tree/actions.rs` `render`, 482 → 27 lines: its four listeners as
+  functions (`on_query_mode`, `on_type_filter`, `on_tree_action` — the
+  dispatch, 154 lines of one arm an action — and `on_editor_action`), and
+  what an action does to keys to `key_tree/key_actions.rs`, one function an
+  arm: tag and note, favorites and recent keys, delete, Remove TTL, set TTL
+  and export, each for the picks, a folder or one key. The picks' read, five
+  copies of the same eight lines, is `picked_keys`. Two UI tests came first:
+  `the_trees_actions_set_what_they_name` (the query modes, the type and TTL
+  filters, the regex switch, the selection) and
+  `the_trees_actions_ask_what_they_have_to` (which question each action
+  opens — none, a confirm, the TTL dialog — the picks' only when there are
+  picks). The first sends no server: a selected server makes a query mode a
+  write of the session file, off the scheduler's threads. Shown to fail
+  with the original mutated: the TTL dialog for no picks, the Hash filter
+  picking sets, the multi-key confirm inverted, the regex switch not set.
+- `root.rs` `render`, 452 → 81 lines: what a frame does before it draws
+  (the placement saved, notices left to say, the pending prompts, the font
+  size, a tab asked for) as `prepare_frame`, and the fourteen action
+  listeners as functions in `root/handlers.rs` (`on_theme` … `on_nav`;
+  `on_server_tool`, 140 lines, is one arm a tool). Three UI tests came
+  first: `the_roots_actions_change_what_they_name` (language, zoom, theme,
+  the Protos and Scripts pages, a tool's route), `the_roots_tabs_follow_their_actions`
+  (a tab built on the next frame, ⌘1, Close, ⌘W) and
+  `the_root_opens_its_dialogs` (the welcome card, Esc closing a dialog
+  first, the tools that are dialogs). Shown to fail with the original
+  mutated: a language saved as another, ⌘1 not switching, Esc not closing
+  the dialog, Monitor going to Config.
+- `migration_window.rs` `render`, 522 → 56 lines: what the sections are
+  drawn with read once into a `JobLook`, and the sections to
+  `migration_window/sections.rs` — `header`, `status_section`,
+  `export_section` (destination, format, prefix), `copy_section`,
+  `import_section`, `log_section`, `footer`. The copy and the import each
+  had the same dry-run block: the sample box is `sample_block`, the sample
+  list `preview_sample`, and the summary, which differed only in its three
+  locale keys, `preview_summary(running, summary, idle)` — the split
+  script asserts the copies were the same lines before folding them. The
+  window had no test; three came first:
+  `an_export_goes_to_a_file_or_to_another_server` (format, prefix filter,
+  destination, targets, copying onto itself, the conflict policy, a dry
+  run's Cancel), `a_copy_handed_its_target_opens_on_it` and
+  `an_import_asks_for_its_file_before_it_previews_or_starts` (and Esc
+  closes the window). A radio group's own id is not something a test can
+  find — only its radios — so "not drawn" is counted through the radios'
+  paths (`radios`); the first version asked for the group and passed
+  whether it was there or not, which the mutation run showed. Shown to
+  fail with the original mutated: nothing to export still offered, Preview
+  before a file, the copy's policy not shown, a format offered for a copy,
+  Esc ignored, copying onto itself allowed, Cancel not stopping the dry
+  run. Not reachable from the tests: a running or finished job (the phase
+  is set by the worker only, so Reveal and the locked controls are
+  unchecked) and the plain labels — title, summaries, the log.
 
 ### Phase 3 — the state layer (largest payoff, highest risk)
 
 `ZedisServerState` is the source of truth for one connection and has grown to
-76 fields and 323 public methods. Analysis first, as a written map, then
-steps:
+76 fields and 282 methods (231 of them not private) over 16 files.
+Analysis first, as a written map, then steps:
 
 1. Map every field to the methods that read and write it, and group them:
    the selected key and its value, the key list and scan, link health and
@@ -341,6 +392,190 @@ steps:
 Acceptance per step: the state's tests and the views' UI tests pass
 unchanged; events (`ServerEvent`) fire in the same order for the same action
 — where a test does not already show that, one is added first.
+
+#### The field map (step 1, 2026-10-20)
+
+Found by the compiler, not by a pattern: in a copy, every field was renamed
+and `cargo check --lib --tests` run, so each "no field" error is one access,
+whatever the receiver is called (`self`, a callback's `this` or `state`).
+722 accesses: 653 in methods, 69 in tests, none anywhere else. The fields are
+private, so that is all of them. 72 methods touch no field and only call
+other methods. The 323 counted earlier included the other types' methods in
+the same files.
+
+The groups, with `server_id` and `db` left out as the identity nearly every
+method reads (54 and 14 methods). "Alone" counts the methods that touch this
+group's fields and no other group's; "with others" leaves out `select` and
+`reset`, which touch every group because they start and end a session.
+
+| Group | Fields | Methods | Alone | With others |
+|---|---|---|---|---|
+| lock — the write lock and access mode | 3 | 11 | 9 | none |
+| prefs — the tree and editor settings resolved for this connection | 6 | 9 | 7 | `sync_tree_ttl` (scan) |
+| panels — what panels left for the session | 3 | 10 | 6 | `cluster_reshard`, `cluster_rebalance` (link) |
+| terminal | 1 | 5 | 2 | `change_channel_mode`, `select_key` (value, scan) |
+| metrics — what the heartbeat and DBSIZE brought | 10 | 18 | 12 | `refresh_redis_info` (link, facts), `refresh_dbsize_now` (link), `reload_topology` (facts), `flush_database` (scan, value) |
+| link — health, heartbeat pacing, load retries | 16 | 24 | 17 | `refresh_redis_info` (metrics, facts), `refresh_dbsize_now` (metrics), `begin_task` (scan), the two cluster tasks (panels) |
+| facts — what a connect learned | 8 | 25 | 17 | `refresh_redis_info` (metrics, link), `reload_topology` (metrics), `get_value`, `scan_keys` (scan, value), `handle_auto_refresh` (scan), `refresh_value_header` (value) |
+| scan — the loaded keys and the scan | 19 | 49 | 36 | 11, below |
+| value — the open key, its value, its history | 7 | 72 | 61 | 10, below |
+| errors | 1 | 1 | 1 | none |
+
+The fields of each:
+
+- **lock**: `access_mode`, `write_unlocked_until`, `unlock_task`.
+- **prefs**: `key_separator`, `key_scan_count`, `max_key_tree_depth`,
+  `auto_expand_threshold`, `show_key_tree_ttl`, `soft_wrap`.
+- **panels**: `report_findings`, `info_snapshot`, `reshard_progress`.
+- **terminal**: `terminal`.
+- **metrics**: `redis_info`, `dbsize`, `last_dbsize_refreshed_at`,
+  `dbsize_refresh_inflight`, `dbsize_refresh_again`,
+  `last_slow_logs_checked_at`, `last_slow_log_count`, `slow_logs`,
+  `slow_logs_generation`, `client_pause`.
+- **link**: `server_status`, `connection_health`, `last_connection_error`,
+  `ping_failures`, `manually_offline`, `link_failure`, `last_offline_notice`,
+  `last_link_notice`, `background`, `last_background_refresh`,
+  `heartbeat_retry_at`, `last_heartbeat_at`, `heartbeat_in_flight`,
+  `load_retry_pending`, `load_retries`, `load_retry_running`.
+- **facts**: `version`, `nodes`, `nodes_description`, `databases`,
+  `supports_rejson`, `supports_search`, `features`, `sentinel_masters`.
+- **scan**: `keyword`, `cursors`, `scanning`, `scan_completed`,
+  `scan_times`, `scan_epoch`, `key_tree_id`, `loaded_prefixes`,
+  `scanning_prefixes`, `complete_before_refresh`, `incomplete_prefixes`,
+  `keys`, `listed_keys`, `key_ttls`, `keys_superseded_by_next_batch`,
+  `type_filter`, `regex_keyword`, `query_mode`, `search_history`.
+- **value**: `key`, `value`, `value_epoch`, `size_gate_bypassed`,
+  `size_gate_preview`, `size_gate_pending`, `histories`.
+- **errors**: `error_messages`.
+
+Where the groups meet, field by field (a `*` is a write):
+
+- scan and value meet in the key operations that change the tree and the
+  open key together: `select_key` (`keys*`, `key*`, `value*`, `histories`,
+  `terminal*`), `rename_key`, `forget_deleted_keys`, `batch_set_ttl_keys`,
+  `batch_set_ttl_folder` (`key`, `key_tree_id*`, `key_ttls*`),
+  `flush_database` (both, and `dbsize*`), `get_value` and `scan_keys` (both,
+  and `features` / `nodes`).
+- `handle_auto_refresh` reads `nodes` for a scan; `refresh_value_header`
+  reads `features` for the value's header.
+- `begin_task` sets `scanning` beside `server_status`.
+- `refresh_redis_info`, the heartbeat, is the one method across link,
+  metrics and facts: the pacing fields, `redis_info*`, `dbsize*`, the slow
+  log, and `nodes`.
+- `refresh_dbsize_now` and the cluster reshard / rebalance read
+  `manually_offline` before they go out.
+- `sync_tree_ttl` reads `show_key_tree_ttl` to decide whether to fill
+  `key_ttls`.
+
+Through calls rather than fields: `can` (facts) asks `readonly` (lock);
+`toggle_readonly` (lock) and `settle_task` (link) add to `error_messages`;
+`note_link_error` (link) reads `nodes_description`; `note_ping_result`
+(link) runs `on_link_restored` (value); `resume_heartbeat`,
+`kill_running_script` and `unpause_clients` run `refresh_redis_info`.
+
+What `reset` keeps, which a sub-struct has to keep too: it does not touch
+`db`, `databases`, `search_history`, the six prefs, `access_mode`,
+`supports_rejson`, `supports_search`, `features`, `query_mode`, `soft_wrap`,
+`server_status`, `load_retries`, `load_retry_running`, `last_offline_notice`,
+`last_link_notice`, `background`, `last_background_refresh` and
+`error_messages`. `select` sets all but the last five again — `databases`,
+`access_mode` and the two `supports_*` only once its connect lands,
+`search_history` only when the history can be read. So a group's reset is
+not its `Default`: `lock` keeps `access_mode`, `link` seven of its sixteen
+fields, `facts` four of its eight, and `prefs` is not reset at all.
+`clear_if_removed` resets without a `select` after it, so there the kept
+values stay as the removed server left them.
+
+What this means for step 2, in order:
+
+1. **lock** first: three fields, nothing else touches them, nine of its
+   eleven methods are its own. Four are plain reads (`readonly`,
+   `strict_readonly`, `unlock_remaining`, `write_gate`); the five that
+   notify, spawn or time out stay on the state and call into it.
+2. **prefs**: six fields `select` resolves from the entry and Settings and
+   nothing but `sync_tree_ttl` reads outside their getters. The resolving
+   moves with them.
+3. **panels** and **terminal**: plain getters and setters; small, low value,
+   done when they are in the way.
+4. **metrics**, then **link**: most of their own methods are plain
+   (`finish_dbsize_refresh`, `request_dbsize_refresh`, `take_load_retry`,
+   `link_problem`, `note_link_failure`, `set_background`); the heartbeat,
+   `refresh_redis_info`, stays on the state and reaches into both.
+5. **facts**: the feature matrix (`can`, `blocked_by`, `command_block`,
+   `panel_block`) is the core of it and plain.
+6. **scan** and **value** last: the largest, and eight key operations change
+   both. They are worth splitting only together with `key.rs` (2.6k lines),
+   which is where all eight live.
+
+#### Steps 2 and 3, done (2026-10-20)
+
+The state is its identity (`server_id`, `db`), seven sub-structs — each in a
+module of `server/` — and five fields left as they were:
+
+| Field | Type, module | What moved onto it | Fields private |
+|---|---|---|---|
+| `lock` | `WriteLock`, `write_lock.rs` | the access mode and the window: `readonly`, `strict_readonly`, `remaining`, `open`, `close`, `refuse`, `toggle`, `forget_window`, `keep_window_from` | 3 of 3 |
+| `prefs` | `ConnectionPrefs`, `prefs.rs` | `resolve_tree` (what `select` did inline: the entry's settings, else the app's) and the getters' clamping | 6 of 6 |
+| `readings` | `Readings`, `readings.rs` | the `DBSIZE` bookkeeping (`request_dbsize_refresh`, `finish_dbsize_refresh`, `note_dbsize`, `note_beat_dbsize`, `flushed`), the slow-log sample, the client pause, `reset` | 10 of 10 |
+| `link` | `Link`, `link.rs` | the heartbeat's pacing (`beat_due`, with the backoff and its constants), the ping's outcome (`note_ping` → `PingOutcome`), `go_offline`, the load retries, the two notice throttles (one of them written out twice before), `problem`, `reset` | 4 of 16 — the heartbeat callback, `select`, the task dispatch and the tests read the rest |
+| `facts` | `ServerFacts`, `facts.rs` | the feature matrix's questions (`blocked_by`, `panel_block`, `command_block`), `supports`, `set_topology`, `note_connect`, `reset` | 8 of 8 |
+| `scan` | `KeyScan`, `scan.rs` | `reset` (the scan's half of `reset_scan`), `extend`, `forget_key`, `forget_keys_where`, `forget_server`, `renew_tree_id` (twelve copies of the line before), `listed_count` | none — `key.rs`'s scan engine reads and writes all of them from its tasks |
+| `open` | `OpenKey`, `open_key.rs` | `next_epoch`, `close` (two copies before), `forget_server`, `try_get_mut_key_value` | none — every editor reads them |
+
+Left as fields: `report_findings`, `reshard_progress` and `info_snapshot`
+(three panels' leftovers with nothing in common but a getter and a setter
+each), `terminal` (a bool) and `error_messages`. A struct around them would
+name nothing.
+
+`reset` now reads as what it is: each group's own reset, each keeping
+exactly what it kept before (*What `reset` keeps*, above). Field writes inside
+one update are not observable in between — events are delivered after it —
+so gathering a group's lines into one call changes nothing anybody sees.
+
+How it was moved: each group's fields nested by a script, every access
+rewritten at the span the compiler reported (desktop, tests and the wasm
+build); then the group's methods that need no `Context` moved onto it, the
+state's public methods kept as one-line delegates, so no caller outside
+`states/server` changed. What emits, spawns or times out
+stayed on the state, and the visibility of each field is what the compiler
+asked for: every field made private, `pub(super)` put back only where it
+reported one reached from outside.
+
+Tests that came first, each shown to fail in a worktree with the code it
+guards mutated (`test_support::record_events` is the event recorder they
+share):
+
+- `the_write_window_opens_closes_and_runs_out_in_order` — lock. Mutated: no
+  announcement on re-lock; a window opened on a strict connection; the timer
+  kept *and* the expiry's guard removed, one round, since each alone is
+  covered by the other.
+- `a_selected_connection_takes_its_tree_settings_from_settings` — prefs,
+  through `select`. The entry's own settings, which `select` cannot reach
+  without dialing, are `an_entry_s_own_tree_settings_win_over_the_apps` on
+  `resolve_tree` after the move.
+- `a_forced_probe_forgets_the_matrix_before_it_asks` — facts.
+- `a_cleared_slow_log_is_a_new_generation_and_a_pause_shows_until_lifted` —
+  readings.
+- `the_heartbeat_moves_the_health_and_announces_only_a_change` and
+  `a_beat_goes_out_only_when_it_is_due` — link. The second's last step at
+  first proved nothing (a tab back in the foreground is not throttled whether
+  or not its window was reset), which the mutation run showed; it now sends
+  the tab back to the background.
+- `a_new_query_announces_the_emptied_tree_and_a_refresh_does_not` — scan.
+
+`note_command_error` has no test: it needs a `redis::RedisError`, which the
+GUI crate cannot build. Only the path of the field it writes changed.
+
+Step 3, `ServerTask`: a variant per operation stays. It is the task's name in
+the logs and the category of its error line (`[delete_key] …`), which the
+status bar shows; grouping variants would change what the user reads. What
+it also carried was a classification written twice — the background
+refreshes, in `settle_task` and in the status bar — and that is
+`ServerTask::is_background_refresh` now, with a test.
+
+Found on the way: `an_entry_comes_back_from_its_form_as_it_went_in` (phase 2)
+waited five seconds for the list's write and ran out once when the whole
+suite ran on a loaded machine; it waits thirty.
 
 ### Phase 4 — the target-gate audit
 
@@ -369,8 +604,8 @@ is reported, not silently fixed.
 
 - `status_bar.rs` (2.0k without tests): the tools menu, the server status
   chip and the metric chips into submodules.
-- `root.rs` `render` (452): the overlays, the tab strip and the pending
-  prompts into methods.
+- `root.rs`: its `render` was split in phase 2; what is left is the tab
+  strip and the overlays as methods, if they still read long.
 - Observability panels: confirm each read-only grid is a `ZedisTextTable` and
   each sampling loop a `PanelPoll`; a panel that still has its own is a step.
 - Administration tools: confirm every destructive action goes through
@@ -400,12 +635,14 @@ a wire field or a test name CI selects by.
 
 | Phase | Step | Status | Commit |
 |---|---|---|---|
-| 1 | `api.rs` split | done | (pending) |
-| 1 | `main.rs` setup functions | done | (pending) |
-| 1 | `accounts.rs` seams (analysis) | done | (pending) |
-| 1 | `accounts.rs` split | done | (pending) |
-| 2 | eleven long functions | 8 of 11 (with the bridge's `main`, phase 1); left: `migration_window` `render`, `key_tree/actions.rs` `render`, `root.rs` `render` | (pending) |
-| 3 | `ZedisServerState` field map | not started | |
+| 1 | `api.rs` split | done | `3fd44e2` |
+| 1 | `main.rs` setup functions | done | `3fd44e2` |
+| 1 | `accounts.rs` seams (analysis) | done | `3fd44e2` |
+| 1 | `accounts.rs` split | done | `3fd44e2` |
+| 2 | eleven long functions | done (with the bridge's `main`, phase 1) | seven in `5590760`; the tree's actions, the root's and the migration window's `render` (pending) |
+| 3 | `ZedisServerState` field map | done: groups, where they meet, what `reset` keeps, the order for step 2 | (pending) |
+| 3 | sub-structs | done: seven groups; the panels' three fields, `terminal` and the errors left as fields | (pending) |
+| 3 | `ServerTask` | done: a variant per operation kept; the background refreshes named once | (pending) |
 | 4 | gate inventory | not started | |
 | 5 | operations ↔ live tests check | not started | |
 | 5 | `tests/live.rs` split | not started | |

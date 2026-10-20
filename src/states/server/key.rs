@@ -51,7 +51,6 @@ use rust_i18n::t;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
-use uuid::Uuid;
 use zedis_core::change_log::ChangeEntry;
 
 /// What a value's `expire_at` reads after `EXPIRE` (`Some` seconds from
@@ -203,9 +202,10 @@ impl ZedisServerState {
         // Filter keys that need type resolution
         let binding = prefix.unwrap_or_default();
         let prefix = binding.as_str();
-        let count = self.keys.len();
+        let count = self.scan.keys.len();
         let separator = self.key_separator();
         let mut keys = self
+            .scan
             .keys
             .iter()
             .filter_map(|(key, value)| {
@@ -247,12 +247,12 @@ impl ZedisServerState {
                 if let Ok(types) = result {
                     // Update local state with fetched types
                     for (key, value) in types {
-                        if let Some(k) = this.keys.get_mut(&key) {
+                        if let Some(k) = this.scan.keys.get_mut(&key) {
                             *k = KeyType::from(value.as_str());
                         }
                     }
                     // Trigger UI update by changing the tree ID
-                    this.key_tree_id = Uuid::now_v7().to_string().into();
+                    this.scan.renew_tree_id();
                 }
                 cx.notify();
             },
@@ -266,10 +266,10 @@ impl ZedisServerState {
     pub(crate) fn scan_keys(&mut self, server_id: SharedString, keyword: SharedString, cx: &mut Context<Self>) {
         let at = self.at();
         // Guard clause: ignore if the context has changed (e.g., switched server)
-        if self.server_id != server_id || self.keyword != keyword {
+        if self.server_id != server_id || self.scan.keyword != keyword {
             return;
         }
-        let cursors = self.cursors.clone();
+        let cursors = self.scan.cursors.clone();
         let processing_server = server_id.clone();
         let processing_keyword = keyword.clone();
         let key_scan_count = self.key_scan_count();
@@ -279,13 +279,13 @@ impl ZedisServerState {
         // many in a single SCAN round), capped so a large cluster can't pull an
         // unbounded batch at once. `scan_times` grows the target by one batch
         // on each "load more". Standalone => masters = 1.
-        let masters = self.nodes.0.max(1);
+        let masters = self.facts.nodes().0.max(1);
         let per_page = key_scan_count.saturating_mul(masters).min(SCAN_RESULT_MAX_CAP);
-        let max = (self.scan_times + 1) * per_page;
+        let max = (self.scan.scan_times + 1) * per_page;
         // Describe this scan round in the task log: per-round COUNT and how many
         // keys are already loaded (the effective offset into the overall scan),
         // plus the match pattern when a keyword filter is active.
-        let offset = self.keys.len();
+        let offset = self.scan.keys.len();
         // A regex keyword has no glob to send: the scan asks for every name
         // and `name_filter` narrows each page as it arrives.
         let name_filter = self.name_filter();
@@ -299,11 +299,11 @@ impl ZedisServerState {
         } else {
             format!("match=*{keyword}* count={key_scan_count} offset={offset}")
         };
-        let type_arg = self.type_filter.and_then(|t| t.scan_type_name());
+        let type_arg = self.scan.type_filter.and_then(|t| t.scan_type_name());
         // The scan session this page belongs to: a type filter, a refresh or
         // a new search starts another (`reset_scan` bumps it) without
         // necessarily changing the keyword.
-        let epoch = self.scan_epoch;
+        let epoch = self.scan.scan_epoch;
         self.spawn_with_arg(
             ServerTask::ScanKeys,
             scan_arg,
@@ -324,7 +324,7 @@ impl ZedisServerState {
                 // or a refresh, which keep it; the epoch does not.
                 // (Server/db switches are already filtered out by
                 // spawn_with_arg's stale guard.)
-                if this.keyword != processing_keyword || this.scan_epoch != epoch {
+                if this.scan.keyword != processing_keyword || this.scan.scan_epoch != epoch {
                     return;
                 }
                 let mut should_select_processing_key = false;
@@ -335,11 +335,11 @@ impl ZedisServerState {
                         debug!("cursors: {cursors:?}, keys count: {}", keys.len());
                         // Check if scan is complete (all cursors returned to 0)
                         if cursors.iter().sum::<u64>() == 0 {
-                            this.scan_completed = true;
+                            this.scan.scan_completed = true;
                             finished = true;
-                            this.cursors = None;
+                            this.scan.cursors = None;
                         } else {
-                            this.cursors = Some(cursors);
+                            this.scan.cursors = Some(cursors);
                         }
                         this.extend_keys(
                             keys.into_iter()
@@ -348,13 +348,13 @@ impl ZedisServerState {
                         );
                     }
                     Err(_) => {
-                        this.cursors = None;
+                        this.scan.cursors = None;
                         // A refresh keeps the rows until its first batch
                         // lands; with no batch coming they stay. Left set,
                         // the flag silenced every auto-refresh and let the
                         // next folder expand replace the tree with that
                         // folder alone.
-                        this.keys_superseded_by_next_batch = false;
+                        this.scan.keys_superseded_by_next_batch = false;
                     }
                 };
                 // Keep paging until this round's target is loaded or the scan
@@ -363,14 +363,14 @@ impl ZedisServerState {
                 // Load more, the tree's loading pill) sees the round's end in
                 // the same frame; and `KeyScanFinished` goes out after the
                 // last page is merged, so its handlers read the final key set.
-                let more = this.cursors.is_some() && this.keys.len() < max;
+                let more = this.scan.cursors.is_some() && this.scan.keys.len() < max;
                 if !more {
-                    this.scanning = false;
+                    this.scan.scanning = false;
                 }
                 if finished {
                     cx.emit(ServerEvent::KeyScanFinished);
                 }
-                if this.cursors.is_some() {
+                if this.scan.cursors.is_some() {
                     cx.emit(ServerEvent::KeyScanPaged);
                 }
                 cx.emit(ServerEvent::KeyTreeUpdated);
@@ -382,9 +382,9 @@ impl ZedisServerState {
                     return cx.notify();
                 }
                 cx.notify();
-                if this.keys.len() == 1
-                    && let Some(key) = this.keys.keys().next()
-                    && *key != this.key.clone().unwrap_or_default()
+                if this.scan.keys.len() == 1
+                    && let Some(key) = this.scan.keys.keys().next()
+                    && *key != this.open.key.clone().unwrap_or_default()
                 {
                     this.select_key(key.clone(), cx);
                 }
@@ -428,7 +428,7 @@ impl ZedisServerState {
     /// [`Self::resolve_query_mode`] for the box as it is now — what the
     /// tree's own wording has to follow, too.
     pub fn keyword_query_mode(&self) -> QueryMode {
-        Self::resolve_query_mode(self.query_mode, self.regex_keyword())
+        Self::resolve_query_mode(self.scan.query_mode, self.regex_keyword())
     }
 
     /// The regex a scan narrows the listed names by: the keyword, when the
@@ -448,7 +448,7 @@ impl ZedisServerState {
     }
 
     fn name_filter(&self) -> Option<Regex> {
-        Self::compile_name_filter(&self.keyword, self.regex_keyword())
+        Self::compile_name_filter(&self.scan.keyword, self.regex_keyword())
     }
 
     /// What an auto-refresh round changes in the loaded key set.
@@ -499,15 +499,6 @@ impl ZedisServerState {
         }
     }
 
-    /// Take one key out of the loaded set, with its TTL — a deleted key
-    /// must not stay behind in the TTL map the tree's filters read.
-    fn forget_loaded_key(&mut self, key: &SharedString) {
-        self.keys.remove(key);
-        if self.key_ttls.contains_key(key) {
-            Arc::make_mut(&mut self.key_ttls).remove(key);
-        }
-    }
-
     /// Everything a delete that went through leaves behind, however its keys
     /// were named: out of the loaded keys, the edit history and the recent
     /// keys, the tree rebuilt, and the open key closed when it was one of
@@ -517,17 +508,15 @@ impl ZedisServerState {
     /// different part.
     fn forget_deleted_keys(&mut self, deleted: DeletedKeys, cx: &mut Context<Self>) {
         match &deleted {
-            DeletedKeys::Named(keys) => keys.iter().for_each(|key| self.forget_loaded_key(key)),
-            DeletedKeys::Prefix(_) => self.forget_loaded_keys_where(|key| deleted.contains(key)),
+            DeletedKeys::Named(keys) => keys.iter().for_each(|key| self.scan.forget_key(key)),
+            DeletedKeys::Prefix(_) => self.scan.forget_keys_where(|key| deleted.contains(key)),
         }
-        self.histories.retain_keys(|key| !deleted.contains(key));
-        if self.key.as_ref().is_some_and(|key| deleted.contains(key)) {
-            self.key = None;
-            self.value = None;
-            self.next_value_epoch();
+        self.open.histories.retain_keys(|key| !deleted.contains(key));
+        if self.open.key.as_ref().is_some_and(|key| deleted.contains(key)) {
+            self.open.close();
         }
         // Force refresh of the key tree view
-        self.key_tree_id = Uuid::now_v7().to_string().into();
+        self.scan.renew_tree_id();
         self.refresh_dbsize_now(cx);
         // So the recent-keys list does not offer a key that is gone.
         let scope = recent_keys_scope(self.server_id.as_str(), self.db);
@@ -541,17 +530,6 @@ impl ZedisServerState {
             }
         })
         .detach();
-    }
-
-    /// [`Self::forget_loaded_key`] for every loaded key `gone` accepts.
-    fn forget_loaded_keys_where(&mut self, gone: impl Fn(&SharedString) -> bool) {
-        let doomed: Vec<SharedString> = self.keys.keys().filter(|key| gone(key)).cloned().collect();
-        for key in &doomed {
-            self.keys.remove(key);
-        }
-        if self.key_ttls.keys().any(&gone) {
-            Arc::make_mut(&mut self.key_ttls).retain(|key, _| !gone(key));
-        }
     }
 
     pub fn handle_auto_refresh(&mut self, keyword: SharedString, cx: &mut Context<Self>) {
@@ -589,9 +567,9 @@ impl ZedisServerState {
         // that covers the keyspace (`plan_auto_refresh`).
         let key_scan_count = self.key_scan_count();
         let with_ttl = self.show_key_tree_ttl();
-        let masters = self.nodes.0.max(1);
-        let count = (self.keys.len().max(key_scan_count) / masters).clamp(1, key_scan_count.max(1));
-        let type_arg = self.type_filter.and_then(|t| t.scan_type_name());
+        let masters = self.facts.nodes().0.max(1);
+        let count = (self.scan.keys.len().max(key_scan_count) / masters).clamp(1, key_scan_count.max(1));
+        let type_arg = self.scan.type_filter.and_then(|t| t.scan_type_name());
         self.spawn_with_arg(
             ServerTask::AutoRefresh,
             pattern.clone(),
@@ -614,7 +592,7 @@ impl ZedisServerState {
                 // abandon it so it can't delete keys that match the new one.
                 // (`keyword` tracks `self.keyword`, set together in
                 // handle_filter; server/db switches are handled upstream.)
-                if this.keyword != keyword {
+                if this.scan.keyword != keyword {
                     return;
                 }
                 // A manual refresh is mid-flight and the rows on screen are
@@ -623,7 +601,7 @@ impl ZedisServerState {
                 // would spend the supersede on a handful of keys and empty
                 // the tree down to them. The re-scan re-reads everything
                 // anyway — drop this round.
-                if this.keys_superseded_by_next_batch {
+                if this.scan.keys_superseded_by_next_batch {
                     return;
                 }
                 if let Ok((cursors, keys)) = result {
@@ -636,7 +614,12 @@ impl ZedisServerState {
                         add: keys_to_add,
                         remove: keys_to_remove,
                         ttls: new_ttls,
-                    } = Self::plan_auto_refresh(complete, keys, &this.keys, with_ttl.then_some(&*this.key_ttls));
+                    } = Self::plan_auto_refresh(
+                        complete,
+                        keys,
+                        &this.scan.keys,
+                        with_ttl.then_some(&*this.scan.key_ttls),
+                    );
 
                     let has_changes = !keys_to_remove.is_empty() || !keys_to_add.is_empty() || !new_ttls.is_empty();
                     debug!(
@@ -650,15 +633,15 @@ impl ZedisServerState {
                     if has_changes {
                         // Remove old keys
                         for key in &keys_to_remove {
-                            this.forget_loaded_key(key);
+                            this.scan.forget_key(key);
                         }
                         if !new_ttls.is_empty() {
-                            Arc::make_mut(&mut this.key_ttls).extend(new_ttls);
+                            Arc::make_mut(&mut this.scan.key_ttls).extend(new_ttls);
                         }
 
                         // Add new keys
                         if keys_to_add.is_empty() {
-                            this.key_tree_id = Uuid::now_v7().to_string().into();
+                            this.scan.renew_tree_id();
                         } else {
                             this.extend_keys(keys_to_add);
                         }
@@ -702,7 +685,7 @@ impl ZedisServerState {
                 // search box to match, auto-refresh re-scanned `*` and poured
                 // unrelated keys into the tree every interval, and the status
                 // bar's Load more scanned unfiltered.
-                self.keyword = keyword.clone();
+                self.scan.keyword = keyword.clone();
                 // Same reason for the tree-wide scanning flag: a folder expand
                 // drives the per-prefix spinner, which is the right scope for
                 // it, but a whole-tree query has no folder row to spin and the
@@ -711,7 +694,7 @@ impl ZedisServerState {
                 // and clears `scan_completed`, so none of that method's early
                 // returns can fire and `scan_prefix_page` always runs to a
                 // `finished` round that puts it back.
-                self.scanning = true;
+                self.scan.scanning = true;
                 self.scan_prefix(keyword, cx);
             }
             QueryMode::Exact => {
@@ -736,8 +719,8 @@ impl ZedisServerState {
     /// Set the key-type filter and re-run the current filter so the tree shows
     /// only keys of that type (`None` clears it).
     pub fn set_type_filter(&mut self, type_filter: Option<KeyType>, cx: &mut Context<Self>) {
-        self.type_filter = type_filter;
-        let keyword = self.keyword.clone();
+        self.scan.type_filter = type_filter;
+        let keyword = self.scan.keyword.clone();
         // A different type filter is a different question: the rows on screen
         // are the wrong ones and go at once.
         self.handle_filter(keyword, false, cx);
@@ -757,8 +740,8 @@ impl ZedisServerState {
     /// The scan itself, with the reset already done by the caller (which
     /// chose whether the old rows stay up meanwhile).
     fn start_scan(&mut self, keyword: SharedString, cx: &mut Context<Self>) {
-        self.scanning = true;
-        self.keyword = keyword.clone();
+        self.scan.scanning = true;
+        self.scan.keyword = keyword.clone();
         cx.emit(ServerEvent::KeyScanStarted);
         cx.notify();
         self.scan_keys(self.server_id.clone(), keyword, cx);
@@ -767,7 +750,7 @@ impl ZedisServerState {
     pub fn scan_next(&mut self, cx: &mut Context<Self>) {
         // A round already in flight would be a second paging chain over the
         // same cursors, and each press grew the target a batch more.
-        if self.scan_completed || self.scanning {
+        if self.scan.scan_completed || self.scan.scanning {
             return;
         }
         // Refused here rather than inside the spawn: nothing would come back
@@ -775,9 +758,9 @@ impl ZedisServerState {
         if self.refuse_while_offline(cx) {
             return;
         }
-        self.scanning = true;
-        self.scan_times += 1;
-        self.scan_keys(self.server_id.clone(), self.keyword.clone(), cx);
+        self.scan.scanning = true;
+        self.scan.scan_times += 1;
+        self.scan_keys(self.server_id.clone(), self.scan.keyword.clone(), cx);
         cx.notify();
     }
     /// Scans keys matching a specific prefix.
@@ -787,7 +770,7 @@ impl ZedisServerState {
         // Avoid reloading if already loaded
         let mut key_type_full_loaded = false;
         let mut key_full_loaded = false;
-        for key in self.loaded_prefixes.iter() {
+        for key in self.scan.loaded_prefixes.iter() {
             if prefix.as_str() == key.as_str() {
                 key_type_full_loaded = true;
                 break;
@@ -800,24 +783,24 @@ impl ZedisServerState {
             return;
         }
         if key_full_loaded {
-            self.loaded_prefixes.insert(prefix.clone());
+            self.scan.loaded_prefixes.insert(prefix.clone());
             self.fill_key_types(Some(prefix), cx);
             return;
         }
         // If global scan is complete, we might just need to resolve types
-        if self.scan_completed {
+        if self.scan.scan_completed {
             self.fill_key_types(Some(prefix), cx);
             return;
         }
         cx.emit(ServerEvent::KeyScanStarted);
         // Mark this prefix as in-flight so the matching folder row shows an
         // inline spinner until the (up to 5-round) scan finishes.
-        self.scanning_prefixes.insert(prefix.clone());
+        self.scan.scanning_prefixes.insert(prefix.clone());
         let page = ScanPrefixPage {
             cursors: None,
             iteration: 0,
             loaded: 0,
-            epoch: self.scan_epoch,
+            epoch: self.scan.scan_epoch,
         };
         self.scan_prefix_page(self.server_id.clone(), prefix, page, cx);
     }
@@ -858,7 +841,7 @@ impl ZedisServerState {
         // Stop this batch once accumulated matches reach ~80% of key_scan_count.
         let threshold = key_scan_count as usize * SCAN_PREFIX_FILL_PERCENT / 100;
         let task_at = self.at();
-        let type_arg = self.type_filter.and_then(|t| t.scan_type_name());
+        let type_arg = self.scan.type_filter.and_then(|t| t.scan_type_name());
         // A folder opened under a regex keyword lists what the tree is
         // showing: the names under it that the regex matches.
         let name_filter = self.name_filter();
@@ -889,7 +872,7 @@ impl ZedisServerState {
                 // entry (making the folder's "Load more" flip-flop). Drop it.
                 // A keyword check can't catch an empty→empty re-search; the epoch
                 // can. (`spawn_with_arg` already guards server/db switches.)
-                if this.scan_epoch != epoch {
+                if this.scan.scan_epoch != epoch {
                     return;
                 }
                 let mut finished = true;
@@ -911,13 +894,15 @@ impl ZedisServerState {
                     );
                     cx.emit(ServerEvent::KeyTreeUpdated);
                     if done {
-                        this.loaded_prefixes.insert(prefix.clone());
-                        this.incomplete_prefixes.remove(&prefix);
+                        this.scan.loaded_prefixes.insert(prefix.clone());
+                        this.scan.incomplete_prefixes.remove(&prefix);
                         // A refreshed folder of a fully loaded keyspace is
                         // whole again: so is the keyspace, once no other
                         // refresh is still on its way.
-                        if this.complete_before_refresh.remove(&prefix) && this.complete_before_refresh.is_empty() {
-                            this.scan_completed = true;
+                        if this.scan.complete_before_refresh.remove(&prefix)
+                            && this.scan.complete_before_refresh.is_empty()
+                        {
+                            this.scan.scan_completed = true;
                         }
                     } else if batch_loaded < threshold && iteration + 1 < SCAN_PREFIX_MAX_PAGES {
                         // Haven't matched ~80% of key_scan_count yet and still
@@ -940,7 +925,7 @@ impl ZedisServerState {
                         // Filled the view (~80% of key_scan_count) or hit the
                         // page budget without finishing — remember the cursor so
                         // the inline "Load more" row can resume the scan here.
-                        this.incomplete_prefixes.insert(prefix.clone(), new_cursor);
+                        this.scan.incomplete_prefixes.insert(prefix.clone(), new_cursor);
                     }
                 }
                 if finished {
@@ -948,12 +933,12 @@ impl ZedisServerState {
                     // errored) — drop the in-flight marker so the folder
                     // spinner clears on the rebuild emitted just below, and
                     // the tree-wide one a whole-tree prefix query set.
-                    this.scanning_prefixes.remove(&prefix);
-                    this.scanning = false;
+                    this.scan.scanning_prefixes.remove(&prefix);
+                    this.scan.scanning = false;
                     cx.emit(ServerEvent::KeyScanFinished);
                     cx.emit(ServerEvent::KeyTreeUpdated);
-                    if this.keys.len() == 1
-                        && let Some(key) = this.keys.keys().next()
+                    if this.scan.keys.len() == 1
+                        && let Some(key) = this.scan.keys.keys().next()
                     {
                         this.select_key(key.clone(), cx);
                     }
@@ -968,18 +953,18 @@ impl ZedisServerState {
     /// the inline "Load more" row in the key tree. No-op if the prefix has
     /// no saved resume state (already finished or never paused).
     pub fn load_more_prefix(&mut self, prefix: SharedString, cx: &mut Context<Self>) {
-        let Some(cursors) = self.incomplete_prefixes.remove(&prefix) else {
+        let Some(cursors) = self.scan.incomplete_prefixes.remove(&prefix) else {
             return;
         };
         cx.emit(ServerEvent::KeyScanStarted);
         // Re-mark in-flight (spinner) and resume from the saved cursor with a
         // fresh page budget.
-        self.scanning_prefixes.insert(prefix.clone());
+        self.scan.scanning_prefixes.insert(prefix.clone());
         let page = ScanPrefixPage {
             cursors: Some(cursors),
             iteration: 0,
             loaded: 0,
-            epoch: self.scan_epoch,
+            epoch: self.scan.scan_epoch,
         };
         self.scan_prefix_page(self.server_id.clone(), prefix, page, cx);
     }
@@ -994,20 +979,22 @@ impl ZedisServerState {
         // folders it sits in: a loaded parent answered `scan_prefix` from
         // the keys at hand, which the removal below just took this folder's
         // out of, so the refresh came back empty.
-        self.loaded_prefixes
+        self.scan
+            .loaded_prefixes
             .retain(|p| !p.as_str().starts_with(prefix.as_str()) && !prefix.as_str().starts_with(p.as_str()));
         // Drop any saved "load more" resume state for this prefix subtree.
-        self.incomplete_prefixes
+        self.scan
+            .incomplete_prefixes
             .retain(|p, _| !p.as_str().starts_with(prefix.as_str()));
         // Remove stale keys so the tree shows only what Redis returns
-        self.forget_loaded_keys_where(|key| key.starts_with(prefix.as_str()));
+        self.scan.forget_keys_where(|key| key.starts_with(prefix.as_str()));
         // Clear scan_completed so scan_prefix performs a full Redis re-scan
         // rather than short-circuiting to fill_key_types; the re-scan puts it
         // back when it runs to its end (see `complete_before_refresh`).
         // (A refresh started while another is on its way joins it: the flag
         // was already taken, but the keyspace was whole before either.)
-        if std::mem::take(&mut self.scan_completed) || !self.complete_before_refresh.is_empty() {
-            self.complete_before_refresh.insert(prefix.clone());
+        if std::mem::take(&mut self.scan.scan_completed) || !self.scan.complete_before_refresh.is_empty() {
+            self.scan.complete_before_refresh.insert(prefix.clone());
         }
         self.scan_prefix(prefix, cx);
     }
@@ -1020,13 +1007,13 @@ impl ZedisServerState {
         let server_id = self.server_id.clone();
         let current_key = key.clone();
         let max_truncate_length = cx.global::<ZedisGlobalStore>().read(cx).max_truncate_length();
-        let bypass_size_gate = self.size_gate_bypassed.as_ref() == Some(&key);
-        let preview = self.size_gate_preview.as_ref() == Some(&key);
+        let bypass_size_gate = self.open.size_gate_bypassed.as_ref() == Some(&key);
+        let preview = self.open.size_gate_preview.as_ref() == Some(&key);
         // Header decorations, both resolved from what the connect-time probe
         // already learned: whether `OBJECT ENCODING` answers here at all, and
         // which of FREQ / IDLETIME this server's eviction policy makes
         // meaningful. A server that has neither simply gets no chip.
-        let with_encoding = self.features.is_usable(ServerCommand::ObjectEncoding);
+        let with_encoding = self.facts.feature_matrix().is_usable(ServerCommand::ObjectEncoding);
         let heat_probe = get_server_heat_probe(&server_id);
 
         self.spawn(
@@ -1163,23 +1150,23 @@ impl ZedisServerState {
                 Ok(redis_value)
             },
             move |this, result, cx| {
-                if this.key.as_ref() != Some(&current_key) {
+                if this.open.key.as_ref() != Some(&current_key) {
                     return;
                 }
                 // A "load anyway" the user cancelled: the gate is back, and
                 // this reply is not wanted any more.
-                if bypass_size_gate && this.size_gate_bypassed.as_ref() != Some(&current_key) {
+                if bypass_size_gate && this.open.size_gate_bypassed.as_ref() != Some(&current_key) {
                     return;
                 }
-                this.size_gate_pending = None;
+                this.open.size_gate_pending = None;
                 match result {
                     Ok(value) => {
-                        if this.value.as_ref() == Some(&value) {
+                        if this.open.value.as_ref() == Some(&value) {
                             return;
                         }
                         let mut tree_changed = false;
                         if !value.is_expired() {
-                            tree_changed = if let Some(k) = this.keys.get_mut(&current_key) {
+                            tree_changed = if let Some(k) = this.scan.keys.get_mut(&current_key) {
                                 if *k != value.key_type {
                                     *k = value.key_type();
                                     true
@@ -1187,7 +1174,7 @@ impl ZedisServerState {
                                     false
                                 }
                             } else {
-                                this.keys.insert(current_key.clone(), value.key_type());
+                                this.scan.keys.insert(current_key.clone(), value.key_type());
                                 true
                             };
                         }
@@ -1195,11 +1182,11 @@ impl ZedisServerState {
                             tree_changed |= this.sync_tree_ttl(&current_key, ttl_secs);
                         }
                         if tree_changed {
-                            this.key_tree_id = Uuid::now_v7().to_string().into();
+                            this.scan.renew_tree_id();
                             cx.emit(ServerEvent::KeyTreeUpdated);
                         }
-                        this.next_value_epoch();
-                        this.value = Some(value);
+                        this.open.next_epoch();
+                        this.open.value = Some(value);
                     }
                     Err(e) => {
                         // Keep the key selected and surface the failure in the
@@ -1209,14 +1196,14 @@ impl ZedisServerState {
                         // "no key selected". The editor renders this inline
                         // with a retry button.
                         let message: SharedString = e.to_string().into();
-                        this.next_value_epoch();
-                        match this.value.as_mut() {
+                        this.open.next_epoch();
+                        match this.open.value.as_mut() {
                             Some(value) => {
                                 value.status = RedisValueStatus::Failed(message);
                                 value.data = None;
                             }
                             None => {
-                                this.value = Some(RedisValue {
+                                this.open.value = Some(RedisValue {
                                     status: RedisValueStatus::Failed(message),
                                     ..Default::default()
                                 });
@@ -1240,21 +1227,22 @@ impl ZedisServerState {
     /// counts already move locally. Does not flip `Updating` — the write
     /// already finished.
     pub(crate) fn refresh_value_header(&mut self, cx: &mut Context<Self>) {
-        let Some(key) = self.key.clone() else {
+        let Some(key) = self.open.key.clone() else {
             return;
         };
         if key.is_empty() {
             return;
         }
         let key_type = self
+            .open
             .value
             .as_ref()
             .map(|value| value.key_type().as_str().to_string())
             .unwrap_or_default();
-        let epoch = self.value_epoch;
+        let epoch = self.open.value_epoch;
         let at = self.at();
         // The same two questions the load asks, answered the same way.
-        let with_encoding = self.features.is_usable(ServerCommand::ObjectEncoding);
+        let with_encoding = self.facts.feature_matrix().is_usable(ServerCommand::ObjectEncoding);
         let heat_probe = get_server_heat_probe(self.server_id.as_str());
         self.spawn(
             ServerTask::RefreshValueHeader,
@@ -1267,13 +1255,13 @@ impl ZedisServerState {
                 Ok((size.ok(), encoding, heat))
             },
             move |this, result, cx| {
-                if this.value_epoch != epoch {
+                if this.open.value_epoch != epoch {
                     return;
                 }
                 let Ok((size, encoding, heat)) = result else {
                     return;
                 };
-                let Some(value) = this.value.as_mut() else {
+                let Some(value) = this.open.value.as_mut() else {
                     return;
                 };
                 if Self::apply_refreshed_header(value, size, encoding.into(), heat) {
@@ -1333,6 +1321,7 @@ impl ZedisServerState {
         // Not a preview's: its bytes are the value's beginning only, and
         // restoring them would cut the key down to that.
         let snapshot = self
+            .open
             .value
             .as_ref()
             .filter(|value| value.preview_of().is_none())
@@ -1392,6 +1381,7 @@ impl ZedisServerState {
     /// The module types among the loaded keys, for the type-filter menu.
     pub fn module_types_seen(&self) -> Vec<ModuleTypeId> {
         let mut ids: Vec<ModuleTypeId> = self
+            .scan
             .keys
             .values()
             .filter_map(|t| match t {
@@ -1409,16 +1399,16 @@ impl ZedisServerState {
     /// preview). The bypass is remembered for the key so a later refresh
     /// doesn't bounce back to the gate panel.
     pub fn load_value_ignore_size_limit(&mut self, key: SharedString, cx: &mut Context<Self>) {
-        self.size_gate_bypassed = Some(key.clone());
-        self.size_gate_preview = None;
+        self.open.size_gate_bypassed = Some(key.clone());
+        self.open.size_gate_preview = None;
         // Busy while the (large) payload downloads, and carrying the size
         // the probe found: the editor says "Loading 22.5 MB…" with a Cancel
         // instead of going blank, and the header keeps the real size.
-        let replaced = self.value.take();
+        let replaced = self.open.value.take();
         let size = replaced.as_ref().map_or(0, |value| value.size);
-        self.size_gate_pending = replaced.map(|value| (key.clone(), value));
-        self.next_value_epoch();
-        self.value = Some(RedisValue {
+        self.open.size_gate_pending = replaced.map(|value| (key.clone(), value));
+        self.open.next_epoch();
+        self.open.value = Some(RedisValue {
             status: RedisValueStatus::Loading,
             size,
             ..Default::default()
@@ -1431,18 +1421,18 @@ impl ZedisServerState {
     /// arrives (`get_value`). The download itself is not interrupted: the
     /// reply is already on the shared connection.
     pub fn cancel_large_load(&mut self, cx: &mut Context<Self>) {
-        let Some((key, replaced)) = self.size_gate_pending.take() else {
+        let Some((key, replaced)) = self.open.size_gate_pending.take() else {
             return;
         };
-        if self.key.as_ref() != Some(&key) {
+        if self.open.key.as_ref() != Some(&key) {
             return;
         }
-        self.size_gate_bypassed = None;
+        self.open.size_gate_bypassed = None;
         if replaced.preview_of().is_some() {
-            self.size_gate_preview = Some(key);
+            self.open.size_gate_preview = Some(key);
         }
-        self.next_value_epoch();
-        self.value = Some(replaced);
+        self.open.next_epoch();
+        self.open.value = Some(replaced);
         cx.emit(ServerEvent::ValueLoaded);
         cx.notify();
     }
@@ -1451,16 +1441,16 @@ impl ZedisServerState {
     /// choice is remembered for the key like the bypass, so a refresh keeps
     /// showing the preview rather than the panel.
     pub fn load_value_preview(&mut self, key: SharedString, cx: &mut Context<Self>) {
-        self.size_gate_preview = Some(key.clone());
-        self.next_value_epoch();
-        self.value = Some(RedisValue {
+        self.open.size_gate_preview = Some(key.clone());
+        self.open.next_epoch();
+        self.open.value = Some(RedisValue {
             status: RedisValueStatus::Loading,
             ..Default::default()
         });
         self.get_value(key, ServerTask::ReloadValue, cx);
     }
     pub fn is_channel_mode(&self) -> bool {
-        self.value.as_ref().is_some_and(|v| v.key_type == KeyType::Channel)
+        self.open.value.as_ref().is_some_and(|v| v.key_type == KeyType::Channel)
     }
     /// Sets the channel mode for current server.
     ///
@@ -1469,12 +1459,12 @@ impl ZedisServerState {
     /// mode changed underneath and the menu item appeared to do nothing
     /// (#191). Like selecting a key, it takes the terminal off.
     pub fn change_channel_mode(&mut self, cx: &mut Context<Self>) {
-        self.next_value_epoch();
-        self.value = Some(RedisValue {
+        self.open.next_epoch();
+        self.open.value = Some(RedisValue {
             key_type: KeyType::Channel,
             ..Default::default()
         });
-        self.key = None;
+        self.open.key = None;
         if self.terminal {
             self.terminal = false;
             cx.emit(ServerEvent::TerminalToggled(false));
@@ -1510,23 +1500,23 @@ impl ZedisServerState {
 
     /// Selects a key and fetches its details (Type, TTL, Value).
     pub fn select_key(&mut self, key: SharedString, cx: &mut Context<Self>) {
-        let same_key = self.key.as_ref() == Some(&key);
-        self.next_value_epoch();
-        self.key = Some(key.clone());
+        let same_key = self.open.key.as_ref() == Some(&key);
+        self.open.next_epoch();
+        self.open.key = Some(key.clone());
         if key.is_empty() {
             return;
         }
         // Opening a key counts as using its history: the budget evicts the
         // key used least recently, and one you keep returning to should stay.
-        self.histories.touch(&key, unix_ts());
+        self.open.histories.touch(&key, unix_ts());
         self.terminal = false;
         // A different key drops the previous payload (type + rows) so the
         // editor cannot paint them under this name. The tree already knows
         // the type. Re-selecting the same key keeps its rows.
-        let tree_type = self.keys.get(&key).copied().unwrap_or(KeyType::Unknown);
-        self.value = Some(RedisValue::for_select(same_key, self.value.take(), tree_type));
-        if !self.keys.contains_key(&key) {
-            self.keys.insert(key.clone(), KeyType::Unknown);
+        let tree_type = self.scan.keys.get(&key).copied().unwrap_or(KeyType::Unknown);
+        self.open.value = Some(RedisValue::for_select(same_key, self.open.value.take(), tree_type));
+        if !self.scan.keys.contains_key(&key) {
+            self.scan.keys.insert(key.clone(), KeyType::Unknown);
         }
         // MRU: most-recent first, capped per (server, db). Best-effort —
         // a full disk/db error must not block opening the key.
@@ -1599,10 +1589,10 @@ impl ZedisServerState {
                     // and load the open key again if it was under it, so the
                     // editor shows whether it is still there.
                     Ok(false) => {
-                        this.histories.retain_keys(|key| !key.starts_with(prefix.as_str()));
+                        this.open.histories.retain_keys(|key| !key.starts_with(prefix.as_str()));
                         this.refresh_prefix(prefix.clone().into(), cx);
                         this.refresh_dbsize_now(cx);
-                        if let Some(key) = this.key.clone().filter(|key| key.starts_with(prefix.as_str())) {
+                        if let Some(key) = this.open.key.clone().filter(|key| key.starts_with(prefix.as_str())) {
                             this.reload_value(key, cx);
                         }
                     }
@@ -1641,20 +1631,17 @@ impl ZedisServerState {
             },
             move |this, result, cx| {
                 if result.is_ok() {
-                    this.keys.clear();
-                    this.key_ttls = Arc::new(AHashMap::new());
-                    this.histories.clear();
-                    this.key = None;
-                    this.value = None;
-                    this.next_value_epoch();
+                    this.scan.keys.clear();
+                    this.scan.key_ttls = Arc::new(AHashMap::new());
+                    this.open.histories.clear();
+                    this.open.close();
                     // The open database is empty now; and the next beat
                     // re-reads DBSIZE rather than wait out its minute, so the
                     // status bar and the database list stop showing the old
                     // counts.
-                    this.dbsize = Some(0);
-                    this.last_dbsize_refreshed_at = 0;
+                    this.readings.flushed();
                     // Force refresh of the key tree view
-                    this.key_tree_id = Uuid::now_v7().to_string().into();
+                    this.scan.renew_tree_id();
                     let message = if all {
                         i18n_status_bar(cx, "flush_all_done_message")
                     } else {
@@ -1702,7 +1689,7 @@ impl ZedisServerState {
     }
     /// Deletes a specified key.
     pub fn delete_select_key(&mut self, key: SharedString, cx: &mut Context<Self>) {
-        let Some(value) = self.value.as_mut() else {
+        let Some(value) = self.open.value.as_mut() else {
             return;
         };
         value.status = RedisValueStatus::Updating;
@@ -1721,7 +1708,7 @@ impl ZedisServerState {
             return;
         }
         let at = self.at();
-        let key_type = self.keys.get(&old).copied();
+        let key_type = self.scan.keys.get(&old).copied();
         let old_done = old.clone();
         let new_done = new.clone();
         let (server_id, db) = (self.server_id.clone(), self.db);
@@ -1742,24 +1729,24 @@ impl ZedisServerState {
                 match result {
                     Ok(true) => {
                         if let Some(kt) = key_type {
-                            this.keys.insert(new_done.clone(), kt);
+                            this.scan.keys.insert(new_done.clone(), kt);
                         }
-                        this.keys.remove(&old_done);
+                        this.scan.keys.remove(&old_done);
                         // The key tree renders each key's TTL state from this
                         // cache (no entry → the TTL icon goes missing), so move
                         // it across too. RENAME preserves the TTL server-side.
-                        let key_ttls = Arc::make_mut(&mut this.key_ttls);
+                        let key_ttls = Arc::make_mut(&mut this.scan.key_ttls);
                         if let Some(ttl) = key_ttls.remove(&old_done) {
                             key_ttls.insert(new_done.clone(), ttl);
                         }
-                        this.histories.rename(&old_done, new_done.clone());
-                        this.key_tree_id = Uuid::now_v7().to_string().into();
+                        this.open.histories.rename(&old_done, new_done.clone());
+                        this.scan.renew_tree_id();
                         // Re-select via the normal path so the key tree expands
                         // to reveal the renamed node — `KeySelected` drives the
                         // tree's `update_expand`; a bare rebuild would leave the
                         // key hidden under a collapsed folder. Also reloads the
                         // value into the editor.
-                        if this.key.as_ref() == Some(&old_done) {
+                        if this.open.key.as_ref() == Some(&old_done) {
                             this.select_key(new_done.clone(), cx);
                         }
                         // A clobbering RENAME leaves the database one key
@@ -1789,23 +1776,24 @@ impl ZedisServerState {
     /// chip would read differently — the same gate auto-refresh uses, so a
     /// select that still paints `10m` does not rebuild the tree.
     fn sync_tree_ttl(&mut self, key: &SharedString, ttl_secs: i64) -> bool {
-        if !self.show_key_tree_ttl {
+        if !self.prefs.show_key_tree_ttl() {
             return false;
         }
         let changed = self
+            .scan
             .key_ttls
             .get(key)
             .is_none_or(|old| format_ttl_chip(*old) != format_ttl_chip(ttl_secs));
         if !changed {
             return false;
         }
-        Arc::make_mut(&mut self.key_ttls).insert(key.clone(), ttl_secs);
+        Arc::make_mut(&mut self.scan.key_ttls).insert(key.clone(), ttl_secs);
         true
     }
 
     fn apply_tree_ttl(&mut self, key: &SharedString, ttl_secs: i64, cx: &mut Context<Self>) {
         if self.sync_tree_ttl(key, ttl_secs) {
-            self.key_tree_id = Uuid::now_v7().to_string().into();
+            self.scan.renew_tree_id();
             cx.emit(ServerEvent::KeyTreeUpdated);
         }
     }
@@ -1816,12 +1804,12 @@ impl ZedisServerState {
             return;
         }
         let at = self.at();
-        let Some(value) = self.value.as_mut() else {
+        let Some(value) = self.open.value.as_mut() else {
             return;
         };
         value.status = RedisValueStatus::Updating;
         let original_ttl = value.expire_at;
-        let epoch = self.value_epoch;
+        let epoch = self.open.value_epoch;
 
         let mut new_ttl = Duration::ZERO;
         let mut parse_fail_error = "".to_string();
@@ -1855,10 +1843,10 @@ impl ZedisServerState {
                 }
                 // The value on screen now is another one's: its expiry and
                 // status are not this change's to restore.
-                if this.value_epoch != epoch {
+                if this.open.value_epoch != epoch {
                     return;
                 }
-                if let Some(value) = this.value.as_mut() {
+                if let Some(value) = this.open.value.as_mut() {
                     if result.is_err() {
                         value.expire_at = original_ttl;
                     }
@@ -1881,12 +1869,12 @@ impl ZedisServerState {
     /// the delete button, not to a typo in a date field.
     pub fn update_key_expire_at(&mut self, key: SharedString, at: i64, cx: &mut Context<Self>) {
         let server_db = self.at();
-        let Some(value) = self.value.as_mut() else {
+        let Some(value) = self.open.value.as_mut() else {
             return;
         };
         value.status = RedisValueStatus::Updating;
         let original_ttl = value.expire_at;
-        let epoch = self.value_epoch;
+        let epoch = self.open.value_epoch;
         value.expire_at = Some(at);
         cx.notify();
         let tree_key = key.clone();
@@ -1908,10 +1896,10 @@ impl ZedisServerState {
                 }
                 // The value on screen now is another one's: its expiry and
                 // status are not this change's to restore.
-                if this.value_epoch != epoch {
+                if this.open.value_epoch != epoch {
                     return;
                 }
-                if let Some(value) = this.value.as_mut() {
+                if let Some(value) = this.open.value.as_mut() {
                     if result.is_err() {
                         value.expire_at = original_ttl;
                     }
@@ -1928,12 +1916,12 @@ impl ZedisServerState {
     /// [`Self::batch_set_ttl_keys`] with `ttl_secs = None`.
     pub fn persist_key_ttl(&mut self, key: SharedString, cx: &mut Context<Self>) {
         let at = self.at();
-        let Some(value) = self.value.as_mut() else {
+        let Some(value) = self.open.value.as_mut() else {
             return;
         };
         value.status = RedisValueStatus::Updating;
         let original_ttl = value.expire_at;
-        let epoch = self.value_epoch;
+        let epoch = self.open.value_epoch;
         // Same encoding the load path uses for `TTL -1` (no expiry).
         value.expire_at = Some(-1);
         cx.notify();
@@ -1953,10 +1941,10 @@ impl ZedisServerState {
                 }
                 // The value on screen now is another one's: its expiry and
                 // status are not this change's to restore.
-                if this.value_epoch != epoch {
+                if this.open.value_epoch != epoch {
                     return;
                 }
-                if let Some(value) = this.value.as_mut() {
+                if let Some(value) = this.open.value.as_mut() {
                     if result.is_err() {
                         value.expire_at = original_ttl;
                     }
@@ -1996,20 +1984,20 @@ impl ZedisServerState {
             move |this, result, cx| {
                 if let Ok(applied) = result {
                     let new_ttl = ttl_secs.map(|s| s as i64).unwrap_or(-1);
-                    let key_ttls = Arc::make_mut(&mut this.key_ttls);
+                    let key_ttls = Arc::make_mut(&mut this.scan.key_ttls);
                     let mut changed = 0usize;
                     let mut includes_open_key = false;
                     for (key, done) in affected.iter().zip(&applied) {
                         if *done {
                             key_ttls.insert(key.clone(), new_ttl);
                             changed += 1;
-                            includes_open_key |= this.key.as_ref() == Some(key);
+                            includes_open_key |= this.open.key.as_ref() == Some(key);
                         }
                     }
                     if includes_open_key {
                         this.follow_batch_ttl(ttl_secs);
                     }
-                    this.key_tree_id = Uuid::now_v7().to_string().into();
+                    this.scan.renew_tree_id();
                     this.notify_batch_ttl_outcome(condition, changed, affected.len().saturating_sub(changed), cx);
                 }
                 cx.emit(ServerEvent::KeyTreeUpdated);
@@ -2040,15 +2028,20 @@ impl ZedisServerState {
                 if let Ok((changed, skipped)) = result {
                     let new_ttl = ttl_secs.map(|s| s as i64).unwrap_or(-1);
                     let changed_set: AHashSet<&str> = changed.iter().map(String::as_str).collect();
-                    for (k, v) in Arc::make_mut(&mut this.key_ttls).iter_mut() {
+                    for (k, v) in Arc::make_mut(&mut this.scan.key_ttls).iter_mut() {
                         if changed_set.contains(&**k) {
                             *v = new_ttl;
                         }
                     }
-                    if this.key.as_ref().is_some_and(|key| changed_set.contains(key.as_ref())) {
+                    if this
+                        .open
+                        .key
+                        .as_ref()
+                        .is_some_and(|key| changed_set.contains(key.as_ref()))
+                    {
                         this.follow_batch_ttl(ttl_secs);
                     }
-                    this.key_tree_id = Uuid::now_v7().to_string().into();
+                    this.scan.renew_tree_id();
                     this.notify_batch_ttl_outcome(condition, changed.len(), skipped, cx);
                 }
                 cx.emit(ServerEvent::KeyTreeUpdated);
@@ -2064,7 +2057,7 @@ impl ZedisServerState {
     /// minutes from the tree went on saying "No TTL" on the right until it
     /// was opened again (#185).
     fn follow_batch_ttl(&mut self, ttl_secs: Option<u64>) {
-        if let Some(value) = self.value.as_mut() {
+        if let Some(value) = self.open.value.as_mut() {
             value.expire_at = Some(expire_at_after(ttl_secs, unix_ts()));
         }
     }
@@ -2206,9 +2199,9 @@ impl ZedisServerState {
             },
             move |this, result, cx| {
                 if result.is_ok() {
-                    this.keys.insert(key_clone.clone(), key_type);
-                    Arc::make_mut(&mut this.key_ttls).insert(key_clone.clone(), ttl_secs);
-                    this.key_tree_id = Uuid::now_v7().to_string().into();
+                    this.scan.keys.insert(key_clone.clone(), key_type);
+                    Arc::make_mut(&mut this.scan.key_ttls).insert(key_clone.clone(), ttl_secs);
+                    this.scan.renew_tree_id();
                     this.select_key(key_clone, cx);
                     // Rebuild the tree from `keys` so the new row actually
                     // appears (without this it stays hidden until a refresh).
@@ -2284,8 +2277,8 @@ mod bulk_delete_tests {
     }
 
     fn open(state: &mut ZedisServerState, key: &str) {
-        state.key = Some(SharedString::from(key.to_string()));
-        state.value = Some(RedisValue::default());
+        state.open.key = Some(SharedString::from(key.to_string()));
+        state.open.value = Some(RedisValue::default());
     }
 
     /// A delete closes the open key when it removed it, whichever way the
@@ -2296,22 +2289,28 @@ mod bulk_delete_tests {
         let state = cx.new(|_| ZedisServerState::default());
         state.update(cx, |state, cx| {
             for key in ["cart:2001", "cart:2002", "user:1", "user:2", "order:1"] {
-                state.keys.insert(SharedString::from(key), KeyType::Hash);
+                state.scan.keys.insert(SharedString::from(key), KeyType::Hash);
             }
 
             open(state, "cart:2002");
             state.forget_deleted_keys(named(&["cart:2001"]), cx);
-            assert_eq!(state.key.as_deref(), Some("cart:2002"), "not one of them");
+            assert_eq!(state.open.key.as_deref(), Some("cart:2002"), "not one of them");
             state.forget_deleted_keys(named(&["cart:2001", "cart:2002"]), cx);
-            assert!(state.key.is_none() && state.value.is_none(), "one of a multi-selection");
+            assert!(
+                state.open.key.is_none() && state.open.value.is_none(),
+                "one of a multi-selection"
+            );
 
             open(state, "user:1");
             state.forget_deleted_keys(DeletedKeys::Prefix("order:".into()), cx);
-            assert_eq!(state.key.as_deref(), Some("user:1"), "another folder");
+            assert_eq!(state.open.key.as_deref(), Some("user:1"), "another folder");
             state.forget_deleted_keys(DeletedKeys::Prefix("user:".into()), cx);
-            assert!(state.key.is_none() && state.value.is_none(), "under the folder");
+            assert!(
+                state.open.key.is_none() && state.open.value.is_none(),
+                "under the folder"
+            );
 
-            let left: Vec<&str> = state.keys.keys().map(|key| key.as_ref()).collect();
+            let left: Vec<&str> = state.scan.keys.keys().map(|key| key.as_ref()).collect();
             assert!(left.is_empty(), "every deleted key leaves the tree: {left:?}");
         });
     }
@@ -2486,6 +2485,7 @@ mod auto_refresh_tests {
 #[cfg(test)]
 mod tree_ttl_tests {
     use super::*;
+    use crate::states::ZedisAppState;
 
     fn key(name: &str) -> SharedString {
         SharedString::from(name)
@@ -2508,17 +2508,19 @@ mod tree_ttl_tests {
         let mut state = ZedisServerState::default();
         let k = key("session");
         assert!(!state.sync_tree_ttl(&k, 30), "chips default off");
-        assert!(state.key_ttls.get(&k).is_none());
+        assert!(state.scan.key_ttls.get(&k).is_none());
 
-        state.show_key_tree_ttl = true;
+        let mut settings = ZedisAppState::default();
+        settings.set_show_key_tree_ttl(true);
+        state.prefs.resolve_tree(None, &settings);
         assert!(state.sync_tree_ttl(&k, 600), "first sample");
-        assert_eq!(state.key_ttls.get(&k), Some(&600));
+        assert_eq!(state.scan.key_ttls.get(&k), Some(&600));
         assert!(!state.sync_tree_ttl(&k, 630), "same 10m chip");
-        assert_eq!(state.key_ttls.get(&k), Some(&600), "stale seconds stay");
+        assert_eq!(state.scan.key_ttls.get(&k), Some(&600), "stale seconds stay");
         assert!(state.sync_tree_ttl(&k, 540), "10m → 9m");
-        assert_eq!(state.key_ttls.get(&k), Some(&540));
+        assert_eq!(state.scan.key_ttls.get(&k), Some(&540));
         assert!(state.sync_tree_ttl(&k, -1), "timed → persist");
-        assert_eq!(state.key_ttls.get(&k), Some(&-1));
+        assert_eq!(state.scan.key_ttls.get(&k), Some(&-1));
     }
 }
 

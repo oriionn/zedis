@@ -208,8 +208,8 @@ impl ZedisServerState {
             return;
         }
         // The value generation this write belongs to — see `value_epoch`.
-        let epoch = self.value_epoch;
-        let Some((key, value)) = self.try_get_mut_key_value() else {
+        let epoch = self.open.value_epoch;
+        let Some((key, value)) = self.open.try_get_mut_key_value() else {
             return;
         };
         let key_str = key.to_string();
@@ -230,10 +230,10 @@ impl ZedisServerState {
             move |this, result, cx| {
                 // Another value is on screen now (a key switch, a reload):
                 // its rows and status are not this write's to touch.
-                if this.value_epoch != epoch {
+                if this.open.value_epoch != epoch {
                     return;
                 }
-                if let Some(value) = this.value.as_mut() {
+                if let Some(value) = this.open.value.as_mut() {
                     value.status = RedisValueStatus::Idle;
                 }
                 match result {
@@ -291,9 +291,9 @@ impl ZedisServerState {
         let same_member = old_value.as_ref().is_some_and(|old| old.raw() == new_value.raw());
         // Scores before the write, from the loaded page: the edited member's
         // (it is in the table), and the target's when it already existed.
-        let log_key = self.key.clone();
+        let log_key = self.open.key.clone();
         let (log_old_score, log_existing_score) = {
-            let loaded = self.value.as_ref().and_then(|v| v.zset_value());
+            let loaded = self.open.value.as_ref().and_then(|v| v.zset_value());
             let score_of = |member: &KvElement| {
                 loaded.as_ref().and_then(|z| {
                     z.values
@@ -368,7 +368,8 @@ impl ZedisServerState {
                     this.record_changes(log_key, entries);
                 }
                 if !is_removed
-                    && let Some(RedisValueData::Zset(zset_data)) = this.value.as_mut().and_then(|v| v.data.as_mut())
+                    && let Some(RedisValueData::Zset(zset_data)) =
+                        this.open.value.as_mut().and_then(|v| v.data.as_mut())
                 {
                     let zset = Arc::make_mut(zset_data);
                     zset.size += count;
@@ -397,7 +398,7 @@ impl ZedisServerState {
         // Not behind the busy guard: a filter typed while the previous one
         // is still paging must replace it, not be dropped (the generation
         // below turns the old pages away).
-        let Some(value) = self.value.as_mut() else {
+        let Some(value) = self.open.value.as_mut() else {
             return;
         };
         let Some(zset) = value.zset_value() else {
@@ -416,7 +417,7 @@ impl ZedisServerState {
         };
         value.data = Some(RedisValueData::Zset(Arc::new(new_zset)));
         value.status = RedisValueStatus::Idle;
-        self.next_value_epoch();
+        self.open.next_epoch();
 
         // Trigger load with the new filter
         self.load_more_zset_value(cx);
@@ -426,7 +427,7 @@ impl ZedisServerState {
     /// `ZREVRANGE`. Any keyword filter stays; a `ZSCAN` walk is unordered,
     /// so the order shows once the filter is cleared.
     pub fn set_zset_sort_order(&mut self, order: SortOrder, cx: &mut Context<Self>) {
-        let Some((_, value)) = self.try_get_mut_key_value() else {
+        let Some((_, value)) = self.open.try_get_mut_key_value() else {
             return;
         };
         let Some(zset) = value.zset_value() else {
@@ -442,7 +443,7 @@ impl ZedisServerState {
             ..Default::default()
         };
         value.data = Some(RedisValueData::Zset(Arc::new(new_zset)));
-        self.next_value_epoch();
+        self.open.next_epoch();
         self.load_more_zset_value(cx);
     }
 
@@ -453,7 +454,7 @@ impl ZedisServerState {
     /// reach the server as "min or max is not a float" *after* the panel has
     /// already thrown away its rows.
     pub fn filter_zset_by_score(&mut self, min: SharedString, max: SharedString, cx: &mut Context<Self>) {
-        let Some((key, value)) = self.try_get_mut_key_value() else {
+        let Some((key, value)) = self.open.try_get_mut_key_value() else {
             return;
         };
         let Some(zset) = value.zset_value() else {
@@ -475,8 +476,8 @@ impl ZedisServerState {
         value.status = RedisValueStatus::Loading;
         cx.emit(ServerEvent::ValueUpdated);
         cx.notify();
-        self.next_value_epoch();
-        let epoch = self.value_epoch;
+        self.open.next_epoch();
+        let epoch = self.open.value_epoch;
 
         let at = self.at();
         self.spawn_with_arg(
@@ -488,14 +489,15 @@ impl ZedisServerState {
                 Ok((size, values))
             },
             move |this, result, cx| {
-                if this.value_epoch != epoch {
+                if this.open.value_epoch != epoch {
                     return;
                 }
-                if let Some(value) = this.value.as_mut() {
+                if let Some(value) = this.open.value.as_mut() {
                     value.status = RedisValueStatus::Idle;
                 }
                 if let Ok((size, values)) = result
-                    && let Some(RedisValueData::Zset(zset_data)) = this.value.as_mut().and_then(|v| v.data.as_mut())
+                    && let Some(RedisValueData::Zset(zset_data)) =
+                        this.open.value.as_mut().and_then(|v| v.data.as_mut())
                 {
                     let zset = Arc::make_mut(zset_data);
                     zset.done = values.len() >= size;
@@ -511,7 +513,7 @@ impl ZedisServerState {
 
     /// Drops the score window and reloads the sorted set whole.
     pub fn clear_zset_score_filter(&mut self, cx: &mut Context<Self>) {
-        let Some((key, value)) = self.try_get_mut_key_value() else {
+        let Some((key, value)) = self.open.try_get_mut_key_value() else {
             return;
         };
         if value.zset_value().is_none_or(|zset| zset.score_range.is_none()) {
@@ -544,7 +546,7 @@ impl ZedisServerState {
     /// # Arguments
     /// * `cx` - GPUI context for spawning async tasks and UI updates
     pub fn load_more_zset_value(&mut self, cx: &mut Context<Self>) {
-        let Some((key, value)) = self.try_get_mut_key_value() else {
+        let Some((key, value)) = self.open.try_get_mut_key_value() else {
             return;
         };
 
@@ -570,7 +572,7 @@ impl ZedisServerState {
 
         cx.emit(ServerEvent::ValuePaginationStarted);
         let keyword_clone = keyword.clone();
-        let epoch = self.value_epoch;
+        let epoch = self.open.value_epoch;
 
         self.spawn_with_arg(
             ServerTask::LoadMoreValue,
@@ -597,13 +599,14 @@ impl ZedisServerState {
             move |this, result, cx| {
                 // A page of another value — another key, a reload, an older
                 // filter or order — would append its members over this one.
-                if this.value_epoch != epoch {
+                if this.open.value_epoch != epoch {
                     return;
                 }
                 let mut should_load_more = false;
 
                 if let Ok((new_cursor, new_values)) = result
-                    && let Some(RedisValueData::Zset(zset_data)) = this.value.as_mut().and_then(|v| v.data.as_mut())
+                    && let Some(RedisValueData::Zset(zset_data)) =
+                        this.open.value.as_mut().and_then(|v| v.data.as_mut())
                 {
                     let zset = Arc::make_mut(zset_data);
 
@@ -630,7 +633,7 @@ impl ZedisServerState {
                 }
 
                 // Reset status to idle
-                if let Some(value) = this.value.as_mut() {
+                if let Some(value) = this.open.value.as_mut() {
                     value.status = RedisValueStatus::Idle;
                 }
 
@@ -655,8 +658,8 @@ impl ZedisServerState {
     /// * `cx` - GPUI context for spawning async tasks and UI updates
     pub fn remove_zset_value(&mut self, remove_value: KvElement, cx: &mut Context<Self>) {
         let remove_value_clone = remove_value.clone();
-        let log_key = self.key.clone();
-        let log_old_score = self.value.as_ref().and_then(|v| v.zset_value()).and_then(|z| {
+        let log_key = self.open.key.clone();
+        let log_old_score = self.open.value.as_ref().and_then(|v| v.zset_value()).and_then(|z| {
             z.values
                 .iter()
                 .find(|(m, _)| m.raw() == remove_value.raw())
@@ -698,9 +701,9 @@ impl ZedisServerState {
         if remove_values.is_empty() {
             return;
         }
-        let log_key = self.key.clone();
+        let log_key = self.open.key.clone();
         let log_removed: Vec<(String, Option<String>)> = {
-            let loaded = self.value.as_ref().and_then(|v| v.zset_value());
+            let loaded = self.open.value.as_ref().and_then(|v| v.zset_value());
             remove_values
                 .iter()
                 .map(|member| {

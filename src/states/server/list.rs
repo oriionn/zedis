@@ -83,8 +83,8 @@ impl ZedisServerState {
             return;
         }
         // The value generation this write belongs to — see `value_epoch`.
-        let epoch = self.value_epoch;
-        let Some((key, value)) = self.try_get_mut_key_value() else {
+        let epoch = self.open.value_epoch;
+        let Some((key, value)) = self.open.try_get_mut_key_value() else {
             return;
         };
         let key_str = key.to_string();
@@ -109,10 +109,10 @@ impl ZedisServerState {
             move |this, result, cx| {
                 // Another value is on screen now (a key switch, a reload):
                 // its rows and status are not this write's to touch.
-                if this.value_epoch != epoch {
+                if this.open.value_epoch != epoch {
                     return;
                 }
-                if let Some(value) = this.value.as_mut() {
+                if let Some(value) = this.open.value.as_mut() {
                     value.status = RedisValueStatus::Idle;
                 }
                 // Step 3: what the server holds, not what the optimistic
@@ -130,7 +130,7 @@ impl ZedisServerState {
     }
 
     pub fn filter_list_value(&mut self, keyword: SharedString, cx: &mut Context<Self>) {
-        let Some((_, value)) = self.try_get_mut_key_value() else {
+        let Some((_, value)) = self.open.try_get_mut_key_value() else {
             return;
         };
         let Some(list_value) = value.list_value() else {
@@ -146,8 +146,9 @@ impl ZedisServerState {
     }
     /// Removes an item at a specific index using a unique marker to ensure atomicity.
     pub fn remove_list_value(&mut self, index: usize, cx: &mut Context<Self>) {
-        let log_key = self.key.clone();
+        let log_key = self.open.key.clone();
         let log_old = self
+            .open
             .value
             .as_ref()
             .and_then(|v| v.list_value())
@@ -192,9 +193,9 @@ impl ZedisServerState {
             return;
         }
         let optimistic = indexes.clone();
-        let log_key = self.key.clone();
+        let log_key = self.open.key.clone();
         let log_removed: Vec<(usize, Option<String>)> = {
-            let loaded = self.value.as_ref().and_then(|v| v.list_value());
+            let loaded = self.open.value.as_ref().and_then(|v| v.list_value());
             indexes
                 .iter()
                 .map(|i| {
@@ -243,7 +244,7 @@ impl ZedisServerState {
     pub fn push_list_value(&mut self, new_value: SharedString, mode: SharedString, cx: &mut Context<Self>) {
         let is_lpush = mode == "1";
         let val_clone = KvElement::from_text(&new_value);
-        let log_key = self.key.clone();
+        let log_key = self.open.key.clone();
         let log_value = new_value.to_string();
 
         self.exec_list_op(
@@ -280,7 +281,7 @@ impl ZedisServerState {
     pub fn update_list_value(&mut self, index: usize, original: KvElement, new: Bytes, cx: &mut Context<Self>) {
         let new = KvElement::from_raw(new);
         let new_val = new.clone();
-        let log_key = self.key.clone();
+        let log_key = self.open.key.clone();
         let log_old = original.text().to_string();
         let log_new = new.text().to_string();
 
@@ -319,7 +320,7 @@ impl ZedisServerState {
     }
     /// Load the next page of items for the current List.
     pub fn load_more_list_value(&mut self, cx: &mut Context<Self>) {
-        let Some((key, value)) = self.try_get_mut_key_value() else {
+        let Some((key, value)) = self.open.try_get_mut_key_value() else {
             return;
         };
 
@@ -336,7 +337,7 @@ impl ZedisServerState {
         let start = current_len;
         let stop = start + 99; // Load 100 items
         cx.emit(ServerEvent::ValuePaginationStarted);
-        let epoch = self.value_epoch;
+        let epoch = self.open.value_epoch;
         self.spawn_with_arg(
             ServerTask::LoadMoreValue,
             key.clone(),
@@ -348,7 +349,7 @@ impl ZedisServerState {
             move |this, result, cx| {
                 // A page of another key's list, or of this one before a
                 // reload, would be appended to the rows on screen.
-                if this.value_epoch != epoch {
+                if this.open.value_epoch != epoch {
                     return;
                 }
                 if let Ok(new_values) = result
@@ -356,13 +357,15 @@ impl ZedisServerState {
                 {
                     // Update Local State (UI Thread)
                     // Append new items to the existing list
-                    if let Some(RedisValueData::List(list_data)) = this.value.as_mut().and_then(|v| v.data.as_mut()) {
+                    if let Some(RedisValueData::List(list_data)) =
+                        this.open.value.as_mut().and_then(|v| v.data.as_mut())
+                    {
                         let list = Arc::make_mut(list_data);
                         list.values.extend(new_values);
                     }
                 }
                 cx.emit(ServerEvent::ValuePaginationFinished);
-                if let Some(value) = this.value.as_mut() {
+                if let Some(value) = this.open.value.as_mut() {
                     value.status = RedisValueStatus::Idle;
                 }
                 cx.notify();

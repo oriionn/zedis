@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::RedisServerStatus;
 #[cfg(target_family = "wasm")]
 use crate::connection::bridge_storage;
 use crate::connection::{
@@ -21,9 +20,7 @@ use crate::connection::{
 #[cfg(not(target_family = "wasm"))]
 use crate::db::list_metrics_samples;
 use crate::helpers::{pacing, unix_ts, unix_ts_millis};
-use crate::states::{
-    ConnectionErrorKind, ConnectionHealth, ServerEvent, ServerTask, ZedisServerState, i18n_status_bar,
-};
+use crate::states::{ServerEvent, ServerTask, ZedisServerState, i18n_status_bar};
 use gpui::SharedString;
 use gpui::prelude::*;
 use parking_lot::RwLock;
@@ -747,71 +744,13 @@ fn parse_keyspace_value(v: &str) -> Result<RedisKeySpaceStats, ()> {
 }
 
 impl ZedisServerState {
-    /// Consecutive heartbeat PING failures before the live link is reported as
-    /// Offline rather than Reconnecting (~2s heartbeat cadence -> >=6s down).
-    const PING_OFFLINE_THRESHOLD: u32 = 3;
-
-    /// The status bar's heartbeat cadence; also the first retry wait. Paced
-    /// per target in `helpers::pacing` (2s on the desktop).
-    const HEARTBEAT_INTERVAL: Duration = pacing::HEARTBEAT_INTERVAL;
-    /// Longest wait between two attempts against an unreachable server.
-    const HEARTBEAT_BACKOFF_CAP: Duration = Duration::from_secs(60);
-
-    /// How long the heartbeat waits before dialling again after `failures`
-    /// consecutive misses: the interval doubled per miss — 2s, 4s, 8s, 16s,
-    /// 32s — and pinned at the cap from there. A failed attempt is a full
-    /// connect (DNS, TLS/SSH handshake, topology discovery, PING), which is
-    /// what the plain 2s tick used to repeat against a dead endpoint for as
-    /// long as its tab stayed open.
-    fn heartbeat_backoff(failures: u32) -> Duration {
-        let doublings = failures.saturating_sub(1).min(5);
-        Self::HEARTBEAT_INTERVAL
-            .saturating_mul(1 << doublings)
-            .min(Self::HEARTBEAT_BACKOFF_CAP)
-    }
-
-    /// Fold a heartbeat `PING` outcome into the observable [`ConnectionHealth`].
-    /// Success -> `Connected` (failure counter cleared). Failure ->
-    /// `Reconnecting` for the first few consecutive misses, then `Offline` past
-    /// the threshold (the heartbeat can't distinguish "retrying" from "down",
-    /// so this elapsed-failures heuristic stands in). Emits
-    /// `ConnectionHealthChanged` only on an actual transition, so a steady
-    /// state costs no extra re-render.
+    /// Fold a heartbeat `PING` outcome into the health ([`Link::note_ping`]),
+    /// announcing a transition and only a transition.
     fn note_ping_result(&mut self, ok: bool, cx: &mut Context<Self>) {
-        let was_down = matches!(
-            self.connection_health,
-            ConnectionHealth::Reconnecting | ConnectionHealth::Offline
-        );
-        let next = if ok {
-            self.ping_failures = 0;
-            self.heartbeat_retry_at = None;
-            self.last_connection_error = ConnectionErrorKind::Unknown;
-            // A load that failed while the server answers beats (a denied
-            // command, say) is still failed: its reason stays until it loads.
-            if !matches!(self.server_status, RedisServerStatus::Failed) {
-                self.link_failure = None;
-            }
-            ConnectionHealth::Connected
-        } else {
-            self.ping_failures = self.ping_failures.saturating_add(1);
-            let wait = Self::heartbeat_backoff(self.ping_failures);
-            self.heartbeat_retry_at = Some(Instant::now() + wait);
-            debug!(
-                server_id = self.server_id.as_str(),
-                failures = self.ping_failures,
-                retry_in_secs = wait.as_secs(),
-                "heartbeat backing off"
-            );
-            if self.ping_failures >= Self::PING_OFFLINE_THRESHOLD {
-                ConnectionHealth::Offline
-            } else {
-                ConnectionHealth::Reconnecting
-            }
-        };
-        if self.connection_health != next {
-            self.connection_health = next;
+        let outcome = self.link.note_ping(ok, self.server_id.as_str());
+        if outcome.changed {
             cx.emit(ServerEvent::ConnectionHealthChanged);
-            if ok && was_down {
+            if outcome.restored {
                 self.on_link_restored(cx);
             }
         }
@@ -834,7 +773,7 @@ impl ZedisServerState {
         } else {
             self.emit_success_notification(server_name.into(), label, cx);
         }
-        if let Some(key) = self.key.clone()
+        if let Some(key) = self.open.key.clone()
             && !key.is_empty()
         {
             self.reload_value(key, cx);
@@ -846,14 +785,12 @@ impl ZedisServerState {
     /// pooled client and pauses the heartbeat (`manually_offline`), so the link
     /// doesn't silently come back on the next tick.
     pub fn disconnect(&mut self, cx: &mut Context<Self>) {
-        if self.server_id.is_empty() || self.manually_offline {
+        if self.server_id.is_empty() || self.link.manually_offline {
             return;
         }
-        self.manually_offline = true;
+        let changed = self.link.go_offline();
         forget_client(&self.at());
-        self.ping_failures = Self::PING_OFFLINE_THRESHOLD;
-        if self.connection_health != ConnectionHealth::Offline {
-            self.connection_health = ConnectionHealth::Offline;
+        if changed {
             cx.emit(ServerEvent::ConnectionHealthChanged);
         }
     }
@@ -862,8 +799,7 @@ impl ZedisServerState {
     /// the page became visible): beat now instead of waiting out what is
     /// left of the relaxed interval.
     pub fn resume_heartbeat(&mut self, cx: &mut Context<Self>) {
-        self.last_background_refresh = 0;
-        self.last_heartbeat_at = None;
+        self.link.beat_now();
         self.refresh_redis_info(cx);
     }
 
@@ -872,10 +808,10 @@ impl ZedisServerState {
     /// remembered and sent when the first lands, so add-then-delete does not
     /// apply a stale total.
     pub fn refresh_dbsize_now(&mut self, cx: &mut Context<Self>) {
-        if self.server_id.is_empty() || self.manually_offline {
+        if self.server_id.is_empty() || self.link.manually_offline {
             return;
         }
-        if !self.request_dbsize_refresh() {
+        if !self.readings.request_dbsize_refresh() {
             return;
         }
         let at = self.at();
@@ -885,15 +821,14 @@ impl ZedisServerState {
             move |this, result, cx| {
                 match result {
                     Ok(n) => {
-                        this.dbsize = Some(n);
-                        this.last_dbsize_refreshed_at = unix_ts();
+                        this.readings.note_dbsize(n);
                         cx.emit(ServerEvent::ServerRedisInfoUpdated);
                     }
                     Err(e) => {
                         debug!(error = %e, "DBSIZE unavailable after a keyspace change; keeping the last key total");
                     }
                 }
-                if this.finish_dbsize_refresh() {
+                if this.readings.finish_dbsize_refresh() {
                     this.refresh_dbsize_now(cx);
                 }
                 cx.notify();
@@ -902,80 +837,25 @@ impl ZedisServerState {
         );
     }
 
-    /// Start a user-driven `DBSIZE`, or remember that another one is owed
-    /// when one is already in flight. Returns whether the caller should spawn.
-    fn request_dbsize_refresh(&mut self) -> bool {
-        if self.dbsize_refresh_inflight {
-            self.dbsize_refresh_again = true;
-            return false;
-        }
-        self.dbsize_refresh_inflight = true;
-        true
-    }
-
-    /// Clear the in-flight flag; answers whether another `DBSIZE` is owed.
-    fn finish_dbsize_refresh(&mut self) -> bool {
-        self.dbsize_refresh_inflight = false;
-        std::mem::take(&mut self.dbsize_refresh_again)
-    }
-
     pub fn refresh_redis_info(&mut self, cx: &mut Context<Self>) {
         if self.server_id.is_empty() {
             return;
         }
-        // Paused by a manual disconnect — don't PING (that would flip health
-        // back to Connected). Cleared by reconnect (via `reset`).
-        if self.manually_offline {
+        if !self.link.beat_due(self.facts.nodes().0) {
             return;
-        }
-        // One attempt at a time: a connect against a dead host takes up to
-        // the 10s connection timeout, and the 2s tick would otherwise stack
-        // five of them.
-        if self.heartbeat_in_flight {
-            return;
-        }
-        // Backing off after failed PINGs (`note_ping_result`): sit this tick
-        // out. Checked before the background throttle so a blocked tick
-        // doesn't consume the background window either.
-        if let Some(retry_at) = self.heartbeat_retry_at
-            && Instant::now() < retry_at
-        {
-            return;
-        }
-        // Inactive workspace tabs poll at a relaxed cadence: the 2s status-bar
-        // heartbeat keeps firing, but only one refresh per interval gets
-        // through. Re-activating the tab resets the window (`set_background`).
-        // A cluster's beat is one `INFO` per master, so a large one beats
-        // less often (`pacing::heartbeat_interval`; up to four masters — and
-        // every standalone or Sentinel entry — are untouched). The 2s tick
-        // stays the metronome; this only decides which ticks go through.
-        // Not while a retry is pending: the backoff above owns that wait.
-        let stretched = pacing::heartbeat_interval(self.nodes.0);
-        if stretched > Self::HEARTBEAT_INTERVAL
-            && let Some(last) = self.last_heartbeat_at
-            && last.elapsed() + Self::HEARTBEAT_INTERVAL / 2 < stretched
-        {
-            return;
-        }
-        if self.is_background() {
-            let now = unix_ts();
-            if now - self.last_background_refresh < pacing::BACKGROUND_REFRESH_SECS {
-                return;
-            }
-            self.last_background_refresh = now;
         }
 
         let slow_logs_check_interval = pacing::SLOW_LOG_CHECK_SECS;
-        let mut last_slow_logs_checked_at = self.last_slow_logs_checked_at;
+        let mut last_slow_logs_checked_at = self.readings.slow_logs_checked_at();
         // The status bar's key total: one `DBSIZE` at most every minute —
         // the number needn't track every tick, and a steady denominator
         // reads calmer than a live one. The same call the initial load
         // made, so the total never changes its meaning between the connect
         // and a minute later.
-        let refresh_dbsize = unix_ts() - self.last_dbsize_refreshed_at >= pacing::DBSIZE_REFRESH_SECS;
+        let refresh_dbsize = unix_ts() - self.readings.dbsize_refreshed_at() >= pacing::DBSIZE_REFRESH_SECS;
         // Captured so a user-driven `DBSIZE` that lands while this beat is
         // in flight is not overwritten by the beat's older total.
-        let dbsize_stamp = self.last_dbsize_refreshed_at;
+        let dbsize_stamp = self.readings.dbsize_refreshed_at();
         if last_slow_logs_checked_at == 0 {
             last_slow_logs_checked_at = unix_ts() - slow_logs_check_interval;
         }
@@ -984,8 +864,7 @@ impl ZedisServerState {
         let db = self.db;
         let server_id_clone = server_id.clone();
 
-        self.heartbeat_in_flight = true;
-        self.last_heartbeat_at = Some(Instant::now());
+        self.link.beat_started();
         self.spawn(
             ServerTask::RefreshRedisInfo,
             move || async move {
@@ -1073,13 +952,13 @@ impl ZedisServerState {
                 Ok((info, has_info, slow_logs, dbsize))
             },
             move |this, result, cx| {
-                this.heartbeat_in_flight = false;
+                this.link.heartbeat_in_flight = false;
                 // Disconnected by hand while this beat was in flight: its
                 // answer is from before the disconnect. Let through, a success
                 // put the health back to Connected and the next beats never
                 // ran (they are paused while offline), so the dot showed a
                 // live link that could be neither dropped nor re-dialled.
-                if this.manually_offline {
+                if this.link.manually_offline {
                     return;
                 }
                 match result {
@@ -1096,9 +975,7 @@ impl ZedisServerState {
                                 "sentinel master demoted; re-resolving"
                             );
                             forget_client(&ServerDb::new(server_id_clone.as_str(), db));
-                            let now = unix_ts();
-                            if now.saturating_sub(this.last_link_notice) >= 10 {
-                                this.last_link_notice = now;
+                            if this.link.link_notice_due() {
                                 this.emit_warning_notification(i18n_status_bar(cx, "conn_master_changed"), cx);
                             }
                         }
@@ -1106,23 +983,12 @@ impl ZedisServerState {
                             METRICS_CACHE.add_metrics(&server_id_clone, info.metrics);
                             maybe_persist_metrics(&server_id_clone, info.metrics, cx);
                         }
-                        if refresh_dbsize && this.last_dbsize_refreshed_at == dbsize_stamp {
-                            // Attempted, whether or not it answered — a denied
-                            // DBSIZE is asked again next minute, not next tick.
-                            this.last_dbsize_refreshed_at = unix_ts();
-                            if let Some(dbsize) = dbsize {
-                                this.dbsize = Some(dbsize);
-                            }
+                        if refresh_dbsize {
+                            this.readings.note_beat_dbsize(dbsize_stamp, dbsize);
                         }
-                        this.redis_info = Some(info);
+                        this.readings.set_redis_info(info);
                         if let Some(slow_logs) = slow_logs {
-                            this.last_slow_log_count = slow_logs
-                                .iter()
-                                .filter(|item| item.timestamp >= last_slow_logs_checked_at)
-                                .count();
-                            this.slow_logs = slow_logs;
-                            this.slow_logs_generation += 1;
-                            this.last_slow_logs_checked_at = unix_ts();
+                            this.readings.note_slow_logs(slow_logs, last_slow_logs_checked_at);
                         }
                         cx.emit(ServerEvent::ServerRedisInfoUpdated);
                         this.note_ping_result(true, cx);
@@ -1155,7 +1021,11 @@ impl ZedisServerState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connection::ReplicationRole;
+    use crate::connection::{RedisClientDescription, ReplicationRole};
+    use crate::states::server::Link;
+    use crate::states::{ConnectionHealth, LinkProblem};
+    use crate::test_support::{EventLog, init_ui, record_events, take_events};
+    use gpui::TestAppContext;
 
     /// The aggregate starts from the first master's INFO, so the fold has
     /// to add the *other* masters to it: a loop over every node counted the
@@ -1377,20 +1247,149 @@ mod tests {
     #[test]
     fn heartbeat_backoff_doubles_per_miss_and_caps_at_a_minute() {
         let secs: Vec<u64> = (0..8)
-            .map(|failures| ZedisServerState::heartbeat_backoff(failures).as_secs())
+            .map(|failures| Link::heartbeat_backoff(failures).as_secs())
             .collect();
         // 0 misses is never asked for, but must not underflow below the interval.
         assert_eq!(secs, vec![2, 2, 4, 8, 16, 32, 60, 60]);
-        assert_eq!(ZedisServerState::heartbeat_backoff(u32::MAX).as_secs(), 60);
+        assert_eq!(Link::heartbeat_backoff(u32::MAX).as_secs(), 60);
     }
 
     #[test]
     fn a_second_keyspace_change_asks_dbsize_again_after_the_first_lands() {
         let mut state = ZedisServerState::new();
-        assert!(state.request_dbsize_refresh());
-        assert!(!state.request_dbsize_refresh());
-        assert!(state.finish_dbsize_refresh());
-        assert!(state.request_dbsize_refresh());
-        assert!(!state.finish_dbsize_refresh());
+        assert!(state.readings.request_dbsize_refresh());
+        assert!(!state.readings.request_dbsize_refresh());
+        assert!(state.readings.finish_dbsize_refresh());
+        assert!(state.readings.request_dbsize_refresh());
+        assert!(!state.readings.finish_dbsize_refresh());
+    }
+
+    /// The heartbeat's outcome moves the health a step at a time and
+    /// announces only a change: misses are Reconnecting, then Offline at the
+    /// threshold, each backing the next attempt off; a reply after them is
+    /// Connected again, and said so. A disconnect by hand is Offline at once,
+    /// announced once, and the heartbeat sends nothing after it.
+    #[gpui::test]
+    fn the_heartbeat_moves_the_health_and_announces_only_a_change(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let state = cx.new(|_| ZedisServerState::default());
+        let log = record_events(cx, &state);
+        state.update(cx, |state, cx| {
+            state.server_id = "linktest".into();
+            state.note_ping_result(true, cx);
+            state.note_ping_result(true, cx);
+            assert_eq!(state.connection_health(), ConnectionHealth::Connected);
+            for miss in 1..=Link::PING_OFFLINE_THRESHOLD {
+                state.note_ping_result(false, cx);
+                assert!(state.link.heartbeat_retry_at.is_some(), "miss {miss} backs off");
+            }
+            assert_eq!(state.connection_health(), ConnectionHealth::Offline);
+            assert!(state.link_problem().is_some());
+            state.note_ping_result(true, cx);
+            assert_eq!(state.connection_health(), ConnectionHealth::Connected);
+            assert!(state.link.heartbeat_retry_at.is_none());
+            assert!(state.link_problem().is_none());
+        });
+        cx.run_until_parked();
+        let restored = cx.update(|cx| i18n_status_bar(cx, "conn_restored"));
+        assert_eq!(
+            take_events(&log),
+            [
+                "ConnectionHealthChanged".to_string(),
+                "ConnectionHealthChanged".to_string(),
+                "ConnectionHealthChanged".to_string(),
+                "ConnectionHealthChanged".to_string(),
+                format!("notice Success: {restored}"),
+            ]
+        );
+
+        state.update(cx, |state, cx| {
+            state.disconnect(cx);
+            state.disconnect(cx);
+            assert_eq!(state.connection_health(), ConnectionHealth::Offline);
+            assert_eq!(state.link_problem(), Some(LinkProblem::Disconnected));
+            state.refresh_redis_info(cx);
+            assert!(!state.link.heartbeat_in_flight, "nothing is sent while offline by hand");
+        });
+        cx.run_until_parked();
+        assert_eq!(take_events(&log), ["ConnectionHealthChanged"]);
+    }
+
+    /// A beat goes out only when it is due: one at a time, not while the
+    /// last miss is still backing off, not more often than a large
+    /// cluster's stretched interval, and in a background tab not more than
+    /// once a relaxed interval — until the tab comes back, and sent back to
+    /// the background it starts a new window.
+    #[gpui::test]
+    fn a_beat_goes_out_only_when_it_is_due(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let state = cx.new(|_| ZedisServerState::default());
+        let log = record_events(cx, &state);
+        let beats = |log: &EventLog| {
+            take_events(log)
+                .iter()
+                .filter(|event| event.as_str() == "TaskStarted(RefreshRedisInfo)")
+                .count()
+        };
+
+        state.update(cx, |state, cx| state.refresh_redis_info(cx));
+        assert_eq!(beats(&log), 0, "no server, no beat");
+        state.update(cx, |state, cx| {
+            state.server_id = "beattest".into();
+            state.refresh_redis_info(cx);
+            state.refresh_redis_info(cx);
+        });
+        assert_eq!(beats(&log), 1, "one at a time");
+        // It fails — there is no such server — and the miss backs off.
+        cx.run_until_parked();
+        take_events(&log);
+        state.update(cx, |state, cx| {
+            assert!(state.link.heartbeat_retry_at.is_some());
+            state.refresh_redis_info(cx);
+        });
+        assert_eq!(beats(&log), 0, "not while backing off");
+
+        state.update(cx, |state, cx| {
+            state.link.heartbeat_retry_at = None;
+            state.facts.set_topology((8, 0), RedisClientDescription::default());
+            state.link.last_heartbeat_at = Some(Instant::now());
+            state.refresh_redis_info(cx);
+        });
+        assert_eq!(beats(&log), 0, "inside a large cluster's stretched interval");
+        state.update(cx, |state, cx| {
+            state.facts.set_topology((1, 0), RedisClientDescription::default());
+            state.refresh_redis_info(cx);
+        });
+        assert_eq!(beats(&log), 1, "a small one's is not stretched");
+        cx.run_until_parked();
+        take_events(&log);
+
+        state.update(cx, |state, cx| {
+            state.link.heartbeat_retry_at = None;
+            state.set_background(true);
+            state.refresh_redis_info(cx);
+        });
+        assert_eq!(beats(&log), 1, "the first beat of a background tab");
+        cx.run_until_parked();
+        take_events(&log);
+        state.update(cx, |state, cx| {
+            state.link.heartbeat_retry_at = None;
+            state.refresh_redis_info(cx);
+        });
+        assert_eq!(beats(&log), 0, "within the relaxed interval");
+        state.update(cx, |state, cx| {
+            state.set_background(false);
+            state.refresh_redis_info(cx);
+        });
+        assert_eq!(beats(&log), 1, "a tab that comes back beats at once");
+        cx.run_until_parked();
+        take_events(&log);
+        state.update(cx, |state, cx| {
+            state.link.heartbeat_retry_at = None;
+            state.set_background(true);
+            state.refresh_redis_info(cx);
+        });
+        assert_eq!(beats(&log), 1, "back in the background, a new window");
+        cx.run_until_parked();
     }
 }

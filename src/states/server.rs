@@ -37,10 +37,16 @@ use crate::states::{
 use ahash::AHashMap;
 use ahash::AHashSet;
 use bytes::Bytes;
+use facts::ServerFacts;
 use gpui::prelude::*;
 use gpui::{SharedString, Task};
 use imbl::OrdMap;
+use link::Link;
+use open_key::OpenKey;
 use parking_lot::RwLock;
+use prefs::ConnectionPrefs;
+use readings::Readings;
+use scan::KeyScan;
 use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -49,6 +55,7 @@ use tracing::{debug, error, info};
 use uuid::Uuid;
 use value::{KeyType, RedisValue, RedisValueData};
 use web_time::Instant;
+use write_lock::WriteLock;
 use zedis_core::change_log::ChangeEntry;
 use zedis_core::report::Section;
 
@@ -56,14 +63,20 @@ use zedis_core::report::Section;
 pub mod cluster;
 pub mod element;
 pub mod event;
+mod facts;
 pub mod hash;
 pub mod history;
 pub mod json;
 pub mod key;
+mod link;
 pub mod list;
+mod open_key;
 pub mod persistence;
+mod prefs;
+mod readings;
 pub mod replication;
 pub mod report;
+mod scan;
 pub mod script_kill;
 #[cfg(not(target_family = "wasm"))]
 pub mod sentinel;
@@ -72,6 +85,7 @@ pub mod stat;
 pub mod stream;
 pub mod string;
 pub mod value;
+mod write_lock;
 pub mod zset;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -151,35 +165,42 @@ pub enum ConnectionHealth {
 /// whole map right there, on the UI thread.
 pub type LoadedKeys = OrdMap<SharedString, KeyType>;
 
-/// Main state management for Redis server operations
-///
-/// This struct manages:
-/// - Server connection and metadata (version, latency, dbsize)
-/// - Key scanning and tree structure
-/// - Selected key and its value
-/// - Error message history
-/// - Async task spawning and coordination
+/// One connection's state: which server and database it is, and what is
+/// known about it, a group a sub-struct of its own module, each with the
+/// methods that read and change only it. What announces a change, spawns a
+/// task or reaches across groups stays here, on the state.
 #[derive(Debug, Clone, Default)]
 pub struct ZedisServerState {
-    redis_info: Option<RedisInfo>,
+    /// Currently selected server id
+    server_id: SharedString,
+
+    /// Currently selected database
+    db: usize,
+
+    /// What a connect learned about the server (`facts.rs`).
+    facts: ServerFacts,
+
+    /// The link as the heartbeat and the loads have known it (`link.rs`).
+    link: Link,
+
+    /// What this connection may do, and the write lock's window (`write_lock.rs`).
+    lock: WriteLock,
+
+    /// How this connection's tree and editor are drawn (`prefs.rs`).
+    prefs: ConnectionPrefs,
+
+    /// What the heartbeat and `DBSIZE` read (`readings.rs`).
+    readings: Readings,
+
+    /// The keys the tree shows, and the scan that loads them (`scan.rs`).
+    scan: KeyScan,
+
+    /// The open key, its value and its history (`open_key.rs`).
+    open: OpenKey,
+
     /// What this session's panels found, for a troubleshooting report
     /// (`report.rs`).
     report_findings: Vec<(ReportFinding, Section)>,
-    /// Last time `dbsize` was filled from `DBSIZE` — the heartbeat asks at
-    /// most once a minute; a user-driven add/delete asks at once.
-    last_dbsize_refreshed_at: i64,
-    /// A user-driven `DBSIZE` is in flight (`refresh_dbsize_now`). A second
-    /// add/delete while it runs sets `dbsize_refresh_again` so the total is
-    /// asked again after this one lands, rather than applying a stale count.
-    dbsize_refresh_inflight: bool,
-    dbsize_refresh_again: bool,
-    last_slow_logs_checked_at: i64,
-    last_slow_log_count: usize,
-    slow_logs: Vec<SlowLogEntry>,
-    /// Bumped whenever `slow_logs` is replaced or cleared, so the panel can
-    /// tell a new log from a heartbeat that brought none without building
-    /// every row to compare the newest one.
-    slow_logs_generation: u64,
 
     /// `(processed, total)` slots of an in-flight cluster reshard;
     /// `None` when no reshard is running. Drives the Topology progress
@@ -195,290 +216,6 @@ pub struct ZedisServerState {
     /// Whether the terminal is open
     terminal: bool,
 
-    /// Currently selected server id
-    server_id: SharedString,
-
-    /// Search history
-    search_history: Vec<SharedString>,
-
-    /// Total number of databases
-    databases: usize,
-
-    /// Currently selected database
-    db: usize,
-
-    /// Key-tree separator for this connection (from server config, else `:`).
-    /// Set on `select`.
-    key_separator: String,
-    /// Resolved SCAN page size for this connection.
-    key_scan_count: usize,
-    /// Resolved max key-tree depth for this connection.
-    max_key_tree_depth: usize,
-    /// Resolved auto-expand threshold for this connection.
-    auto_expand_threshold: usize,
-    /// Resolved "show TTL in key tree" for this connection.
-    show_key_tree_ttl: bool,
-
-    /// Access mode
-    access_mode: AccessMode,
-
-    /// When the entry's write lock is open until, if it is (ADR 14). A
-    /// locked entry (`RedisServer::write_locked`) connects in `SafeMode` and
-    /// leaves it for `WRITE_UNLOCK_SECS` at a time; `unlock_task` is the
-    /// timer that puts it back, and dropping it (a re-lock, a server switch)
-    /// cancels the timer.
-    write_unlocked_until: Option<Instant>,
-    /// The `CLIENT PAUSE` this app sent (actions, until), for the status
-    /// bar on a server that does not report pauses — Redis; Valkey 8.1+
-    /// says so in `INFO clients` and is believed instead.
-    client_pause: Option<(String, Instant)>,
-    /// `Arc` only because the state derives `Clone` and a `Task` cannot;
-    /// the last handle dropping is what cancels the timer.
-    unlock_task: Option<Arc<Task<()>>>,
-
-    /// Whether the server supports ReJSON module
-    supports_rejson: bool,
-
-    /// Whether the server has the RediSearch module loaded. Gates the
-    /// "Search" entry in the Tools dropdown so unrelated servers don't
-    /// surface a useless menu item.
-    supports_search: bool,
-
-    /// Which commands this server offers the connected user — probed in the
-    /// background after connect, cached per server (shared across dbs), and
-    /// refined by runtime `NOPERM` / `unknown command` replies. Drives panel
-    /// placeholders, disabled menu entries and per-section chips.
-    features: Arc<ServerFeatures>,
-
-    /// Query mode (All/Prefix/Exact) for key filtering
-    query_mode: QueryMode,
-    /// The key tree reads its keyword box as a regex. `SCAN` has no regex,
-    /// so this turns the server-side `MATCH` off and every page of names is
-    /// narrowed on this side (`name_filter`) — a full walk of the keyspace,
-    /// which is the price of a regex and is why it is off by default. It
-    /// also takes the query mode's place: see `keyword_query_mode`.
-    regex_keyword: bool,
-    /// Optional filter to show only keys of one native type (`SCAN ... TYPE`).
-    type_filter: Option<KeyType>,
-
-    /// Whether to soft wrap the editor
-    soft_wrap: bool,
-
-    /// Current server status
-    server_status: RedisServerStatus,
-
-    /// Live-connection health derived from the heartbeat PING (online /
-    /// reconnecting / offline). Separate from `server_status`, which only
-    /// covers the initial connect/load.
-    connection_health: ConnectionHealth,
-
-    /// Why the last heartbeat failed (auth / perms / timeout / network /
-    /// tunnel), surfaced in the status-bar offline tooltip. Cleared on a
-    /// healthy PING.
-    last_connection_error: ConnectionErrorKind,
-
-    /// Consecutive heartbeat PING failures; drives the reconnecting->offline
-    /// transition in `note_ping_result`, reset to 0 on any success.
-    ping_failures: u32,
-
-    /// User pressed "disconnect" on the status-bar health dot: the live
-    /// connection is dropped and the heartbeat paused (health stays `Offline`)
-    /// until `reconnect` re-establishes it. Distinct from an involuntary drop,
-    /// where the heartbeat keeps retrying on its own.
-    manually_offline: bool,
-
-    /// The error the link last failed with — a refused connect, a failed
-    /// beat — for the panel that says why there is nothing to show
-    /// ([`Self::link_problem`]). Kept across the retries of the same target,
-    /// which `reset` otherwise wipes, so the panel does not flicker back to
-    /// the empty state for the length of every attempt; cleared once a load
-    /// or a beat goes through.
-    link_failure: Option<(ConnectionErrorKind, SharedString)>,
-
-    /// Unix seconds of the last "reconnect first" notice shown while
-    /// `manually_offline`. Throttles it so a background refresh loop can't spam
-    /// the notification each tick.
-    last_offline_notice: i64,
-    /// Unix seconds of the last link-level notice (`note_link_error`), so a
-    /// burst of failed calls during a reconnect yields one toast, not ten.
-    last_link_notice: i64,
-
-    /// This state belongs to an inactive workspace tab: its status-bar
-    /// heartbeat keeps ticking, but `refresh_redis_info` throttles itself to a
-    /// relaxed cadence so background tabs don't poll Redis at full speed.
-    background: bool,
-
-    /// Unix seconds of the last refresh allowed through while `background`.
-    last_background_refresh: i64,
-
-    /// Earliest moment the heartbeat may dial again after a failed PING.
-    /// Consecutive failures double the wait (2s, 4s, 8s … capped at 60s), so
-    /// an unreachable server is not put through DNS, the TLS/SSH handshake
-    /// and topology discovery every two seconds for as long as the tab stays
-    /// open. Cleared by a healthy PING, by any other task reaching the server
-    /// (the link is evidently up) and by `reset` (ADR 5).
-    heartbeat_retry_at: Option<Instant>,
-    /// When the last heartbeat attempt went out — what a large cluster's
-    /// stretched interval is measured from (`pacing::heartbeat_interval`).
-    last_heartbeat_at: Option<Instant>,
-
-    /// A heartbeat refresh is still in flight: the next tick skips instead of
-    /// stacking a second attempt while a connect timeout runs its course.
-    heartbeat_in_flight: bool,
-
-    /// Total number of keys in the database (from DBSIZE command)
-    dbsize: Option<u64>,
-
-    /// Number of Redis nodes (master, replica) for cluster info
-    nodes: (usize, usize),
-    /// Description of the nodes
-    nodes_description: Arc<RedisClientDescription>,
-    /// Sentinel only: the monitored masters as the sentinels describe them
-    /// (quorum, timing, down flags) — see `server/sentinel.rs`.
-    #[cfg(not(target_family = "wasm"))]
-    sentinel_masters: Vec<SentinelMaster>,
-
-    /// Redis server version string
-    version: SharedString,
-
-    /// List of all configured servers
-    // servers: Option<Vec<RedisServer>>,
-
-    /// Currently selected key name
-    key: Option<SharedString>,
-
-    /// Value data for the currently selected key
-    value: Option<RedisValue>,
-
-    /// Key whose oversized value the user chose to load anyway ("Load
-    /// anyway" on the too-large panel). While the selected key matches,
-    /// `get_value` skips the size gate so a later refresh doesn't bounce
-    /// back to the panel. Cleared on server switch.
-    size_gate_bypassed: Option<SharedString>,
-
-    /// Key whose oversized String the user chose to preview ("Preview" on
-    /// the too-large panel): `get_value` then fetches its first
-    /// `VALUE_PREVIEW_BYTES` instead of stopping at the gate, so a refresh
-    /// keeps the preview. Cleared on server switch.
-    size_gate_preview: Option<SharedString>,
-
-    /// What a "load anyway" still in flight replaced, with its key: the
-    /// gate panel's value, or a preview. Cancel puts it back as it was —
-    /// without asking the server, whose connection is the one the large
-    /// reply is still arriving on. Cleared when the load lands.
-    size_gate_pending: Option<(SharedString, RedisValue)>,
-
-    /// The last full load (`select`) failed for a reason the link explains —
-    /// refused, timed out, still loading its dataset — so the heartbeat runs
-    /// it again once the server answers ([`Self::retry_failed_load`]). A
-    /// server that was down when the app started used to come back as
-    /// "Connected" over an empty tree, with no version, no databases and no
-    /// node count, until the user reconnected by hand.
-    load_retry_pending: bool,
-    /// Automatic retries since the last load somebody asked for. Bounded
-    /// ([`MAX_LOAD_RETRIES`]): a load that keeps failing while the heartbeat
-    /// keeps succeeding must not be retried, and toasted, on every beat.
-    load_retries: u8,
-    /// The `select` now starting is one of those retries, not a new request.
-    load_retry_running: bool,
-
-    // ===== Key scanning state =====
-    /// Search keyword for filtering keys
-    keyword: SharedString,
-
-    /// SCAN cursors for cluster nodes (one per node)
-    cursors: Option<Vec<u64>>,
-
-    /// Whether a scan operation is in progress
-    scanning: bool,
-
-    /// Whether the current scan has completed
-    scan_completed: bool,
-
-    /// Number of scan iterations performed
-    scan_times: usize,
-
-    /// Monotonic scan-session counter, bumped by [`Self::reset_scan`]. Every
-    /// in-flight prefix scan captures the epoch at launch and bails on
-    /// completion if it no longer matches — so a lazy folder scan / "Load
-    /// more" still streaming when the user re-runs the search can't write its
-    /// stale keys and `incomplete_prefixes`/`loaded_prefixes` entries back
-    /// onto the freshly-reset tree. A keyword check alone can't catch this:
-    /// an empty-keyword browse re-searched with an empty keyword keeps the
-    /// same keyword, so only a generation bump distinguishes the sessions.
-    scan_epoch: u64,
-
-    /// Generation of the selected value: bumped when a key is selected, a
-    /// value is (re)loaded or replaced, or a collection filter starts over
-    /// (`next_value_epoch`). A task that reads or writes the loaded value —
-    /// a page of a hash / list / set / zset, a write and its follow-up, a
-    /// string save, a TTL change — captures it at launch, and its callback
-    /// leaves the value alone when it moved on. Without it one key's fields
-    /// were appended to another's table, an `HSCAN` went on over the new key
-    /// from the old one's cursor, and a failed string save wrote the old
-    /// key's bytes into the new key's editor. The key name cannot tell:
-    /// re-selecting the same key is a new generation too.
-    value_epoch: u64,
-
-    /// Unique ID for current key tree (changes when keys are reloaded)
-    key_tree_id: SharedString,
-
-    /// Set of prefixes that have been scanned (for lazy loading folders)
-    loaded_prefixes: AHashSet<SharedString>,
-
-    /// Prefixes whose lazy folder-scan (`scan_prefix`) is currently in
-    /// flight, stored in the same `"{folder_id}:"` form `scan_prefix`
-    /// receives. Drives the inline spinner on the matching folder row;
-    /// entries are removed as each prefix scan finishes and the whole set
-    /// is cleared on reset / server switch.
-    scanning_prefixes: AHashSet<SharedString>,
-    /// Folders re-scanned by `refresh_prefix` while the whole keyspace was
-    /// loaded (`scan_completed`). The refresh has to clear that flag — its
-    /// keys are gone until the re-scan lands — and it comes back once every
-    /// such re-scan has run to its end, where it used to stay off for good
-    /// and every later folder open went back to the server.
-    complete_before_refresh: AHashSet<SharedString>,
-
-    /// Prefixes whose lazy scan stopped at the per-load page cap before
-    /// completing, mapped to the SCAN cursors to resume from. Drives the
-    /// inline "Load more" row under the folder; an entry is removed once
-    /// its prefix finishes (or is refreshed) and the whole map is cleared
-    /// on reset / server switch.
-    incomplete_prefixes: AHashMap<SharedString, Vec<u64>>,
-
-    /// Every loaded key and its type ([`LoadedKeys`]).
-    keys: LoadedKeys,
-    /// How many keys the tree lists, where that is not all of `keys`: a
-    /// filter the tree applies itself (a tag, a TTL range, a regex) narrowed
-    /// them. Written by the tree after each build — `set_listed_keys`.
-    listed_keys: Option<usize>,
-
-    /// Parallel map of per-key TTL in seconds, populated alongside `keys`
-    /// during SCAN. `-1` = no expiry, `-2` = missing (key vanished between
-    /// SCAN and the TTL pipeline).
-    ///
-    /// Behind an `Arc` so the key tree's background build snapshots it with
-    /// an Arc clone instead of a structural copy (with 500k keys that copy
-    /// was ~20MB resident, twice). Writers go through `Arc::make_mut`: the
-    /// map is copied only when a write lands while a build holds it. Keep it
-    /// that way — a reader that keeps the `Arc` between builds turns every
-    /// write into a copy of the whole map (the key tree once did).
-    key_ttls: Arc<AHashMap<SharedString, i64>>,
-
-    /// Set by [`Self::begin_refresh_scan`]: the rows currently on screen are
-    /// the *previous* answer to the question the new scan is asking, kept so
-    /// the tree never blanks, and owed to whichever batch lands first —
-    /// `extend_keys` takes the flag and empties them before inserting.
-    /// `false` everywhere else, including after a plain [`Self::reset_scan`],
-    /// where the rows are gone already.
-    keys_superseded_by_next_batch: bool,
-
-    /// Per-key String versions and collection change logs for this
-    /// connection, under one memory budget with least-recently-used
-    /// eviction (`history::KeyHistories`). In memory only, never persisted.
-    histories: KeyHistories,
-
-    // ===== Error tracking =====
     /// Recent error messages (limited to MAX_ERROR_MESSAGES)
     error_messages: Arc<RwLock<Vec<ErrorMessage>>>,
 }
@@ -612,10 +349,7 @@ impl ZedisServerState {
     /// throttle window so a re-activated tab refreshes on its next heartbeat
     /// tick instead of waiting out the relaxed interval.
     pub fn set_background(&mut self, background: bool) {
-        self.background = background;
-        if !background {
-            self.last_background_refresh = 0;
-        }
+        self.link.set_background(background);
     }
 
     /// Whether this state belongs to an inactive (background) workspace tab.
@@ -626,7 +360,7 @@ impl ZedisServerState {
     /// (`pacing::unattended`): a hidden browser page, or a desktop window that
     /// has been inactive for a while.
     pub fn is_background(&self) -> bool {
-        self.background || pacing::unattended()
+        self.link.is_background()
     }
 
     /// Reset all scan-related state (clears keys, cursors, etc.)
@@ -656,35 +390,7 @@ impl ZedisServerState {
     }
 
     fn reset_scan_inner(&mut self, keep_rows: bool, cx: &mut Context<Self>) {
-        self.keyword = SharedString::default();
-        // A refresh owes its rows to the first batch back; a new query owns
-        // them outright and empties them right here.
-        self.keys_superseded_by_next_batch = keep_rows;
-        self.cursors = None;
-        if !keep_rows {
-            self.keys.clear();
-            self.listed_keys = None;
-            // Fresh Arc instead of `make_mut(..).clear()` — when a build still
-            // holds the old snapshot, `make_mut` would copy the whole map just
-            // to empty it.
-            self.key_ttls = Arc::new(AHashMap::new());
-            // The rows changed (to none); a refresh leaves them as they are,
-            // so re-identifying the tree would only cost a rebuild of the
-            // same rows. `extend_keys` bumps it when the new batch lands.
-            self.key_tree_id = Uuid::now_v7().to_string().into();
-        }
-        self.scanning = false;
-        self.scan_completed = false;
-        self.scan_times = 0;
-        // New scan session: bump the epoch so any prefix scan still in flight
-        // from the previous session (a folder expand / "Load more" that hadn't
-        // finished) is recognised as stale and drops its result instead of
-        // re-injecting keys and resurrecting `incomplete_prefixes` entries.
-        self.scan_epoch = self.scan_epoch.wrapping_add(1);
-        self.loaded_prefixes.clear();
-        self.scanning_prefixes.clear();
-        self.complete_before_refresh.clear();
-        self.incomplete_prefixes.clear();
+        self.scan.reset(keep_rows);
         if !keep_rows {
             // Both events describe rows that just went away: the tree
             // collapses and scrolls back to the top, then rebuilds empty. A
@@ -719,59 +425,16 @@ impl ZedisServerState {
     /// Reset all state when switching to a different server
     fn reset(&mut self, cx: &mut Context<Self>) {
         // A window belongs to the server it was opened on.
-        self.write_unlocked_until = None;
-        self.client_pause = None;
-        self.unlock_task = None;
+        self.lock.forget_window();
         self.server_id = SharedString::default();
-        self.version = SharedString::default();
-        self.nodes = (0, 0);
-        self.keys.clear();
-        self.listed_keys = None;
-        self.key_ttls = Arc::new(AHashMap::new());
-        // History is scoped to the current server session; drop it when
-        // we move to a different server to avoid restoring stale bytes
-        // into the wrong target.
-        self.histories.clear();
-        self.key_tree_id = SharedString::default();
-        self.nodes_description = Arc::new(RedisClientDescription::default());
-        #[cfg(not(target_family = "wasm"))]
-        self.sentinel_masters.clear();
-        self.dbsize = None;
-        self.key = None;
-        self.redis_info = None;
-        self.connection_health = ConnectionHealth::Unknown;
-        self.last_connection_error = ConnectionErrorKind::Unknown;
-        self.link_failure = None;
-        self.ping_failures = 0;
-        self.heartbeat_retry_at = None;
-        self.last_heartbeat_at = None;
-        self.heartbeat_in_flight = false;
-        // A fresh select / reconnect always re-establishes the link, so clear
-        // any manual-disconnect pause (reconnect routes through here too).
-        self.manually_offline = false;
-        self.value = None;
-        self.next_value_epoch();
-        self.size_gate_bypassed = None;
-        self.size_gate_preview = None;
-        self.size_gate_pending = None;
-        self.load_retry_pending = false;
-        // Cleared on server switch (but NOT in reset_scan, which a filter
-        // change triggers and must preserve the just-set filter).
-        self.type_filter = None;
-        // The key tree starts over with its regex toggle off on the same
-        // event; left on here, the next keyword was scanned as a regex under
-        // a box that said substring.
-        self.regex_keyword = false;
+        self.facts.reset();
+        self.scan.forget_server();
+        self.open.forget_server();
+        self.link.reset();
         self.reset_scan(cx);
         self.terminal = false;
         self.report_findings.clear();
-        self.last_dbsize_refreshed_at = 0;
-        self.dbsize_refresh_inflight = false;
-        self.dbsize_refresh_again = false;
-        self.last_slow_logs_checked_at = 0;
-        self.last_slow_log_count = 0;
-        self.slow_logs.clear();
-        self.slow_logs_generation += 1;
+        self.readings.reset();
         // A reshard task from the previous server can no longer report back
         // (its completion callback is stale-guarded) — drop its progress.
         self.reshard_progress = None;
@@ -780,47 +443,9 @@ impl ZedisServerState {
         self.info_snapshot = None;
     }
 
-    /// Add new keys with their types to the key map (deduplicating automatically)
-    ///
-    /// If any new keys were added, generates a new tree ID to trigger UI refresh
+    /// Add new keys with their types to the loaded ones ([`KeyScan::extend`]).
     fn extend_keys(&mut self, keys: Vec<(SharedString, SharedString, i64)>) {
-        // The first batch of a refresh is what the displayed rows were
-        // waiting for: they go now, so a key deleted on the server does not
-        // survive the refresh that should have removed it. Emptied here
-        // rather than before the scan so the panel never blanks.
-        let superseded = std::mem::take(&mut self.keys_superseded_by_next_batch);
-        if superseded {
-            self.keys.clear();
-            self.key_ttls = Arc::new(AHashMap::new());
-        }
-        let key_ttls = Arc::make_mut(&mut self.key_ttls);
-        key_ttls.reserve(keys.len());
-        let mut insert_count = 0;
-
-        for (key, key_type, ttl_secs) in keys {
-            let kt = KeyType::from(key_type.as_ref());
-            // One walk down the tree, not the two an `entry` takes (it looks
-            // the key up, then inserts): half the cost of a scan page. A
-            // known type stays as it was — only an `Unknown` is replaced —
-            // so the rare page that knows the key less well puts it back.
-            match self.keys.insert(key.clone(), kt) {
-                None => insert_count += 1,
-                Some(existing) if existing != KeyType::Unknown && existing != kt => {
-                    self.keys.insert(key.clone(), existing);
-                }
-                Some(_) => {}
-            }
-            // Always update the freshest TTL (it counts down) — replace
-            // existing rather than insert_with.
-            key_ttls.insert(key, ttl_secs);
-        }
-
-        // Update tree ID only if new keys were added — or if a refresh just
-        // took the old ones out, which a batch of zero would otherwise leave
-        // on screen.
-        if insert_count != 0 || superseded {
-            self.key_tree_id = Uuid::now_v7().to_string().into();
-        }
+        self.scan.extend(keys);
     }
 
     /// Add an error message to the history and emit error event
@@ -886,12 +511,10 @@ impl ZedisServerState {
     /// *before* its optimistic change — [`Self::spawn`] drops the task, and
     /// the change it had already made was never taken back.
     pub(crate) fn refuse_while_offline(&mut self, cx: &mut Context<Self>) -> bool {
-        if !self.manually_offline {
+        if !self.link.manually_offline {
             return false;
         }
-        let now = unix_ts();
-        if now.saturating_sub(self.last_offline_notice) >= 3 {
-            self.last_offline_notice = now;
+        if self.link.offline_notice_due() {
             self.emit_warning_notification(i18n_common(cx, "reconnect_first"), cx);
         }
         true
@@ -944,9 +567,9 @@ impl ZedisServerState {
             // If `select` already flipped us to Loading before calling spawn,
             // leave Failed so the UI is not stuck on the busy skeleton with
             // no in-flight task to clear it.
-            if matches!(self.server_status, RedisServerStatus::Loading) {
-                self.server_status = RedisServerStatus::Failed;
-                self.scanning = false;
+            if matches!(self.link.server_status, RedisServerStatus::Loading) {
+                self.link.server_status = RedisServerStatus::Failed;
+                self.scan.scanning = false;
                 cx.emit(ServerEvent::ServerInfoUpdated);
                 cx.notify();
             }
@@ -990,13 +613,8 @@ impl ZedisServerState {
             // "not available on this server" notice and degrades the
             // UI; repeats stay quiet.
             if !stale
-                && !matches!(
-                    run.name,
-                    ServerTask::RefreshRedisInfo
-                        | ServerTask::RefreshDbsize
-                        | ServerTask::RefreshValueHeader
-                        | ServerTask::ProbeFeatures
-                )
+                && !run.name.is_background_refresh()
+                && run.name != ServerTask::ProbeFeatures
                 && !self.note_command_error(e, cx)
                 && !self.note_link_error(e, cx)
             {
@@ -1007,17 +625,9 @@ impl ZedisServerState {
             return false;
         }
         if failure.is_none() && run.name != ServerTask::RefreshRedisInfo {
-            // Some other task just reached the server, so the link
-            // is up: let the next heartbeat tick PING right away
-            // instead of sitting out its backoff.
-            self.heartbeat_retry_at = None;
+            self.link.reached();
         }
         true
-    }
-
-    /// Start a new generation of the selected value — see `value_epoch`.
-    fn next_value_epoch(&mut self) {
-        self.value_epoch = self.value_epoch.wrapping_add(1);
     }
 
     /// After a write to the loaded value failed: the optimistic change never
@@ -1025,18 +635,9 @@ impl ZedisServerState {
     /// keep showing a write that did not happen — or guess at undoing it,
     /// which for an `RPUSH` onto a partly loaded list popped a real element.
     fn reload_after_failed_write(&mut self, cx: &mut Context<Self>) {
-        if let Some(key) = self.key.clone().filter(|key| !key.is_empty()) {
+        if let Some(key) = self.open.key.clone().filter(|key| !key.is_empty()) {
             self.reload_value(key, cx);
         }
-    }
-
-    fn try_get_mut_key_value(&mut self) -> Option<(SharedString, &mut RedisValue)> {
-        let key = self.key.as_ref().filter(|k| !k.is_empty())?.clone();
-        let value = self.value.as_mut()?;
-        if value.is_busy() {
-            return None;
-        }
-        Some((key, value))
     }
 
     // ===== Public accessor methods =====
@@ -1056,49 +657,50 @@ impl ZedisServerState {
     /// (empty) editor so the user can re-select and retry, otherwise the
     /// loading skeleton would spin forever after a connection failure.
     pub fn is_busy(&self) -> bool {
-        matches!(self.server_status, RedisServerStatus::Loading)
+        self.link.is_busy()
     }
 
     /// Get the current key tree ID (changes when keys are reloaded)
     pub fn key_tree_id(&self) -> &str {
-        &self.key_tree_id
+        &self.scan.key_tree_id
     }
 
     /// Get the search history
     pub fn search_history(&self) -> Vec<SharedString> {
-        self.search_history.clone()
+        self.scan.search_history.clone()
     }
 
     pub fn clear_search_history(&mut self, _cx: &mut Context<Self>) {
-        self.search_history.clear();
+        self.scan.search_history.clear();
     }
 
     /// Get whether the server supports ReJSON module
     pub fn supports_rejson(&self) -> bool {
-        self.supports_rejson
+        self.facts.supports_rejson()
     }
 
     /// Whether the server has the RediSearch module loaded.
     pub fn supports_search(&self) -> bool {
-        self.supports_search
+        self.facts.supports_search()
     }
 
     /// Whether writes are refused by something the user cannot switch: a
     /// read-only ACL user, or a read-only bridge account.
     pub fn strict_readonly(&self) -> bool {
-        matches!(self.access_mode, AccessMode::StrictReadOnly)
+        self.lock.strict_readonly()
     }
 
     /// Get whether the server is readonly
     pub fn readonly(&self) -> bool {
-        matches!(self.access_mode, AccessMode::StrictReadOnly | AccessMode::SafeMode)
+        self.lock.readonly()
     }
 
     /// What a typed write meets here — see [`WriteGate`].
     pub fn write_gate(&self) -> WriteGate {
         // The config is only read where it decides something.
-        let write_locked = matches!(self.access_mode, AccessMode::SafeMode) && self.write_locked();
-        write_gate_for(self.access_mode, write_locked)
+        let mode = self.lock.access_mode();
+        let write_locked = matches!(mode, AccessMode::SafeMode) && self.write_locked();
+        write_gate_for(mode, write_locked)
     }
 
     /// Whether `cap` is allowed under the current access mode *and* every
@@ -1109,31 +711,30 @@ impl ZedisServerState {
     /// refresh, export, multi-select, local tags) stay available when
     /// the connection is locked.
     pub fn can(&self, cap: Capability) -> bool {
-        cap.available(self.readonly(), &self.features)
+        cap.available(self.readonly(), self.facts.feature_matrix())
     }
 
     /// Why `cap` is blocked on the server side, if it is — the command the
     /// probe found missing or denied. `None` when only the access mode (or
     /// nothing) stands in the way.
     pub fn blocked_by(&self, cap: Capability) -> Option<(ServerCommand, CommandStatus)> {
-        cap.blocked_by(&self.features)
+        self.facts.blocked_by(cap)
     }
 
     /// The probed feature matrix for this server (optimistic until probed).
     pub fn features(&self) -> Arc<ServerFeatures> {
-        self.features.clone()
+        self.facts.features()
     }
 
     /// The first command `view` cannot function without that this server
     /// lacks — `Some` means the route shows a placeholder, not the panel.
     pub fn panel_block(&self, view: ServerView) -> Option<(ServerCommand, CommandStatus)> {
-        self.features.first_unusable(view.required_commands())
+        self.facts.panel_block(view)
     }
 
     /// Why `command` is unusable here, if it is.
     pub fn command_block(&self, command: ServerCommand) -> Option<CommandStatus> {
-        let status = self.features.status(command);
-        (!status.is_usable()).then_some(status)
+        self.facts.command_block(command)
     }
 
     /// Runs the command probe in the background. Skipped when a probed
@@ -1146,9 +747,9 @@ impl ZedisServerState {
         }
         if force {
             invalidate_server_features(server_id.as_str());
-            self.features = Arc::default();
+            self.facts.set_features(Arc::default());
             cx.emit(ServerEvent::FeaturesProbed);
-        } else if self.features.probed {
+        } else if self.facts.feature_matrix().probed {
             return;
         }
         let db = self.db;
@@ -1158,7 +759,7 @@ impl ZedisServerState {
             move || async move { Ok(probe_server_features(id.as_str(), db).await?) },
             move |this, result, cx| {
                 if let Ok(features) = result {
-                    this.features = features;
+                    this.facts.set_features(features);
                     cx.emit(ServerEvent::FeaturesProbed);
                     cx.notify();
                 }
@@ -1196,7 +797,7 @@ impl ZedisServerState {
             }
             K::Network => {
                 forget_client(&self.at());
-                match self.connection_health {
+                match self.link.connection_health {
                     // The status bar already shows "reconnecting" — no toast
                     // per failed click on top of it.
                     ConnectionHealth::Reconnecting | ConnectionHealth::Offline => return true,
@@ -1210,9 +811,7 @@ impl ZedisServerState {
             K::Timeout | K::Loading | K::Busy | K::ClusterDown => i18n_status_bar(cx, kind.reason_key()),
             _ => return false,
         };
-        let now = unix_ts();
-        if now.saturating_sub(self.last_link_notice) >= 10 {
-            self.last_link_notice = now;
+        if self.link.link_notice_due() {
             self.emit_warning_notification(message, cx);
         }
         true
@@ -1232,12 +831,13 @@ impl ZedisServerState {
         if changed.is_empty() {
             return match source {
                 ConnectionError::Redis { source } => self
-                    .features
+                    .facts
+                    .feature_matrix()
                     .already_explains(source.code(), source.detail().unwrap_or_default()),
                 _ => false,
             };
         }
-        self.features = features;
+        self.facts.set_features(features);
         for (command, status) in changed {
             let message = command_unavailable_message(cx, command, status);
             self.emit_warning_notification(message, cx);
@@ -1256,27 +856,20 @@ impl ZedisServerState {
     /// Remember the `CLIENT PAUSE` the clients panel just sent, so the
     /// status bar can show it on a server that will not say (Redis).
     pub fn note_client_pause(&mut self, mode: PauseMode, timeout_ms: u64, cx: &mut Context<Self>) {
-        let until = Instant::now() + Duration::from_millis(timeout_ms);
-        self.client_pause = Some((mode.as_str().to_ascii_lowercase(), until));
+        self.readings.note_client_pause(mode, timeout_ms);
         cx.notify();
     }
 
     /// The clients panel lifted the pause.
     pub fn note_client_unpause(&mut self, cx: &mut Context<Self>) {
-        self.client_pause = None;
+        self.readings.clear_client_pause();
         cx.notify();
     }
 
     /// Whether clients are paused right now, for how long and by whose
     /// word — the server's (Valkey 8.1+), else this app's own record.
     pub fn client_pause(&self) -> Option<ClientPause> {
-        client_pause_now(
-            self.redis_info.as_ref().map(|info| &info.metrics),
-            self.client_pause
-                .as_ref()
-                .map(|(actions, until)| (actions.as_str(), *until)),
-            Instant::now(),
-        )
+        self.readings.client_pause()
     }
 
     /// `CLIENT UNPAUSE` on every master — the status bar chip's click.
@@ -1286,7 +879,7 @@ impl ZedisServerState {
             self.emit_warning_notification("Read-only mode — client commands blocked".into(), cx);
             return;
         }
-        self.client_pause = None;
+        self.readings.clear_client_pause();
         let at = self.at();
         self.spawn(
             ServerTask::ClientUnpause,
@@ -1303,9 +896,7 @@ impl ZedisServerState {
 
     /// How much of the open write window is left, if one is open.
     pub fn unlock_remaining(&self) -> Option<Duration> {
-        let until = self.write_unlocked_until?;
-        let now = Instant::now();
-        (until > now).then(|| until - now)
+        self.lock.remaining()
     }
 
     /// Open the write window: leave `SafeMode` for `WRITE_UNLOCK_SECS`, then
@@ -1315,25 +906,23 @@ impl ZedisServerState {
     /// again here: a page that believes itself unlocked while the bridge
     /// refuses every write would be the worse state.
     pub fn unlock_writes(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.access_mode, AccessMode::StrictReadOnly) {
+        if self.lock.strict_readonly() {
             return;
         }
         let window = Duration::from_secs(WRITE_UNLOCK_SECS);
-        self.write_unlocked_until = Some(Instant::now() + window);
-        self.access_mode = AccessMode::ReadWrite;
-        self.unlock_task = Some(Arc::new(cx.spawn(async move |this, cx| {
+        let until = Instant::now() + window;
+        let timer = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(window).await;
             let _ = this.update(cx, |this, cx| this.expire_unlock(cx));
-        })));
+        });
+        self.lock.open(until, timer);
         let at = self.at();
         self.spawn(
             ServerTask::UnlockWrites,
             move || async move { Ok(unlock_writes(&at).await?) },
             move |this, result, cx| {
                 if let Err(e) = result {
-                    this.write_unlocked_until = None;
-                    this.unlock_task = None;
-                    this.access_mode = AccessMode::SafeMode;
+                    this.lock.refuse();
                     let message = i18n_status_bar(cx, "unlock_failed").replace("%{error}", &e.to_string());
                     this.emit_warning_notification(message.into(), cx);
                     cx.emit(ServerEvent::ServerInfoUpdated);
@@ -1348,7 +937,7 @@ impl ZedisServerState {
     /// Close the window early. The bridge is told the same, so a script
     /// cannot keep using a window the page has closed.
     pub fn lock_writes(&mut self, cx: &mut Context<Self>) {
-        if self.write_unlocked_until.is_none() {
+        if !self.lock.is_open() {
             return;
         }
         self.relock(cx);
@@ -1365,7 +954,7 @@ impl ZedisServerState {
     /// may be mid-thought, and the next write refusing without a word would
     /// read as a bug.
     fn expire_unlock(&mut self, cx: &mut Context<Self>) {
-        if self.write_unlocked_until.is_none() {
+        if !self.lock.is_open() {
             return;
         }
         self.relock(cx);
@@ -1375,17 +964,13 @@ impl ZedisServerState {
     }
 
     fn relock(&mut self, cx: &mut Context<Self>) {
-        self.write_unlocked_until = None;
-        self.unlock_task = None;
-        if self.access_mode == AccessMode::ReadWrite {
-            self.access_mode = AccessMode::SafeMode;
-        }
+        self.lock.close();
         cx.emit(ServerEvent::ServerInfoUpdated);
         cx.notify();
     }
 
     pub fn toggle_readonly(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.access_mode, AccessMode::StrictReadOnly) {
+        if !self.lock.toggle() {
             self.add_error_message(
                 "toggle_readonly".to_string(),
                 "Strict read-only mode, cannot be toggled".to_string(),
@@ -1393,71 +978,66 @@ impl ZedisServerState {
             );
             return;
         }
-        if self.access_mode == AccessMode::ReadWrite {
-            self.access_mode = AccessMode::SafeMode;
-        } else {
-            self.access_mode = AccessMode::ReadWrite;
-        }
         cx.emit(ServerEvent::ServerInfoUpdated);
     }
 
     /// Set the query mode (All/Prefix/Exact)
     pub fn set_query_mode(&mut self, mode: QueryMode, _cx: &mut Context<Self>) {
-        self.query_mode = mode;
+        self.scan.query_mode = mode;
     }
     /// Whether the keyword is a regex, which the scan cannot narrow by.
     pub fn regex_keyword(&self) -> bool {
-        self.regex_keyword
+        self.scan.regex_keyword
     }
     pub fn set_regex_keyword(&mut self, on: bool, _cx: &mut Context<Self>) {
-        self.regex_keyword = on;
+        self.scan.regex_keyword = on;
     }
     /// The active key-type filter, if any.
     pub fn type_filter(&self) -> Option<KeyType> {
-        self.type_filter
+        self.scan.type_filter
     }
     /// Set whether to soft wrap the editor
     pub fn set_soft_wrap(&mut self, soft_wrap: bool, cx: &mut Context<Self>) {
-        self.soft_wrap = soft_wrap;
-        cx.emit(ServerEvent::SoftWrapToggled(self.soft_wrap));
+        self.prefs.set_soft_wrap(soft_wrap);
+        cx.emit(ServerEvent::SoftWrapToggled(self.prefs.soft_wrap()));
     }
     /// Get the current query mode (All/Prefix/Exact)
     pub fn query_mode(&self) -> QueryMode {
-        self.query_mode
+        self.scan.query_mode
     }
 
     /// The keyword the current key scan was started with (empty = full scan).
     pub fn keyword(&self) -> SharedString {
-        self.keyword.clone()
+        self.scan.keyword.clone()
     }
 
     /// Check if the current scan has completed
     pub fn scan_completed(&self) -> bool {
-        self.scan_completed
+        self.scan.scan_completed
     }
 
     /// Check if a scan is currently in progress
     pub fn scanning(&self) -> bool {
-        self.scanning
+        self.scan.scanning
     }
 
     /// Prefixes whose lazy folder-scan is currently in flight (form
     /// `"{folder_id}:"`). The key tree reads this to show an inline
     /// spinner on the matching folder row.
     pub fn scanning_prefixes(&self) -> &AHashSet<SharedString> {
-        &self.scanning_prefixes
+        &self.scan.scanning_prefixes
     }
 
     /// Prefixes whose folder scan stopped at the page cap with more keys
     /// still on the server (form `"{folder_id}:"`). The key tree shows an
     /// inline "Load more" row for each so the user can resume the scan.
     pub fn incomplete_prefix_set(&self) -> AHashSet<SharedString> {
-        self.incomplete_prefixes.keys().cloned().collect()
+        self.scan.incomplete_prefixes.keys().cloned().collect()
     }
 
     /// Get the total database size (number of keys)
     pub fn dbsize(&self) -> Option<u64> {
-        self.dbsize
+        self.readings.dbsize()
     }
 
     /// How many keys the tree lists: the loaded ones, less what a filter of
@@ -1466,22 +1046,22 @@ impl ZedisServerState {
     /// that matched, and with a tag or a TTL filter it stayed at everything
     /// loaded, 25/25 beside a tree of one key (#189).
     pub fn listed_count(&self) -> usize {
-        self.listed_keys.unwrap_or(self.keys.len())
+        self.scan.listed_count()
     }
 
     /// The tree's report after a build: `listed` keys of the ones loaded
     /// when it started. `None` when it lists them all, so that the count
     /// follows a scan page by page instead of a build behind it.
     pub fn set_listed_keys(&mut self, listed: Option<usize>, cx: &mut Context<Self>) {
-        if self.listed_keys != listed {
-            self.listed_keys = listed;
+        if self.scan.listed_keys != listed {
+            self.scan.listed_keys = listed;
             cx.emit(ServerEvent::KeysListed);
         }
     }
 
     /// Get the last measured latency to the server
     pub fn redis_info(&self) -> Option<&RedisInfo> {
-        self.redis_info.as_ref()
+        self.readings.redis_info()
     }
 
     /// The link problem to show in place of the workspace's content, if the
@@ -1490,12 +1070,7 @@ impl ZedisServerState {
         if self.server_id.is_empty() {
             return None;
         }
-        link_problem_for(
-            &self.server_status,
-            self.connection_health,
-            self.manually_offline,
-            self.link_failure.as_ref(),
-        )
+        self.link.problem()
     }
 
     /// Remember what the link failed with, for [`Self::link_problem`].
@@ -1506,38 +1081,35 @@ impl ZedisServerState {
             .map(|server| server.tls.unwrap_or(false))
             .unwrap_or(false);
         let kind = error.connection_kind_tls_aware(tls_enabled);
-        self.last_connection_error = kind;
-        self.link_failure = Some((kind, error.to_string().into()));
+        self.link.note_failure(kind, error.to_string().into());
     }
 
     /// Current live-connection health (online / reconnecting / offline),
     /// updated each heartbeat tick by `note_ping_result`.
     pub fn connection_health(&self) -> ConnectionHealth {
-        self.connection_health
+        self.link.connection_health
     }
 
     /// Why the last heartbeat failed, for the offline tooltip. `Unknown` when
     /// healthy or when the driver didn't give us enough to classify.
     pub fn last_connection_error(&self) -> ConnectionErrorKind {
-        self.last_connection_error
+        self.link.last_connection_error
     }
 
     /// Get the slow logs
     pub fn slow_logs(&self) -> &Vec<SlowLogEntry> {
-        &self.slow_logs
+        self.readings.slow_logs()
     }
     /// Which version of [`Self::slow_logs`] this is — it changes exactly
     /// when the log does.
     pub fn slow_logs_generation(&self) -> u64 {
-        self.slow_logs_generation
+        self.readings.slow_logs_generation()
     }
     /// Drop the cached slow-log entries and notify listeners — called
     /// after a `SLOWLOG RESET` so the panel empties immediately instead
     /// of waiting for the next heartbeat refresh.
     pub fn clear_slow_logs(&mut self, cx: &mut Context<Self>) {
-        self.slow_logs.clear();
-        self.slow_logs_generation += 1;
-        self.last_slow_log_count = 0;
+        self.readings.clear_slow_logs();
         cx.emit(ServerEvent::ServerRedisInfoUpdated);
     }
 
@@ -1564,31 +1136,28 @@ impl ZedisServerState {
     }
     /// Get the last slow log count
     pub fn last_slow_log_count(&self) -> usize {
-        self.last_slow_log_count
+        self.readings.last_slow_log_count()
     }
 
     /// Get cluster node counts (master, replica)
     pub fn nodes(&self) -> (usize, usize) {
-        self.nodes
+        self.facts.nodes()
     }
     /// Get the description of the nodes
     pub fn nodes_description(&self) -> Arc<RedisClientDescription> {
-        self.nodes_description.clone()
+        self.facts.nodes_description()
     }
 
     /// Get the Redis server version string
     pub fn version(&self) -> &str {
-        &self.version
+        self.facts.version()
     }
 
     /// The one version gate: both flavors decided by a [`Floor`] from
     /// `floors.rs` — Valkey's version numbers run ahead of Redis's, so a
     /// bare floor written for Redis is wrong on Valkey.
     pub fn supports(&self, floor: Floor) -> bool {
-        use semver::Version;
-        Version::parse(self.version.as_ref())
-            .map(|v| floor.met_by(self.nodes_description().is_valkey, &v))
-            .unwrap_or(false)
+        self.facts.supports(floor)
     }
 
     /// Per-field hash TTL (`HEXPIRE / HTTL / HPERSIST`) — Redis 7.4,
@@ -1676,75 +1245,71 @@ impl ZedisServerState {
     /// Key-tree / prefix separator for the active connection.
     /// Never empty — defaults to `":"`.
     pub fn key_separator(&self) -> &str {
-        if self.key_separator.is_empty() {
-            ":"
-        } else {
-            &self.key_separator
-        }
+        self.prefs.key_separator()
     }
 
     /// SCAN page size for the active connection (never below the floor).
     pub fn key_scan_count(&self) -> usize {
-        self.key_scan_count.clamp(MIN_KEY_SCAN_COUNT, MAX_KEY_SCAN_COUNT)
+        self.prefs.key_scan_count()
     }
 
     /// Max key-tree nesting depth for the active connection.
     pub fn max_key_tree_depth(&self) -> usize {
-        self.max_key_tree_depth.max(1)
+        self.prefs.max_key_tree_depth()
     }
 
     /// Auto-expand threshold for the active connection.
     pub fn auto_expand_threshold(&self) -> usize {
-        self.auto_expand_threshold
+        self.prefs.auto_expand_threshold()
     }
 
     /// Whether TTL chips are shown in the key tree for this connection.
     pub fn show_key_tree_ttl(&self) -> bool {
-        self.show_key_tree_ttl
+        self.prefs.show_key_tree_ttl()
     }
 
     /// Get the total number of databases
     pub fn databases(&self) -> usize {
-        self.databases
+        self.facts.databases()
     }
 
     /// Get whether to soft wrap the editor
     pub fn soft_wrap(&self) -> bool {
-        self.soft_wrap
+        self.prefs.soft_wrap()
     }
 
     /// Get the currently selected key name
     pub fn key(&self) -> Option<SharedString> {
-        self.key.clone()
+        self.open.key.clone()
     }
     /// Shared handle to the TTL map for background snapshots (the key-tree
     /// build) — an Arc clone instead of copying the whole map.
     pub fn key_ttls_arc(&self) -> Arc<AHashMap<SharedString, i64>> {
-        Arc::clone(&self.key_ttls)
+        Arc::clone(&self.scan.key_ttls)
     }
     /// The loaded keys. A clone is a pointer copy (see [`LoadedKeys`]),
     /// which is how a background build should take them.
     pub fn keys(&self) -> &LoadedKeys {
-        &self.keys
+        &self.scan.keys
     }
 
     /// Get the value data for the currently selected key
     pub fn value(&self) -> Option<&RedisValue> {
-        self.value.as_ref()
+        self.open.value.as_ref()
     }
 
     /// Put `value` on screen as if it had been loaded: a view test has no
     /// server to load one from.
     #[cfg(test)]
     pub(crate) fn show_value_for_test(&mut self, value: RedisValue) {
-        self.value = Some(value);
+        self.open.value = Some(value);
     }
 
     /// Get the in-memory value history for `key` (newest first), if any.
     /// Returns `None` rather than an empty slice so callers can easily
     /// distinguish "never written" from "written and rolled back to 0".
     pub fn value_history_for(&self, key: &SharedString) -> Option<&VecDeque<ValueHistoryEntry>> {
-        self.histories.value_history_for(key)
+        self.open.histories.value_history_for(key)
     }
 
     /// Append the bytes about to be overwritten to the history ring buffer.
@@ -1753,20 +1318,20 @@ impl ZedisServerState {
     /// history to roll back to. A version over
     /// `VALUE_HISTORY_MAX_VERSION_BYTES` is not kept.
     pub(super) fn push_value_history(&mut self, key: SharedString, bytes: Bytes) {
-        self.histories.push_value(key, bytes, unix_ts());
+        self.open.histories.push_value(key, bytes, unix_ts());
     }
 
     /// The session change log for `key` (oldest first), if anything was
     /// recorded.
     pub fn change_log_for(&self, key: &SharedString) -> Option<&VecDeque<ChangeEntry>> {
-        self.histories.change_log_for(key)
+        self.open.histories.change_log_for(key)
     }
 
     /// Append `entries` to `key`'s change log. Called from each collection
     /// write's success callback — never before the server confirmed it, so
     /// a refused write never shows up as a change.
     pub(super) fn record_changes(&mut self, key: SharedString, entries: Vec<ChangeEntry>) {
-        self.histories.record_changes(key, entries, unix_ts());
+        self.open.histories.record_changes(key, entries, unix_ts());
     }
 
     /// Drop the history of every key not used for a week
@@ -1776,13 +1341,13 @@ impl ZedisServerState {
     pub fn sweep_expired_histories(&mut self, cx: &mut Context<Self>) {
         // The toolbar gates its diff and change-log entries on these
         // histories, so a sweep that dropped one has to re-render it.
-        if self.histories.sweep_expired(unix_ts()) {
+        if self.open.histories.sweep_expired(unix_ts()) {
             cx.notify();
         }
     }
 
     pub fn set_search_history(&mut self, history: Vec<SharedString>) {
-        self.search_history = history.into_iter().collect();
+        self.scan.search_history = history.into_iter().collect();
     }
 
     /// Select and connect to a Redis server
@@ -1807,14 +1372,9 @@ impl ZedisServerState {
         // stays stale; without the `Failed` check, re-clicking the server
         // after a network error would be a silent no-op and never retry.
         let same_target = self.server_id == server_id && self.db == db;
-        let retry_failed = same_target && matches!(self.server_status, RedisServerStatus::Failed);
+        let retry_failed = same_target && matches!(self.link.server_status, RedisServerStatus::Failed);
         if !same_target || retry_failed {
-            // A load somebody asked for starts the count of automatic
-            // retries again; one the heartbeat started carries it on.
-            if !std::mem::take(&mut self.load_retry_running) {
-                self.load_retries = 0;
-            }
-            self.load_retry_pending = false;
+            self.link.start_load();
             // The metrics history is the server's, whichever database is
             // open: a database switch or a retry keeps it (it used to empty
             // the charts), another server drops the last one's.
@@ -1825,47 +1385,33 @@ impl ZedisServerState {
             // window is still the user's. `reset` closes windows because one
             // belongs to the server it was opened on, which this still is —
             // closing it made every reconnect re-lock the entry.
-            let open_window = retry_failed.then(|| (self.write_unlocked_until, self.unlock_task.clone()));
+            let open_window = retry_failed.then(|| self.lock.clone());
             // And what the link failed with stays on screen while it is
             // tried again.
-            let link_failure = if retry_failed { self.link_failure.take() } else { None };
+            let link_failure = if retry_failed {
+                self.link.link_failure.take()
+            } else {
+                None
+            };
             // And what this session's panels found is still this server's.
             let findings = retry_failed.then(|| std::mem::take(&mut self.report_findings));
             self.reset(cx);
             if let Some(findings) = findings {
                 self.report_findings = findings;
             }
-            if let Some((until, task)) = open_window {
-                self.write_unlocked_until = until;
-                self.unlock_task = task;
+            if let Some(earlier) = open_window {
+                self.lock.keep_window_from(&earlier);
             }
-            self.link_failure = link_failure;
+            self.link.link_failure = link_failure;
             self.server_id = server_id.clone();
             self.db = db;
             // Cached matrix from an earlier connect to this server (or the
             // optimistic default); the background probe refines it below.
-            self.features = get_server_features(server_id.as_str());
+            self.facts.set_features(get_server_features(server_id.as_str()));
             // Resolve key-tree / scan prefs: per-server override, else Settings.
-            let global = cx.global::<ZedisGlobalStore>().read(cx);
-            let g_scan = global.key_scan_count_setting();
-            let g_depth = global.max_key_tree_depth();
-            let g_expand = global.auto_expand_threshold();
-            let g_ttl = global.show_key_tree_ttl();
-            if let Ok(server) = get_server(server_id.as_str()) {
-                self.key_separator = server.resolve_key_separator();
-                self.key_scan_count = server.resolve_key_scan_count(g_scan);
-                self.max_key_tree_depth = server.resolve_max_key_tree_depth(g_depth);
-                self.auto_expand_threshold = server.resolve_auto_expand_threshold(g_expand);
-                self.show_key_tree_ttl = server.resolve_show_key_tree_ttl(g_ttl);
-            } else {
-                self.key_separator = ":".to_string();
-                self.key_scan_count = g_scan
-                    .unwrap_or(DEFAULT_KEY_SCAN_COUNT)
-                    .clamp(MIN_KEY_SCAN_COUNT, MAX_KEY_SCAN_COUNT);
-                self.max_key_tree_depth = g_depth.max(1);
-                self.auto_expand_threshold = g_expand;
-                self.show_key_tree_ttl = g_ttl;
-            }
+            let settings = cx.global::<ZedisGlobalStore>().read(cx);
+            self.prefs
+                .resolve_tree(get_server(server_id.as_str()).ok().as_ref(), settings);
 
             let (query_mode, soft_wrap) = get_session_option(&server_id)
                 .map(|option| {
@@ -1881,8 +1427,8 @@ impl ZedisServerState {
                     (mode, wrap)
                 })
                 .unwrap_or((QueryMode::All, true));
-            self.query_mode = query_mode;
-            self.soft_wrap = soft_wrap;
+            self.scan.query_mode = query_mode;
+            self.prefs.set_soft_wrap(soft_wrap);
 
             debug!(server_id = self.server_id.as_str(), "Selecting server");
             // In the browser, the tags and notes other accounts set here
@@ -1890,13 +1436,13 @@ impl ZedisServerState {
             ask_for_fresh_page_data();
             let search_history_manager = get_search_history_manager();
             if let Ok(history) = search_history_manager.records(server_id.as_str()) {
-                self.search_history = history.into_iter().map(Into::into).collect();
+                self.scan.search_history = history.into_iter().map(Into::into).collect();
             }
             cx.emit(ServerEvent::ServerSelected(server_id));
 
             // Set loading state
-            self.server_status = RedisServerStatus::Loading;
-            self.scanning = true;
+            self.link.server_status = RedisServerStatus::Loading;
+            self.scan.scanning = true;
             cx.notify();
 
             let server_id_clone = self.server_id.clone();
@@ -1927,14 +1473,14 @@ impl ZedisServerState {
                             supports_rejson,
                             supports_search,
                         }) => {
-                            this.load_retries = 0;
-                            this.link_failure = None;
-                            this.dbsize = Some(dbsize);
-                            this.nodes = nodes;
-                            this.nodes_description = Arc::new(nodes_description);
+                            this.link.load_retries = 0;
+                            this.link.link_failure = None;
+                            this.readings.set_dbsize(dbsize);
+                            this.facts.set_topology(nodes, nodes_description);
                             #[cfg(not(target_family = "wasm"))]
                             this.note_sentinel_master_choice(cx);
-                            this.version = version.into();
+                            this.facts
+                                .note_connect(version.into(), databases, supports_rejson, supports_search);
                             // Stamp the connection for the server list's
                             // "last used" order. Once per successful connect,
                             // and the write itself is a background task.
@@ -1943,10 +1489,9 @@ impl ZedisServerState {
                                 option.last_connected_at = Some(unix_ts());
                                 save_session_option(&sid, option, cx);
                             }
-                            this.databases = databases;
                             // A locked entry starts in SafeMode — unless this
                             // connect is a reconnect inside an open window.
-                            this.access_mode = if access_mode == AccessMode::ReadWrite
+                            let access_mode = if access_mode == AccessMode::ReadWrite
                                 && this.write_locked()
                                 && this.unlock_remaining().is_none()
                             {
@@ -1954,16 +1499,15 @@ impl ZedisServerState {
                             } else {
                                 access_mode
                             };
-                            this.supports_rejson = supports_rejson;
-                            this.supports_search = supports_search;
+                            this.lock.set_access_mode(access_mode);
                             this.probe_features(false, cx);
 
                             let server_id = this.server_id.clone();
-                            this.server_status = RedisServerStatus::Idle;
+                            this.link.server_status = RedisServerStatus::Idle;
                             cx.emit(ServerEvent::ServerInfoUpdated);
-                            let is_exact_mode = this.query_mode == QueryMode::Exact;
+                            let is_exact_mode = this.scan.query_mode == QueryMode::Exact;
                             if is_exact_mode {
-                                this.scanning = false;
+                                this.scan.scanning = false;
                             }
                             cx.notify();
                             // One-time onboarding toast on the very first
@@ -1990,18 +1534,15 @@ impl ZedisServerState {
                         }
                         Err(error) => {
                             this.note_link_failure(&error);
-                            // Worth another go by itself once the server
-                            // answers, when it is the link that failed it.
-                            this.load_retry_pending =
-                                this.load_retries < MAX_LOAD_RETRIES && heals_with_the_link(error.connection_kind());
+                            this.link.note_load_failure(error.connection_kind());
                             // Connection / metadata load failed (e.g. network
                             // down). Mark Failed so a later re-select retries
                             // instead of being swallowed by select()'s
                             // same-server guard. The error toast was already
                             // emitted in spawn_with_arg; skip the key scan
                             // since it would just fail again with a 2nd toast.
-                            this.server_status = RedisServerStatus::Failed;
-                            this.scanning = false;
+                            this.link.server_status = RedisServerStatus::Failed;
+                            this.scan.scanning = false;
                             cx.emit(ServerEvent::ServerInfoUpdated);
                             cx.notify();
                         }
@@ -2016,29 +1557,17 @@ impl ZedisServerState {
     /// an answer from a server with its dataset in memory. Called on every
     /// such beat; does nothing unless a load is owed.
     pub(super) fn retry_failed_load(&mut self, cx: &mut Context<Self>) {
-        if !self.take_load_retry() {
+        if !self.link.take_load_retry() {
             return;
         }
         info!(
             server_id = self.server_id.as_str(),
-            attempt = self.load_retries,
+            attempt = self.link.load_retries,
             "the server answers: loading what the failed connect could not"
         );
         let server_id = self.server_id.clone();
         let db = self.db;
         self.select(server_id, db, cx);
-    }
-
-    /// Whether a retry is owed, taking it: the load failed with the link, it
-    /// is still the failed one on screen, and nothing has retried it since.
-    fn take_load_retry(&mut self) -> bool {
-        if !self.load_retry_pending || !matches!(self.server_status, RedisServerStatus::Failed) {
-            return false;
-        }
-        self.load_retry_pending = false;
-        self.load_retries += 1;
-        self.load_retry_running = true;
-        true
     }
 
     /// Force a reconnect of the currently-selected server/db.
@@ -2055,7 +1584,7 @@ impl ZedisServerState {
         }
         let server_id = self.server_id.clone();
         let db = self.db;
-        self.server_status = RedisServerStatus::Failed;
+        self.link.server_status = RedisServerStatus::Failed;
         self.select(server_id, db, cx);
     }
 }
@@ -2063,6 +1592,7 @@ impl ZedisServerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{init_ui, record_events, take_events};
     use gpui::TestAppContext;
 
     fn batch(keys: &[(&str, &str)]) -> Vec<(SharedString, SharedString, i64)> {
@@ -2072,7 +1602,7 @@ mod tests {
     }
 
     fn key_names(state: &ZedisServerState) -> Vec<String> {
-        let mut names: Vec<String> = state.keys.keys().map(|k| k.to_string()).collect();
+        let mut names: Vec<String> = state.scan.keys.keys().map(|k| k.to_string()).collect();
         names.sort();
         names
     }
@@ -2125,13 +1655,13 @@ mod tests {
         state.update(cx, |state, cx| {
             state.begin_refresh_scan(cx);
             assert_eq!(key_names(state), ["a", "b"], "rows stay up while the scan runs");
-            assert!(state.keys_superseded_by_next_batch);
+            assert!(state.scan.keys_superseded_by_next_batch);
 
             // "b" was deleted on the server since the last scan.
             state.extend_keys(batch(&[("a", "string"), ("c", "list")]));
             assert_eq!(key_names(state), ["a", "c"]);
             assert!(
-                !state.keys_superseded_by_next_batch,
+                !state.scan.keys_superseded_by_next_batch,
                 "spent once; the scan's later pages append"
             );
 
@@ -2147,11 +1677,11 @@ mod tests {
         let state = cx.new(|_| ZedisServerState::default());
         state.update(cx, |state, cx| {
             state.extend_keys(batch(&[("a", "string")]));
-            let before = state.key_tree_id.clone();
+            let before = state.scan.key_tree_id.clone();
             state.begin_refresh_scan(cx);
             state.extend_keys(Vec::new());
             assert!(key_names(state).is_empty());
-            assert_ne!(state.key_tree_id, before, "the tree has to rebuild for that");
+            assert_ne!(state.scan.key_tree_id, before, "the tree has to rebuild for that");
         });
     }
 
@@ -2164,7 +1694,7 @@ mod tests {
             state.extend_keys(batch(&[("a", "string")]));
             state.reset_scan(cx);
             assert!(key_names(state).is_empty());
-            assert!(!state.keys_superseded_by_next_batch);
+            assert!(!state.scan.keys_superseded_by_next_batch);
         });
     }
 
@@ -2181,8 +1711,8 @@ mod tests {
             // let it dial a server that does not exist. The guard's one-per-
             // 3s notice needs a global store this test has no use for — a
             // fresh timestamp keeps it throttled.
-            state.manually_offline = true;
-            state.last_offline_notice = unix_ts();
+            state.link.manually_offline = true;
+            state.link.last_offline_notice = unix_ts();
             for mode in [QueryMode::Prefix, QueryMode::All] {
                 state.set_query_mode(mode, cx);
                 state.handle_filter("user:".into(), false, cx);
@@ -2279,17 +1809,17 @@ mod tests {
 
         let state = cx.new(|_| ZedisServerState::default());
         state.update(cx, |state, _| {
-            assert!(!state.take_load_retry(), "nothing is owed");
+            assert!(!state.link.take_load_retry(), "nothing is owed");
             // Owed, but a load has succeeded since: not the failed one any more.
-            state.load_retry_pending = true;
-            state.server_status = RedisServerStatus::Idle;
-            assert!(!state.take_load_retry());
+            state.link.load_retry_pending = true;
+            state.link.server_status = RedisServerStatus::Idle;
+            assert!(!state.link.take_load_retry());
 
-            state.server_status = RedisServerStatus::Failed;
-            assert!(state.take_load_retry());
-            assert_eq!(state.load_retries, 1);
-            assert!(state.load_retry_running, "the select that follows is a retry");
-            assert!(!state.take_load_retry(), "one retry per failure");
+            state.link.server_status = RedisServerStatus::Failed;
+            assert!(state.link.take_load_retry());
+            assert_eq!(state.link.load_retries, 1);
+            assert!(state.link.load_retry_running, "the select that follows is a retry");
+            assert!(!state.link.take_load_retry(), "one retry per failure");
         });
     }
 
@@ -2299,16 +1829,16 @@ mod tests {
     fn load_more_starts_one_round_and_none_while_offline(cx: &mut TestAppContext) {
         let state = cx.new(|_| ZedisServerState::default());
         state.update(cx, |state, cx| {
-            state.manually_offline = true;
-            state.last_offline_notice = unix_ts();
+            state.link.manually_offline = true;
+            state.link.last_offline_notice = unix_ts();
             state.scan_next(cx);
             assert!(!state.scanning(), "an offline press starts nothing");
-            assert_eq!(state.scan_times, 0);
+            assert_eq!(state.scan.scan_times, 0);
 
-            state.manually_offline = false;
-            state.scanning = true;
+            state.link.manually_offline = false;
+            state.scan.scanning = true;
             state.scan_next(cx);
-            assert_eq!(state.scan_times, 0, "a press during a round adds no batch");
+            assert_eq!(state.scan.scan_times, 0, "a press during a round adds no batch");
         });
     }
 
@@ -2321,24 +1851,27 @@ mod tests {
     fn a_regex_keyword_is_scanned_in_every_query_mode(cx: &mut TestAppContext) {
         let state = cx.new(|_| ZedisServerState::default());
         state.update(cx, |state, cx| {
-            state.manually_offline = true;
-            state.last_offline_notice = unix_ts();
+            state.link.manually_offline = true;
+            state.link.last_offline_notice = unix_ts();
             let pattern = SharedString::from("^zedis:fn:session");
 
-            state.regex_keyword = true;
+            state.scan.regex_keyword = true;
             for mode in [QueryMode::All, QueryMode::Prefix, QueryMode::Exact] {
-                state.query_mode = mode;
+                state.scan.query_mode = mode;
                 state.handle_filter(pattern.clone(), false, cx);
                 assert_eq!(state.keyword(), pattern, "{mode:?}: what the tree is showing");
-                assert!(state.scanning_prefixes.is_empty(), "{mode:?}: not sent as a prefix");
-                assert!(state.key.is_none(), "{mode:?}: not looked up as a key name");
+                assert!(
+                    state.scan.scanning_prefixes.is_empty(),
+                    "{mode:?}: not sent as a prefix"
+                );
+                assert!(state.open.key.is_none(), "{mode:?}: not looked up as a key name");
             }
 
             // Without the toggle the mode decides, as it always did.
-            state.regex_keyword = false;
-            state.query_mode = QueryMode::Prefix;
+            state.scan.regex_keyword = false;
+            state.scan.query_mode = QueryMode::Prefix;
             state.handle_filter(pattern.clone(), false, cx);
-            assert!(state.scanning_prefixes.contains(&pattern));
+            assert!(state.scan.scanning_prefixes.contains(&pattern));
         });
     }
 
@@ -2350,7 +1883,7 @@ mod tests {
     fn a_server_switch_turns_the_regex_keyword_off(cx: &mut TestAppContext) {
         let state = cx.new(|_| ZedisServerState::default());
         state.update(cx, |state, cx| {
-            state.regex_keyword = true;
+            state.scan.regex_keyword = true;
             state.reset(cx);
             assert!(!state.regex_keyword());
         });
@@ -2371,9 +1904,9 @@ mod tests {
                 .begin_task(ServerTask::DeleteKey, "key".into(), cx)
                 .expect("a connected state starts its tasks");
 
-            state.heartbeat_retry_at = Some(Instant::now());
+            state.link.heartbeat_retry_at = Some(Instant::now());
             assert!(state.settle_task(&run, None, cx));
-            assert!(state.heartbeat_retry_at.is_none(), "a reply means the link is up");
+            assert!(state.link.heartbeat_retry_at.is_none(), "a reply means the link is up");
 
             let failure = Error::Invalid {
                 message: "gone".to_string(),
@@ -2397,17 +1930,237 @@ mod tests {
     fn no_task_starts_while_the_server_is_offline(cx: &mut TestAppContext) {
         let state = cx.new(|_| ZedisServerState::default());
         state.update(cx, |state, cx| {
-            state.manually_offline = true;
-            state.last_offline_notice = unix_ts();
-            state.server_status = RedisServerStatus::Loading;
-            state.scanning = true;
+            state.link.manually_offline = true;
+            state.link.last_offline_notice = unix_ts();
+            state.link.server_status = RedisServerStatus::Loading;
+            state.scan.scanning = true;
             assert!(
                 state
                     .begin_task(ServerTask::SelectServer, SharedString::default(), cx)
                     .is_none()
             );
-            assert_eq!(state.server_status, RedisServerStatus::Failed);
-            assert!(!state.scanning);
+            assert_eq!(state.link.server_status, RedisServerStatus::Failed);
+            assert!(!state.scan.scanning);
         });
+    }
+
+    /// A new query empties the tree and says so — the rows went, then the
+    /// tree changed; a refresh keeps its rows and says nothing until its
+    /// first batch lands.
+    #[gpui::test]
+    fn a_new_query_announces_the_emptied_tree_and_a_refresh_does_not(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let state = cx.new(|_| ZedisServerState::default());
+        let log = record_events(cx, &state);
+        state.update(cx, |state, cx| {
+            state.extend_keys(batch(&[("a", "string")]));
+            state.reset_scan(cx);
+            assert!(state.keys().is_empty());
+        });
+        assert_eq!(take_events(&log), ["KeyScanReset", "KeyTreeUpdated"]);
+        state.update(cx, |state, cx| {
+            state.extend_keys(batch(&[("a", "string")]));
+            let id = state.key_tree_id().to_string();
+            state.begin_refresh_scan(cx);
+            assert_eq!(state.key_tree_id(), id, "the rows stay");
+            assert_eq!(state.keys().len(), 1);
+        });
+        assert!(take_events(&log).is_empty());
+    }
+
+    /// The write window (ADR 14), opened from SafeMode for its time and
+    /// closed early — after which its timer says nothing — or by that timer,
+    /// with a word to the user; toggled by hand; neither where writes are
+    /// refused outright. Each change is announced as it happens.
+    #[gpui::test]
+    fn the_write_window_opens_closes_and_runs_out_in_order(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let state = cx.new(|_| ZedisServerState::default());
+        let log = record_events(cx, &state);
+        let window = Duration::from_secs(WRITE_UNLOCK_SECS);
+
+        state.update(cx, |state, cx| {
+            state.toggle_readonly(cx);
+            assert!(state.readonly() && !state.strict_readonly());
+            assert_eq!(
+                state.write_gate(),
+                WriteGate::ReadOnly,
+                "a SafeMode the entry did not lock"
+            );
+            state.unlock_writes(cx);
+            assert!(!state.readonly());
+            let left = state.unlock_remaining().expect("the window is open");
+            assert!(left <= window && left + Duration::from_secs(1) > window);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            take_events(&log),
+            ["ServerInfoUpdated", "TaskStarted(UnlockWrites)", "ServerInfoUpdated"]
+        );
+
+        state.update(cx, |state, cx| state.lock_writes(cx));
+        cx.run_until_parked();
+        assert_eq!(take_events(&log), ["ServerInfoUpdated", "TaskStarted(LockWrites)"]);
+        state.read_with(cx, |state, _| {
+            assert!(state.readonly());
+            assert!(state.unlock_remaining().is_none());
+        });
+        cx.executor().advance_clock(window);
+        cx.run_until_parked();
+        state.update(cx, |state, cx| state.lock_writes(cx));
+        cx.run_until_parked();
+        assert!(
+            take_events(&log).is_empty(),
+            "a window closed by hand is not closed again by its timer, nor twice"
+        );
+
+        state.update(cx, |state, cx| state.unlock_writes(cx));
+        cx.run_until_parked();
+        take_events(&log);
+        cx.executor().advance_clock(window);
+        cx.run_until_parked();
+        let relocked = cx.update(|cx| i18n_status_bar(cx, "relocked_message").replace("%{server}", ""));
+        assert_eq!(
+            take_events(&log),
+            ["ServerInfoUpdated".to_string(), format!("notice Info: {relocked}")]
+        );
+        state.read_with(cx, |state, _| {
+            assert!(state.readonly() && state.unlock_remaining().is_none())
+        });
+
+        state.update(cx, |state, cx| {
+            state.toggle_readonly(cx);
+            assert!(!state.readonly());
+            state.lock.set_access_mode(AccessMode::StrictReadOnly);
+            state.unlock_writes(cx);
+            assert!(state.unlock_remaining().is_none());
+            state.toggle_readonly(cx);
+            assert!(state.strict_readonly());
+            assert_eq!(state.write_gate(), WriteGate::ReadOnly);
+        });
+        cx.run_until_parked();
+        let events = take_events(&log);
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert_eq!(events[0], "ServerInfoUpdated");
+        assert!(events[1].starts_with("notice Error: [toggle_readonly]"), "{events:?}");
+        assert!(events[2].starts_with("ErrorOccurred("), "{events:?}");
+    }
+
+    /// What a connection's tree and editor go by is settled when it is
+    /// selected: here from Settings, the entry not being in the list — the
+    /// scan count as chosen, the defaults where nothing was — and the soft
+    /// wrap from the session, on by default.
+    #[gpui::test]
+    fn a_selected_connection_takes_its_tree_settings_from_settings(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let global = cx.update(|cx| cx.global::<ZedisGlobalStore>().state());
+        let state = cx.new(|_| ZedisServerState::default());
+
+        cx.update(|cx| {
+            global.update(cx, |settings, _| {
+                settings.set_key_scan_count(2_500);
+                settings.set_max_key_tree_depth(7);
+                settings.set_auto_expand_threshold(40);
+                settings.set_show_key_tree_ttl(false);
+            })
+        });
+        state.update(cx, |state, cx| state.select("prefstest-a".into(), 0, cx));
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.key_separator(), ":");
+            assert_eq!(state.key_scan_count(), 2_500);
+            assert_eq!(state.max_key_tree_depth(), 7);
+            assert_eq!(state.auto_expand_threshold(), 40);
+            assert!(!state.show_key_tree_ttl());
+            assert!(state.soft_wrap());
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            global.update(cx, |settings, _| {
+                settings.set_key_scan_count(0);
+                settings.set_max_key_tree_depth(0);
+                settings.set_auto_expand_threshold(0);
+                settings.set_show_key_tree_ttl(true);
+            })
+        });
+        state.update(cx, |state, cx| state.select("prefstest-b".into(), 0, cx));
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.key_scan_count(), DEFAULT_KEY_SCAN_COUNT);
+            assert_eq!(state.max_key_tree_depth(), 5);
+            assert_eq!(state.auto_expand_threshold(), 100);
+            assert!(state.show_key_tree_ttl());
+        });
+        cx.run_until_parked();
+    }
+
+    /// A forced probe drops what was known and says so before it asks
+    /// again; an unforced one asks only while nothing was ever probed; a
+    /// state without a server asks nothing.
+    #[gpui::test]
+    fn a_forced_probe_forgets_the_matrix_before_it_asks(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let state = cx.new(|_| ZedisServerState::default());
+        let log = record_events(cx, &state);
+
+        state.update(cx, |state, cx| state.probe_features(true, cx));
+        cx.run_until_parked();
+        assert!(take_events(&log).is_empty());
+
+        state.update(cx, |state, cx| {
+            state.server_id = "factstest".into();
+            state.probe_features(true, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(take_events(&log), ["FeaturesProbed", "TaskStarted(ProbeFeatures)"]);
+
+        state.update(cx, |state, cx| state.probe_features(false, cx));
+        cx.run_until_parked();
+        assert_eq!(take_events(&log), ["TaskStarted(ProbeFeatures)"]);
+
+        state.update(cx, |state, cx| {
+            let mut probed = ServerFeatures::default();
+            probed.probed = true;
+            state.facts.set_features(Arc::new(probed));
+            state.probe_features(false, cx);
+        });
+        cx.run_until_parked();
+        assert!(take_events(&log).is_empty());
+    }
+
+    /// Emptying the slow log is a new generation of it, announced; a pause
+    /// this app sent shows until it is lifted.
+    #[gpui::test]
+    fn a_cleared_slow_log_is_a_new_generation_and_a_pause_shows_until_lifted(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let state = cx.new(|_| ZedisServerState::default());
+        let log = record_events(cx, &state);
+        state.update(cx, |state, cx| {
+            let entry = SlowLogEntry {
+                id: 0,
+                timestamp: 1,
+                duration: Duration::ZERO,
+                amount: 0,
+                args: Vec::new(),
+                client_addr: None,
+                client_name: None,
+            };
+            state.readings.note_slow_logs(vec![entry; 4], 0);
+            assert_eq!(state.last_slow_log_count(), 4);
+            let generation = state.slow_logs_generation();
+            state.clear_slow_logs(cx);
+            assert_eq!(state.slow_logs_generation(), generation + 1);
+            assert_eq!(state.last_slow_log_count(), 0);
+            assert!(state.slow_logs().is_empty());
+
+            assert!(state.client_pause().is_none());
+            state.note_client_pause(PauseMode::Write, 60_000, cx);
+            let pause = state.client_pause().expect("the pause this app sent");
+            assert_eq!(pause.actions, "write");
+            assert!(!pause.from_server);
+            state.note_client_unpause(cx);
+            assert!(state.client_pause().is_none());
+        });
+        cx.run_until_parked();
+        assert_eq!(take_events(&log), ["ServerRedisInfoUpdated"]);
     }
 }

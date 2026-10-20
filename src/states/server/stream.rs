@@ -172,7 +172,7 @@ impl ZedisServerState {
         if self.refuse_while_offline(cx) {
             return;
         }
-        let Some((key, value)) = self.try_get_mut_key_value() else {
+        let Some((key, value)) = self.open.try_get_mut_key_value() else {
             return;
         };
         let key_str = key.to_string();
@@ -189,7 +189,7 @@ impl ZedisServerState {
             task,
             move || async move { redis_op(key_str, at).await },
             move |this, result, cx| {
-                if let Some(value) = this.value.as_mut() {
+                if let Some(value) = this.open.value.as_mut() {
                     value.status = RedisValueStatus::Idle;
                 }
                 match result {
@@ -208,7 +208,7 @@ impl ZedisServerState {
     /// stores the result in `RedisStreamValue::info`.  Emits `ValueUpdated` on
     /// completion so the stream editor can re-render.
     pub fn fetch_stream_info(&mut self, cx: &mut Context<Self>) {
-        let Some(key) = self.key.clone() else { return };
+        let Some(key) = self.open.key.clone() else { return };
         let at = self.at();
         let guard_key = key.clone();
 
@@ -219,13 +219,13 @@ impl ZedisServerState {
             move |this, result, cx| {
                 // Drop a result that arrived after the user switched keys — it
                 // would otherwise be written into the newly selected key.
-                if this.key.as_ref() != Some(&guard_key) {
+                if this.open.key.as_ref() != Some(&guard_key) {
                     return;
                 }
                 match result {
                     Ok(info) => {
                         if let Some(RedisValueData::Stream(stream_data)) =
-                            this.value.as_mut().and_then(|v| v.data.as_mut())
+                            this.open.value.as_mut().and_then(|v| v.data.as_mut())
                         {
                             Arc::make_mut(stream_data).info = Some(Arc::new(info));
                         }
@@ -244,11 +244,11 @@ impl ZedisServerState {
     /// Unlike `get_value`, this skips the TYPE/TTL round-trip and calls
     /// `first_load_stream_value` directly, since the key type is already known.
     pub fn reload_stream_value(&mut self, reverse: bool, cx: &mut Context<Self>) {
-        let Some(key) = self.key.clone() else { return };
+        let Some(key) = self.open.key.clone() else { return };
         let at = self.at();
         let guard_key = key.clone();
 
-        if let Some(value) = self.value.as_mut() {
+        if let Some(value) = self.open.value.as_mut() {
             value.status = RedisValueStatus::Loading;
         }
         cx.notify();
@@ -260,12 +260,12 @@ impl ZedisServerState {
             move |this, result, cx| {
                 // Drop a result that arrived after the user switched keys — it
                 // would otherwise overwrite the newly selected key's value.
-                if this.key.as_ref() != Some(&guard_key) {
+                if this.open.key.as_ref() != Some(&guard_key) {
                     return;
                 }
                 match result {
                     Ok(new_value) => {
-                        if let Some(value) = this.value.as_mut() {
+                        if let Some(value) = this.open.value.as_mut() {
                             value.data = new_value.data;
                             value.status = RedisValueStatus::Idle;
                         }
@@ -281,7 +281,7 @@ impl ZedisServerState {
 
     /// Applies a keyword filter to stream entries (client-side filtering).
     pub fn filter_stream_value(&mut self, keyword: SharedString, cx: &mut Context<Self>) {
-        let Some((_, value)) = self.try_get_mut_key_value() else {
+        let Some((_, value)) = self.open.try_get_mut_key_value() else {
             return;
         };
         let Some(stream_value) = value.stream_value() else {
@@ -301,7 +301,7 @@ impl ZedisServerState {
     }
 
     pub fn load_more_stream_value(&mut self, cx: &mut Context<Self>) {
-        let Some((key, value)) = self.try_get_mut_key_value() else {
+        let Some((key, value)) = self.open.try_get_mut_key_value() else {
             return;
         };
 
@@ -326,12 +326,13 @@ impl ZedisServerState {
             move |this, result, cx| {
                 // Drop results for a key the user already navigated away from —
                 // appending them would corrupt the newly selected stream.
-                if this.key.as_ref() != Some(&guard_key) {
+                if this.open.key.as_ref() != Some(&guard_key) {
                     return;
                 }
                 let mut should_load_more = false;
                 if let Ok((new_cursor, new_values)) = result
-                    && let Some(RedisValueData::Stream(stream_data)) = this.value.as_mut().and_then(|v| v.data.as_mut())
+                    && let Some(RedisValueData::Stream(stream_data)) =
+                        this.open.value.as_mut().and_then(|v| v.data.as_mut())
                 {
                     let stream = Arc::make_mut(stream_data);
                     // Mark as done when cursor returns to 0 (scan complete)
@@ -353,7 +354,7 @@ impl ZedisServerState {
                 cx.emit(ServerEvent::ValuePaginationFinished);
 
                 // Reset status to idle
-                if let Some(value) = this.value.as_mut() {
+                if let Some(value) = this.open.value.as_mut() {
                     value.status = RedisValueStatus::Idle;
                 }
                 cx.notify();
@@ -386,7 +387,9 @@ impl ZedisServerState {
                 Ok(stream_add(&at, &key, id.as_str(), &fields).await?)
             },
             |this, id, cx| {
-                if let Some(RedisValueData::Stream(stream_data)) = this.value.as_mut().and_then(|v| v.data.as_mut()) {
+                if let Some(RedisValueData::Stream(stream_data)) =
+                    this.open.value.as_mut().and_then(|v| v.data.as_mut())
+                {
                     let stream = Arc::make_mut(stream_data);
                     stream.size += 1;
                     place_new_entry(
@@ -413,7 +416,9 @@ impl ZedisServerState {
                 Ok(())
             },
             |this, _, cx| {
-                if let Some(RedisValueData::Stream(stream_data)) = this.value.as_mut().and_then(|v| v.data.as_mut()) {
+                if let Some(RedisValueData::Stream(stream_data)) =
+                    this.open.value.as_mut().and_then(|v| v.data.as_mut())
+                {
                     let stream = Arc::make_mut(stream_data);
                     stream.size -= 1;
                 }
@@ -442,7 +447,9 @@ impl ZedisServerState {
                 Ok(stream_delete(&at, &key, &ids).await?)
             },
             |this, removed, cx| {
-                if let Some(RedisValueData::Stream(stream_data)) = this.value.as_mut().and_then(|v| v.data.as_mut()) {
+                if let Some(RedisValueData::Stream(stream_data)) =
+                    this.open.value.as_mut().and_then(|v| v.data.as_mut())
+                {
                     let stream = Arc::make_mut(stream_data);
                     stream.size = stream.size.saturating_sub(removed as usize);
                 }
@@ -499,10 +506,10 @@ impl ZedisServerState {
         if entries.is_empty() {
             return;
         }
-        if self.key.as_ref().map(|k| k.as_str()) != Some(key) {
+        if self.open.key.as_ref().map(|k| k.as_str()) != Some(key) {
             return;
         }
-        if let Some(RedisValueData::Stream(stream_data)) = self.value.as_mut().and_then(|v| v.data.as_mut()) {
+        if let Some(RedisValueData::Stream(stream_data)) = self.open.value.as_mut().and_then(|v| v.data.as_mut()) {
             let stream = Arc::make_mut(stream_data);
             let added = entries.len();
             if stream.reverse {
@@ -571,6 +578,7 @@ impl ZedisServerState {
             },
             |this, _, cx| {
                 let reverse = this
+                    .open
                     .value
                     .as_ref()
                     .and_then(|v| v.stream_value())
@@ -740,6 +748,7 @@ impl ZedisServerState {
                 let title: SharedString = t!("stream_editor.trim_title", locale = locale).to_string().into();
                 this.emit_success_notification(message, title, cx);
                 let reverse = this
+                    .open
                     .value
                     .as_ref()
                     .and_then(|v| v.stream_value())
@@ -755,6 +764,7 @@ impl ZedisServerState {
     /// entry (portable ms-seq stepping — no exclusive ranges needed).
     pub fn load_more_stream_pending(&mut self, group: SharedString, cx: &mut Context<Self>) {
         let start = self
+            .open
             .value
             .as_ref()
             .and_then(|v| v.stream_value())
@@ -773,7 +783,9 @@ impl ZedisServerState {
                 Ok(entries.into_iter().map(project_pending).collect::<Vec<_>>())
             },
             move |this, entries: Vec<StreamPendingEntry>, cx| {
-                if let Some(RedisValueData::Stream(stream_data)) = this.value.as_mut().and_then(|v| v.data.as_mut()) {
+                if let Some(RedisValueData::Stream(stream_data)) =
+                    this.open.value.as_mut().and_then(|v| v.data.as_mut())
+                {
                     let stream = Arc::make_mut(stream_data);
                     if let Some(info) = stream.info.as_mut() {
                         let info = Arc::make_mut(info);

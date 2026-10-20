@@ -741,7 +741,9 @@ mod tests {
             );
         })
         .expect("the window is open");
-        for _ in 0..500 {
+        // The write is on a thread of its own; on a loaded machine (the
+        // whole suite at once) it has taken longer than five seconds.
+        for _ in 0..3_000 {
             cx.run_until_parked();
             if saved.get() {
                 break;

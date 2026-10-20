@@ -82,7 +82,7 @@ impl ZedisServerState {
                     // The heartbeat was backing off behind BUSY: let it look
                     // again now, so the link reads Connected without waiting
                     // out the retry window.
-                    this.heartbeat_retry_at = None;
+                    this.link.reached();
                     this.refresh_redis_info(cx);
                 } else if !unkillable.is_empty() {
                     let message = t!(

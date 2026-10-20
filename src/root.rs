@@ -149,6 +149,7 @@ impl Render for TabDragPreview {
 /// The desktop-only half of the root — see the module for why it is one.
 #[cfg(not(target_family = "wasm"))]
 mod desktop;
+mod handlers;
 #[cfg(not(target_family = "wasm"))]
 use desktop::DesktopOnly;
 
@@ -1013,66 +1014,7 @@ impl Zedis {
 
 impl Render for Zedis {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let current_bounds = window.bounds();
-        if current_bounds != self.last_bounds {
-            // The display the window is currently on, used to anchor the saved
-            // placement to it (so it survives multi-monitor rearrangement).
-            let display = window
-                .display(cx)
-                .and_then(|d| Some((d.uuid().ok()?.to_string(), d.bounds().origin)));
-            self.persist_window_state(current_bounds, display, window.is_maximized(), cx);
-        }
-        if let Some(notification) = self.pending_notification.take() {
-            window.push_notification(notification, cx);
-        }
-        for recovery in std::mem::take(&mut self.pending_config_recoveries) {
-            let message = config_recovery_message(&recovery, cx);
-            // Losing the server list (secrets included) is an error; a
-            // successful restore from `.bak` is only worth a warning.
-            let notification = match recovery {
-                ConfigRecovery::Reset { .. } => Notification::error(message),
-                ConfigRecovery::RestoredFromBackup { .. } => Notification::warning(message),
-            };
-            window.push_notification(notification, cx);
-        }
-        // The crash report, the install-quit prompt and the update prompt.
-        // Before the welcome card, so the two deferred dialogs keep their
-        // order (crash report first).
-        #[cfg(not(target_family = "wasm"))]
-        self.open_desktop_prompts(window, cx);
-        if std::mem::take(&mut self.pending_welcome) {
-            // Defer past this frame: opening the dialog focuses it, but the
-            // views built later in this same first frame steal that focus
-            // back (the servers page focuses itself in `new` so ⌘F works on
-            // arrival) — leaving Esc/Enter dispatched to the page behind the
-            // overlay. Deferring makes the dialog the last focus claimant.
-            window.defer(cx, open_welcome_dialog);
-        }
-        if let Some(font_size) = cx.global::<ZedisGlobalStore>().read(cx).font_rem_px() {
-            window.set_rem_size(font_size);
-        }
-        if let Some((id, db)) = self.pending_new_tab.take() {
-            // Build the new tab's content now that we have the `Window`, make
-            // it the active tab, then project the connection — the fresh
-            // content (already subscribed) receives the `ServerSelected` and
-            // loads the server.
-            let content = cx.new(|cx| ZedisContent::new(window, cx));
-            self.tabs[self.active_tab]
-                .content
-                .update(cx, |content, cx| content.set_active(false, cx));
-            self.tabs.push(ContentTab::new(id.clone(), db, content, cx));
-            self.active_tab = self.tabs.len() - 1;
-            self.rebind_palettes(cx);
-            cx.global::<ZedisGlobalStore>().clone().update(cx, |state, cx| {
-                // An empty server id is a Home tab: route to Home instead of
-                // connecting (matches the sidebar Home button's new-tab path).
-                if id.is_empty() {
-                    state.clear_selected_server(cx);
-                } else {
-                    state.connect_server(id, db, cx);
-                }
-            });
-        }
+        self.prepare_frame(window, cx);
 
         // The status bar is the bottom row *of the content column*, not of the
         // window: it starts where the sidebar ends, which is what lets the sidebar
@@ -1137,330 +1079,89 @@ impl Render for Zedis {
         // model as the palette; rendered last so it stacks on top.
         let content = content.child(self.shortcuts_overlay.clone());
         content
-            .on_action(cx.listener(|_this, e: &ThemeAction, _window, cx| {
-                let action = *e;
+            .on_action(cx.listener(handlers::on_theme))
+            .on_action(cx.listener(handlers::on_select_theme))
+            .on_action(cx.listener(handlers::on_locale))
+            .on_action(cx.listener(handlers::on_settings))
+            .on_action(cx.listener(handlers::on_diagnostics))
+            .on_action(cx.listener(handlers::on_server_tool))
+            .on_action(cx.listener(handlers::on_tab))
+            .on_action(cx.listener(handlers::on_sidebar_server))
+            .on_action(cx.listener(handlers::on_workspace_tab))
+            .on_action(cx.listener(handlers::on_zoom))
+            .on_action(cx.listener(handlers::on_window))
+            .on_action(cx.listener(handlers::on_menu))
+            .on_action(cx.listener(handlers::on_editor))
+            .on_action(cx.listener(handlers::on_nav))
+    }
+}
 
-                // Convert action to theme mode
-                let mode = match action {
-                    ThemeAction::Light => Some(ThemeMode::Light),
-                    ThemeAction::Dark => Some(ThemeMode::Dark),
-                    ThemeAction::System => None, // Follow OS theme
-                };
-
-                // Determine actual render mode (resolve System to Light/Dark)
-                let render_mode = match mode {
-                    Some(m) => m,
-                    None => theme_mode_for_appearance(cx.window_appearance()),
-                };
-
-                // A previously-applied named theme overwrote the Theme's
-                // light/dark slot, so restore the registry defaults first —
-                // otherwise switching mode would just re-apply that named theme.
-                restore_default_themes(cx);
-                // Apply theme immediately for instant visual feedback
-                Theme::change(render_mode, None, cx);
-                apply_default_ui_font_size(cx);
-
-                // Save preference to disk asynchronously
-                update_app_state_and_save(cx, "save_theme", move |state, _cx| {
-                    state.set_theme(mode);
-                });
-            }))
-            .on_action(cx.listener(|_this, e: &SelectThemeAction, _window, cx| {
-                let name = e.name.clone();
-                if apply_named_theme(&name, cx) {
-                    update_app_state_and_save(cx, "save_theme_name", move |state, _cx| {
-                        state.set_theme_name(Some(name));
-                    });
+impl Zedis {
+    /// What a frame does before it draws: the window's placement saved
+    /// when it moved, what was left to say (notifications, recovered
+    /// configuration), the prompts and the welcome card, the font size,
+    /// and a tab asked for — which needs the `Window` to be built.
+    fn prepare_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current_bounds = window.bounds();
+        if current_bounds != self.last_bounds {
+            // The display the window is currently on, used to anchor the saved
+            // placement to it (so it survives multi-monitor rearrangement).
+            let display = window
+                .display(cx)
+                .and_then(|d| Some((d.uuid().ok()?.to_string(), d.bounds().origin)));
+            self.persist_window_state(current_bounds, display, window.is_maximized(), cx);
+        }
+        if let Some(notification) = self.pending_notification.take() {
+            window.push_notification(notification, cx);
+        }
+        for recovery in std::mem::take(&mut self.pending_config_recoveries) {
+            let message = config_recovery_message(&recovery, cx);
+            // Losing the server list (secrets included) is an error; a
+            // successful restore from `.bak` is only worth a warning.
+            let notification = match recovery {
+                ConfigRecovery::Reset { .. } => Notification::error(message),
+                ConfigRecovery::RestoredFromBackup { .. } => Notification::warning(message),
+            };
+            window.push_notification(notification, cx);
+        }
+        // The crash report, the install-quit prompt and the update prompt.
+        // Before the welcome card, so the two deferred dialogs keep their
+        // order (crash report first).
+        #[cfg(not(target_family = "wasm"))]
+        self.open_desktop_prompts(window, cx);
+        if std::mem::take(&mut self.pending_welcome) {
+            // Defer past this frame: opening the dialog focuses it, but the
+            // views built later in this same first frame steal that focus
+            // back (the servers page focuses itself in `new` so ⌘F works on
+            // arrival) — leaving Esc/Enter dispatched to the page behind the
+            // overlay. Deferring makes the dialog the last focus claimant.
+            window.defer(cx, open_welcome_dialog);
+        }
+        if let Some(font_size) = cx.global::<ZedisGlobalStore>().read(cx).font_rem_px() {
+            window.set_rem_size(font_size);
+        }
+        if let Some((id, db)) = self.pending_new_tab.take() {
+            // Build the new tab's content now that we have the `Window`, make
+            // it the active tab, then project the connection — the fresh
+            // content (already subscribed) receives the `ServerSelected` and
+            // loads the server.
+            let content = cx.new(|cx| ZedisContent::new(window, cx));
+            self.tabs[self.active_tab]
+                .content
+                .update(cx, |content, cx| content.set_active(false, cx));
+            self.tabs.push(ContentTab::new(id.clone(), db, content, cx));
+            self.active_tab = self.tabs.len() - 1;
+            self.rebind_palettes(cx);
+            cx.global::<ZedisGlobalStore>().clone().update(cx, |state, cx| {
+                // An empty server id is a Home tab: route to Home instead of
+                // connecting (matches the sidebar Home button's new-tab path).
+                if id.is_empty() {
+                    state.clear_selected_server(cx);
+                } else {
+                    state.connect_server(id, db, cx);
                 }
-            }))
-            // Locale action handler - changes language and saves to disk
-            .on_action(cx.listener(|_this, e: &LocaleAction, _window, cx| {
-                let locale = match e {
-                    LocaleAction::Zh => "zh",
-                    LocaleAction::En => "en",
-                    LocaleAction::Ja => "ja",
-                    LocaleAction::Ru => "ru",
-                    LocaleAction::Pt => "pt",
-                    LocaleAction::De => "de",
-                    LocaleAction::Fr => "fr",
-                    LocaleAction::Es => "es",
-                };
-
-                save_ui_locale(cx, locale);
-            }))
-            .on_action(cx.listener(move |this, e: &SettingsAction, window, cx| match e {
-                SettingsAction::Editor => {
-                    this.keep_focus_in_page(window, cx);
-                    open_settings(window, cx)
-                }
-                SettingsAction::Protos => {
-                    cx.update_global::<ZedisGlobalStore, ()>(|store, cx| {
-                        store.update(cx, |state, cx| {
-                            state.go_to(Route::Protos, cx);
-                        });
-                    });
-                }
-                SettingsAction::Scripts => {
-                    cx.update_global::<ZedisGlobalStore, ()>(|store, cx| {
-                        store.update(cx, |state, cx| {
-                            state.go_to(Route::Scripts, cx);
-                        });
-                    });
-                }
-            }))
-            .on_action(cx.listener(|this, _: &DiagnosticsAction, window, cx| {
-                this.export_diagnostics(window, cx);
-            }))
-            .on_action(cx.listener(move |this, e: &ServerToolsAction, window, cx| {
-                let target = match e {
-                    ServerToolsAction::Monitor => ServerView::Monitor,
-                    ServerToolsAction::Config => ServerView::Config,
-                    ServerToolsAction::Acl => ServerView::Acl,
-                    ServerToolsAction::Search => ServerView::Search,
-                    ServerToolsAction::Functions => ServerView::Functions,
-                    ServerToolsAction::LuaScripts => ServerView::LuaScripts,
-                    ServerToolsAction::Persistence => ServerView::Persistence,
-                    ServerToolsAction::KeyspaceNotifications => ServerView::KeyspaceNotifications,
-                    ServerToolsAction::Topology => ServerView::Topology,
-                    ServerToolsAction::ServerLoad => ServerView::ServerLoad,
-                    ServerToolsAction::Hotkeys => ServerView::Hotkeys,
-                    ServerToolsAction::TimeSeriesExplorer => ServerView::TimeSeriesExplorer,
-                    ServerToolsAction::ValueSearch => ServerView::ValueSearch,
-                    ServerToolsAction::ServerInfo => ServerView::ServerInfo,
-                    // FLUSHDB / FLUSHALL: a confirm dialog over whatever view
-                    // is active, never a route. The menu entry is already
-                    // disabled on a read-only connection and
-                    // `flush_database` re-checks the capability, so this arm
-                    // only has to raise the dialog.
-                    ServerToolsAction::FlushDb | ServerToolsAction::FlushAll => {
-                        let all = matches!(e, ServerToolsAction::FlushAll);
-                        let Some((server_id, _)) = cx.global::<ZedisGlobalStore>().read(cx).selected_server().cloned()
-                        else {
-                            return;
-                        };
-                        let Ok(server) = get_server(&server_id) else {
-                            return;
-                        };
-                        let kind = if all { DangerKind::FlushAll } else { DangerKind::FlushDb };
-                        let line = if all { "FLUSHALL" } else { "FLUSHDB" };
-                        let server_state = this.active_content().read(cx).server_state();
-                        let db = server_state.read(cx).db();
-                        confirm_dangerous_command(&server, db, &kind, Some(line), window, cx, move |_window, cx| {
-                            server_state.update(cx, |state, cx| {
-                                state.flush_database(all, cx);
-                            });
-                        });
-                        return;
-                    }
-                    // A dialog, not a sub-route: keeps whatever view is
-                    // active underneath.
-                    ServerToolsAction::Trash => {
-                        let server_state = this.active_content().read(cx).server_state();
-                        open_trash_dialog(server_state, window, cx);
-                        return;
-                    }
-                    // The probed command matrix of the active tab's connection.
-                    ServerToolsAction::Capabilities => {
-                        let server_state = this.active_content().read(cx).server_state();
-                        open_features_dialog(server_state, window, cx);
-                        return;
-                    }
-                    // What the server says about itself, with what this
-                    // session's panels found, to paste or send.
-                    ServerToolsAction::TroubleshootingReport => {
-                        let server_state = this.active_content().read(cx).server_state();
-                        open_troubleshoot_report(server_state, window, cx);
-                        return;
-                    }
-                    // Dump import into the active server / db (not a
-                    // key-tree prefix). Opens a dedicated window.
-                    ServerToolsAction::ImportKeys => {
-                        #[cfg(not(target_family = "wasm"))]
-                        {
-                            let Some((server_id, db)) =
-                                cx.global::<ZedisGlobalStore>().read(cx).selected_server().cloned()
-                            else {
-                                return;
-                            };
-                            let server_name: gpui::SharedString = get_server(&server_id)
-                                .map(|s| s.name.into())
-                                .unwrap_or_else(|_| server_id.clone().into());
-                            open_migration_import_window(server_id.into(), server_name, db, cx);
-                        }
-                        return;
-                    }
-                    // Pub/Sub lives inside the editor suite (channel mode),
-                    // not on a tool route — flip the mode, then land on the
-                    // editor view so the panel is visible.
-                    ServerToolsAction::PubsubMode => {
-                        let server_state = this.active_content().read(cx).server_state();
-                        server_state.update(cx, |state, cx| state.change_channel_mode(cx));
-                        cx.update_global::<ZedisGlobalStore, ()>(|store, cx| {
-                            store.update(cx, |state, cx| state.go_to_view(ServerView::Editor, cx));
-                        });
-                        return;
-                    }
-                    // Compare a prefix of the active server / db with another
-                    // server / db, in its own window.
-                    ServerToolsAction::CompareKeys => {
-                        let Some((server_id, db)) = cx.global::<ZedisGlobalStore>().read(cx).selected_server().cloned()
-                        else {
-                            return;
-                        };
-                        let server_name: gpui::SharedString = get_server(&server_id)
-                            .map(|s| s.name.into())
-                            .unwrap_or_else(|_| server_id.clone().into());
-                        this.keep_focus_in_page(window, cx);
-                        open_compare(server_id.into(), server_name, db, window, cx);
-                        return;
-                    }
-                    // Export every key loaded in the active tab's tree (a
-                    // SCAN-limited subset, same coverage as the tree itself).
-                    ServerToolsAction::ExportKeys => {
-                        let Some((server_id, db)) = cx.global::<ZedisGlobalStore>().read(cx).selected_server().cloned()
-                        else {
-                            return;
-                        };
-                        let server_name: gpui::SharedString = get_server(&server_id)
-                            .map(|s| s.name.into())
-                            .unwrap_or_else(|_| server_id.clone().into());
-                        let mut keys: Vec<gpui::SharedString> = this
-                            .active_content()
-                            .read(cx)
-                            .server_state()
-                            .read(cx)
-                            .keys()
-                            .keys()
-                            .cloned()
-                            .collect();
-                        if keys.is_empty() {
-                            return;
-                        }
-                        keys.sort_unstable();
-                        this.keep_focus_in_page(window, cx);
-                        open_key_export(
-                            server_id.into(),
-                            server_name,
-                            db,
-                            keys,
-                            ExportSource::Loaded,
-                            window,
-                            cx,
-                        );
-                        return;
-                    }
-                };
-                cx.update_global::<ZedisGlobalStore, ()>(|store, cx| {
-                    store.update(cx, |state, cx| {
-                        state.toggle_view(target, cx);
-                    });
-                });
-            }))
-            // Esc mirrors the tool pages' "back to editor" button. The
-            // global keybinding only reaches here when no deeper handler
-            // (focused input, open dialog, command palette) claimed the
-            // keystroke; no-op on routes without a back affordance.
-            .on_action(cx.listener(|this, e: &TabAction, _window, cx| match e {
-                TabAction::Close(ix) => this.close_tab(*ix, cx),
-                TabAction::CloseOthers(ix) => this.close_others(*ix, cx),
-                TabAction::CloseRight(ix) => this.close_right(*ix, cx),
-            }))
-            // ⌘1–⌘8 / Ctrl+1–8: jump to the Nth workspace tab (1-based key).
-            // No-op when that index is not open yet (or already active).
-            .on_action(cx.listener(|this, e: &SidebarServerAction, window, cx| {
-                this.on_sidebar_server_action(e, window, cx);
-            }))
-            .on_action(cx.listener(|this, e: &WorkspaceTabAction, window, cx| {
-                let WorkspaceTabAction::Select(ix) = *e;
-                if ix < this.tabs.len() {
-                    this.activate_tab(ix, Some(window), cx);
-                    this.project_active_tab(cx);
-                }
-            }))
-            // ⌘W / Ctrl+W closes the active workspace tab while more than one is
-            // open. With a single tab (or any non-Close menu action) it
-            // propagates to the app-level `MemuAction` handler, which hides the
-            // app on macOS / closes the window elsewhere — the red-button
-            // behavior. Handled here (not only globally) so the view's tab list
-            // is in reach; ⌘W stays bound to the one `MemuAction::Close`.
-            // ⌘+ / ⌘- / ⌘0: the same UI font size Settings drives, stepped
-            // by one pixel inside that range; the store's value is applied
-            // to the theme on the next frame.
-            .on_action(cx.listener(|_this, e: &ZoomAction, _window, cx| {
-                let current = cx
-                    .global::<ZedisGlobalStore>()
-                    .read(cx)
-                    .font_rem_px()
-                    .unwrap_or(DEFAULT_UI_FONT_SIZE);
-                let next = match e {
-                    ZoomAction::In => current + 1.0,
-                    ZoomAction::Out => current - 1.0,
-                    ZoomAction::Reset => DEFAULT_UI_FONT_SIZE,
-                }
-                .clamp(UI_FONT_SIZE_MIN, UI_FONT_SIZE_MAX);
-                update_app_state_and_save(cx, "zoom", move |state, _| {
-                    state.set_font_rem_px(Some(next));
-                });
-            }))
-            .on_action(cx.listener(|_this, e: &WindowAction, window, _cx| match e {
-                WindowAction::Minimize => window.minimize_window(),
-                WindowAction::Zoom => window.zoom_window(),
-                WindowAction::ToggleFullscreen => window.toggle_fullscreen(),
-            }))
-            .on_action(cx.listener(|this, e: &MemuAction, window, cx| match e {
-                MemuAction::Close if this.tabs.len() > 1 => this.close_tab(this.active_tab, cx),
-                // The bridge's account page, as a dialog over the page; on
-                // the desktop nothing draws the item, and nothing opens.
-                MemuAction::Account => {
-                    this.keep_focus_in_page(window, cx);
-                    open_account(window, cx);
-                }
-                _ => cx.propagate(),
-            }))
-            // ⌘F / secondary-f: focus the active page's filter box.
-            // Must live on the window root — after a tab switch focus often
-            // sits on the tab pill (sibling of content), so handlers only on
-            // `ZedisContent` / `ZedisServers` never see the action.
-            // The binding carries `!Input`, so while focus is inside any
-            // gpui-component `Input` this never fires and a code editor's
-            // built-in ⌘F search panel takes the keystroke instead.
-            .on_action(cx.listener(|this, e: &EditorAction, window, cx| match e {
-                EditorAction::Search => {
-                    this.active_content().update(cx, |content, cx| {
-                        content.focus_search(window, cx);
-                    });
-                }
-                _ => cx.propagate(),
-            }))
-            .on_action(cx.listener(|_this, _e: &NavAction, window, cx| {
-                // Esc first dismisses an open dialog (the server editor,
-                // import/export, a confirm alert, …). This binding lives in the
-                // `Workspace` context and consumes Esc without propagating, so
-                // when a dialog's own `escape` handler doesn't win (e.g. focus
-                // isn't inside the dialog subtree) Esc would otherwise be
-                // swallowed here — doing nothing on Home, or worse, navigating
-                // the page *behind* the still-open dialog on a Server route.
-                if window.has_active_dialog(cx) {
-                    window.close_dialog(cx);
-                    return;
-                }
-                cx.update_global::<ZedisGlobalStore, ()>(|store, cx| {
-                    store.update(cx, |state, cx| {
-                        if !matches!(
-                            state.route(),
-                            Route::Home
-                                | Route::Settings
-                                | Route::Server {
-                                    view: ServerView::Editor,
-                                    ..
-                                }
-                        ) {
-                            state.go_to_view(ServerView::Editor, cx);
-                        }
-                    });
-                });
-            }))
+            });
+        }
     }
 }
 
@@ -1574,6 +1275,160 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod ui_tests {
+    use super::*;
+    use crate::states::ZedisAppState;
+    use crate::test_support::init_ui;
+    use gpui::{AnyWindowHandle, TestAppContext, px, size};
+    use gpui_kit::component::Root;
+    use gpui_kit::test::TestWindowExt;
+
+    fn open_root(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Zedis>) {
+        let mut root = None;
+        let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+            let view = cx.new(|cx| Zedis::new(window, cx));
+            root = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        cx.run_until_parked();
+        (handle.into(), root.expect("the window built the root"))
+    }
+
+    /// Send `action` from inside the active page, as a key or a menu does.
+    fn send(cx: &mut TestAppContext, handle: AnyWindowHandle, root: &Entity<Zedis>, action: impl Action) {
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let focus = root.read(cx).active_content().read(cx).focus_handle();
+            focus.focus(window, cx);
+            window.dispatch_action(Box::new(action), cx);
+        })
+        .expect("the window is open");
+        cx.run_until_parked();
+    }
+
+    fn stored<T>(cx: &mut TestAppContext, read: impl FnOnce(&ZedisAppState) -> T) -> T {
+        cx.read(|cx| read(cx.global::<ZedisGlobalStore>().read(cx)))
+    }
+
+    fn dialog_open(cx: &mut TestAppContext, handle: AnyWindowHandle) -> bool {
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.has_active_dialog(cx)
+        })
+        .expect("the window is open")
+    }
+
+    /// The settings the root's actions change, and where its routes go: the
+    /// language, the zoom, the theme, the Protos and Scripts pages, a
+    /// server tool's view and Pub/Sub back on the editor.
+    #[gpui::test]
+    fn the_roots_actions_change_what_they_name(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let (handle, root) = open_root(cx);
+
+        send(cx, handle, &root, LocaleAction::De);
+        assert_eq!(stored(cx, |s| s.locale().to_string()), "de");
+        send(cx, handle, &root, ZoomAction::In);
+        assert_eq!(stored(cx, |s| s.font_rem_px()), Some(DEFAULT_UI_FONT_SIZE + 1.));
+        send(cx, handle, &root, ZoomAction::Reset);
+        // The default size is stored as no size at all.
+        assert_eq!(
+            stored(cx, |s| s.font_rem_px().unwrap_or(DEFAULT_UI_FONT_SIZE)),
+            DEFAULT_UI_FONT_SIZE
+        );
+        send(cx, handle, &root, ThemeAction::Dark);
+        assert_eq!(stored(cx, |s| s.theme()), Some(ThemeMode::Dark));
+        assert!(cx.read(|cx| cx.theme().is_dark()));
+
+        send(cx, handle, &root, SettingsAction::Protos);
+        assert!(matches!(stored(cx, |s| s.route()), Route::Protos));
+        send(cx, handle, &root, SettingsAction::Scripts);
+        assert!(matches!(stored(cx, |s| s.route()), Route::Scripts));
+
+        cx.update(|cx| {
+            cx.global::<ZedisGlobalStore>()
+                .clone()
+                .update(cx, |state, cx| state.connect_server("scratch".into(), 0, cx));
+        });
+        cx.run_until_parked();
+        send(cx, handle, &root, ServerToolsAction::Monitor);
+        assert_eq!(stored(cx, |s| s.route().server_view()), Some(ServerView::Monitor));
+        send(cx, handle, &root, ServerToolsAction::ServerInfo);
+        assert_eq!(stored(cx, |s| s.route().server_view()), Some(ServerView::ServerInfo));
+        send(cx, handle, &root, ServerToolsAction::PubsubMode);
+        assert_eq!(stored(cx, |s| s.route().server_view()), Some(ServerView::Editor));
+    }
+
+    /// A tab asked for is built on the next frame; ⌘1 goes to the first,
+    /// a tab's Close takes it away, and ⌘W closes the active tab while
+    /// there is another.
+    #[gpui::test]
+    fn the_roots_tabs_follow_their_actions(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let (handle, root) = open_root(cx);
+        let tabs = |cx: &mut TestAppContext| root.read_with(cx, |root, _| (root.tabs.len(), root.active_tab));
+        assert_eq!(tabs(cx), (1, 0));
+
+        for _ in 0..2 {
+            cx.update(|cx| {
+                cx.global::<ZedisGlobalStore>()
+                    .state()
+                    .update(cx, |_, cx| cx.emit(GlobalEvent::ServerOpenInNewTab("".into(), 0, true)));
+            });
+            cx.run_until_parked();
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+                .expect("the window is open");
+            cx.run_until_parked();
+        }
+        assert_eq!(tabs(cx), (3, 2));
+
+        send(cx, handle, &root, WorkspaceTabAction::Select(0));
+        assert_eq!(tabs(cx), (3, 0));
+        send(cx, handle, &root, TabAction::Close(2));
+        assert_eq!(tabs(cx).0, 2);
+        send(cx, handle, &root, MemuAction::Close);
+        assert_eq!(tabs(cx).0, 1);
+        send(cx, handle, &root, MemuAction::Close);
+        assert_eq!(tabs(cx).0, 1, "the last tab is the app's to close");
+    }
+
+    /// What the root was left to open, it opens on its next frame — the
+    /// welcome card — and Esc closes a dialog before it goes anywhere; the
+    /// server tools that are dialogs open over the page.
+    #[gpui::test]
+    fn the_root_opens_its_dialogs(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let (handle, root) = open_root(cx);
+        root.update(cx, |root, cx| {
+            root.pending_welcome = true;
+            cx.notify();
+        });
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("the window is open");
+        cx.run_until_parked();
+        assert!(dialog_open(cx, handle), "the welcome card");
+        let route = stored(cx, |s| s.route());
+        send(cx, handle, &root, NavAction::Back);
+        assert!(!dialog_open(cx, handle), "Esc closes it");
+        assert_eq!(stored(cx, |s| s.route()), route, "and goes nowhere");
+
+        cx.update(|cx| {
+            cx.global::<ZedisGlobalStore>()
+                .clone()
+                .update(cx, |state, cx| state.connect_server("scratch".into(), 0, cx));
+        });
+        cx.run_until_parked();
+        for tool in [ServerToolsAction::Capabilities, ServerToolsAction::Trash] {
+            send(cx, handle, &root, tool);
+            assert!(dialog_open(cx, handle), "{tool:?}");
+            cx.update_window(handle, |_, window, cx| window.close_all_dialogs(cx))
+                .expect("the window is open");
+            cx.run_until_parked();
         }
     }
 }

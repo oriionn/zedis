@@ -234,6 +234,16 @@ pub enum ServerTask {
 }
 
 impl ServerTask {
+    /// The refreshes the app runs by itself, on a timer or behind a view:
+    /// starting one changes nothing anybody sees, and a failure of one is
+    /// not the user's to be told about.
+    pub fn is_background_refresh(&self) -> bool {
+        matches!(
+            self,
+            ServerTask::RefreshRedisInfo | ServerTask::RefreshDbsize | ServerTask::RefreshValueHeader
+        )
+    }
+
     /// Get string representation of task (for logging and error messages)
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -460,5 +470,31 @@ impl ZedisServerState {
         cx.global::<ZedisGlobalStore>().clone().update(cx, |_state, cx| {
             cx.emit(GlobalEvent::Notification(NotificationAction::new_error(message)));
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The heartbeat, the key total and the open key's header refresh by
+    /// themselves; nothing the user asked for does.
+    #[test]
+    fn only_what_refreshes_by_itself_is_a_background_refresh() {
+        for task in [
+            ServerTask::RefreshRedisInfo,
+            ServerTask::RefreshDbsize,
+            ServerTask::RefreshValueHeader,
+        ] {
+            assert!(task.is_background_refresh(), "{task:?}");
+        }
+        for task in [
+            ServerTask::ProbeFeatures,
+            ServerTask::SelectServer,
+            ServerTask::DeleteKey,
+            ServerTask::AutoRefresh,
+        ] {
+            assert!(!task.is_background_refresh(), "{task:?}");
+        }
     }
 }

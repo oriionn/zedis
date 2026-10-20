@@ -15,8 +15,10 @@
 //! What a test in this crate starts from.
 
 use crate::helpers::override_config_dir;
-use crate::states::{ZedisAppState, ZedisGlobalStore};
-use gpui::{AppContext, TestAppContext};
+use crate::states::{GlobalEvent, ServerEvent, ZedisAppState, ZedisGlobalStore, ZedisServerState};
+use gpui::{AppContext, Entity, TestAppContext};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// Point the config directory at a scratch one. The first call in a process
 /// wins, so every test names the same directory.
@@ -49,4 +51,36 @@ pub(crate) fn init_ui(cx: &mut TestAppContext) {
 pub(crate) fn hold_the_server_list() -> std::sync::MutexGuard<'static, ()> {
     static SERVER_LIST: std::sync::Mutex<()> = std::sync::Mutex::new(());
     SERVER_LIST.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// What a server state said, in the order it said it: each `ServerEvent` as
+/// its `Debug` text, each notice it put up as `notice <category>: <message>`.
+pub(crate) type EventLog = Rc<RefCell<Vec<String>>>;
+
+/// Start recording what `state` says (`init_ui` first: the notices go
+/// through the app state it installs).
+pub(crate) fn record_events(cx: &mut TestAppContext, state: &Entity<ZedisServerState>) -> EventLog {
+    let log = EventLog::default();
+    let (events, notices) = (log.clone(), log.clone());
+    cx.update(|cx| {
+        cx.subscribe(state, move |_, event: &ServerEvent, _| {
+            events.borrow_mut().push(format!("{event:?}"));
+        })
+        .detach();
+        let global = cx.global::<ZedisGlobalStore>().state();
+        cx.subscribe(&global, move |_, event: &GlobalEvent, _| {
+            if let GlobalEvent::Notification(notice) = event {
+                notices
+                    .borrow_mut()
+                    .push(format!("notice {:?}: {}", notice.category, notice.message));
+            }
+        })
+        .detach();
+    });
+    log
+}
+
+/// What was recorded since the last call, and a clean log after it.
+pub(crate) fn take_events(log: &EventLog) -> Vec<String> {
+    std::mem::take(&mut *log.borrow_mut())
 }

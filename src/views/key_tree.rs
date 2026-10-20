@@ -73,6 +73,7 @@ mod bar_menus;
 mod build;
 mod delegate;
 mod folder_delete;
+mod key_actions;
 mod render;
 mod row_menu;
 

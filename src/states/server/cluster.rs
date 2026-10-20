@@ -49,7 +49,6 @@ use crate::helpers::channel;
 use crate::states::{ServerEvent, ServerTask, ZedisServerState, i18n_common};
 use futures::future::try_join_all;
 use gpui::{SharedString, prelude::*};
-use std::sync::Arc;
 use tracing::warn;
 
 /// Per-master load sample for the Topology heatmap (memory + OPS).
@@ -95,9 +94,8 @@ impl ZedisServerState {
                     return;
                 }
                 if let Ok(summary) = result {
-                    this.dbsize = Some(summary.dbsize);
-                    this.nodes = summary.nodes;
-                    this.nodes_description = Arc::new(summary.description);
+                    this.readings.set_dbsize(summary.dbsize);
+                    this.facts.set_topology(summary.nodes, summary.description);
                     cx.emit(ServerEvent::ServerInfoUpdated);
                 }
                 this.refresh_redis_info(cx);
@@ -428,7 +426,7 @@ impl ZedisServerState {
         if legs.is_empty() {
             return;
         }
-        if self.manually_offline {
+        if self.link.manually_offline {
             self.emit_warning_notification(i18n_common(cx, "reconnect_first"), cx);
             return;
         }
@@ -567,7 +565,7 @@ impl ZedisServerState {
         }
         // `spawn` refuses to run while manually disconnected (and warns) —
         // bail before arming the progress state so it can't get stuck.
-        if self.manually_offline {
+        if self.link.manually_offline {
             self.emit_warning_notification(i18n_common(cx, "reconnect_first"), cx);
             return;
         }
