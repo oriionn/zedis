@@ -14,9 +14,10 @@
 
 //! Who is using the bridge now, and on which servers (`GET /v1/clients`):
 //! every sign-in, script and MCP token with a request in the last few
-//! minutes — so whoever is about to restart or flush a shared server can
-//! see who else is on it. A full account's section; the bridge answers a
-//! read-only one with a refusal, since the list names other accounts.
+//! minutes — so an administrator about to restart or flush a shared server
+//! can see who else is on it. An administrator's section, like the account
+//! list: it names other accounts and where they call from, and the bridge
+//! refuses anyone else.
 
 use super::*;
 use crate::assets::CustomIconName;

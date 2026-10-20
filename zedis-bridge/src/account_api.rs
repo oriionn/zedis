@@ -137,7 +137,7 @@ async fn password_is(state: &AppState, name: &str, password: &str) -> bool {
 
 /// Who is calling, for a route only an administrator may use. A refusal is
 /// an audit line, as a read-only account's is.
-fn authorize_admin(
+pub(crate) fn authorize_admin(
     state: &AppState,
     headers: &HeaderMap,
     origin: &mut Origin,

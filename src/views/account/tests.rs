@@ -254,11 +254,32 @@ fn a_read_only_account_has_its_tokens_and_no_administration(cx: &mut TestAppCont
     .expect("the window is open");
 }
 
-/// A full account sees who is using the bridge, read each time the section
-/// is opened: one row a client, with the servers it is on.
+/// A full account has its password and nothing of an administrator's — not
+/// who is online either, which names the other accounts and where they call
+/// from — and is never asked for them.
 #[gpui::test]
-fn a_full_account_sees_who_is_online_and_on_which_servers(cx: &mut TestAppContext) {
+fn a_full_account_has_its_password_and_no_administration(cx: &mut TestAppContext) {
     let bridge = FakeBridge::signed_in_as("alice", BridgeRole::Full);
+    let (_, window) = open(cx, bridge.clone());
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("section_password").is_some());
+        for section in ["section_online", "section_accounts", "section_invites", "section_audit"] {
+            assert!(window.try_find(section).is_none(), "{section}");
+        }
+    })
+    .expect("the window is open");
+    assert!(
+        !bridge.requests().contains(&"clients".to_string()),
+        "never asked who is online"
+    );
+}
+
+/// An administrator sees who is using the bridge, read each time the
+/// section is opened: one row a client, with the servers it is on.
+#[gpui::test]
+fn an_administrator_sees_who_is_online_and_on_which_servers(cx: &mut TestAppContext) {
+    let bridge = FakeBridge::signed_in_as("alice", BridgeRole::Admin);
     *bridge.clients.lock().expect("lock") = BridgeClients {
         process: "0123456789abcdef".to_string(),
         window_secs: 300,

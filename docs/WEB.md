@@ -206,7 +206,7 @@ INFO zedis_bridge::api: client online account="alice" kind="browser" online=3
 INFO zedis_bridge: client offline account="ops" kind="basic" online=2
 ```
 
-`GET /v1/clients` lists who is online now, the most recently seen first, with the servers each client used in the same five minutes — the one a page has open, a terminal's, a subscription's, a tool call's — latest first. It names other accounts and where they call from, so a read-only account is refused (`403`, and an audit line when the audit log is on); and it names only the servers the asker may see, so someone else's private entry is never confirmed to exist by who is on it:
+`GET /v1/clients` lists who is online now, the most recently seen first, with the servers each client used in the same five minutes — the one a page has open, a terminal's, a subscription's, a tool call's — latest first. It names other accounts, where they call from and which servers they are on, so it is an administrator's to read, like the account list — anyone else is refused (`403`, and an audit line when the audit log is on); and it names only the servers the asker may see, so someone else's private entry is never confirmed to exist by who is on it:
 
 ```console
 $ curl -s -u alice:secret https://zedis.example.com/v1/clients
@@ -217,7 +217,7 @@ $ curl -s -u alice:secret https://zedis.example.com/v1/clients
    "servers":[]}]}
 ```
 
-In the page the same list is **Account… → Online**, for every full account: who, from where, on which servers, last seen — so whoever is about to restart or flush a shared server can see who else is on it first.
+In the page the same list is **Account… → Online**, an administrator's section: who, from where, on which servers, last seen — so an administrator about to restart or flush a shared server can see who else is on it first.
 
 `peer` is the socket peer, which behind a reverse proxy is the proxy; `forwarded_for` is added when the proxy wrote `X-Forwarded-For`. The count is kept in memory: after a restart each client is back with its next request. With [several bridges](#several-bridges-on-one-database) each counts its own clients, and `process` says which bridge answered.
 

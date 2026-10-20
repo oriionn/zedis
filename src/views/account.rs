@@ -93,10 +93,11 @@ impl AccountSection {
         }
     }
 
-    /// What `me` has: tokens are a read-only account's (ADR 15), who is
-    /// online a full account's (the list names other accounts), the
-    /// accounts, the invitations and the audit an administrator's — and the
-    /// requests for an account too, on a bridge that takes them.
+    /// What `me` has: tokens are a read-only account's (ADR 15); who is
+    /// online, the accounts, the invitations and the audit an
+    /// administrator's — the online list names other accounts and where they
+    /// call from — and the requests for an account too, on a bridge that
+    /// takes them.
     fn of(me: &BridgeOwnAccount) -> Vec<Self> {
         let mut sections = vec![Self::Password];
         match me.account.role {
@@ -110,7 +111,7 @@ impl AccountSection {
                 }
                 sections.push(Self::Audit);
             }
-            BridgeRole::Full => sections.push(Self::Online),
+            BridgeRole::Full => {}
         }
         sections
     }

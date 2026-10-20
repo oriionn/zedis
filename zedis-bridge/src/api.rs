@@ -904,22 +904,18 @@ struct ClientsReply {
 }
 
 /// Who is using the bridge now: every client that made a request within
-/// `presence::ONLINE_WINDOW`, the most recently seen first. A full account's
-/// question — the answer names other accounts and where they call from —
-/// so a read-only one is refused, and the refusal is audited like a write.
+/// `presence::ONLINE_WINDOW`, the most recently seen first. An
+/// administrator's question, like the account list: the answer names other
+/// accounts, where they call from and which servers they are on, which is
+/// not every colleague's to read. Anyone else is refused, and the refusal
+/// is an audit line.
 async fn clients(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> ApiResult<Json<ClientsReply>> {
     let mut origin = Origin::new(peer, &headers);
-    let account = authorize(&state, &headers, &mut origin)?;
-    if state.accounts.is_read_only(&account) {
-        state
-            .audit
-            .record(&account, &origin, Event::Refused { action: "list clients" });
-        return Err(ApiError::Forbidden(READ_ONLY_REFUSAL.to_string()));
-    }
+    let account = account_api::authorize_admin(&state, &headers, &mut origin, "list clients")?;
     let mut clients = state.presence.online();
     // Each client's servers by name — and only those the asker may see: an
     // entry of someone else's is not confirmed to exist by who uses it.
@@ -2640,42 +2636,55 @@ mod mcp_auth_tests {
     }
 
     /// Whoever signs in is online — a browser by its login, a script by its
-    /// account and address — and the list of who is online is a full
-    /// account's to read.
+    /// account and address — and the list of who is online is an
+    /// administrator's to read: it names the others and where they call
+    /// from, so a full account is refused like a read-only one.
     #[test]
-    fn whoever_signs_in_is_online_and_only_a_full_account_reads_the_list() {
+    fn whoever_signs_in_is_online_and_only_an_administrator_reads_the_list() {
         let state = state(
             "[[users]]\nname = \"ops\"\npassword = \"secret\"\n\n\
-             [[users]]\nname = \"viewer\"\npassword = \"look\"\nread_only = true",
+             [[users]]\nname = \"viewer\"\npassword = \"look\"\nread_only = true\n\n\
+             [[users]]\nname = \"root\"\npassword = \"rootpass\"",
         );
+        let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
+        runtime
+            .block_on(state.accounts.make_admin("root", None))
+            .expect("root is the administrator");
         let peer: SocketAddr = "10.0.0.7:5000".parse().expect("address");
-        let id = state.logins.open("ops", &state.accounts, false).expect("login");
-        let mut browser = HeaderMap::new();
-        let cookie = format!("{}={id}", auth::COOKIE_NAME);
-        browser.insert("cookie", cookie.parse().expect("cookie"));
+        let browser_of = |name: &str| {
+            let id = state.logins.open(name, &state.accounts, false).expect("login");
+            let mut browser = HeaderMap::new();
+            let cookie = format!("{}={id}", auth::COOKIE_NAME);
+            browser.insert("cookie", cookie.parse().expect("cookie"));
+            browser
+        };
+        let ops = browser_of("ops");
+        let root = browser_of("root");
         let script = headers(&format!(
             "Basic {}",
             base64::engine::general_purpose::STANDARD.encode("viewer:look")
         ));
-        for headers in [&browser, &script] {
+        for headers in [&ops, &script, &root] {
             let mut origin = Origin::new(peer, headers);
             assert!(authorize(&state, headers, &mut origin).is_ok());
         }
 
-        let list = |headers: HeaderMap| {
-            tokio::runtime::Builder::new_current_thread()
-                .build()
-                .expect("runtime")
-                .block_on(clients(State(state.clone()), ConnectInfo(peer), headers))
+        let list = |headers: HeaderMap| runtime.block_on(clients(State(state.clone()), ConnectInfo(peer), headers));
+        assert!(
+            matches!(list(script.clone()), Err(ApiError::Forbidden(_))),
+            "not a read-only account"
+        );
+        assert!(
+            matches!(list(ops.clone()), Err(ApiError::Forbidden(_))),
+            "nor a full one"
+        );
+        let Ok(Json(reply)) = list(root.clone()) else {
+            panic!("an administrator reads the list");
         };
-        assert!(matches!(list(script.clone()), Err(ApiError::Forbidden(_))));
-        let Ok(Json(reply)) = list(browser.clone()) else {
-            panic!("a full account reads the list");
-        };
-        assert_eq!(reply.online, 2);
+        assert_eq!(reply.online, 3);
         let mut seen: Vec<(&str, &str)> = reply.clients.iter().map(|c| (c.account.as_str(), c.kind)).collect();
         seen.sort();
-        assert_eq!(seen, [("ops", "browser"), ("viewer", "basic")]);
+        assert_eq!(seen, [("ops", "browser"), ("root", "browser"), ("viewer", "basic")]);
         assert!(reply.clients.iter().all(|c| c.peer.as_deref() == Some("10.0.0.7")));
     }
 }
@@ -3000,7 +3009,7 @@ mod online_servers_tests {
 
     /// Who is online says which servers each client used, by name — and
     /// only those the asker may see: someone else's private entry is not
-    /// confirmed to exist by who is on it.
+    /// confirmed to exist by who is on it, not even to an administrator.
     #[tokio::test]
     async fn the_online_list_names_the_servers_each_client_used_that_the_asker_sees() {
         override_config_dir(std::env::temp_dir().join(format!("zedis-bridge-store-{}", std::process::id())));
@@ -3015,6 +3024,7 @@ mod online_servers_tests {
         for server in [
             entry("online-prod", "prod", None),
             entry("online-bobs", "bob's own", Some("bob")),
+            entry("online-opss", "ops's own", Some("ops")),
         ] {
             crate::store::LocalServers.put(server).await.expect("server");
         }
@@ -3022,6 +3032,7 @@ mod online_servers_tests {
             "[[users]]\nname = \"ops\"\npassword = \"secret\"\n\n\
              [[users]]\nname = \"bob\"\npassword = \"bobs-password\"",
         );
+        state.accounts.make_admin("ops", None).await.expect("ops administers");
         let peer: SocketAddr = "10.0.0.7:5000".parse().expect("address");
         let basic = |who: &str| {
             let mut headers = HeaderMap::new();
@@ -3034,23 +3045,39 @@ mod online_servers_tests {
         assert!(authorize(&state, &bob, &mut origin).is_ok());
         note_server(&state, &origin, "online-bobs");
         note_server(&state, &origin, "online-prod");
+        let ops = basic("ops:secret");
+        let mut origin = Origin::new(peer, &ops);
+        assert!(authorize(&state, &ops, &mut origin).is_ok());
+        note_server(&state, &origin, "online-opss");
 
-        let Ok(Json(reply)) = clients(State(state.clone()), ConnectInfo(peer), basic("ops:secret")).await else {
-            panic!("a full account reads the list");
+        let Ok(Json(reply)) = clients(State(state.clone()), ConnectInfo(peer), ops.clone()).await else {
+            panic!("the administrator reads the list");
         };
-        let bobs = reply
-            .clients
-            .iter()
-            .find(|client| client.account == "bob")
-            .expect("bob is online");
-        let named: Vec<(&str, &str)> = bobs.servers.iter().map(|s| (s.id.as_str(), s.name.as_str())).collect();
-        assert_eq!(named, [("online-prod", "prod")]);
+        let named = |account: &str| -> Vec<(String, String)> {
+            reply
+                .clients
+                .iter()
+                .find(|client| client.account == account)
+                .expect("online")
+                .servers
+                .iter()
+                .map(|s| (s.id.clone(), s.name.clone()))
+                .collect()
+        };
+        assert_eq!(named("bob"), [("online-prod".to_string(), "prod".to_string())]);
+        assert_eq!(
+            named("ops"),
+            [("online-opss".to_string(), "ops's own".to_string())],
+            "its own private entry, by name"
+        );
 
-        let Ok(Json(reply)) = clients(State(state.clone()), ConnectInfo(peer), bob.clone()).await else {
-            panic!("bob reads the list");
-        };
-        let own = reply.clients.iter().find(|c| c.account == "bob").expect("bob");
-        assert_eq!(own.servers.len(), 2, "bob sees his own entry");
+        assert!(
+            matches!(
+                clients(State(state.clone()), ConnectInfo(peer), bob.clone()).await,
+                Err(ApiError::Forbidden(_))
+            ),
+            "a full account does not read it"
+        );
     }
 }
 
