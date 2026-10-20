@@ -373,3 +373,110 @@ pub(super) fn on_nav(_this: &mut Zedis, _e: &NavAction, window: &mut Window, cx:
         });
     });
 }
+
+/// What the app announces that the root answers for: a notification to show,
+/// the active tab's connection, a request for a tab, and the server list.
+pub(super) fn on_global_event(this: &mut Zedis, event: &GlobalEvent, cx: &mut Context<Zedis>) {
+    match event {
+        GlobalEvent::Notification(e) => {
+            let message = e.message.clone();
+            let mut notification = match e.category {
+                NotificationCategory::Info => {
+                    info!(message = %message, "info notification");
+                    Notification::info(message)
+                }
+                NotificationCategory::Success => {
+                    info!(message = %message, "success notification");
+                    Notification::success(message)
+                }
+                NotificationCategory::Warning => {
+                    info!(message = %message, "warning notification");
+                    Notification::warning(message)
+                }
+                NotificationCategory::Error => {
+                    error!(message = %message, "error notification");
+                    Notification::error(message)
+                }
+            };
+            // An empty title must not reach the toast: it renders as a
+            // blank title row with the message pushed below it.
+            if let Some(title) = e.title.as_ref().filter(|title| !title.is_empty()) {
+                notification = notification.title(title);
+            }
+            this.pending_notification = Some(notification);
+        }
+        GlobalEvent::ServerSelected(server_id, db) => {
+            // Track the active tab's connection identity. Deliberately
+            // no "jump to an existing tab" here: the contents'
+            // subscriptions run before this one, so by the time this
+            // fired the active tab has already followed the selection.
+            // Normal clicks navigate the current tab (browser-like);
+            // only the explicit open-in-new-tab path below dedupes
+            // onto an existing tab.
+            let tab = &mut this.tabs[this.active_tab];
+            if server_id.is_empty() {
+                tab.server_id.clear();
+                tab.db = 0;
+            } else {
+                tab.server_id = server_id.to_string();
+                tab.db = *db;
+            }
+            this.persist_tabs(cx);
+        }
+        GlobalEvent::ServerOpenInNewTab(server_id, db, force) => {
+            // `force` (⌘/Ctrl+Shift+click) skips the dedup lookup so a
+            // duplicate tab on the same `(server, db)` can be opened.
+            let existing = (!*force).then(|| {
+                this.tabs
+                    .iter()
+                    .position(|tab| tab.server_id.as_str() == server_id.as_str() && tab.db == *db)
+            });
+            if let Some(ix) = existing.flatten() {
+                this.activate_tab(ix, None, cx);
+                this.project_active_tab(cx);
+            } else if this.tabs.len() >= MAX_TABS {
+                // The click still keeps its promise — the server opens
+                // — just in the tab that is already active, and the
+                // notice says which limit was hit and what to do about
+                // it. A refusal alone read as the click doing nothing.
+                let body = i18n_common(cx, "tab_limit_body").replace("%{max}", &MAX_TABS.to_string());
+                this.pending_notification = Some(Notification::warning(body).title(i18n_common(cx, "tab_limit_title")));
+                let (id, db) = (server_id.to_string(), *db);
+                cx.global::<ZedisGlobalStore>().clone().update(cx, |state, cx| {
+                    if id.is_empty() {
+                        state.clear_selected_server(cx);
+                    } else {
+                        state.connect_server(id, db, cx);
+                    }
+                });
+            } else {
+                // Creating a `ZedisContent` needs a `Window`; stash the
+                // request and let `render` build the tab.
+                this.pending_new_tab = Some((server_id.to_string(), *db));
+            }
+        }
+        GlobalEvent::ServerListUpdated => this.close_tabs_of_removed_servers(cx),
+        _ => {}
+    }
+    cx.notify();
+}
+
+/// The OS appearance changed.
+pub(super) fn on_window_appearance(this: &mut Zedis, cx: &mut Context<Zedis>) {
+    // Only follow the OS appearance on System mode with no named theme
+    // active — a named theme should persist across OS appearance changes.
+    let follow_system = {
+        let store = cx.global::<ZedisGlobalStore>().read(cx);
+        store.theme().is_none() && store.theme_name().is_none()
+    };
+    if follow_system {
+        this.theme_update_task = Some(cx.spawn(async move |_this, cx| {
+            cx.update(|cx| {
+                restore_default_themes(cx);
+                Theme::change(cx.window_appearance(), None, cx);
+                apply_default_ui_font_size(cx);
+                cx.refresh_windows();
+            });
+        }));
+    }
+}

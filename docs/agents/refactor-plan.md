@@ -833,6 +833,62 @@ loaded machine the button had moved by then. `init_ui` now reduces motion,
 as gpui-component's own dialog tests do, so the entrance settles on its
 first frame; the same five-at-once run passed ten times in ten.
 
+#### The root (2026-10-21)
+
+`root.rs` was 1,440 lines; it is 946, of which 275 are its UI tests. Two
+moves:
+
+- **`root/tabs.rs`** — the workspace tab strip: `ContentTab`, `TabAction`,
+  the drag payload and preview, `MAX_TABS`, activating, closing (one, the
+  others, to the right, those of removed connections), moving, persisting,
+  `render_tab_bar`, the two pure functions behind them and their unit tests,
+  and `restore_tabs`, the strip a session ended with.
+- **`new`** went from 235 lines to 40: the restore is `tabs::restore_tabs`,
+  the global events the root answers for are `handlers::on_global_event`,
+  following the system appearance is `handlers::on_window_appearance`, and
+  the housekeeping loop is `start_housekeeping`. Each body moved as it was.
+
+The line-by-line count differs only in the headers, the `mod` / `use`
+lines, the calls that replaced the moved bodies, `pub(super)` on what the
+root and its handlers reach (eight methods, `ContentTab::new` and its three
+fields) and one line rustfmt joined at the shallower indent.
+
+Three UI tests came first, for what the strip did that nothing pinned: a
+drag moves a tab and the active one with it, Open in New Tab finds the tab
+already on that connection, Close Right and Close Others leave what they
+name, each written down (`the_tab_strip_moves_finds_and_closes_its_tabs`); a
+selection is its tab's connection from then on, and one past the limit opens
+in place with a notice (`a_tab_follows_its_selection_and_one_past_the_limit_opens_in_place`);
+a session's tabs come back on their databases, without the one whose
+connection is gone, with the remembered one active
+(`a_session_s_tabs_come_back_and_the_remembered_one_is_active`). Nine ways
+of breaking those paths each fail one of them. The notice is counted, not
+read: a notification has no label a test can find, and a tab on a server
+that does not exist puts up a notice of its own, so the limit is reached on
+Home tabs.
+
+#### The panels and the administration tools, checked (2026-10-21)
+
+Read-only grids: every one is a `ZedisTextTable`. The table and list
+delegates still written by hand are the editable grids CLAUDE.md names
+(stream entries, proto bindings, the script library), the hex viewer and
+the key tree.
+
+Sampling loops: Server Load and Hot Keys are `PanelPoll`s. Three loops are
+their own — the cluster Load tab, the Latency tab and the command log —
+because each samples while one tab of its panel is showing and stops when
+the tab changes, and the Load tab's fetch needs the view's master list,
+where `PanelPoll`'s takes only the server and database. All three take
+their interval from `pacing` and skip a round in the background, which is
+what the rule is for, so they stay. The Pub/Sub panel's five-second loop is
+a repaint of its status line, not a poll.
+
+Confirms: of the sixty alerts in `src/views`, forty-four are `.danger()` or
+go through `danger_confirm.rs`; most of the rest change nothing that cannot
+be changed back (`BGSAVE`, `CONFIG SET`, a copy, starting `MONITOR`, an
+import that never overwrites). What is left is listed under *Progress* as
+findings: they are behaviour — Return would answer Cancel — not structure.
+
 ### Phase 7 — the browser entry and the helpers
 
 - `zedis-web/src/transport.rs` (1.6k without tests): one module per trait it
@@ -869,8 +925,9 @@ a wire field or a test name CI selects by.
 | 5 | operations ↔ live tests check | done: 210 operations, all typed; 28 without a live test, listed | (pending) |
 | 5 | `tests/live.rs` split | done: fifteen modules and `main.rs`, the 94 names kept | (pending) |
 | 5 | `client.rs`, `config.rs`, `ssh_tunnel.rs` read for seams | read: ten submodules named; the splits wait for the matrix to have run on step 2 | |
-| 6 | status bar | done: four submodules, two UI tests first; UI tests reduce motion | (pending) |
-| 6 | root, panels, administration tools | not started | |
+| 6 | status bar | done: four submodules, two UI tests first; UI tests reduce motion | `2ffdd87` |
+| 6 | root | done: the tab strip into `root/tabs.rs`, `new` into named parts, three UI tests first | (pending) |
+| 6 | panels, administration tools | checked: the grids and loops follow the rules; five confirms listed as findings | (pending) |
 | 7 | transport, updater | not started | |
 | 8 | core, db pass | not started | |
 
@@ -881,3 +938,20 @@ and fixed as their own changes.
   dropping it, which reaches the master key (a keychain read where nothing
   else has needed it). The fix is the order it had before `dbcb4aa`:
   `if api_key.is_empty() { None } else { Some(seal_secret(api_key)) }`.
+- Phase 6: the editor's per-value auto refresh (`ZedisEditor::start_auto_refresh`)
+  reloads the open value on its interval in a background tab and in an
+  unattended app, where the key tree's auto refresh, the heartbeat and the
+  sampling panels stop (ADR 5) — `handle_auto_refresh` asks `is_background()`,
+  `reload_value` does not.
+- Phase 6: confirms that destroy something and are not `.danger()`, so
+  Return goes ahead where the one-key delete's answers Cancel:
+  - the key tree's folder delete (`key_tree/folder_delete.rs`), which deletes
+    every key under the prefix;
+  - the topology's Forget node (`topology/cluster_nodes.rs`) — the terminal
+    classifies `CLUSTER FORGET` as destructive (`DangerKind::ClusterReset`);
+  - Sentinel's Remove and Reset (`topology/sentinel.rs`);
+  - the clients panel's Kill, Kill selected and Kill by filter
+    (`clients_manager.rs`).
+
+  The first two are the clearest; each is one change with a UI test that
+  Return cancels.
