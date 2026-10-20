@@ -963,6 +963,32 @@ Low risk, low priority: a pass over `zedis-core` and `zedis-db` for dead code,
 duplication with `zedis-connection`, and the storage rules (container-level
 `serde(default)`, a bad row skipped and never deleted).
 
+#### Done (2026-10-21)
+
+- **Dead code.** Of the public items in the two crates, two were named by
+  nothing: `zedis_core::json::empty_object` and `ParamKind::is_vector` in
+  `search_params.rs`. Neither had a hand-written twin to take its place, so
+  both went. `RdbParser::rdb_version` is read only by the parser's own
+  tests, which is what it is for, and stays; `init_database_for_tests` is
+  already `#[cfg(test)]`.
+- **Duplication with `zedis-connection`.** None. The names the crates share
+  are different functions: the codecs' `float` / `int` / `pairs` read
+  binary formats where `reply`'s read RESP, the two `classify_reply`s
+  classify a probe and a `KILL`, and the connection crate's `string.rs`
+  re-exports `zedis-core`'s string helpers on purpose. Its
+  `redis_value_to_string` is the terminal's text rendering, not a second
+  `reply::display`: the two print a nil and an array differently.
+- **Storage rules.** Every stored value type carries a container-level
+  `#[serde(default)]` but `KeyMetadata`, whose two fields each had one: it
+  has one now, so a field added later cannot make an existing note
+  unreadable (nothing reads differently today). Left as they are:
+  `StoredEnvelope`, the versioned envelope (its version defaults to 1, not
+  0), and `LuaScriptExport`, the clipboard's import format, which is never a
+  stored row. Every loader skips a row it cannot read or returns the error
+  without writing; none deletes one. The bin's purge removes expired
+  entries by the time in their key and never decodes them, which is its
+  retention working, not a bad row being dropped.
+
 ## Out of scope
 
 Behaviour changes, UI redesign, new dependencies, performance work without a
@@ -989,8 +1015,8 @@ a wire field or a test name CI selects by.
 | 6 | root | done: the tab strip into `root/tabs.rs`, `new` into named parts, three UI tests first | `b54fde5` |
 | 6 | panels, administration tools | checked: the grids and loops follow the rules; five confirms listed as findings | `b54fde5` |
 | 7 | transport | done: one submodule per trait, three tests first | `2d90e1f` |
-| 7 | updater | done: check, manifest, download, install; two tests first | (pending) |
-| 8 | core, db pass | not started | |
+| 7 | updater | done: check, manifest, download, install; two tests first | `c78ad4e` |
+| 8 | core, db pass | done: two dead helpers gone, no duplication, `KeyMetadata` given its container default | (pending) |
 
 Findings that are bugs rather than structure are listed here as they turn up,
 and fixed as their own changes.

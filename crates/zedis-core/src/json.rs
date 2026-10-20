@@ -24,7 +24,7 @@
 //! saves the whole value — the same menu either way.
 
 use serde::de::IgnoredAny;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::borrow::Cow;
 use std::fmt;
 
@@ -574,11 +574,6 @@ fn preview(value: &Value) -> String {
         }
         other => other.to_string(),
     }
-}
-
-/// An empty object, the document a new JSON key starts as.
-pub fn empty_object() -> Value {
-    Value::Object(Map::new())
 }
 
 #[cfg(test)]

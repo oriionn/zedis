@@ -55,10 +55,6 @@ impl ParamKind {
             ParamKind::BFloat16 => "BFLOAT16",
         }
     }
-
-    pub fn is_vector(self) -> bool {
-        !matches!(self, ParamKind::Text)
-    }
 }
 
 fn is_ident_start(c: char) -> bool {

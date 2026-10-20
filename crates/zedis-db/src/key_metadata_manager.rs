@@ -103,6 +103,7 @@ impl TagColor {
 /// treats an entry with `tag == None && note.is_empty()` as equivalent
 /// to "no record" and deletes it on save.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct KeyMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<TagColor>,
