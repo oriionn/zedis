@@ -137,11 +137,15 @@ pub(super) fn open_folder_delete_dialog(
     .detach();
 
     let body = preview.clone();
+    // Every key under the prefix: the destructive shape, so Return answers
+    // Cancel, as for one key.
     ZedisDialog::new(i18n_key_tree(cx, "delete_folder_title"))
         .alert()
         .icon(IconName::Info)
         .child(move || body.clone())
-        .button_props(dialog_button_props(cx))
+        .danger()
+        .ok_text(i18n_common(cx, "delete"))
+        .cancel_text(i18n_common(cx, "cancel"))
         .on_ok(move |_, _, cx| {
             // Not before the number: the number is the question.
             if !preview.read(cx).counted() {

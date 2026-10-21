@@ -10,8 +10,9 @@
 #                                 ("mymaster") and 16383 / replica 16384 ("mymaster2").
 #                                 Password-protected, and the sentinel's own password is a
 #                                 *different* one — the shape `sentinel_password` exists for.
-#   busy        127.0.0.1:16385   plain server the runaway-script test parks in BUSY (its own,
-#                                 so the other tests never see the BUSY replies)
+#   busy        127.0.0.1:16385   plain server the runaway-script test parks in BUSY and the
+#                                 server-wide flushes empty (its own, so the other tests never
+#                                 see either; the two take turns on `BUSY_SERVER`)
 #   replication 127.0.0.1:16386   a primary with a replica on 16387, for the REPLICAOF / FAILOVER
 #                                 test (its own pair: that test promotes and fails over, which
 #                                 would upset the sentinel's)

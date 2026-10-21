@@ -14,7 +14,8 @@
 
 use super::conn::RedisAsyncConn;
 use super::config::{RedisServer, SERVER_TYPE_SENTINEL, get_server};
-use super::ssh_tunnel::{open_single_sni_tls_connection, open_single_ssh_tunnel_connection, tls_server_name};
+use super::ssh_tunnel::open_single_ssh_tunnel_connection;
+use super::tls_connection::{open_single_sni_tls_connection, tls_server_name};
 use crate::error::{ConnectionErrorKind, Error};
 use crate::floors;
 use crate::reply;

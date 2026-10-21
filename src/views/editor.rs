@@ -631,6 +631,12 @@ impl ZedisEditor {
                     .timer(Duration::from_secs(auto_refresh_interval_sec))
                     .await;
                 server_state.update(cx, move |state, cx| {
+                    // Nobody is looking: a background tab, or an app left
+                    // unattended. The key tree's refresh, the heartbeat and
+                    // the sampling panels wait then too (ADR 5).
+                    if state.is_background() {
+                        return;
+                    }
                     let key = state.key().unwrap_or_default();
                     if key.is_empty() {
                         return;
@@ -1029,11 +1035,59 @@ mod tests {
     use crate::helpers::hot_key_table;
     use crate::states::ZedisServerState;
     use crate::states::{DataFormat, ViewMode};
-    use crate::test_support::init_ui;
+    use crate::test_support::{EventLog, init_ui, record_events, take_events};
     use gpui::{AppContext, TestAppContext, px, size};
     use gpui_kit::component::Root;
     use gpui_kit::test::TestWindowExt;
+    use std::time::Duration;
     use zedis_core::validate::ttl_secs;
+
+    /// How many times the value was read again, by the editor's own auto
+    /// refresh, in the events since `log` was last taken.
+    fn reloads(log: &EventLog) -> usize {
+        take_events(log)
+            .iter()
+            .filter(|event| event.as_str() == "TaskStarted(ReloadValue)")
+            .count()
+    }
+
+    /// A value's auto refresh reads it again on its interval while its tab is
+    /// in front, and not while nobody is looking — the key tree's refresh,
+    /// the heartbeat and the sampling panels already wait then (ADR 5), and a
+    /// server billed per command was still sent a read a second.
+    #[gpui::test]
+    fn a_values_auto_refresh_waits_while_its_tab_is_in_the_background(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let server_state = cx.new(|_| ZedisServerState::default());
+        server_state.update(cx, |state, cx| {
+            state.select("scratch".into(), 0, cx);
+            state.select_key("watched".into(), cx);
+        });
+        let mut editor = None;
+        cx.open_window(size(px(900.), px(600.)), |window, cx| {
+            let view = cx.new(|cx| ZedisEditor::new(server_state.clone(), window, cx));
+            editor = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        cx.run_until_parked();
+        let editor = editor.expect("the window built the editor");
+        let log = record_events(cx, &server_state);
+        editor.update(cx, |editor, cx| editor.start_auto_refresh(Some(1), cx));
+
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(reloads(&log), 1, "in front, on its interval");
+
+        server_state.update(cx, |state, _| state.set_background(true));
+        cx.executor().advance_clock(Duration::from_secs(3));
+        cx.run_until_parked();
+        assert_eq!(reloads(&log), 0, "not in a background tab");
+
+        server_state.update(cx, |state, _| state.set_background(false));
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(reloads(&log), 1, "and again once it is in front");
+    }
 
     /// Whether the empty editor offers *New key*, with the connection
     /// read-only or not.

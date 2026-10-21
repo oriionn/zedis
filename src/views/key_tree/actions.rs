@@ -573,6 +573,11 @@ mod tests {
         assert_eq!(dialog_of(cx, handle, &tree, A::PersistKey("k".into())), "none");
         assert_eq!(dialog_of(cx, handle, &tree, A::EditKeyTag("k".into())), "tag");
         assert_eq!(dialog_of(cx, handle, &tree, A::PersistFolder("user".into())), "alert");
+        assert_eq!(
+            dialog_of(cx, handle, &tree, A::DeleteFolder("user".into())),
+            "confirm",
+            "a folder's delete is the destructive shape, as one key's is"
+        );
         assert_eq!(dialog_of(cx, handle, &tree, A::SetTtlFolder("user".into())), "ttl");
 
         pick(cx, &tree, &[]);

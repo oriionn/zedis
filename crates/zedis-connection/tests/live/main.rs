@@ -66,6 +66,13 @@ use zedis_connection::{
     zset_range, zset_range_by_score, zset_remove, zset_scan,
 };
 use zedis_connection::{
+    AggregateOptions, CreateFieldSpec, CreateIndexOptions, FunctionRestorePolicy, ReducerFn, ReducerSpec, acl_list,
+    acl_load, cluster_forget, cluster_meet, failover_abort, flush_all, flush_db, ft_aggregate, ft_alter_add, ft_create,
+    ft_dropindex, ft_profile, function_dump, function_fcall, function_flush, function_list, function_restore, json_get,
+    json_merge, json_set, key_size_distributions, memory_stats, node_migrate_slots, publish, sample_memory_usage,
+    script_flush, stream_ack_delete, stream_nack,
+};
+use zedis_connection::{
     CopyLoss, SearchableType, ValueSearchSpec, copy_preflight, multi_search_exact, multi_search_scan, scan_values_round,
 };
 use zedis_connection::{
@@ -122,6 +129,11 @@ static REGISTER: smol::lock::Mutex<()> = smol::lock::Mutex::new(());
 /// that is importing a slot atomically refuses `SETSLOT … IMPORTING`
 /// with "Slot import in progress".
 static CLUSTER_SLOTS: smol::lock::Mutex<()> = smol::lock::Mutex::new(());
+
+/// Held by every test on the `busy` scenario's server: the runaway-script
+/// test parks it in BUSY and the server-wide flushes empty it, and either
+/// would fail the other.
+static BUSY_SERVER: smol::lock::Mutex<()> = smol::lock::Mutex::new(());
 
 async fn register(server: RedisServer) -> String {
     isolate();

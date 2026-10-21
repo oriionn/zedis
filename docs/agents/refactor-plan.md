@@ -816,6 +816,67 @@ two, `redact_servers` and `RedisServers`, which now say `config/store.rs`.
 Left for a step of its own, as above: the TLS pieces in `ssh_tunnel.rs`
 that have nothing to do with SSH.
 
+#### The TLS pieces, moved (2026-10-21)
+
+`tls_connection.rs`, native only like `ssh_tunnel.rs`: the insecure
+certificate verifier, `install_crypto_provider`, the connector built from an
+entry's TLS settings (`build_tls_connector`), the server name it checks
+(`tls_server_name`) and `open_single_sni_tls_connection` — 195 lines, and
+`ssh_tunnel.rs` is 655. It is not beside `config/tls.rs` after all, which is
+the TLS *material* an entry carries and compiles for both targets; this is
+the dialing, which the browser never does. `lib.rs` re-exports
+`install_crypto_provider` from there (the wasm build keeps its no-op), the
+tunnel imports the connector and the server name, and `authenticate_redis`
+became `pub(crate)` for the direct connection. Before the move the one path
+no test held — that the certificate is checked against the configured server
+name, not the dialed host — got a live test,
+`tls_checks_the_certificate_against_the_server_name_it_was_given`
+(`transport`): `localhost` is accepted on 127.0.0.1, `wrong.example` refused.
+It fails with the name taken out of the check. The live suite after the
+move: 95 passed — the 94 and the new test — with the same skips.
+
+#### The 28 operations, tested (2026-10-21)
+
+Seven new tests and five extended ones; where a test already sent the raw
+command an operation wraps, it now calls the operation.
+
+| Operations | Test | Runs on |
+|---|---|---|
+| `flush_db`, `flush_all`, `script_flush`, `function_flush` | `busy_server_flushes_empty_what_they_name` (new, `server`), with `function_restore … FLUSH` | the `busy` server, which the runaway-script test now takes turns on (`BUSY_SERVER`) |
+| `function_list`, `function_fcall`, `function_dump`, `function_restore` | `standalone_functions_list_call_dump_and_restore` (new, `scripts`) | standalone, `floors::FUNCTIONS` |
+| `acl_list`, `acl_load` | `acl_log_dryrun_genpass_and_the_aclfile_gate` | standalone |
+| `failover_abort` | `replication_pair_promotes_relinks_and_fails_over` | the pair, `floors::FAILOVER` |
+| `cluster_meet`, `cluster_forget` | `cluster_meet_and_forget_are_told_to_every_master` (new, `cluster_admin`) | cluster, under `CLUSTER_SLOTS` |
+| `node_migrate_slots` | `cluster_migrates_slots_atomically_on_valkey_9_and_redis_8_4`, whose way back goes through it | cluster, `floors::ATOMIC_SLOT_MIGRATION` |
+| `publish` | `standalone_channel_subscription_delivers_both_kinds_of_pubsub`, plain and sharded | standalone |
+| `key_size_distributions` | `standalone_info_keysizes_buckets_types`, and its empty answer without the section | standalone |
+| `sample_memory_usage`, `memory_stats` | `standalone_memory_panels_sample_keys_and_read_memory_stats` (new, `server`) | standalone |
+| `stream_ack_delete`, `stream_nack` | `standalone_stream_ack_delete_and_nack_settle_one_pending_entry` (new, `values`) | standalone, `STREAM_REF_POLICIES` / `STREAM_NACK` |
+| `json_get`, `json_set`, `json_merge` | `stack_json_document_is_read_written_whole_and_merged` (new) | the module lanes; `JSON.MERGE` where the server has it |
+| `ft_create`, `ft_alter_add`, `ft_aggregate`, `ft_profile`, `ft_dropindex` | `stack_search_index_is_created_altered_aggregated_and_dropped` (new) | the module lanes; `FT.ALTER` / `FT.PROFILE` where the server has them, `DD` by `valkey_lane()` |
+
+What the harness cannot show, said in the tests: `ACL LOAD` only as the
+refusal of a server without an `aclfile`; `FAILOVER ABORT` only as the
+refusal with nothing to abort (an idle pair finishes a failover before an
+abort could land); `CLUSTER MEET` only with a member every master already
+has, and `CLUSTER FORGET` only with an id none of them knows — there is no
+spare node to add and take away; `ASYNC` against `SYNC` on the two flushes
+not at all, the cache being empty at once either way.
+
+Run locally: the whole suite on the topology (Redis 8.6.1), 102 passed —
+the 95 and seven new; the standalone, busy and replication tests also on
+Redis 6.2.20 and on Valkey 9.0.0, and the standalone ones on Redis 8.10.2,
+the only server here with `XNACK`. Each test fails with its operation
+broken (21 changes in a worktree, one at a time: a command swapped, an
+argument dropped, a policy mapped wrong — `SILENT` for `XNACK`'s `FAIL`,
+`APPEND` for `FUNCTION RESTORE`'s `REPLACE` and `FLUSH`, the end
+`node_migrate_slots` is told on), every one caught. The JSON and search
+tests have not run anywhere yet — no module here — and are written to the
+command lists valkey-search and valkey-json publish (no `FT.ALTER`,
+`FT.PROFILE` or `JSON.MERGE`; `FT.AGGREGATE` groups an indexed field
+without a `LOAD`, as its own tests do), so a red module lane after the push
+points at them first.
+
 ### Phase 6 — the shell and the panels
 
 - `status_bar.rs` (2.0k without tests): the tools menu, the server status
@@ -1041,7 +1102,9 @@ a wire field or a test name CI selects by.
 | 4 | gate inventory | done: 23 of 24 statement gates up to items, seams or modules; the four `cfg!` asks go through `this_build` | `b22963a` |
 | 5 | operations ↔ live tests check | done: 210 operations, all typed; 28 without a live test, listed | `cb3cb50` |
 | 5 | `tests/live.rs` split | done: fifteen modules and `main.rs`, the 94 names kept | `cb3cb50` |
-| 5 | `client.rs`, `config.rs`, `ssh_tunnel.rs` split | done: ten submodules, the live suite with SSH before and after; the matrix checks it on push | (pending) |
+| 5 | `client.rs`, `config.rs`, `ssh_tunnel.rs` split | done: ten submodules, the live suite with SSH before and after; the matrix checks it on push | `0604a68` |
+| 5 | TLS out of `ssh_tunnel.rs` | done: `tls_connection.rs`, one live test of the server name first | (pending) |
+| 5 | the 28 operations without a live test | done: seven new tests, five extended; 6.2, 8.6, 8.10 and Valkey 9 locally, the module lanes on push | (pending) |
 | 6 | status bar | done: four submodules, two UI tests first; UI tests reduce motion | `2ffdd87` |
 | 6 | root | done: the tab strip into `root/tabs.rs`, `new` into named parts, three UI tests first | `b54fde5` |
 | 6 | panels, administration tools | checked: the grids and loops follow the rules; five confirms listed as findings | `b54fde5` |
@@ -1050,17 +1113,25 @@ a wire field or a test name CI selects by.
 | 8 | core, db pass | done: two dead helpers gone, no duplication, `KeyMetadata` given its container default | `52facc6` |
 
 Findings that are bugs rather than structure are listed here as they turn up,
-and fixed as their own changes.
+and fixed as their own changes. The first three were fixed on 2026-10-21, each
+with a test that fails with the fix taken out (checked in a worktree); the
+fourth is open.
 
 - Phase 4: `ZedisAppState::set_ai_api_key` encrypts an empty key before
   dropping it, which reaches the master key (a keychain read where nothing
   else has needed it). The fix is the order it had before `dbcb4aa`:
   `if api_key.is_empty() { None } else { Some(seal_secret(api_key)) }`.
+  **Fixed** that way. No test: the master key is cached per process, so
+  whether this call reached it cannot be seen from a test in the same binary.
 - Phase 6: the editor's per-value auto refresh (`ZedisEditor::start_auto_refresh`)
   reloads the open value on its interval in a background tab and in an
   unattended app, where the key tree's auto refresh, the heartbeat and the
   sampling panels stop (ADR 5) — `handle_auto_refresh` asks `is_background()`,
   `reload_value` does not.
+  **Fixed**: the loop skips a round while `is_background()`;
+  `a_values_auto_refresh_waits_while_its_tab_is_in_the_background`
+  (`views/editor.rs`) counts the reloads in front, in the background and
+  back in front.
 - Phase 6: confirms that destroy something and are not `.danger()`, so
   Return goes ahead where the one-key delete's answers Cancel:
   - the key tree's folder delete (`key_tree/folder_delete.rs`), which deletes
@@ -1073,3 +1144,15 @@ and fixed as their own changes.
 
   The first two are the clearest; each is one change with a UI test that
   Return cancels.
+  **Fixed**: all five are `.danger()` with the verb on OK (the clients
+  panel's three through one `confirm_kill`). `ZedisDialog` has its own test
+  that a destructive confirm answers Return with Cancel and a click with OK
+  (`a_destructive_confirm_answers_return_with_cancel`), and each confirm one
+  that it is opened in that shape — the folder delete in
+  `the_trees_actions_ask_what_they_have_to`, Forget, Reset and Remove in
+  `forgetting_a_node_and_resetting_or_removing_a_master_are_destructive_confirms`,
+  Kill in `a_kill_is_asked_as_a_destructive_confirm`.
+- Phase 6: the Sentinel confirms' bodies are English in every locale — the
+  Failover, Reset and Remove prompts in `topology/sentinel.rs` are `format!`
+  strings, where their titles are `i18n_topology` keys. Seen while fixing the
+  confirms above; open.

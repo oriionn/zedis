@@ -61,6 +61,41 @@ fn tls_connects_with_the_root_cert_and_in_insecure_mode() {
     });
 }
 
+/// A TLS server name that is not the dialed host: the certificate is checked
+/// against that name and the handshake carries it, on the connection Zedis
+/// dials itself (`open_single_sni_tls_connection`) — an endpoint reached by
+/// IP whose certificate names a host. The test server's certificate names
+/// `127.0.0.1` and `localhost`, so a name it does not carry must be refused:
+/// were the name ignored, the IP alone would pass.
+#[test]
+#[ignore]
+fn tls_checks_the_certificate_against_the_server_name_it_was_given() {
+    smol::block_on(async {
+        let addr = skip_unless!("ZEDIS_IT_TLS");
+        let ca = std::fs::read_to_string(env::var("ZEDIS_IT_TLS_CA").expect("ZEDIS_IT_TLS_CA")).expect("read ca");
+        let named = |id: &str, name: &str| {
+            let mut entry = server(id, addr.clone());
+            entry.tls = Some(true);
+            entry.root_cert = Some(ca.clone());
+            entry.tls_server_name = Some(name.to_string());
+            entry
+        };
+
+        let id = register(named("it-tls-sni", "localhost")).await;
+        let client = get_connection_manager()
+            .get_client(&id, 0)
+            .await
+            .expect("tls client under the certificate's name");
+        client.ping().await.expect("ping over tls");
+
+        let id = register(named("it-tls-sni-wrong", "wrong.example")).await;
+        assert!(
+            get_connection_manager().get_client(&id, 0).await.is_err(),
+            "a name the certificate does not carry is refused"
+        );
+    });
+}
+
 /// Mutual TLS: the server verifies the client too (`tls-auth-clients yes`).
 ///
 /// Three things the plain-TLS test cannot reach — the `client_cert` /

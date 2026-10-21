@@ -1245,3 +1245,78 @@ fn standalone_a_hash_field_ttl_is_set_and_taken_away_alone() {
         assert_eq!(hash_delete_fields(&at, &hash, &[b"f1"]).await.expect("hdel"), 1);
     });
 }
+
+/// The pending list's two newer settlements, each on the Redis that has it:
+/// `XACKDEL` (8.2) acknowledges an entry and deletes it from the stream in
+/// one step, and `XNACK` (8.8) hands one back to its group unowned — still
+/// pending, its delivery still counted, its consumer cleared. Valkey has
+/// neither.
+#[test]
+#[ignore]
+fn standalone_stream_ack_delete_and_nack_settle_one_pending_entry() {
+    smol::block_on(async {
+        let id = register(server("it-stream-settle", standalone())).await;
+        if !supports(&id, floors::STREAM_REF_POLICIES).await {
+            eprintln!("skipped: XACKDEL is Redis 8.2+");
+            return;
+        }
+        let at = ServerDb::new(&id, 0);
+        let mut c = conn(&id, 0).await;
+        let key = unique("stream-settle");
+        let mut ids = Vec::new();
+        for n in 1..=3 {
+            ids.push(
+                stream_add(&at, &key, "*", &[("n".to_string(), n.to_string())])
+                    .await
+                    .expect("xadd"),
+            );
+        }
+        let group = "g1";
+        group_create(&at, &key, group, "0").await.expect("xgroup create");
+        let _: redis::Value = cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg(group)
+            .arg("c1")
+            .arg("COUNT")
+            .arg(3)
+            .arg("STREAMS")
+            .arg(&key)
+            .arg(">")
+            .query_async(&mut c)
+            .await
+            .expect("xreadgroup");
+        let pending_ids = async || -> Vec<String> {
+            pending_page(&at, &key, group, "-")
+                .await
+                .expect("xpending")
+                .into_iter()
+                .map(|entry| entry.id)
+                .collect()
+        };
+
+        stream_ack_delete(&at, &key, group, &ids[0]).await.expect("xackdel");
+        assert_eq!(stream_len(&at, &key).await.expect("xlen"), 2, "deleted from the stream");
+        assert_eq!(pending_ids().await, ids[1..], "and acknowledged");
+
+        if supports(&id, floors::STREAM_NACK).await {
+            stream_nack(&at, &key, group, &ids[1]).await.expect("xnack");
+            assert_eq!(pending_ids().await, ids[1..], "a released entry is still pending");
+            let pending = pending_page(&at, &key, group, "-").await.expect("xpending");
+            let released = pending.iter().find(|entry| entry.id == ids[1]).expect("released");
+            assert_eq!(
+                (released.consumer.as_str(), released.delivery_count),
+                ("", 1),
+                "owned by nobody, its delivery still counted"
+            );
+            let info = stream_info(&at, &key).await.expect("xinfo");
+            assert_eq!(
+                info.groups[0].consumers[0].pending, 1,
+                "the consumer holds only the other one"
+            );
+        } else {
+            eprintln!("skipped the XNACK half: it is Redis 8.8+");
+        }
+
+        cmd("DEL").arg(&key).exec_async(&mut c).await.expect("del");
+    });
+}

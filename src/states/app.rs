@@ -1176,8 +1176,14 @@ impl ZedisAppState {
     /// value clears it.
     pub fn set_ai_api_key(&mut self, api_key: String) {
         let api_key = api_key.trim();
-        let stored = seal_secret(api_key);
-        self.ai_api_key = if api_key.is_empty() { None } else { Some(stored) };
+        // Sealed only when there is a key to keep: clearing it needs no
+        // master key, which on a machine where nothing else asked for one
+        // would be the session's first keychain read.
+        self.ai_api_key = if api_key.is_empty() {
+            None
+        } else {
+            Some(seal_secret(api_key))
+        };
     }
     /// Model name passed to the AI endpoint. Empty when unset.
     pub fn ai_model(&self) -> String {

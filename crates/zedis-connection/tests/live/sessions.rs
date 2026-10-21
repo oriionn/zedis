@@ -155,12 +155,13 @@ fn standalone_channel_subscription_delivers_both_kinds_of_pubsub() {
             .await
             .expect("publish");
         assert_eq!(receivers, 1, "the subscription is live once `open` returns");
-        let _: i64 = cmd("PUBLISH")
-            .arg(format!("{channel}:b"))
-            .arg("second")
-            .query_async(&mut c)
-            .await
-            .expect("publish");
+        // The panel's own publish answers the same count.
+        assert_eq!(
+            publish(&at, &format!("{channel}:b"), "second", false)
+                .await
+                .expect("publish"),
+            1
+        );
         let first = subscription.next_message().await.expect("first message");
         assert_eq!(first.channel, format!("{channel}:a"), "the channel, not the pattern");
         assert_eq!(first.payload, b"\xffbytes", "the payload is handed over undecoded");
@@ -199,12 +200,7 @@ fn standalone_channel_subscription_delivers_both_kinds_of_pubsub() {
         // server counts the subscriber.
         let mut delivered = false;
         for _ in 0..50 {
-            let receivers: i64 = cmd("SPUBLISH")
-                .arg(&channel)
-                .arg("shard")
-                .query_async(&mut c)
-                .await
-                .expect("spublish");
+            let receivers = publish(&at, &channel, "shard", true).await.expect("spublish");
             if receivers > 0 {
                 delivered = true;
                 break;

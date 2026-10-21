@@ -30,7 +30,7 @@ use crate::states::{
     dialog_button_props, escalate_dangerous_body, i18n_clients_manager, i18n_common,
 };
 use crate::views::{KillFilterSupport, ZedisClientKillFilterDialog, ZedisClientPauseDialog, unavailable_chip};
-use gpui::{Edges, Entity, SharedString, Subscription, Task, Window, div, prelude::*, px};
+use gpui::{App, ClickEvent, Edges, Entity, SharedString, Subscription, Task, Window, div, prelude::*, px};
 use gpui_kit::component::button::ButtonVariants;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, IconName, IndexPath, Sizable, StyledExt, WindowExt,
@@ -317,6 +317,24 @@ struct KillContext {
     nodes: HashMap<String, RedisServer>,
 }
 
+/// The question before a kill. A disconnected client is not given back its
+/// connection, so this is the destructive shape: Kill is the danger button
+/// and Return answers Cancel.
+fn confirm_kill(
+    title: impl Into<SharedString>,
+    prompt: impl Into<SharedString>,
+    on_ok: impl Fn(&ClickEvent, &mut Window, &mut App) -> bool + 'static,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    ZedisDialog::new_alert(title, prompt)
+        .danger()
+        .ok_text(i18n_clients_manager(cx, "kill_filter_ok"))
+        .cancel_text(i18n_common(cx, "cancel"))
+        .on_ok(on_ok)
+        .open(window, cx);
+}
+
 /// The client grid: eight text columns plus, when the user may kill
 /// clients, an action column with the per-row button.
 fn build_table(
@@ -485,16 +503,19 @@ fn build_table(
                             let client_id = client_id.clone();
                             let client_addr = client_addr.clone();
                             let client_node = client_node.clone();
-                            ZedisDialog::new_alert(title.clone(), prompt.clone())
-                                .button_props(dialog_button_props(cx).ok_text(i18n_common(cx, "confirm")))
-                                .on_ok(move |_, window, cx| {
+                            confirm_kill(
+                                title.clone(),
+                                prompt.clone(),
+                                move |_, window, cx| {
                                     if let Some(ref cb) = kill_callback {
                                         cb(client_id.clone(), client_addr.clone(), client_node.clone());
                                     }
                                     window.close_dialog(cx);
                                     true
-                                })
-                                .open(window, cx);
+                                },
+                                window,
+                                cx,
+                            );
                         }),
                 )
                 .into_any_element(),
@@ -877,17 +898,20 @@ impl ZedisClientsManager {
         let prompt = escalate_dangerous_body(cx, &server_id, prompt);
         let entity = cx.entity().clone();
 
-        ZedisDialog::new_alert(title, prompt)
-            .button_props(dialog_button_props(cx).ok_text(i18n_common(cx, "confirm")))
-            .on_ok(move |_, window, cx| {
+        confirm_kill(
+            title,
+            prompt,
+            move |_, window, cx| {
                 let targets = targets.clone();
                 entity.update(cx, |this, cx| {
                     this.batch_kill(targets, cx);
                 });
                 window.close_dialog(cx);
                 true
-            })
-            .open(window, cx);
+            },
+            window,
+            cx,
+        );
     }
 
     /// Kill the given clients one by one (`CLIENT KILL ID`, each on its own
@@ -1064,15 +1088,18 @@ impl ZedisClientsManager {
                 let prompt = escalate_dangerous_body(cx, &server_id, prompt);
                 let entity = entity.clone();
                 let commands = plan.commands;
-                ZedisDialog::new_alert(title, prompt)
-                    .button_props(dialog_button_props(cx).ok_text(i18n_common(cx, "confirm")))
-                    .on_ok(move |_, window, cx| {
+                confirm_kill(
+                    title,
+                    prompt,
+                    move |_, window, cx| {
                         let commands = commands.clone();
                         entity.update(cx, |this, cx| this.run_kill_filter(commands, cx));
                         window.close_dialog(cx);
                         true
-                    })
-                    .open(window, cx);
+                    },
+                    window,
+                    cx,
+                );
                 // The form is closed above and the confirm is now the top of
                 // the stack: answering `true` here closed *it*, so the
                 // question was never seen and the kill never sent — the bug
@@ -1314,6 +1341,40 @@ impl gpui::Render for ZedisClientsManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::init_ui;
+    use gpui::{TestAppContext, size};
+    use gpui_kit::component::Root;
+    use gpui_kit::test::TestWindowExt;
+
+    /// A kill — of one client, the filtered ones or by filter — asks in the
+    /// destructive shape, its button named for what it does. Its Return
+    /// used to go ahead.
+    #[gpui::test]
+    fn a_kill_is_asked_as_a_destructive_confirm(cx: &mut TestAppContext) {
+        init_ui(cx);
+        struct Page;
+        impl Render for Page {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+        let handle = cx.open_window(size(px(800.), px(600.)), |window, cx| {
+            let page = cx.new(|_| Page);
+            Root::new(page, window, cx)
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            confirm_kill("Kill Client", "10.0.0.1:50000", |_, _, _| true, window, cx)
+        })
+        .expect("the window is open");
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.has_active_dialog(cx));
+            let ok = window.find("zedis-dialog-ok");
+            assert_eq!(ok.label(), Some("Kill"));
+        })
+        .expect("the window is open");
+    }
 
     #[test]
     fn a_row_is_found_by_its_node_and_id_not_the_id_alone() {

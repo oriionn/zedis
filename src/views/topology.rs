@@ -560,6 +560,70 @@ async fn fetch_slot_stats(server_id: String, db: usize, metric: SlotStatMetric) 
 #[cfg(test)]
 mod tests {
     use super::parse_host_port;
+    use super::*;
+    use crate::test_support::init_ui;
+    use gpui::{AnyWindowHandle, TestAppContext, px, size};
+    use gpui_kit::component::Root;
+    use gpui_kit::test::TestWindowExt;
+
+    /// Whether what `open` puts up is the destructive confirm: an alert with
+    /// buttons of its own, whose Return answers Cancel (`ZedisDialog::danger`).
+    fn asks_in_the_destructive_shape(
+        cx: &mut TestAppContext,
+        handle: AnyWindowHandle,
+        topology: &Entity<ZedisTopology>,
+        open: impl FnOnce(&mut ZedisTopology, &mut Window, &mut Context<ZedisTopology>),
+    ) -> bool {
+        cx.update_window(handle, |_, window, cx| {
+            topology.update(cx, |topology, cx| open(topology, window, cx))
+        })
+        .expect("the window is open");
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let shaped = window.has_active_dialog(cx) && window.try_find("zedis-dialog-ok").is_some();
+            window.close_all_dialogs(cx);
+            shaped
+        })
+        .expect("the window is open")
+    }
+
+    /// Forgetting a node and resetting or removing a Sentinel's master each
+    /// ask in the destructive shape: the terminal counts `CLUSTER FORGET` as
+    /// destructive, and the other two make the sentinels forget what they
+    /// track. Their Return used to go ahead.
+    #[gpui::test]
+    fn forgetting_a_node_and_resetting_or_removing_a_master_are_destructive_confirms(cx: &mut TestAppContext) {
+        init_ui(cx);
+        let server_state = cx.new(|_| ZedisServerState::default());
+        let mut topology = None;
+        let handle = cx.open_window(size(px(1000.), px(700.)), |window, cx| {
+            let view = cx.new(|cx| ZedisTopology::new(server_state.clone(), window, cx));
+            topology = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        cx.run_until_parked();
+        let (handle, topology): (AnyWindowHandle, _) = (handle.into(), topology.expect("the window built it"));
+
+        assert!(
+            asks_in_the_destructive_shape(cx, handle, &topology, |topology, window, cx| {
+                topology.open_forget_dialog("n1".into(), "10.0.0.1:7000".into(), window, cx)
+            }),
+            "forget a node"
+        );
+        assert!(
+            asks_in_the_destructive_shape(cx, handle, &topology, |topology, window, cx| {
+                topology.open_sentinel_reset_dialog("mymaster".into(), window, cx)
+            }),
+            "reset a master"
+        );
+        assert!(
+            asks_in_the_destructive_shape(cx, handle, &topology, |topology, window, cx| {
+                topology.open_sentinel_remove_dialog("mymaster".into(), window, cx)
+            }),
+            "remove a master"
+        );
+    }
 
     #[test]
     fn host_port_forms_accepted_by_the_replication_forms() {

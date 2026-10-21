@@ -28,6 +28,7 @@ fn busy_script_kill_stops_a_runaway_script() {
         // Its own server: while the script runs, every command there gets
         // BUSY, which the other tests must never see.
         let addr = skip_unless!("ZEDIS_IT_BUSY");
+        let _busy = BUSY_SERVER.lock().await;
         let id = register(server("it-busy", addr)).await;
         let entry = get_server(&id).expect("saved entry");
         let mut c = conn(&id, 0).await;
@@ -197,5 +198,126 @@ fn standalone_script_show_reads_the_cache_back_on_valkey() {
                 .expect("an unknown digest is not an error"),
             None
         );
+    });
+}
+
+/// The function editor's round trip (7.0+): a loaded library is listed with
+/// its functions — and its source, when asked — `FCALL` runs one and
+/// `FCALL_RO` refuses the one that writes, and a dump puts back a library
+/// deleted since, where `APPEND` refuses the libraries still there.
+#[test]
+#[ignore]
+fn standalone_functions_list_call_dump_and_restore() {
+    smol::block_on(async {
+        let id = register(server("it-functions", standalone())).await;
+        if !supports(&id, floors::FUNCTIONS).await {
+            eprintln!("skipped: functions are Redis 7.0+");
+            return;
+        }
+        let at = ServerDb::new(&id, 0);
+        let mut c = conn(&id, 0).await;
+        // Unique, so a library an earlier run left behind is not this one.
+        let suffix = unique("fn").rsplit(':').take(3).collect::<Vec<_>>().join("_");
+        let library = format!("zedis_it_fn_{suffix}");
+        let (reader, writer) = (format!("{library}_get"), format!("{library}_set"));
+        let code = format!(
+            "#!lua name={library}\n\
+             redis.register_function{{function_name='{reader}', \
+             callback=function(keys) return redis.call('GET', keys[1]) end, flags={{'no-writes'}}}}\n\
+             redis.register_function('{writer}', function(keys, args) return redis.call('SET', keys[1], args[1]) end)"
+        );
+        assert_eq!(function_load(&at, &code, false).await.expect("function load"), library);
+
+        let listing = function_list(&at, true).await.expect("function list");
+        assert!(!listing.unsupported);
+        let listed = listing
+            .libraries
+            .iter()
+            .find(|lib| lib.name == library)
+            .expect("the library is listed");
+        assert_eq!(listed.engine.to_ascii_uppercase(), "LUA");
+        let mut functions: Vec<(&str, &[String])> = listed
+            .functions
+            .iter()
+            .map(|f| (f.name.as_str(), f.flags.as_slice()))
+            .collect();
+        functions.sort();
+        assert_eq!(
+            functions,
+            [
+                (reader.as_str(), &["no-writes".to_string()][..]),
+                (writer.as_str(), &[][..])
+            ],
+            "both functions, each with its flags"
+        );
+        assert_eq!(
+            listed.code.as_deref(),
+            Some(code.as_str()),
+            "WITHCODE hands the source back"
+        );
+        assert!(
+            function_list(&at, false)
+                .await
+                .expect("function list")
+                .libraries
+                .iter()
+                .any(|lib| lib.name == library && lib.code.is_none()),
+            "and only WITHCODE does"
+        );
+
+        let key = unique("fn-key");
+        let keys = vec![key.clone()];
+        assert_eq!(
+            function_fcall(&at, &writer, &keys, &["written".to_string()], false)
+                .await
+                .expect("fcall"),
+            "OK"
+        );
+        assert_eq!(
+            function_fcall(&at, &reader, &keys, &[], true).await.expect("fcall_ro"),
+            "written"
+        );
+        let refused = function_fcall(&at, &writer, &keys, &["again".to_string()], true)
+            .await
+            .expect_err("FCALL_RO refuses a function that may write");
+        assert!(
+            refused.to_string().to_lowercase().contains("write"),
+            "the server names the reason: {refused}"
+        );
+
+        // A dump holds every library. A second one stays loaded while the
+        // first is deleted, so APPEND collides with it and REPLACE puts the
+        // first back beside it.
+        let other = format!("{library}_other");
+        function_load(
+            &at,
+            &format!("#!lua name={other}\nredis.register_function('{other}_f', function() return 1 end)"),
+            false,
+        )
+        .await
+        .expect("function load");
+        let dump = function_dump(&at).await.expect("function dump");
+        assert!(!dump.is_empty());
+        function_delete(&at, &library).await.expect("function delete");
+        assert!(
+            function_restore(&at, &dump, FunctionRestorePolicy::Append)
+                .await
+                .is_err(),
+            "APPEND refuses a library that is loaded"
+        );
+        function_restore(&at, &dump, FunctionRestorePolicy::Replace)
+            .await
+            .expect("function restore replace");
+        assert_eq!(
+            function_fcall(&at, &reader, &keys, &[], true)
+                .await
+                .expect("the restored library runs"),
+            "written"
+        );
+
+        for name in [&library, &other] {
+            function_delete(&at, name).await.expect("function delete");
+        }
+        cmd("DEL").arg(&key).exec_async(&mut c).await.expect("del");
     });
 }

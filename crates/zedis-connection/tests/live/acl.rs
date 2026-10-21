@@ -232,6 +232,13 @@ fn acl_log_dryrun_genpass_and_the_aclfile_gate() {
         )
         .await
         .expect("setuser");
+        let listed = acl_list(&at_admin).await.expect("acl users");
+        assert!(!listed.unsupported);
+        assert!(
+            listed.usernames.contains(&username),
+            "the new user is listed: {:?}",
+            listed.usernames
+        );
 
         // Trip one denial on a connection of that user's own.
         let mut user_server = server(&format!("it-acllog-{suffix}"), standalone());
@@ -287,6 +294,11 @@ fn acl_log_dryrun_genpass_and_the_aclfile_gate() {
         // the command itself says why.
         assert!(acl_file(&at_admin).await.expect("config get aclfile").is_none());
         assert!(acl_save(&at_admin).await.is_err(), "ACL SAVE needs an aclfile");
+        let refused = acl_load(&at_admin).await.expect_err("ACL LOAD needs one too");
+        assert!(
+            refused.to_string().to_lowercase().contains("acl file"),
+            "the server says why: {refused}"
+        );
 
         acl_log_reset(&at_admin).await.expect("acl log reset");
         assert!(
@@ -298,6 +310,14 @@ fn acl_log_dryrun_genpass_and_the_aclfile_gate() {
             "RESET cleared the log"
         );
         acl_del_user(&at_admin, &username).await.expect("deluser");
+        assert!(
+            !acl_list(&at_admin)
+                .await
+                .expect("acl users")
+                .usernames
+                .contains(&username),
+            "and gone again"
+        );
     });
 }
 

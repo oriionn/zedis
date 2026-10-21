@@ -333,3 +333,88 @@ impl ZedisDialog {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{AnyWindowHandle, AppContext, Context, Render, TestAppContext, div, px, size};
+    use gpui_kit::component::Root;
+    use gpui_kit::test::TestWindowExt;
+    use std::cell::Cell;
+
+    struct Page;
+    impl Render for Page {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    fn window(cx: &mut TestAppContext) -> AnyWindowHandle {
+        cx.update(|cx| {
+            gpui_kit::component::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let handle = cx.open_window(size(px(800.), px(600.)), |window, cx| {
+            let page = cx.new(|_| Page);
+            Root::new(page, window, cx)
+        });
+        handle.into()
+    }
+
+    /// Opens an alert whose OK records that it ran; `danger` picks the shape.
+    fn ask(cx: &mut TestAppContext, handle: AnyWindowHandle, danger: bool) -> Rc<Cell<bool>> {
+        let ran = Rc::new(Cell::new(false));
+        let seen = ran.clone();
+        cx.update_window(handle, |_, window, cx| {
+            let dialog = ZedisDialog::new_alert("Delete \"k\"?", "It cannot be undone.")
+                .ok_text("Delete")
+                .cancel_text("Cancel")
+                .on_ok(move |_, _, _| {
+                    seen.set(true);
+                    true
+                });
+            let dialog = if danger { dialog.danger() } else { dialog };
+            dialog.open(window, cx);
+        })
+        .expect("the window is open");
+        cx.run_until_parked();
+        ran
+    }
+
+    fn press_return(cx: &mut TestAppContext, handle: AnyWindowHandle) -> bool {
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.press("enter", cx);
+        })
+        .expect("the window is open");
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| window.has_active_dialog(cx))
+            .expect("the window is open")
+    }
+
+    /// A destructive confirm answers Return with Cancel: it closes and runs
+    /// nothing, and only its own Delete button goes ahead. A plain alert's
+    /// Return is its OK — which is why every confirm that destroys something
+    /// is this shape.
+    #[gpui::test]
+    fn a_destructive_confirm_answers_return_with_cancel(cx: &mut TestAppContext) {
+        let handle = window(cx);
+
+        let ran = ask(cx, handle, true);
+        assert!(!press_return(cx, handle), "Return closes it");
+        assert!(!ran.get(), "and deletes nothing");
+
+        let ran = ask(cx, handle, true);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("zedis-dialog-ok", cx);
+        })
+        .expect("the window is open");
+        cx.run_until_parked();
+        assert!(ran.get(), "its Delete button goes ahead");
+
+        let ran = ask(cx, handle, false);
+        press_return(cx, handle);
+        assert!(ran.get(), "a plain alert's Return is its OK");
+    }
+}

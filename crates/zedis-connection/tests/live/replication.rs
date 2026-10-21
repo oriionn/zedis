@@ -79,6 +79,15 @@ fn replication_pair_promotes_relinks_and_fails_over() {
         if supports(&primary, floors::FAILOVER).await {
             let info = wait_replication(&primary, "no failover pending", |i| !i.failover_in_progress()).await;
             assert_eq!(info.master_failover_state, "no-failover");
+            // With nothing to abort, the abort reaches the primary and is
+            // refused for that reason.
+            let refused = failover_abort(&ServerDb::new(&primary, 0))
+                .await
+                .expect_err("no failover to abort");
+            assert!(
+                refused.to_string().to_lowercase().contains("no failover in progress"),
+                "{refused}"
+            );
             primary_client
                 .failover(Some(("127.0.0.1", replica_addr.1)), false, FAILOVER_TIMEOUT_MS)
                 .await

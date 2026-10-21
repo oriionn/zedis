@@ -327,16 +327,18 @@ fn cluster_migrates_slots_atomically_on_valkey_9_and_redis_8_4() {
             "ownership moved with the slots"
         );
 
-        // Put them back so the cluster ends where it started.
+        // Put them back so the cluster ends where it started — through the
+        // operation the Topology page calls, which is handed both ends and
+        // picks the one its dialect is told on by itself.
         let before = migration_names(&mut target_conn, dialect).await;
-        let starter: &mut RedisAsyncConn = if dialect.starts_on_target() {
-            &mut source_conn
-        } else {
-            &mut target_conn
-        };
-        cluster_migrate_slots(starter, dialect, &[moving], &source.node_id)
-            .await
-            .expect("start the migration back");
+        node_migrate_slots(
+            &ClusterNode::new(&*id, &target.addr),
+            &ClusterNode::new(&*id, &source.addr),
+            &source.node_id,
+            &[moving],
+        )
+        .await
+        .expect("start the migration back");
         let back = wait_for_export(
             &mut target_conn,
             dialect,
@@ -633,5 +635,74 @@ fn cluster_slot_stats_ranks_slots_by_key_count() {
         for key in &keys {
             cmd("DEL").arg(key).exec_async(&mut c).await.expect("del");
         }
+    });
+}
+
+/// `CLUSTER MEET` and `CLUSTER FORGET` are told to every master (ADR 10).
+/// The harness has no spare node to add and take away, so this introduces a
+/// member every master already has — each takes the handshake and settles
+/// it on the node it knows — and forgets an id none of them knows, which
+/// each refuses by name. The cluster ends as it started.
+#[test]
+#[ignore]
+fn cluster_meet_and_forget_are_told_to_every_master() {
+    smol::block_on(async {
+        let addr = skip_unless!("ZEDIS_IT_CLUSTER");
+        let id = register(protected_server("it-cluster-meet", addr)).await;
+        // Until it settles, the handshake is an extra entry in every node's
+        // table, which the tests holding this lock count.
+        let _slots = CLUSTER_SLOTS.lock().await;
+        let at = ServerDb::new(&*id, 0);
+
+        /// The node ids each master's own table lists, handshakes included.
+        async fn node_tables(addrs: &[String]) -> Vec<HashSet<String>> {
+            let mut tables = Vec::new();
+            for addr in addrs {
+                let (host, port) = addr.rsplit_once(':').expect("host:port");
+                let entry = protected_server("it-cluster-meet-node", (host.to_string(), port.parse().expect("port")));
+                let mut c = open_single_connection(&entry, 0, false)
+                    .await
+                    .expect("connect to a master");
+                let nodes: String = cmd("CLUSTER")
+                    .arg("NODES")
+                    .query_async(&mut c)
+                    .await
+                    .expect("cluster nodes");
+                tables.push(
+                    nodes
+                        .lines()
+                        .filter_map(|line| line.split_whitespace().next())
+                        .map(str::to_string)
+                        .collect(),
+                );
+            }
+            tables
+        }
+
+        let masters = master_addrs(&at).await.expect("masters");
+        let before = node_tables(&masters).await;
+        let member = masters.last().expect("a master");
+        let (host, port) = member.rsplit_once(':').expect("host:port");
+        cluster_meet(&at, host, port.parse().expect("port"))
+            .await
+            .expect("every master takes a member it knows");
+        let mut after = Vec::new();
+        for _ in 0..80 {
+            after = node_tables(&masters).await;
+            if after == before {
+                break;
+            }
+            smol::Timer::after(std::time::Duration::from_millis(250)).await;
+        }
+        assert_eq!(after, before, "the handshake settled on the node every master had");
+
+        let unknown = "deadbeef".repeat(5);
+        let refused = cluster_forget(&at, &unknown)
+            .await
+            .expect_err("no master knows that id");
+        assert!(
+            refused.to_string().to_lowercase().contains("unknown node"),
+            "the master says why: {refused}"
+        );
     });
 }

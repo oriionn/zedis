@@ -608,7 +608,11 @@ fn standalone_info_keysizes_buckets_types() {
         let client = get_connection_manager().get_client(&id, 0).await.expect("client");
         // Flavor-aware: Valkey 8.x passes a bare 8.0 floor but has no
         // `keysizes` section, so `INFO keysizes` comes back empty there.
+        let at = ServerDb::new(&id, 0);
         if !client.supports_info_keysizes() {
+            // The panel's operation answers no histogram rather than an
+            // error, and sends nothing for it.
+            assert!(key_size_distributions(&at).await.expect("keysizes").is_empty());
             eprintln!("skipped: server has no INFO keysizes (Redis 8+ only)");
             return;
         }
@@ -629,7 +633,7 @@ fn standalone_info_keysizes_buckets_types() {
                 .expect("rpush");
         }
 
-        let dists = client.info_keysizes().await.expect("keysizes");
+        let dists = key_size_distributions(&at).await.expect("keysizes");
         let strings = dists.iter().find(|d| d.type_name == "strings").expect("strings dist");
         assert_eq!(strings.unit, KeysizesUnit::Bytes);
         assert!(strings.total() >= 1);
@@ -675,5 +679,196 @@ fn standalone_bgsave_cancel_stops_a_snapshot_on_valkey_8_1() {
         taken(bgsave_cancel(&at).await);
         smol::Timer::after(std::time::Duration::from_millis(500)).await;
         taken(bgsave_cancel(&at).await);
+    });
+}
+
+/// The memory analyzer's round: a scan of the whole keyspace in pages, each
+/// sampled key with its type, size, TTL, encoding and idle time — and the
+/// `MEMORY STATS` table beside it, a row per metric with the per-database
+/// entries flattened under a dotted name.
+#[test]
+#[ignore]
+fn standalone_memory_panels_sample_keys_and_read_memory_stats() {
+    smol::block_on(async {
+        let id = register(server("it-memory-panels", standalone())).await;
+        let at = ServerDb::new(&id, 0);
+        let mut c = conn(&id, 0).await;
+        let prefix = unique("memory");
+        let (hash, string) = (format!("{prefix}:h"), format!("{prefix}:s"));
+        cmd("HSET")
+            .arg(&hash)
+            .arg("a")
+            .arg("1")
+            .arg("b")
+            .arg("2")
+            .exec_async(&mut c)
+            .await
+            .expect("hset");
+        cmd("SET")
+            .arg(&string)
+            .arg("x".repeat(1000))
+            .arg("EX")
+            .arg(600)
+            .exec_async(&mut c)
+            .await
+            .expect("set");
+
+        // Every key, at a ratio of 1: the rounds end when every cursor is 0.
+        // The heat column is whichever probe the policy makes answerable,
+        // as the analyzer asks it.
+        let heat = get_server_heat_probe(&id);
+        let mut sampled = Vec::new();
+        let mut cursors = None;
+        for _ in 0..100 {
+            let (scanned, next, rows) = sample_memory_usage(&at, 1.0, 500, cursors, heat, true)
+                .await
+                .expect("sample");
+            assert!(scanned as usize >= rows.len(), "a ratio of 1 samples what it scans");
+            sampled.extend(rows);
+            if next.iter().all(|cursor| *cursor == 0) {
+                break;
+            }
+            cursors = Some(next);
+        }
+        let row = |key: &str| {
+            sampled
+                .iter()
+                .find(|row| row.key == key)
+                .unwrap_or_else(|| panic!("{key} was sampled"))
+        };
+        let (hash_row, string_row) = (row(&hash), row(&string));
+        assert_eq!((hash_row.key_type.as_str(), hash_row.ttl), ("hash", -1));
+        assert_eq!(string_row.key_type, "string");
+        assert!(string_row.ttl > 0 && string_row.ttl <= 600, "ttl {}", string_row.ttl);
+        assert!(
+            string_row.memory_usage >= 1000,
+            "MEMORY USAGE counts the value: {}",
+            string_row.memory_usage
+        );
+        assert!(hash_row.memory_usage > 0);
+        assert!(
+            hash_row.encoding == "listpack" || hash_row.encoding == "ziplist",
+            "OBJECT ENCODING was asked: {:?}",
+            hash_row.encoding
+        );
+        assert!(
+            match heat {
+                HeatProbe::Freq => matches!(hash_row.heat, HeatMetric::Freq(_)),
+                HeatProbe::IdleTime => matches!(hash_row.heat, HeatMetric::IdleTime(_)),
+                HeatProbe::None => hash_row.heat == HeatMetric::None,
+            },
+            "the heat the policy answers: {heat:?} → {:?}",
+            hash_row.heat
+        );
+
+        let stats = memory_stats(&at).await.expect("memory stats");
+        let [node]: [_; 1] = stats.try_into().expect("one node on a standalone");
+        let metric = |name: &str| {
+            node.value
+                .iter()
+                .find(|(metric, _)| metric == name)
+                .map(|(_, value)| value)
+        };
+        assert!(
+            metric("keys.count").is_some_and(|count| count.parse::<u64>().is_ok_and(|count| count >= 2)),
+            "the table counts the keys: {:?}",
+            node.value
+        );
+        assert!(metric("peak.allocated").is_some(), "{:?}", node.value);
+        assert!(
+            node.value.iter().any(|(metric, _)| metric.starts_with("db.0.")),
+            "the database's own map is flattened under db.0: {:?}",
+            node.value
+        );
+
+        cmd("DEL")
+            .arg(&hash)
+            .arg(&string)
+            .exec_async(&mut c)
+            .await
+            .expect("del");
+    });
+}
+
+/// What the server-wide confirms run: `FLUSHDB` empties the database it is
+/// told and no other, `FLUSHALL` every one, `SCRIPT FLUSH` the script cache
+/// and (7.0+) `FUNCTION FLUSH` the libraries — and `FUNCTION RESTORE …
+/// FLUSH` puts back what a dump held in place of what is there. On the
+/// `busy` scenario's server, which no shared test writes to.
+#[test]
+#[ignore]
+fn busy_server_flushes_empty_what_they_name() {
+    smol::block_on(async {
+        let addr = skip_unless!("ZEDIS_IT_BUSY");
+        let _busy = BUSY_SERVER.lock().await;
+        let id = register(server("it-busy", addr)).await;
+        let (db0, db1) = (ServerDb::new(&id, 0), ServerDb::new(&id, 1));
+        let key = unique("flush");
+        let mut c0 = conn(&id, 0).await;
+        let mut c1 = conn(&id, 1).await;
+        for c in [&mut c0, &mut c1] {
+            cmd("SET").arg(&key).arg("v").exec_async(c).await.expect("set");
+        }
+        let exists = async |c: &mut RedisAsyncConn| -> bool {
+            cmd("EXISTS").arg(&key).query_async::<i64>(c).await.expect("exists") == 1
+        };
+
+        flush_db(&db1).await.expect("flushdb");
+        assert!(!exists(&mut c1).await, "the database it was told");
+        assert!(exists(&mut c0).await, "and no other");
+        flush_all(&db1).await.expect("flushall");
+        assert!(!exists(&mut c0).await, "every database");
+
+        let script = format!("return '{}'", unique("flushed"));
+        for async_mode in [false, true] {
+            let sha = script_load(&db0, &script).await.expect("script load");
+            script_flush(&db0, async_mode).await.expect("script flush");
+            assert_eq!(
+                script_exists(&db0, &[sha]).await.expect("script exists"),
+                [false],
+                "the cache is empty at once, ASYNC={async_mode} or not"
+            );
+        }
+
+        if !supports(&id, floors::FUNCTIONS).await {
+            eprintln!("skipped the functions half: they are Redis 7.0+");
+            return;
+        }
+        let library =
+            |name: &str| format!("#!lua name={name}\nredis.register_function('{name}_f', function() return 1 end)");
+        let names = async || -> Vec<String> {
+            let mut names: Vec<String> = function_list(&db0, false)
+                .await
+                .expect("function list")
+                .libraries
+                .into_iter()
+                .map(|lib| lib.name)
+                .collect();
+            names.sort();
+            names
+        };
+        function_flush(&db0, false).await.expect("start from none");
+        function_load(&db0, &library("zedis_it_kept"), false)
+            .await
+            .expect("load");
+        let dump = function_dump(&db0).await.expect("function dump");
+        function_load(&db0, &library("zedis_it_dropped"), false)
+            .await
+            .expect("load");
+        function_restore(&db0, &dump, FunctionRestorePolicy::Flush)
+            .await
+            .expect("function restore flush");
+        assert_eq!(
+            names().await,
+            ["zedis_it_kept"],
+            "what the dump held, in place of what was there"
+        );
+        for async_mode in [false, true] {
+            function_load(&db0, &library("zedis_it_flushed"), true)
+                .await
+                .expect("load");
+            function_flush(&db0, async_mode).await.expect("function flush");
+            assert!(names().await.is_empty(), "every library, ASYNC={async_mode} or not");
+        }
     });
 }

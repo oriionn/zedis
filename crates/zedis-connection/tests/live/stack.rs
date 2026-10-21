@@ -760,3 +760,243 @@ fn stack_search_params_bind_a_knn_vector() {
         drop_index_and_docs(&mut c, &index, &prefix).await;
     });
 }
+
+/// The JSON editor reads and writes a document whole: `JSON.GET` hands back
+/// what `JSON.SET` stored, a second set replaces it, and `JSON.MERGE` writes
+/// only what changed — RFC 7396, where a `null` removes a member.
+#[test]
+#[ignore]
+fn stack_json_document_is_read_written_whole_and_merged() {
+    smol::block_on(async {
+        if env::var("ZEDIS_IT_STACK").is_err() {
+            eprintln!("skipped: ZEDIS_IT_STACK not set");
+            return;
+        }
+        let id = register(server("it-stack-json-whole", standalone())).await;
+        let mut c = conn(&id, 0).await;
+        if !has_command(&mut c, "JSON.SET").await {
+            eprintln!("skipped: no JSON module on this server");
+            return;
+        }
+        let at = ServerDb::new(&id, 0);
+        let key = unique("json-whole");
+        let read = async || -> serde_json::Value {
+            let text = json_get(&at, &key).await.expect("json.get");
+            serde_json::from_str(&text).expect("a JSON document")
+        };
+
+        json_set(&at, &key, r#"{"name":"zedis","tags":["a"],"n":1}"#)
+            .await
+            .expect("json.set");
+        assert_eq!(
+            read().await,
+            serde_json::json!({"name": "zedis", "tags": ["a"], "n": 1})
+        );
+
+        if has_command(&mut c, "JSON.MERGE").await {
+            json_merge(&at, &key, r#"{"n":2,"tags":null,"extra":true}"#)
+                .await
+                .expect("json.merge");
+            assert_eq!(
+                read().await,
+                serde_json::json!({"name": "zedis", "n": 2, "extra": true}),
+                "a null removes, the rest replaces or adds"
+            );
+        } else {
+            eprintln!("skipped JSON.MERGE: not in this module");
+        }
+
+        json_set(&at, &key, "[1,2]").await.expect("json.set again");
+        assert_eq!(read().await, serde_json::json!([1, 2]), "the whole document replaced");
+
+        cmd("DEL").arg(&key).exec_async(&mut c).await.expect("del");
+    });
+}
+
+/// An index from the search panel's own forms, start to end: `FT.CREATE`
+/// from a schema, `FT.ALTER` adding a field, `FT.AGGREGATE` grouping by a
+/// tag, `FT.PROFILE` timing a query and `FT.DROPINDEX` — with its documents
+/// on RediSearch, and on valkey-search, which has no `DD`, refused in words
+/// that say so and then without them.
+#[test]
+#[ignore]
+fn stack_search_index_is_created_altered_aggregated_and_dropped() {
+    smol::block_on(async {
+        if env::var("ZEDIS_IT_STACK").is_err() {
+            eprintln!("skipped: ZEDIS_IT_STACK not set");
+            return;
+        }
+        let id = register(server("it-stack-ft-lifecycle", standalone())).await;
+        let mut c = conn(&id, 0).await;
+        if !has_command(&mut c, "FT.CREATE").await {
+            eprintln!("skipped: no search module on this server");
+            return;
+        }
+        let at = ServerDb::new(&id, 0);
+        let index = unique("idx-life");
+        let prefix = unique("doc-life");
+        let field = |name: &str, field_type: &str, sortable: bool| CreateFieldSpec {
+            name: name.to_string(),
+            field_type: field_type.to_string(),
+            sortable,
+            ..Default::default()
+        };
+        ft_create(
+            &at,
+            &CreateIndexOptions {
+                index: index.clone(),
+                on_json: false,
+                prefixes: vec![format!("{prefix}:")],
+                // SORTABLE, so the grouping below reads the tag without a
+                // LOAD on any RediSearch: the panel sends none.
+                fields: vec![field("title", "TEXT", false), field("kind", "TAG", true)],
+            },
+        )
+        .await
+        .expect("ft.create");
+        for (name, title, kind, n) in [
+            ("a", "hello world", "red", 1),
+            ("b", "hello again", "blue", 2),
+            ("c", "goodbye", "red", 3),
+        ] {
+            cmd("HSET")
+                .arg(format!("{prefix}:{name}"))
+                .arg("title")
+                .arg(title)
+                .arg("kind")
+                .arg(kind)
+                .arg("n")
+                .arg(n)
+                .exec_async(&mut c)
+                .await
+                .expect("hset");
+        }
+        let mut info = ft_info(&at, &index).await.expect("ft.info");
+        for _ in 0..50 {
+            if !info.indexing && info.num_docs == 3 {
+                break;
+            }
+            smol::Timer::after(std::time::Duration::from_millis(100)).await;
+            info = ft_info(&at, &index).await.expect("ft.info");
+        }
+        assert_eq!(info.num_docs, 3, "the schema indexed every document: {info:?}");
+
+        // A field added later is searchable on what is written after it.
+        if has_command(&mut c, "FT.ALTER").await {
+            ft_alter_add(&at, &index, &field("n", "NUMERIC", true))
+                .await
+                .expect("ft.alter");
+            cmd("HSET")
+                .arg(format!("{prefix}:d"))
+                .arg("title")
+                .arg("later")
+                .arg("kind")
+                .arg("green")
+                .arg("n")
+                .arg(50)
+                .exec_async(&mut c)
+                .await
+                .expect("hset");
+            let opts = SearchOptions {
+                limit: (0, 10),
+                ..Default::default()
+            };
+            let mut hits = Vec::new();
+            for _ in 0..50 {
+                hits = ft_search(&at, &index, "@n:[50 50]", &opts)
+                    .await
+                    .expect("ft.search")
+                    .hits
+                    .into_iter()
+                    .map(|hit| hit.doc_id)
+                    .collect();
+                if !hits.is_empty() {
+                    break;
+                }
+                smol::Timer::after(std::time::Duration::from_millis(100)).await;
+            }
+            assert_eq!(hits, [format!("{prefix}:d")], "the added NUMERIC field answers a range");
+        } else {
+            eprintln!("skipped FT.ALTER: not in this module");
+        }
+
+        if has_command(&mut c, "FT.AGGREGATE").await {
+            let opts = AggregateOptions {
+                group_by: vec!["kind".to_string()],
+                reducer: Some(ReducerSpec {
+                    func: Some(ReducerFn::Count),
+                    args: Vec::new(),
+                    alias: Some("count".to_string()),
+                }),
+                ..Default::default()
+            };
+            let result = ft_aggregate(&at, &index, "@title:hello", &opts)
+                .await
+                .expect("ft.aggregate");
+            let mut groups: Vec<(String, String)> = result
+                .rows
+                .iter()
+                .map(|row| {
+                    let cell = |name: &str| {
+                        row.iter()
+                            .find(|(field, _)| field == name)
+                            .map(|(_, value)| value.clone())
+                            .unwrap_or_default()
+                    };
+                    (cell("kind"), cell("count"))
+                })
+                .collect();
+            groups.sort();
+            assert_eq!(
+                groups,
+                [
+                    ("blue".to_string(), "1".to_string()),
+                    ("red".to_string(), "1".to_string())
+                ],
+                "one row per tag among the matches, counted: {:?}",
+                result.rows
+            );
+        } else {
+            eprintln!("skipped FT.AGGREGATE: not in this module");
+        }
+
+        if has_command(&mut c, "FT.PROFILE").await {
+            for aggregate in [false, true] {
+                let profile = ft_profile(&at, &index, aggregate, "hello", &[], None)
+                    .await
+                    .expect("ft.profile");
+                assert!(!profile.trim().is_empty(), "the profile section, as text");
+            }
+        } else {
+            eprintln!("skipped FT.PROFILE: not in this module");
+        }
+
+        let docs = || {
+            cmd("EXISTS")
+                .arg(format!("{prefix}:a"))
+                .arg(format!("{prefix}:b"))
+                .clone()
+        };
+        if valkey_lane() {
+            let refused = ft_dropindex(&at, &index, true)
+                .await
+                .expect_err("valkey-search has no DD");
+            assert!(refused.to_string().contains("no DD"), "said in our words: {refused}");
+            assert!(ft_info(&at, &index).await.is_ok(), "and nothing was dropped");
+            ft_dropindex(&at, &index, false).await.expect("ft.dropindex");
+            let left: i64 = docs().query_async(&mut c).await.expect("exists");
+            assert_eq!(left, 2, "the documents stay");
+            let keys: Vec<String> = cmd("KEYS")
+                .arg(format!("{prefix}:*"))
+                .query_async(&mut c)
+                .await
+                .expect("keys");
+            cmd("DEL").arg(keys).exec_async(&mut c).await.expect("del docs");
+        } else {
+            ft_dropindex(&at, &index, true).await.expect("ft.dropindex dd");
+            let left: i64 = docs().query_async(&mut c).await.expect("exists");
+            assert_eq!(left, 0, "DD took the documents with the index");
+        }
+        assert!(ft_info(&at, &index).await.is_err(), "the index is gone");
+    });
+}

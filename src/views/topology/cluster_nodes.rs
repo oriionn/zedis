@@ -566,8 +566,12 @@ impl ZedisTopology {
         .to_string();
         let server_state = self.server_state.clone();
         let server_id = self.server_state.read(cx).server_id().to_string();
+        // `CLUSTER FORGET` is destructive by the terminal's own measure
+        // (`DangerKind::ClusterReset`): Return answers Cancel here too.
         ZedisDialog::new_alert(title, escalate_dangerous_body(cx, &server_id, body))
-            .button_props(dialog_button_props(cx).ok_text(i18n_common(cx, "confirm")))
+            .danger()
+            .ok_text(i18n_topology(cx, "forget_button"))
+            .cancel_text(i18n_common(cx, "cancel"))
             .on_ok(move |_, window, cx| {
                 let id = node_id.clone();
                 server_state.update(cx, |state, cx| state.cluster_forget(id, cx));

@@ -46,6 +46,7 @@ native_only!(
     ssh_cluster_connection,
     ssh_stream,
     ssh_tunnel,
+    tls_connection,
 );
 mod bitmap;
 mod bridge;
@@ -252,7 +253,7 @@ pub use server_report::{NodeReply, latency_doctor, memory_doctor, memory_stats};
 pub use set_ops::{set_add, set_card, set_remove, set_replace_member, set_scan};
 pub use slot_stats::{SlotStatMetric, SlotStatRow};
 #[cfg(not(target_family = "wasm"))]
-pub use ssh_tunnel::{HostKeyApprover, HostKeyDecision, HostKeyPrompt, install_crypto_provider, set_host_key_approver};
+pub use ssh_tunnel::{HostKeyApprover, HostKeyDecision, HostKeyPrompt, set_host_key_approver};
 pub use stream_ops::{
     PENDING_PAGE, StreamConsumer, StreamEntry, StreamGroup, StreamIdmp, StreamInfo, StreamPending, StreamRefPolicy,
     StreamSummary, StreamTrim, consumer_create, consumer_delete, group_create, group_destroy, group_set_id,
@@ -273,6 +274,8 @@ pub use subscription_web::{
     ChannelMessage, ChannelSubscription, MonitorFeed, MonitorFeeds, SubscribeKind, open_monitor_feeds,
 };
 pub use terminal::{ExecReplies, TerminalReply, TerminalSession};
+#[cfg(not(target_family = "wasm"))]
+pub use tls_connection::install_crypto_provider;
 pub use troubleshoot::{Part, REPORT_CONFIG, TroubleshootingSnapshot, troubleshooting_snapshot};
 pub use vector_set::{
     VectorNeighbour, VectorSetInfo, VectorSim, VectorSimOptions, vset_info, vset_remove, vset_set_attr, vset_sim,
