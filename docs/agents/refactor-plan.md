@@ -1113,9 +1113,9 @@ a wire field or a test name CI selects by.
 | 8 | core, db pass | done: two dead helpers gone, no duplication, `KeyMetadata` given its container default | `52facc6` |
 
 Findings that are bugs rather than structure are listed here as they turn up,
-and fixed as their own changes. The first three were fixed on 2026-10-21, each
-with a test that fails with the fix taken out (checked in a worktree); the
-fourth is open.
+and fixed as their own changes. All four were fixed on 2026-10-21; under
+each, what holds it — a test or check shown to fail with the fix taken out
+in a worktree — or why nothing can.
 
 - Phase 4: `ZedisAppState::set_ai_api_key` encrypts an empty key before
   dropping it, which reaches the master key (a keychain read where nothing
@@ -1155,4 +1155,10 @@ fourth is open.
 - Phase 6: the Sentinel confirms' bodies are English in every locale — the
   Failover, Reset and Remove prompts in `topology/sentinel.rs` are `format!`
   strings, where their titles are `i18n_topology` keys. Seen while fixing the
-  confirms above; open.
+  confirms above.
+  **Fixed**: `topology.sentinel_{failover,reset,remove}_confirm_body` in all
+  eight locales, with the master's name as `%{name}`, read like
+  `forget_confirm_body`. A body is drawn text, not an accessibility label, so
+  no UI test reads it; what holds it is `tests/locale_keys.rs`, whose orphan
+  check fails as soon as a body is a `format!` again (one put back in a
+  worktree: `every_en_key_is_reachable_from_source` names the key).

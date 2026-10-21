@@ -318,11 +318,13 @@ impl ZedisTopology {
         cx: &mut Context<Self>,
     ) {
         let title = i18n_topology(cx, "sentinel_failover_confirm_title");
-        let body = format!(
-            "Force a failover on master {master_name} across the sentinel quorum. The current \
-             master will demote to replica and a healthy replica will be promoted. This skips \
-             automatic detection — use when manual intervention is required."
-        );
+        let locale = cx.global::<ZedisGlobalStore>().read(cx).locale().to_string();
+        let body = rust_i18n::t!(
+            "topology.sentinel_failover_confirm_body",
+            name = master_name.as_ref(),
+            locale = &locale
+        )
+        .to_string();
         let server_state = self.server_state.clone();
         let server_id = self.server_state.read(cx).server_id().to_string();
         ZedisDialog::new_alert(title, escalate_dangerous_body(cx, &server_id, body))
@@ -343,11 +345,13 @@ impl ZedisTopology {
         cx: &mut Context<Self>,
     ) {
         let title = i18n_topology(cx, "sentinel_reset_confirm_title");
-        let body = format!(
-            "Reset sentinel state for master {master_name}. Forces re-discovery of replicas \
-             and sentinel peers — useful after a network split healed. Does not affect the \
-             data masters themselves."
-        );
+        let locale = cx.global::<ZedisGlobalStore>().read(cx).locale().to_string();
+        let body = rust_i18n::t!(
+            "topology.sentinel_reset_confirm_body",
+            name = master_name.as_ref(),
+            locale = &locale
+        )
+        .to_string();
         let server_state = self.server_state.clone();
         let server_id = self.server_state.read(cx).server_id().to_string();
         // Forgets what the sentinels learned of the master's replicas and
@@ -372,11 +376,13 @@ impl ZedisTopology {
         cx: &mut Context<Self>,
     ) {
         let title = i18n_topology(cx, "sentinel_remove_confirm_title");
-        let body = format!(
-            "Stop monitoring master {master_name} across the sentinel quorum. The master and \
-             its replicas continue to run, but sentinels will no longer track health or \
-             failover for them. Re-adding requires SENTINEL MONITOR (config + quorum)."
-        );
+        let locale = cx.global::<ZedisGlobalStore>().read(cx).locale().to_string();
+        let body = rust_i18n::t!(
+            "topology.sentinel_remove_confirm_body",
+            name = master_name.as_ref(),
+            locale = &locale
+        )
+        .to_string();
         let server_state = self.server_state.clone();
         let server_id = self.server_state.read(cx).server_id().to_string();
         ZedisDialog::new_alert(title, escalate_dangerous_body(cx, &server_id, body))
