@@ -1,5 +1,71 @@
 # Changelog
 
+## [0.15.0](https://github.com/vicanso/zedis/compare/v0.14.0..v0.15.0) - 2026-10-21
+
+### ⛰️  Features
+
+- *(bridge, audit)* Push audit lines to a Feishu / DingTalk / WeCom / Slack bot or any URL with --audit-webhook, signed where the bot checks, never a plain write - ([9b06764](https://github.com/vicanso/zedis/commit/9b0676420ec71e6d2c15dcdd8102ff536c6f13ba))
+- *(bridge, docs)* Compress the API's answers per request with zstd or gzip from 1 KiB, leaving the page's prebuilt files as they are - ([9fb6f80](https://github.com/vicanso/zedis/commit/9fb6f80f1b7463125f221b647cb5420be7f327a5))
+- *(bridge, web, gui)* Registered accounts with setup token, invitations, account page and users import - ([22542a7](https://github.com/vicanso/zedis/commit/22542a7d38b3586fcc02e8f43f92df573e0be616))
+- *(bridge, web, gui, connection)* A locked account for demonstrations, which keeps its password, its tokens and no rows of its own - ([ccb385a](https://github.com/vicanso/zedis/commit/ccb385a86225cfe8b959fd0872baadcc79bff6c5))
+- *(bridge, web, gui, connection)* Ask for an account and wait for an administrator's approval (--signup approval), beside the invitations - ([9b2d033](https://github.com/vicanso/zedis/commit/9b2d033e322457d6b95de13f1d9cfe9739659da6))
+- *(bridge, web, gui, connection)* ADR 18, the bridge's stores in PostgreSQL or MySQL, import-local and the audit viewer - ([c4279e6](https://github.com/vicanso/zedis/commit/c4279e68551431ef746d1288058798ea94a9a192))
+- *(bridge, web, gui, db)* The page's favorites, history, key notes, scripts and settings are kept on the bridge - ([4feaac2](https://github.com/vicanso/zedis/commit/4feaac2f64302f0434d0e0a0f67fc04cc4c633bc))
+- *(bridge,web,account)* Settle a deleted account's own entries, default admin token expiry, refresh page data while open - ([b01b479](https://github.com/vicanso/zedis/commit/b01b47990afbe3ba128d139dec65deeb6ba4d16e))
+- *(copy, connection)* Check a cross-server key copy first and say what re-creating it by type leaves behind - ([1bb0ea0](https://github.com/vicanso/zedis/commit/1bb0ea0f0c9b7cd5fae9657cb87e8cf8891cba49))
+- *(deps, web, gui, ui, docs)* Move to gpui-kit 0.8.0, highlight the page's editors with syntect up to 512 kB, scroll the workspace tab strip sideways, and fit a text-table column to its widest cell on a double-click - ([ce98791](https://github.com/vicanso/zedis/commit/ce98791300a04f13956345a59fbac911168f5e8d))
+- *(gui, docs)* Settings picks whether a JSON value, or a collection's JSON element, opens as text or as a tree, and the value diff keeps the layout last used - ([56b5bd0](https://github.com/vicanso/zedis/commit/56b5bd069876ed227f28cbfe546e4c994b96cadb))
+- *(gui, web, connection, core, docs)* A troubleshooting report reads the server once and saves it as Markdown or HTML with this session's findings, and the slow log reads CONFIG GET as one command - ([0e91143](https://github.com/vicanso/zedis/commit/0e91143e48c993b524f9612cc2d76d5db16fe4a8))
+- *(mcp, monitor, topology, bitmap, core)* Slowlog_summary / hotkeys / memory_summary MCP tools, timed MONITOR samples counted by client / command / key prefix, per-master keys and slot-share skew on the Load tab, bit edits behind an Edit bits switch - ([412485d](https://github.com/vicanso/zedis/commit/412485d904feeaefd697a4d9bf644c72116866de))
+- *(release, updater)* Ship GPUI Fast builds for Windows and Linux and keep each install on its own build - ([89cd737](https://github.com/vicanso/zedis/commit/89cd737acca1c6ace4289e9fe28ae931a24ea47b))
+- *(value-search, connection)* Search one key type and continue a stopped search from its cursors - ([a2af7f2](https://github.com/vicanso/zedis/commit/a2af7f205808e7a500bf49c721c31197b50106a4))
+- *(web, bridge)* Bring multi-db search, compare, Pub/Sub, keyspace events, MONITOR, recycle bin and metrics history to the browser - ([30af915](https://github.com/vicanso/zedis/commit/30af915df1acecb280d130cc060334c27f0de000))
+- *(web, bridge, gui, connection, docs)* A page diagnoses a connection through the bridge, exports keys as a JSON or CSV download, opens a value too large to save read-only, and lists who is online on which servers - ([61e5179](https://github.com/vicanso/zedis/commit/61e5179e8d65c253a0e37b9d051e768668a356db))
+- *(web, gui, connection)* The account page is a GPUI dialog behind a BridgeAccounts seam - ([118f312](https://github.com/vicanso/zedis/commit/118f31277d47d2dc5ff141b5b56a03e08a4be797))
+- *(web, gui, db, connection, bridge, docs)* A page downloads every export and picks files to import, decodes Protobuf values with viewers the bridge keeps, and remembers the terminal's history in the browser with credentials blanked - ([c952344](https://github.com/vicanso/zedis/commit/c952344760af6e74c027a128dfb84225a16430bb))
+
+### 🐛 Bug Fixes
+
+- *(bridge)* Serialize server-list edits so overlapping changes stop dropping each other's entries - ([e95e817](https://github.com/vicanso/zedis/commit/e95e8176f2303a82ad05f83256fdfaec52fcb9eb))
+- *(bridge, docs)* A schema step cut short is run again at start, released migrations are pinned and kept LF, and the guides say to use :nightly until the next release - ([5ac9667](https://github.com/vicanso/zedis/commit/5ac9667726f9b4ba19b8480383f9a731b98dc22d))
+- *(bridge, gui, docs)* Who is online is an administrator's to read, like the account list, and no longer every full account's - ([95c1b20](https://github.com/vicanso/zedis/commit/95c1b20ef33fb97e8c84cb8327297bed53dce480))
+- *(bridge, web)* The bridge fills in the page's asset map as it serves it, and the git filter goes - ([593d6e2](https://github.com/vicanso/zedis/commit/593d6e2e63dd9f7abf6dbeeb9da788ef15ebb132))
+- *(connection, gui)* A bridge error reply is an error in the browser, and the empty editor offers New key only where a key can be made - ([55f5eca](https://github.com/vicanso/zedis/commit/55f5ecaf979840da8104c129463c0e1e03ef519c))
+- *(gui, docs)* The audit's new search clears the picked line and its event field shows its placeholder whole; ADR 18 records the bridge's measured size - ([f50b223](https://github.com/vicanso/zedis/commit/f50b22367e15b5958804a2b373f716e07cda16ae))
+- *(topology, locales)* Localize the Sentinel failover, reset and remove confirm bodies - ([f02a4de](https://github.com/vicanso/zedis/commit/f02a4de42c8f786105da69bbec927bb7272fb714))
+- *(value-search, deps, locales)* Name the match cap when the match list fills ([#230](https://github.com/orhun/git-cliff/issues/230)) and bump rustls-webpki to 0.103.16 ([#231](https://github.com/orhun/git-cliff/issues/231)) - ([e8ac49c](https://github.com/vicanso/zedis/commit/e8ac49c4b3ba69927aea2edbd32a6c692e1eb5f7))
+- *(web)* Every glyph is antialiased grayscale, so Latin words and digits in a Chinese line no longer show colour fringes - ([3df2281](https://github.com/vicanso/zedis/commit/3df2281da4ae337ca0ad1824bb34f616682ae197))
+
+### 🚜 Refactor
+
+- *(bridge)* Keep the server list, recycle bin, metrics and audit log behind store traits, and seal the bin's values - ([5aa2e20](https://github.com/vicanso/zedis/commit/5aa2e20dfad23fb4f2272cd1d1cf926ccfd8f55a))
+- *(bridge, docs)* Split the bridge's api.rs and accounts.rs into modules by family, moves only, and its main() into start-up functions, and add the phased refactor plan - ([3fd44e2](https://github.com/vicanso/zedis/commit/3fd44e24e0a7b9b3d5d2acbc1ebceee34d81fe8c))
+- *(connection)* Move TLS dialing out of ssh_tunnel.rs into tls_connection.rs - ([70ad069](https://github.com/vicanso/zedis/commit/70ad069cd04f174c2b8131a16c8a8d9e92e2a5ea))
+- *(connection, docs)* Split ssh_tunnel.rs, config.rs and manager/client.rs into submodules of whole items, every outside path re-exported, the live suite with SSH run before and after - ([0604a68](https://github.com/vicanso/zedis/commit/0604a68ba371e6f95fb293da4dea974a1543ff35))
+- *(connection, docs)* Split the live tests into tests/live/ modules by feature with the fixtures in main.rs, names and CI filters unchanged, and list the operations without a live test - ([cb3cb50](https://github.com/vicanso/zedis/commit/cb3cb50db500bdc409f7a65330a2d95f41c1662a))
+- *(core, db, docs)* Remove two helpers nothing called, give KeyMetadata its container serde default, and record the core and db pass - ([52facc6](https://github.com/vicanso/zedis/commit/52facc62a9733e0bb007f25432f65d89e6595deb))
+- *(gui, docs)* Split the updater into check, manifest, download and install modules with tests for the download's checksum and the mirror fallback first - ([c78ad4e](https://github.com/vicanso/zedis/commit/c78ad4e82315e2d950084b0f32f98b1bdea15cf4))
+- *(gui, docs)* Move the workspace tab strip into root/tabs.rs and the root's constructor into named parts with UI tests for the strip first, and record the panel and confirm checks - ([b54fde5](https://github.com/vicanso/zedis/commit/b54fde5d22a7db6aec930fdfcbffed2a0c9646b9))
+- *(gui, docs)* Split the status bar into tools menu, server status, telemetry and editor controls modules with UI tests first, and reduce motion in UI tests so a dialog's button stays where the click was aimed - ([2ffdd87](https://github.com/vicanso/zedis/commit/2ffdd8717d45975ef71d75c0a95094e46b4770e6))
+- *(gui, docs)* Lift the browser's statement-level target gates into function pairs, named seams and web modules, ask this_build for the Kill and AI buttons, with tests for the moved desktop arms first - ([b22963a](https://github.com/vicanso/zedis/commit/b22963af7399d19cd6d5b4d7f52fa9b0b9a33835))
+- *(gui, docs)* Split seven of the longest view functions — key tree row and keyword bar, editor key bar, sidebar list, settings constructor, server form and servers page — into named parts, with UI tests for each first and a lock for the shared server list - ([5590760](https://github.com/vicanso/zedis/commit/5590760e624448fbb539fbec33c2e8eb29b035b7))
+- *(states, docs)* Group ZedisServerState's fields into seven sub-structs holding the logic that touches only them, with tests for their events first, and name the background refreshes once on ServerTask - ([e22ca9a](https://github.com/vicanso/zedis/commit/e22ca9ab285ecdae0080a104373263327d1d4291))
+- *(web, docs)* Split the bridge transport into one submodule per seam it carries, with tests for the server list's save, the bin and metrics routes and the session, lock and watch routes first - ([2d90e1f](https://github.com/vicanso/zedis/commit/2d90e1f20e87e98d4737b2efb38a7f3f93546370))
+
+### 📚 Documentation
+
+- *(adr)* ADR 17 amended, the account page is drawn by the app - ([337dceb](https://github.com/vicanso/zedis/commit/337dceb3988b1d4536483c6afd9ac7717fb78725))
+- *(adr)* ADR 17, the bridge registers its accounts and keeps its data behind stores - ([6ef4ea1](https://github.com/vicanso/zedis/commit/6ef4ea1be3be95ee5ed1f579a75db5544a69717d))
+- *(bridge, readme)* A PostgreSQL and MySQL storage guide with Docker commands and the schema, linked from the READMEs - ([ea6f195](https://github.com/vicanso/zedis/commit/ea6f195781f736e0fa5eb82f95e0f9f96d0422ec))
+
+### 🧪 Testing
+
+- *(connection)* Wait out another test's background save before the live BGSAVE check on Valkey - ([3b365a2](https://github.com/vicanso/zedis/commit/3b365a28a009446dce705eb67b0a57237d17d487))
+
+### ⚙️ Miscellaneous Tasks
+
+- *(audit)* Ignore the zbus 5 unmaintained advisories and move off the yanked inout 0.2.3, closes #227, closes #228, closes #229 - ([e446162](https://github.com/vicanso/zedis/commit/e44616212acdbb409147969ba5ad3b7f8f0852bf))
+
 ## [0.14.0](https://github.com/vicanso/zedis/compare/v0.13.0..v0.14.0) - 2026-10-17
 
 ### ⛰️  Features
