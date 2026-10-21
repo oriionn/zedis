@@ -66,7 +66,7 @@ use gpui_kit::component::{
     notification::Notification,
     v_flex,
 };
-use std::{mem::take, sync::Arc};
+use std::{mem::take, sync::Arc, time::Duration};
 use web_time::Instant;
 
 // The scan cap, time budget and match cap are user-tunable (Settings →
@@ -92,16 +92,49 @@ const CONTINUE_BUTTON_ID: &str = "vs-continue";
 const EXAMPLE_PREFIXES: &[&str] = &["session:", "user:", "cache:", "job:"];
 
 /// Why a search loop stopped — drives the honest summary line.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum StopReason {
     /// Whole (prefix-scoped) keyspace covered.
     Done,
-    /// Hit the scan-count or match cap.
-    Capped,
+    /// Scanned as many keys as one run may.
+    ScanCapped,
+    /// Listed as many matches as one run may — that number. The keys
+    /// scanned can be far under their own cap then, and a continue lists
+    /// more matches rather than scanning further (#230: both caps used to
+    /// read "hit scan cap").
+    MatchCapped(usize),
     /// Ran out the time budget.
     Timeout,
     /// User pressed Stop.
     Cancelled,
+}
+
+/// The guardrails one run of a search is held to, each counted from the
+/// run's start.
+#[derive(Clone, Copy)]
+struct SearchBudget {
+    scan_cap: usize,
+    time_budget_secs: u64,
+    max_matches: usize,
+}
+
+impl SearchBudget {
+    /// Whether a round ends the run, and why. The match cap comes first:
+    /// the hits past it are held for a continue, so even the end of the
+    /// keyspace is not the end of the list.
+    fn stop_after_round(&self, truncated: bool, done: bool, scanned: usize, elapsed: Duration) -> Option<StopReason> {
+        if truncated {
+            Some(StopReason::MatchCapped(self.max_matches))
+        } else if done {
+            Some(StopReason::Done)
+        } else if scanned >= self.scan_cap {
+            Some(StopReason::ScanCapped)
+        } else if elapsed.as_secs() >= self.time_budget_secs {
+            Some(StopReason::Timeout)
+        } else {
+            None
+        }
+    }
 }
 
 /// Where a stopped search can go on from: what it was asked, as typed, and
@@ -357,7 +390,7 @@ impl ZedisValueSearch {
         if self.running
             || !matches!(
                 self.stop_reason,
-                Some(StopReason::Capped | StopReason::Timeout | StopReason::Cancelled)
+                Some(StopReason::ScanCapped | StopReason::MatchCapped(_) | StopReason::Timeout | StopReason::Cancelled)
             )
         {
             return false;
@@ -395,19 +428,19 @@ impl ZedisValueSearch {
         };
         // Snapshot the tunable guardrails at search start — a mid-search
         // settings change applies to the next search, not this one.
-        let (scan_cap, time_budget_secs, max_matches) = {
+        let budget = {
             let store = cx.global::<ZedisGlobalStore>().read(cx);
-            (
-                store.value_search_scan_cap(),
-                store.value_search_time_budget_secs(),
-                store.value_search_max_matches(),
-            )
+            SearchBudget {
+                scan_cap: store.value_search_scan_cap(),
+                time_budget_secs: store.value_search_time_budget_secs(),
+                max_matches: store.value_search_max_matches(),
+            }
         };
-        let limit = self.matches.len() + max_matches;
+        let limit = self.matches.len() + budget.max_matches;
         self.running = true;
         self.admit(held, limit);
         if self.truncated {
-            self.finish(StopReason::Capped, cx);
+            self.finish(StopReason::MatchCapped(budget.max_matches), cx);
             return;
         }
         cx.notify();
@@ -449,17 +482,7 @@ impl ZedisValueSearch {
                     }
                     this.admit(matches, limit);
                     cx.notify();
-                    if this.truncated {
-                        Some(StopReason::Capped)
-                    } else if done {
-                        Some(StopReason::Done)
-                    } else if scanned_here >= scan_cap {
-                        Some(StopReason::Capped)
-                    } else if start.elapsed().as_secs() >= time_budget_secs {
-                        Some(StopReason::Timeout)
-                    } else {
-                        None
-                    }
+                    budget.stop_after_round(this.truncated, done, scanned_here, start.elapsed())
                 });
                 match stop {
                     Ok(Some(reason)) => {
@@ -652,7 +675,14 @@ impl ZedisValueSearch {
     fn reason_label(&self, cx: &Context<Self>) -> SharedString {
         match self.stop_reason {
             Some(StopReason::Done) => i18n_value_search(cx, "reason_done"),
-            Some(StopReason::Capped) => i18n_value_search(cx, "reason_capped"),
+            Some(StopReason::ScanCapped) => i18n_value_search(cx, "reason_capped"),
+            Some(StopReason::MatchCapped(cap)) => rust_i18n::t!(
+                "value_search.reason_match_capped",
+                cap = group_thousands(cap as u64),
+                locale = cx.global::<ZedisGlobalStore>().read(cx).locale()
+            )
+            .to_string()
+            .into(),
             Some(StopReason::Timeout) => i18n_value_search(cx, "reason_timeout"),
             Some(StopReason::Cancelled) => i18n_value_search(cx, "reason_cancelled"),
             None if self.running => i18n_value_search(cx, "searching"),
@@ -1357,6 +1387,69 @@ mod tests {
             admit_up_to(&mut matches, vec![hit("e")], 3).len() == 1,
             "a full list takes none"
         );
+    }
+
+    /// A run that fills its match list stops for that, not for the scan cap
+    /// it may be far from: the status read "hit scan cap" after 1,024 of
+    /// 10,000 keys (#230).
+    #[test]
+    fn a_full_match_list_stops_for_the_match_cap_not_the_scan_cap() {
+        let budget = SearchBudget {
+            scan_cap: 10_000,
+            time_budget_secs: 10,
+            max_matches: 500,
+        };
+        let early = Duration::from_secs(1);
+        assert_eq!(
+            budget.stop_after_round(true, false, 1_024, early),
+            Some(StopReason::MatchCapped(500))
+        );
+        assert_eq!(
+            budget.stop_after_round(true, true, 1_024, early),
+            Some(StopReason::MatchCapped(500)),
+            "hits held past the cap outlast the keyspace's end"
+        );
+        assert_eq!(
+            budget.stop_after_round(false, false, 10_000, early),
+            Some(StopReason::ScanCapped)
+        );
+        assert_eq!(
+            budget.stop_after_round(false, true, 10_000, early),
+            Some(StopReason::Done)
+        );
+        assert_eq!(
+            budget.stop_after_round(false, false, 1_024, Duration::from_secs(10)),
+            Some(StopReason::Timeout)
+        );
+        assert_eq!(budget.stop_after_round(false, false, 1_024, early), None);
+    }
+
+    /// The status names the cap that stopped the search, and the match cap
+    /// its number.
+    #[gpui::test]
+    fn the_status_names_the_cap_that_stopped_the_search(cx: &mut TestAppContext) {
+        init_ui(cx);
+        cx.update(|cx| {
+            let store = cx.global::<ZedisGlobalStore>().clone();
+            store.update(cx, |state, _| state.set_locale("en".to_string()));
+        });
+        let server_state = cx.new(|_| ZedisServerState::default());
+        let mut panel = None;
+        cx.open_window(size(px(1000.), px(600.)), |window, cx| {
+            let view = cx.new(|cx| ZedisValueSearch::new(server_state.clone(), window, cx));
+            panel = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let panel = panel.expect("the window built the panel");
+        let status = |reason: StopReason, cx: &mut TestAppContext| {
+            panel.update(cx, |this, cx| {
+                this.stop_reason = Some(reason);
+                this.reason_label(cx).to_string()
+            })
+        };
+        assert_eq!(status(StopReason::MatchCapped(500), cx), "hit match cap (500)");
+        assert_eq!(status(StopReason::MatchCapped(2_000), cx), "hit match cap (2,000)");
+        assert_eq!(status(StopReason::ScanCapped, cx), "hit scan cap");
     }
 
     /// Continue is offered for a search that stopped with something left to
