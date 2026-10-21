@@ -106,9 +106,20 @@ fn standalone_value_search_reads_by_type_and_goes_on_from_its_cursors() {
         for write in &writes {
             write.exec_async(&mut c).await.expect("write");
         }
+        // SCAN COUNT is a hint. Valkey 9's hashtable can return a small
+        // MATCH set in one call (7 keys at COUNT 2 → cursor 0), so extra
+        // string keys under the same prefix, without the needle, grow the
+        // table until a round leaves a cursor — the Continue path the panel
+        // uses.
+        const FILLERS: usize = 32;
+        let mut fill = cmd("MSET");
+        for i in 0..FILLERS {
+            fill.arg(key(&format!("fill-{i}"))).arg("pad");
+        }
+        fill.exec_async(&mut c).await.expect("fillers");
 
         // Every round goes on from the last one's cursors, as a search that
-        // stopped and is continued does; a COUNT of 2 makes that many rounds.
+        // stopped and is continued does.
         let search = |only| {
             let at = at.clone();
             let spec = ValueSearchSpec {
@@ -163,7 +174,8 @@ fn standalone_value_search_reads_by_type_and_goes_on_from_its_cursors() {
         let (found, _, _) = search(Some(SearchableType::Zset)).await;
         assert_eq!(found, [(key("z1"), "zset".to_string())]);
 
-        let names: Vec<String> = ["s1", "s2", "h1", "l1", "set1", "z1", "x1"].map(key).to_vec();
+        let mut names: Vec<String> = ["s1", "s2", "h1", "l1", "set1", "z1", "x1"].map(key).to_vec();
+        names.extend((0..FILLERS).map(|i| key(&format!("fill-{i}"))));
         cmd("DEL").arg(&names).exec_async(&mut c).await.expect("cleanup");
     });
 }
