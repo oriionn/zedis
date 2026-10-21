@@ -315,7 +315,21 @@ fn standalone_server_operations_describe_and_administer_the_server() {
         // and is not read; what is checked is that the server took it. In
         // this order: an AOF rewrite asked for while a BGSAVE runs is
         // *scheduled*, while a BGSAVE asked for during a rewrite is refused.
-        bgsave(&at).await.expect("bgsave");
+        // A save another test started may still be running — the BGSAVE
+        // CANCEL test's on Valkey 8.1+, whose child is reaped some time after
+        // the cancel — and a second one is refused as "already in progress"
+        // until it is gone; ours goes in then.
+        let mut started = bgsave(&at).await;
+        for _ in 0..100 {
+            match &started {
+                Err(e) if e.to_string().contains("already in progress") => {
+                    smol::Timer::after(std::time::Duration::from_millis(100)).await;
+                    started = bgsave(&at).await;
+                }
+                _ => break,
+            }
+        }
+        started.expect("bgsave");
         bgrewriteaof(&at).await.expect("bgrewriteaof");
         let saved = master_infos(&at, None).await.expect("infos");
         assert!(
