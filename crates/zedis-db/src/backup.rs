@@ -296,12 +296,20 @@ mod tests {
 
         // The JSON round trip is what a file restore does.
         let json = serde_json::to_string(&backup).expect("json");
-        let parsed: LocalDataBackup = serde_json::from_str(&json).expect("parse");
+        let mut parsed: LocalDataBackup = serde_json::from_str(&json).expect("parse");
+        // Other stored tests share this process's redb. Importing the full
+        // snapshot would merge their keys back (a renamed key's old name
+        // came back as a second record).
+        parsed.key_metadata.retain(|item| item.server_id == server);
+        parsed.favorites.retain(|item| item.server_id == server);
+        parsed.script_viewers.retain(|item| item.value.server_id == server);
+        parsed.lua_scripts.retain(|item| item.id == "backup-lua");
+        parsed.protos.retain(|item| item.value.server_id == server);
         let summary = import_local_data(&parsed).expect("import");
-        assert!(summary.key_metadata >= 1);
-        assert!(summary.favorites >= 2);
-        assert!(summary.script_viewers >= 1);
-        assert!(summary.lua_scripts >= 1);
+        assert_eq!(summary.key_metadata, 1);
+        assert_eq!(summary.favorites, 2);
+        assert_eq!(summary.script_viewers, 1);
+        assert_eq!(summary.lua_scripts, 1);
         assert_eq!(summary.skipped, 0);
         assert_eq!(
             ProtoManager::get_proto("backup-proto")
